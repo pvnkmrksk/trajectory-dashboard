@@ -925,16 +925,20 @@ def build_heatmap_figure(df, group_by="config", pool_mode="separate", ncols=2,
         zmin, zmax = mmin, mmax
         cbar = dict(title=unit, thickness=12, len=0.5)
 
+    # IMPORTANT: pass z / customdata as plain Python lists. 2-D numpy arrays get
+    # serialised with Plotly-6's typed-array ("bdata") encoding, which Dash does
+    # not round-trip for 2-D data — z arrives as `undefined` in the browser and
+    # the heatmap renders blank. Lists serialise as normal JSON and always work.
+    xl, yl = xc.tolist(), yc.tolist()
     hov = "x=%{x:.1f} z=%{y:.1f}<br>%{customdata:.3g} " + unit + "<extra></extra>"
     for idx, M in enumerate(mats):
         disp = M.copy()
         disp[disp == 0] = np.nan          # blank empty cells
         z = np.log10(disp) if log_scale else disp
         fig.add_trace(
-            go.Heatmap(x=xc, y=yc, z=z, customdata=M,
-                       colorscale=HEATMAP_COLORSCALE,
-                       zmin=zmin, zmax=zmax, showscale=(idx == 0),
-                       colorbar=cbar, hovertemplate=hov),
+            go.Heatmap(x=xl, y=yl, z=z.tolist(), customdata=M.tolist(),
+                       colorscale=HEATMAP_COLORSCALE, zmin=zmin, zmax=zmax,
+                       showscale=(idx == 0), colorbar=cbar, hovertemplate=hov),
             row=idx // ncols + 1, col=idx % ncols + 1,
         )
 
@@ -1014,15 +1018,18 @@ def build_raw_trace_figure(df, columns, max_points=None):
     n = len(columns)
     fig = make_subplots(rows=n, cols=1, shared_xaxes=True,
                         subplot_titles=columns, vertical_spacing=0.15)
-    budget = int(max_points) if (max_points and max_points > 0) else BUDGET_RAW
+    # SVG (go.Scatter), not WebGL: this plot lives in a panel that starts hidden,
+    # and a WebGL canvas created while hidden won't paint. Use a smaller budget
+    # so SVG stays light.
+    budget = int(max_points) if (max_points and max_points > 0) else 8000
     step = max(1, len(df) // budget)
     sub = df.sort_values("Current Time").iloc[::step]
     for i, col in enumerate(columns):
         if col not in sub.columns:
             continue
         fig.add_trace(
-            go.Scattergl(x=sub["Current Time"], y=sub[col], mode="lines",
-                          line=dict(width=1, color=COLORS[i % len(COLORS)]), name=col),
+            go.Scatter(x=sub["Current Time"], y=sub[col], mode="lines",
+                       line=dict(width=1, color=COLORS[i % len(COLORS)]), name=col),
             row=i + 1, col=1,
         )
     fig.update_layout(height=max(180, n * 140), margin=dict(l=50, r=10, t=25, b=20),
@@ -1123,6 +1130,11 @@ def _load_data(pattern):
 # ---------------------------------------------------------------------------
 
 _EMPTY = go.Figure().update_layout(height=190, template="plotly_white")
+
+# Each view panel fills the panels-wrapper and is hidden via `visibility` so its
+# graph keeps full dimensions (Plotly never sees a 0-size container).
+_PANEL_STYLE = {"position": "absolute", "top": 0, "left": 0, "right": 0,
+                "bottom": 0, "overflowY": "auto"}
 
 app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
@@ -1382,65 +1394,62 @@ app.layout = html.Div([
             # Summary
             html.Div(id="data-summary",
                      style={"fontSize": "11px", "padding": "3px 8px", "background": "#e9ecef",
-                            "borderRadius": "3px", "margin": "0 0 3px 0"}),
+                            "borderRadius": "3px", "margin": "0 0 3px 0", "flexShrink": "0"}),
 
-            # View switch. All three panels stay MOUNTED (just shown/hidden) so
-            # the trajectory & heatmap graphs are always in the DOM — that's what
-            # keeps their zoom genuinely linked (and the URL viewbox in sync).
+            # View switch.
             dcc.RadioItems(id="view-mode", options=[
                 {"label": "Trajectories", "value": "traj"},
                 {"label": "Heatmap", "value": "heat"},
                 {"label": "Diagnostics", "value": "diag"},
             ], value="traj", inline=True,
-               labelStyle={"marginRight": "14px", "cursor": "pointer"},
-               style={"fontSize": "12px", "fontWeight": "bold", "padding": "2px 4px",
-                      "borderBottom": "1px solid #ddd", "marginBottom": "2px"}),
+               labelStyle={"marginRight": "16px", "cursor": "pointer"},
+               style={"fontSize": "12px", "fontWeight": "bold", "padding": "3px 4px",
+                      "borderBottom": "1px solid #ddd", "marginBottom": "2px",
+                      "flexShrink": "0"}),
 
-            # --- Trajectories panel ---
+            # Panels wrapper. Every panel is absolutely positioned to FILL this
+            # box and is hidden with `visibility` (NOT display:none). That keeps
+            # each graph at full size the whole time — so Plotly always measures
+            # correctly and there is no 0-size render when a panel is first shown.
             html.Div([
-                # Sticky playback bar — stays visible above the scrolling plot.
+                # --- Trajectories ---
                 html.Div([
-                    html.Button("▶", id="anim-play", n_clicks=0, title="Play",
-                                style={"fontSize": "13px", "padding": "1px 9px",
-                                       "cursor": "pointer"}),
-                    html.Button("⏸", id="anim-pause", n_clicks=0, title="Pause",
-                                style={"fontSize": "13px", "padding": "1px 9px",
-                                       "cursor": "pointer"}),
-                    html.Div(dcc.Slider(id="anim-slider", min=0, max=100, step=1,
-                                        value=100, marks=None,
-                                        tooltip={"placement": "bottom",
-                                                 "always_visible": False}),
-                             style={"flex": "1", "minWidth": "0"}),
-                    html.Span("time", style={"fontSize": "10px", "color": "#888"}),
-                    html.Div(id="anim-dummy", style={"display": "none"}),
-                ], id="anim-bar",
-                   style={"display": "flex", "alignItems": "center", "gap": "8px",
-                          "padding": "4px 10px 2px", "background": "#fff",
-                          "borderBottom": "1px solid #e3e6ee"}),
-                html.Div(
+                    html.Div([
+                        html.Button("▶", id="anim-play", n_clicks=0, title="Play",
+                                    style={"fontSize": "13px", "padding": "1px 9px",
+                                           "cursor": "pointer"}),
+                        html.Button("⏸", id="anim-pause", n_clicks=0, title="Pause",
+                                    style={"fontSize": "13px", "padding": "1px 9px",
+                                           "cursor": "pointer"}),
+                        html.Div(dcc.Slider(id="anim-slider", min=0, max=100, step=1,
+                                            value=100, marks=None,
+                                            tooltip={"placement": "bottom",
+                                                     "always_visible": False}),
+                                 style={"flex": "1", "minWidth": "0"}),
+                        html.Span("time", style={"fontSize": "10px", "color": "#888"}),
+                        html.Div(id="anim-dummy", style={"display": "none"}),
+                    ], id="anim-bar",
+                       style={"display": "flex", "alignItems": "center", "gap": "8px",
+                              "padding": "4px 10px 2px", "background": "#fff",
+                              "position": "sticky", "top": "0", "zIndex": "5",
+                              "borderBottom": "1px solid #e3e6ee"}),
                     dcc.Loading(
                         dcc.Graph(id="trajectory-plot", figure=_EMPTY,
-                                  config={"scrollZoom": True, "displayModeBar": True,
-                                          "responsive": True},
+                                  config={"scrollZoom": True, "displayModeBar": True},
                                   style={"width": "100%"}),
                         type="circle"),
-                    style={"height": "calc(100vh - 165px)", "overflowY": "auto"}),
-            ], id="view-traj"),
+                ], id="view-traj", style={**_PANEL_STYLE}),
 
-            # --- Heatmap panel ---
-            html.Div(
+                # --- Heatmap ---
                 html.Div(
                     dcc.Loading(
                         dcc.Graph(id="heatmap-plot", figure=_EMPTY,
-                                  config={"scrollZoom": True, "displayModeBar": True,
-                                          "responsive": True},
+                                  config={"scrollZoom": True, "displayModeBar": True},
                                   style={"width": "100%"}),
                         type="circle"),
-                    style={"height": "calc(100vh - 130px)", "overflowY": "auto"}),
-                id="view-heat", style={"display": "none"}),
+                    id="view-heat", style={**_PANEL_STYLE, "visibility": "hidden"}),
 
-            # --- Diagnostics panel ---
-            html.Div(
+                # --- Diagnostics ---
                 html.Div([
                     html.Div([
                         html.Div([
@@ -1462,11 +1471,10 @@ app.layout = html.Div([
                         dcc.Graph(id="raw-trace-plot", figure=_EMPTY,
                                   config={"scrollZoom": True}),
                         type="circle"),
-                ], style={"height": "calc(100vh - 130px)", "overflowY": "auto",
-                           "paddingTop": "4px"}),
-                id="view-diag", style={"display": "none"}),
-        ], style={"flex": "1", "padding": "4px 8px", "overflowY": "hidden",
-                   "height": "calc(100vh - 46px)"}),
+                ], id="view-diag", style={**_PANEL_STYLE, "visibility": "hidden"}),
+            ], style={"position": "relative", "flex": "1", "minHeight": "0"}),
+        ], style={"flex": "1", "padding": "4px 8px", "display": "flex",
+                   "flexDirection": "column", "height": "calc(100vh - 46px)"}),
     ], style={"display": "flex", "height": "calc(100vh - 46px)"}),
 
     # Stores
@@ -1521,6 +1529,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("raw-columns", "value", allow_duplicate=True),
     Output("subplot-ncols", "value", allow_duplicate=True),
     Output("plot-points", "value", allow_duplicate=True),
+    Output("view-mode", "value", allow_duplicate=True),
     Output("viewport-store", "data", allow_duplicate=True),
     Output("url-restored", "data"),
     Input("url", "search"),
@@ -1528,7 +1537,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     prevent_initial_call="initial_duplicate",
 )
 def restore_from_url(search, already):
-    n_out = 26
+    n_out = 27
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -1553,6 +1562,7 @@ def restore_from_url(search, already):
 
     anim = (["on"] if p["anim"][0] == "1" else []) if "anim" in p else no_update
     rebase = (["on"] if p["rebase"][0] == "1" else []) if "rebase" in p else no_update
+    view = p["view"][0] if p.get("view", [""])[0] in ("traj", "heat", "diag") else no_update
 
     vp = no_update
     if all(k in p for k in ("vbx0", "vbx1", "vby0", "vby1")):
@@ -1568,7 +1578,7 @@ def restore_from_url(search, already):
         num("hbin"), s("hscale"), num("hbound"), s("hmetric"),
         num("hcmin"), num("hcmax"), s("hcrange"),
         lst("fcfg"), lst("fvr"), lst("ffly"), lst("fscn"), lst("ffld"),
-        lst("raw"), num("ncols"), num("pts"), vp, True,
+        lst("raw"), num("ncols"), num("pts"), view, vp, True,
     )
 
 
@@ -1674,11 +1684,12 @@ def tick_progress(n, barstyle, trackstyle):
     State("raw-columns", "value"),
     State("subplot-ncols", "value"),
     State("plot-points", "value"),
+    State("view-mode", "value"),
     prevent_initial_call=True,
 )
 def update_url(n, vp, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
                hbin, hscale, hbound, hmetric, hcmin, hcmax, hcrange,
-               fcfg, fvr, ffly, fscn, ffld, raw, ncols, pts):
+               fcfg, fvr, ffly, fscn, ffld, raw, ncols, pts, view):
     params = {}
     if g:
         params["glob"] = g
@@ -1688,7 +1699,7 @@ def update_url(n, vp, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
         if v is not None and v != "":
             params[k] = v
     strs = {"groupby": gb, "pool": pm, "color": color, "hscale": hscale,
-            "hmetric": hmetric, "hcrange": hcrange}
+            "hmetric": hmetric, "hcrange": hcrange, "view": view}
     for k, v in strs.items():
         if v:
             params[k] = v
@@ -1933,7 +1944,8 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                                      bound_pct=hm_bound if hm_bound else 100,
                                      metric=hm_metric or "time",
                                      cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange)
-    raw_fig = build_raw_trace_figure(df_f, raw_cols or [], max_points=max_points)
+    raw_fig = build_raw_trace_figure(
+        df_f, raw_cols or ["GameObjectPosX", "GameObjectPosZ"], max_points=max_points)
     bt = time.time() - t0
 
     # Retain / restore the shared viewbox across replots and from the URL.
@@ -1960,7 +1972,9 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     return traj_fig, heat_fig, raw_fig, summary, vel_fig, disp_fig
 
 
-# Rebuild only the heatmap when bin size / scale change (fast, no full replot)
+# Rebuild the heatmap on its own controls AND whenever the Heatmap view is
+# opened. Re-pushing the figure to the now-visible graph is what makes it draw
+# reliably (a graph born in a hidden panel won't render an earlier figure push).
 @app.callback(
     Output("heatmap-plot", "figure", allow_duplicate=True),
     Input("heatmap-binsize", "value"),
@@ -1970,6 +1984,7 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     Input("heatmap-cmin", "value"),
     Input("heatmap-cmax", "value"),
     Input("heatmap-crange", "value"),
+    Input("view-mode", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
@@ -1990,11 +2005,14 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     prevent_initial_call=True,
 )
 def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_cmax,
-                        hm_crange, pattern, vel_thresh,
+                        hm_crange, view, pattern, vel_thresh,
                         min_disp, trim, jump_buf, group_by, pool_mode, ncols, rebase,
                         cfg, vrs, fids, scenes, folders,
                         vel_selection, disp_selection, viewport):
     if not pattern:
+        return no_update
+    # If this fire came from switching views, only act when heatmap is shown.
+    if ctx.triggered_id == "view-mode" and view != "heat":
         return no_update
     df_f, df_sub, _ = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -2077,7 +2095,8 @@ def sync_viewport(traj_relayout, heat_relayout):
     return no_update, patch, ranges
 
 
-# Show/hide the mounted panels (graphs stay in the DOM the whole time).
+# Show exactly one mounted panel (graphs are never unmounted, so their figures
+# and zoom persist).
 @app.callback(
     Output("view-traj", "style"),
     Output("view-heat", "style"),
@@ -2085,24 +2104,33 @@ def sync_viewport(traj_relayout, heat_relayout):
     Input("view-mode", "value"),
 )
 def switch_view(v):
-    shown, hidden = {"display": "block"}, {"display": "none"}
-    return (shown if v == "traj" else hidden,
-            shown if v == "heat" else hidden,
-            shown if v == "diag" else hidden)
+    def st(name):
+        return {**_PANEL_STYLE, "visibility": "visible" if v == name else "hidden"}
+    return st("traj"), st("heat"), st("diag")
 
 
-# Plotly graphs rendered while hidden have zero size — resize the now-visible
-# one(s) after a view switch so they fill the panel.
+# The heatmap uses a 1:1 aspect lock (scaleanchor). Dash's Plotly.react update
+# path crashes on that with "axis scaling" when the figure is applied to a graph
+# that isn't at full size yet, and never recovers — so the heatmap stays blank.
+# A fresh Plotly.newPlot re-initialises cleanly and renders. Do that whenever the
+# heatmap figure changes or the Heatmap view is opened; resize the others.
 app.clientside_callback(
-    "function(v){setTimeout(function(){"
-    "function rs(id){var c=document.getElementById(id);var g=c&&c.querySelector('.js-plotly-plot');"
-    "if(g&&window.Plotly)window.Plotly.Plots.resize(g);}"
-    "if(v==='traj')rs('trajectory-plot');"
-    "else if(v==='heat')rs('heatmap-plot');"
-    "else{rs('vel-histogram');rs('disp-histogram');rs('raw-trace-plot');}"
-    "},60);return '';}",
+    "function(hfig, view){setTimeout(function(){"
+    "var hc=document.getElementById('heatmap-plot');"
+    "var hg=hc&&hc.querySelector('.js-plotly-plot');"
+    "if(hg&&window.Plotly&&hg.data&&hg.data.length){"
+    "try{window.Plotly.newPlot(hg,hg.data,hg.layout,{scrollZoom:true,displayModeBar:true});}"
+    "catch(e){}}"
+    "['trajectory-plot','vel-histogram','disp-histogram','raw-trace-plot']"
+    ".forEach(function(id){var c=document.getElementById(id);"
+    "var g=c&&c.querySelector('.js-plotly-plot');"
+    "if(g&&window.Plotly&&window.Plotly.Plots){try{window.Plotly.Plots.resize(g);}catch(e){}}});"
+    "try{window.dispatchEvent(new Event('resize'));}catch(e){}"
+    "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
-    Input("view-mode", "value"), prevent_initial_call=True,
+    Input("heatmap-plot", "figure"),
+    Input("view-mode", "value"),
+    prevent_initial_call=True,
 )
 
 
