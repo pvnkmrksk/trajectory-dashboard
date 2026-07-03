@@ -1,133 +1,230 @@
-# Architecture & agent guide
+# Architecture & context — Trajectory Dashboard
 
-This document orients a developer or coding agent inside `app.py`. The whole app
-is one file, organised top-to-bottom in clearly commented sections. Read this
-before editing — it captures the invariants that are easy to break.
+> One-stop context for a developer or coding agent. Read this instead of scanning
+> all ~2400 lines. The app is a **single file** (`app.py`, mirrored as
+> `dashboard.py` in the sibling `Plotting/` project — they are identical bar the
+> `python app.py` vs `python dashboard.py` line). Keep the two in sync.
 
-## Mental model
+---
+
+## 1. What it is
+
+An interactive Dash + Plotly web app for exploring **VR insect-trajectory
+experiments**. You point it at a folder of CSVs and it pools, filters, animates,
+and density-maps 2-D trajectories — fast, on millions of rows.
+
+Stack in this environment: **Dash 4.2, Plotly 6.8, pandas 2, numpy**. (Dash 4 /
+Plotly 6 matter — see the rendering gotchas in §7.)
+
+---
+
+## 2. Data model (the one thing to internalise)
+
+- Input CSVs have columns: `Current Time, CurrentTrial, CurrentStep,
+  GameObjectPosX, GameObjectPosZ` (X/Z is the ground plane; **not** Y), plus
+  optional rotation/sensor columns.
+- Sibling JSON is auto-detected per folder: `*_ControlScene_sequenceConfig.json`
+  maps `CurrentStep → ConfigFile` (the treatment); `*FlyMetaData.json` maps
+  `VR → FlyID/Sex`.
+- **A _segment_ is the atomic unit:** `_seg_id = SourceFolder + VR + CurrentTrial
+  + CurrentStep`. Everything groups/filters by this. **Never** group by
+  `(Trial, Step)` alone — different files reuse the same numbers and would merge
+  unrelated tracks. This was a real early bug.
+- **Velocity is in raw position-units per second, NOT cm/s.** Values are large
+  (median ~thousands). Histograms cap at the 99th percentile; the velocity
+  colour mode drops reset-spikes above the 99.5th pct before smoothing.
+
+---
+
+## 3. File map (top to bottom)
+
+| Lines (~) | Section | Key functions |
+|---|---|---|
+| 28–131 | **Config name humaniser** | `humanise_config` + `_MANUAL_LUT` + live `_USER_LUT`. Regex rules turn messy config filenames into readable subplot titles. |
+| 133–251 | **Data loading** | `find_csv_files`, `load_csv_fast` (1 CSV → tidy df with `_seg_id`+metadata), `_load_data` (concat, cache, progress). |
+| 252–411 | **Filtering / stats** | `velocity_all` (vectorised per-row speed), `smoothed_velocity`, `compute_segment_stats`, `apply_filters`, `filter_by_stat_range`, `_dilate_keep`. |
+| 413–1039 | **Plotting** | colour resolution + `_prepare_merged_groups`; `build_trajectory_figure`, `build_heatmap_figure`, histograms, `build_raw_trace_figure`; `_apply_axis_sync`, `_shared_range`/`_robust_range`, `rebase_to_origin`, `default_bin_size`, heatmap metric/colourbar helpers. |
+| 1041–1127 | **Dash app + caches** | `app`, `_DATA_CACHE`, `_STATS_CACHE`, `_LOAD_PROGRESS`, `resolve_dropped_folder`, `_load_data`. |
+| 1128–1489 | **Layout** | sidebar (glob/drop-zone/filters/colour/heatmap/advanced/LUT/metadata) + main area (radio view-switch + 3 absolutely-positioned panels + `dcc.Store`s). |
+| 1490–2322 | **Callbacks** | URL state, drop-folder, progress, load, `update_plots`, `update_heatmap_only`, viewport sync, view switch, selection info, LUT, export. |
+| 2323–2369 | **Clientside** | playback (Play/Pause/slider → `Plotly.animate`), heatmap `newPlot` re-init + resize, view-switch resize. |
+| 2371–end | **`__main__`** | CLI (`--glob/--port/--host/--debug`), optional pre-load. |
+
+Assets (Dash auto-serves `/assets`):
+- `assets/dropzone.js` — folder drag-and-drop → `set_props('drop-data', …)`.
+- `assets/heatsync.js` — re-attaches a relayout→`viewport-store` handler after the heatmap is `newPlot`-ed (Dash's own listener is lost on newPlot).
+
+---
+
+## 4. The processing pipeline
 
 ```
 glob / dropped folder
-        │  find_csv_files → load_csv_fast (per file) → concat → sort
-        ▼
-   _load_data(pattern)                       cached in _DATA_CACHE
-        │  adds _seg_id, ConfigFile, VR, FlyID, SourceFolder; segment stats
-        ▼
-   _filtered_df(...)                         cached in _FILTER_CACHE (last 4)
-        │  subset (config/vr/fly/scene/folder) + histogram range-selections
-        │  apply_filters: velocity-jump, min-displacement, trim  (all vectorised)
-        ▼
-   build_trajectory_figure / build_heatmap_figure / build_raw_trace_figure
-        │  _prepare_merged_groups → few NaN-separated WebGL traces
-        ▼
-   dcc.Graph(s) in always-mounted panels (radio toggles visibility)
+   └─ find_csv_files → load_csv_fast (per file) → concat → sort ONCE by time
+      └─ _load_data(pattern)                         cached in _DATA_CACHE
+         └─ _filtered_df(...)                        cached in _FILTER_CACHE (last 4)
+            ├─ subset by config/vr/fly/scene/folder + histogram range-selections
+            └─ apply_filters: velocity-jump (time-buffered), min-displacement, trim
+               └─ build_* figures → dcc.Graph
 ```
 
-## File sections (in order)
+**Everything downstream assumes the load-time time-sort** and uses
+`groupby(..., sort=False)`. Do not re-sort per segment (that was the original
+perf killer).
 
-1. **Config name humaniser** — `humanise_config` + `_MANUAL_LUT` + `_USER_LUT`
-   (live overrides from the JSON LUT editor). Regex rules map messy config
-   filenames to readable subplot titles.
-2. **Data loading** — `find_csv_files`, `load_csv_fast` (one CSV → tidy df with
-   `_seg_id`, metadata), `_load_data` (concat + cache + progress).
-3. **Filtering / stats** — `velocity_all` (vectorised per-row speed),
-   `smoothed_velocity` (rolling, spike-clipped), `compute_segment_stats`,
-   `apply_filters`, `filter_by_stat_range`.
-4. **Plotting** — colour resolution + `_prepare_merged_groups`, the figure
-   builders, range/aspect helpers, heatmap metric + colourbar helpers.
-5. **Dash app** — caches, `_load_data`, the layout, then all callbacks and the
-   clientside playback/resize callbacks. `__main__` parses CLI args.
+`apply_filters` is fully vectorised: the velocity-jump buffer is a
+`np.searchsorted` "dilation" (`_dilate_keep`), displacement/trim are groupby
+transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
 
-## Hard invariants (don't break these)
+---
 
-- **`_seg_id = SourceFolder + VR + Trial + Step`.** A segment is the unit of
-  everything. Never group trajectories by `(Trial, Step)` alone — different
-  files reuse the same numbers and would merge.
-- **Data is time-sorted at load** (`_load_data` sorts once). Downstream code
-  relies on this and must NOT re-sort per segment — that was the original perf
-  bug. Use `groupby(..., sort=False)`.
-- **Vectorise.** `apply_filters`, velocity, and stats are array/groupby ops, not
-  per-segment Python loops. Keep new filters vectorised (see `_dilate_keep` for
-  the jump-buffer trick via `np.searchsorted`).
-- **Trace count is the render cost**, not point count. Segments sharing a colour
-  collapse into ONE NaN-separated trace per (subplot, colour) in
-  `_prepare_merged_groups`. Do not emit one trace per segment.
-- **1:1 aspect + linked axes.** `_apply_axis_sync` sets `scaleanchor`,
-  `matches`, and a shared range. Trajectory and heatmap share `uirevision`.
-- **Panels stay mounted.** The Trajectories / Heatmap / Diagnostics views are
-  three always-rendered `<div>`s toggled by `view-mode` (NOT `dcc.Tabs`, which
-  unmounts and breaks live zoom-sync). `switch_view` flips `display`; a
-  clientside callback `Plotly.Plots.resize`s the now-visible graph.
+## 5. Rendering model & tuning knobs
 
-## Decimation & animation budgets
+- **Trace count, not point count, drives Plotly render cost.** Segments sharing
+  a colour collapse into ONE NaN-separated trace per (subplot, colour) via
+  `_prepare_merged_groups` (vectorised). ~100 traces instead of ~4000.
+- **Decimation budgets** (`_decimation_budget` / build): static WebGL
+  `BUDGET_GL=300k`; animated `BUDGET_SVG=40k` (every frame is embedded in the
+  figure JSON — Plotly cannot stream frames, so the budget is the payload lever);
+  raw plot `BUDGET_RAW=25k`. "Max plot points" (Advanced) overrides.
+- **Colour modes** (`color_by`): `individual`/`vr` (categorical, lines, legend);
+  `trial`/`local_time`/`velocity` (sequential; markers for per-point ones; a
+  hidden anchor trace supplies the Viridis colourbar). Velocity is
+  rolling-smoothed (10 frames) and spike-clipped.
+- **Layout**: 2-col grid, `SUBPLOT_PX=480` per subplot → the figure is its
+  natural full height and the panel scrolls (no squishing). 1:1 aspect on
+  trajectories via `scaleanchor` (see §7 for why the heatmap can't use it).
+- **Heatmap**: `build_heatmap_figure` bins X/Z with `np.histogram2d`.
+  `bin_size` is in **data units** (blank → `default_bin_size` ≈ 1/20 of the
+  95th-pct extent); `bound_pct` clips the extent to a central percentile;
+  `metric ∈ {count, time=count×median_dt seconds, percent}`; `log_scale` with
+  human tick labels (`_log_colorbar`/`_fmt_metric`); `cmin/cmax` blank→auto,
+  absolute or `crange_mode="percentile"`; occupancy floored at 100 ms.
 
-`_decimation_budget` / the budget block in `build_trajectory_figure`:
-- static WebGL view → `BUDGET_GL` (300k points total),
-- animated view → `BUDGET_SVG` (40k) because **every frame is embedded in the
-  figure JSON**; payload ≈ budget × (N_FRAMES/2). Plotly cannot stream frames —
-  they are pre-materialised, so the budget is the cost lever. Users can override
-  with "Max plot points".
-- Each segment is decimated to `budget / n_segments` points, always keeping
-  index 0 (so playback starts at each track's first point).
+---
 
-## Colour modes (`color_by`)
+## 6. Callback graph (what talks to what)
 
-| value        | kind                | trace mode | colourbar      |
-|--------------|---------------------|------------|----------------|
-| `individual` | categorical (VR+Fly)| lines      | legend         |
-| `vr`         | categorical         | lines      | legend         |
-| `trial`      | sequential/segment  | lines      | Viridis bar    |
-| `local_time` | sequential/point    | markers    | Viridis bar    |
-| `velocity`   | sequential/point    | markers    | Viridis "u/s"  |
-
-Sequential point modes carry a per-point `mc` array + `cmin/cmax`; the colourbar
-is a hidden anchor trace added AFTER the data traces (so animation frames, which
-update only the data traces by index, leave it alone).
-
-## Heatmap
-
-`build_heatmap_figure` bins X/Z with `np.histogram2d`. Key knobs:
-- `bin_size` in **data units** (blank → `default_bin_size` ≈ 1/20 of the 95th-pct
-  extent); `bound_pct` clips the extent to a central percentile;
-- `metric` ∈ {count, time (occupancy = count × median dt), percent};
-- `log_scale` with human tick labels via `_log_colorbar` / `_fmt_metric`;
-- `cmin`/`cmax` blank→auto, as absolute value or `crange_mode="percentile"`;
-  occupancy is floored at 100 ms.
-
-## Callback map
-
-- `restore_from_url` (once) ↔ `update_url` — full bidirectional URL state incl.
-  the viewbox; a `url-restored` flag breaks the echo loop.
-- `on_folder_drop` — `drop-data` (set by `assets/dropzone.js`) →
-  `resolve_dropped_folder` → glob + auto-load.
-- `start_progress` / `tick_progress` — poll the `_LOAD_PROGRESS` global (works
+- `restore_from_url` (fires **once**, guarded by `url-restored`) ⇄ `update_url`
+  (fires on every setting/zoom change — all controls are Inputs). Full
+  bidirectional URL state **including the viewbox** (`vbx0…vby1`) and the current
+  `view`. The once-guard breaks the echo loop.
+- `on_folder_drop` ← `drop-data` (set by dropzone.js) → `resolve_dropped_folder`
+  → glob + auto-load.
+- `start_progress`/`tick_progress` poll the `_LOAD_PROGRESS` global (works
   because the dev server is threaded).
-- `load_data_cb` — populate filter options, histograms, smart default bin size;
-  auto-triggers `update_plots`.
-- `update_plots` — the main replot (trajectory + heatmap + raw + summary).
-- `update_heatmap_only` — fast heatmap-only rebuild on bin/metric/scale/cmin
-  change (reuses the filter cache).
-- `sync_viewport` + clientside playback (`anim-play/pause/slider`) + `switch_view`.
-- `export_html` — rebuilds figures server-side and emits a self-contained file.
+- `load_data_cb` populates filter options, histograms, the smart default bin
+  size, then auto-triggers `update_plots`.
+- `update_plots` — the main replot (trajectory + heatmap + raw + summary + hists).
+- `update_heatmap_only` — fast heatmap-only rebuild on any heatmap control **or
+  view switch to heatmap** (reuses the filter cache; re-applies the viewbox).
+- `sync_viewport` — records the current viewbox into `viewport-store` (does NOT
+  live-patch the other figure — that caused glitches). `apply_viewport_traj`
+  re-applies it to the trajectory on view switch (heatmap side is done in
+  `update_heatmap_only`).
+- `switch_view` toggles panel `visibility`. Clientside callbacks drive playback,
+  resize graphs shown for the first time, and `newPlot` the heatmap.
+- `export_html` rebuilds all figures server-side and emits one self-contained file.
 
-## Extending — common tasks
+---
 
-- **New colour mode**: add an option to the `color-by` dropdown, a branch in
-  `_prepare_merged_groups` (set `ck`, `mode`, `mc`/`color`, `cmin/cmax`), and (if
-  sequential) extend the colourbar block + title map in `build_trajectory_figure`.
-- **New filter**: add the control, thread it through `_filtered_df` /
-  `apply_filters` (vectorised), and include it in `_filter_signature` so the
-  cache stays correct.
-- **New persisted control**: add it to BOTH `update_url` (encode) and
-  `restore_from_url` (decode + an Output), keeping `n_out` in sync.
-- **New heatmap metric**: extend `METRIC_UNITS`, the metric conversion in
-  `build_heatmap_figure`, and `_fmt_metric`.
+## 7. Hard-won rendering gotchas (do not "simplify" these away)
 
-## Gotchas
+These cost a very long debugging session; each is confirmed via Chrome CDP
+(`--remote-debugging-port=9222 --remote-allow-origins=*` + a websocket
+`Runtime.evaluate` — see §9). The `claude-in-chrome` MCP was unavailable.
 
-- Adding a control that is also written elsewhere needs `allow_duplicate=True`
-  on the secondary Output (the dependency graph 500s otherwise — check
-  `/_dash-dependencies` returns 200 after changes).
-- The drop zone can only resolve folders that live under the working directory
-  (browsers don't expose absolute paths); fall back to typing a path.
-- Velocity/occupancy are in raw position-units, not cm — see README.
+1. **2-D numpy arrays don't round-trip through Dash + Plotly 6.**
+   `go.Heatmap(z=<2-D numpy>)` serialises with Plotly-6's typed-array (`bdata`)
+   encoding, which Dash does **not** decode for 2-D — `z` arrives `undefined` in
+   the browser and the heatmap is blank. **Fix: pass `z`/`customdata`/`x`/`y` as
+   plain Python lists (`.tolist()`).** 1-D arrays (scattergl x/y) are fine.
+
+2. **The heatmap crashes `Plotly.react` (Dash's update path).** With a subplot
+   grid, applying a new figure to a graph that isn't full-size yet throws
+   *"Something went wrong with axis scaling"* in `setScale`, and it then never
+   repaints. It happens **even without `scaleanchor`** (it's the subplot axis
+   layout at a bad size). A fresh `Plotly.newPlot` re-initialises cleanly. **Fix:
+   a clientside callback re-runs `Plotly.newPlot(hg, hfig.data, hfig.layout)`
+   whenever the heatmap figure changes or the Heatmap view opens.** It must read
+   the **fresh figure prop `hfig`**, not the graph's own `hg.data` (which stays
+   stale because react crashed) — reading `hg.data` is exactly what caused the
+   "stale heatmap until hard reload" bug.
+
+3. **WebGL (`Scattergl`) graphs created in a hidden panel never paint.** Hence
+   the raw time-series plot uses SVG `go.Scatter` (smaller budget). Trajectory is
+   WebGL but is the default-visible panel, so it's fine; a resize is nudged when
+   it's shown after being created hidden.
+
+4. **Panels hide with `visibility:hidden` + absolute positioning, not
+   `display:none`.** `display:none` gives a graph 0 size at creation and it can't
+   recover; `dcc.Tabs` is worse (it *remounts* and resets the figure to the
+   layout default). So all three views stay mounted and only toggle visibility.
+
+---
+
+## 8. Known issues / glitches / limitations
+
+- **Heatmap "flash" on rebuild.** Because of §7.2 the heatmap does a full
+  `newPlot` on every update, so changing a heatmap control or reloading data
+  briefly re-inits the plot. Functionally correct, just not a silky in-place
+  transition. *Cleanest future fix:* find a figure/graph state where
+  `Plotly.react` doesn't throw on the subplot grid (or render the heatmap as a
+  single `Image`/`go.Heatmap` without `make_subplots`), which would let normal
+  Dash updates work and remove the whole newPlot/heatsync machinery.
+- **Heatmap→trajectory zoom sync depends on `assets/heatsync.js`.** newPlot drops
+  Dash's relayout listener; the asset re-attaches one that writes `viewport-store`
+  via `set_props`. If you refactor the heatmap rendering, keep or drop this in
+  tandem.
+- **Playback frames use `Scattergl` and are re-drawn client-side.** On very large
+  animated selections the embedded frames make the figure JSON heavy (~tens of
+  MB). Animation auto-uses the tighter `BUDGET_SVG`; still, prefer "Playback off"
+  for the biggest datasets or lower "Max plot points".
+- **Drag-drop can only resolve folders under the working directory.** Browsers
+  don't expose absolute paths; `resolve_dropped_folder` searches `cwd`. Data
+  elsewhere → type/paste a path. Status line says when it can't locate a folder.
+- **Two copies of the code** (`Plotting/dashboard.py` and `trajectory-dashboard/
+  app.py`) can drift. Decide on one source of truth.
+- **`raw-columns` default** doesn't always stick in the control; `update_plots`
+  defaults it to `[GameObjectPosX, GameObjectPosZ]` so the raw plot isn't empty.
+- Filter cache holds up to 4 filtered frames (`_FILTER_CACHE_MAX`) — a few
+  hundred MB for multi-million-row frames. Lower it if memory-constrained.
+
+---
+
+## 9. How to verify UI changes (no browser MCP needed)
+
+Server-side callbacks: `import dashboard as d; d._load_data("<glob>")` then call
+the builder/callback directly and assert on the returned figure. For anything
+that only shows up in the browser (rendering, clientside, drag-drop), drive
+Chrome over the DevTools Protocol:
+
+```bash
+Google\ Chrome --remote-debugging-port=9222 "--remote-allow-origins=*" \
+  --user-data-dir=/tmp/cdpchrome "http://127.0.0.1:PORT/?glob=..."
+# then websocket to the page's webSocketDebuggerUrl and Runtime.evaluate JS,
+# e.g. count g.querySelectorAll('image').length on #heatmap-plot, read
+# location.search, or push figures via window.dash_clientside.set_props(...).
+```
+
+Always confirm `GET /_dash-dependencies` returns **200** after editing callbacks
+(catches duplicate-output / missing-id errors). New persisted controls must be
+added to BOTH `update_url` and `restore_from_url` (keep the return arity in
+sync); secondary Outputs need `allow_duplicate=True`.
+
+---
+
+## 10. Scope for improvement (nice-to-haves, roughly ordered)
+
+1. Remove the heatmap `newPlot` workaround (see §8) for flash-free updates.
+2. Background/long callback for loading with true streamed progress (currently a
+   threaded-global poll; would also decouple heavy loads from the request).
+3. Server-side figure/HTML caching for exports and repeat views.
+4. Persist the config LUT to disk so renames survive restarts.
+5. Downsample-on-zoom (send more points only for the visible window) instead of a
+   fixed global budget.
+6. Unit tests around `apply_filters`, `_prepare_merged_groups`, and
+   `resolve_dropped_folder`; a smoke test that boots the app and checks
+   `/_dash-dependencies`.
+7. Optional hexbin/KDE heatmap; per-subplot colour ranges.
+8. Consolidate to a single source file / package instead of two copies.
