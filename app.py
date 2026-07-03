@@ -1659,32 +1659,32 @@ def tick_progress(n, barstyle, trackstyle):
     Output("url", "search"),
     Input("btn-plot", "n_clicks"),
     Input("viewport-store", "data"),
-    State("glob-input", "value"),
-    State("vel-threshold", "value"),
-    State("min-disp", "value"),
-    State("trim-samples", "value"),
-    State("jump-buffer", "value"),
-    State("group-by", "value"),
-    State("pool-mode", "value"),
-    State("color-by", "value"),
-    State("animate-toggle", "value"),
-    State("rebase-origin", "value"),
-    State("heatmap-binsize", "value"),
-    State("heatmap-scale", "value"),
-    State("heatmap-bound", "value"),
-    State("heatmap-metric", "value"),
-    State("heatmap-cmin", "value"),
-    State("heatmap-cmax", "value"),
-    State("heatmap-crange", "value"),
-    State("filter-configs", "value"),
-    State("filter-vrs", "value"),
-    State("filter-flyids", "value"),
-    State("filter-scenes", "value"),
-    State("filter-folders", "value"),
-    State("raw-columns", "value"),
-    State("subplot-ncols", "value"),
-    State("plot-points", "value"),
-    State("view-mode", "value"),
+    Input("glob-input", "value"),
+    Input("vel-threshold", "value"),
+    Input("min-disp", "value"),
+    Input("trim-samples", "value"),
+    Input("jump-buffer", "value"),
+    Input("group-by", "value"),
+    Input("pool-mode", "value"),
+    Input("color-by", "value"),
+    Input("animate-toggle", "value"),
+    Input("rebase-origin", "value"),
+    Input("heatmap-binsize", "value"),
+    Input("heatmap-scale", "value"),
+    Input("heatmap-bound", "value"),
+    Input("heatmap-metric", "value"),
+    Input("heatmap-cmin", "value"),
+    Input("heatmap-cmax", "value"),
+    Input("heatmap-crange", "value"),
+    Input("filter-configs", "value"),
+    Input("filter-vrs", "value"),
+    Input("filter-flyids", "value"),
+    Input("filter-scenes", "value"),
+    Input("filter-folders", "value"),
+    Input("raw-columns", "value"),
+    Input("subplot-ncols", "value"),
+    Input("plot-points", "value"),
+    Input("view-mode", "value"),
     prevent_initial_call=True,
 )
 def update_url(n, vp, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
@@ -2074,25 +2074,22 @@ def _range_patch(ranges):
 
 
 @app.callback(
-    Output("heatmap-plot", "figure", allow_duplicate=True),
-    Output("trajectory-plot", "figure", allow_duplicate=True),
     Output("viewport-store", "data"),
     Input("trajectory-plot", "relayoutData"),
     Input("heatmap-plot", "relayoutData"),
     prevent_initial_call=True,
 )
 def sync_viewport(traj_relayout, heat_relayout):
+    # Only RECORD the current viewbox. We deliberately do NOT patch the other
+    # figure live: only one panel is visible at a time, and patching the hidden
+    # heatmap forced a full re-init (newPlot) that produced zoom glitches. The
+    # stored viewbox is re-applied to whichever panel is opened next.
     trigger = ctx.triggered_id
     relayout = traj_relayout if trigger == "trajectory-plot" else heat_relayout
     ranges = _extract_axis_ranges(relayout)
     if not ranges:
-        return no_update, no_update, no_update
-
-    patch = _range_patch(ranges)
-    # Apply to the OTHER figure only (avoid feedback loop); store for tab switch.
-    if trigger == "trajectory-plot":
-        return patch, no_update, ranges
-    return no_update, patch, ranges
+        return no_update
+    return ranges
 
 
 # Show exactly one mounted panel (graphs are never unmounted, so their figures
@@ -2109,6 +2106,26 @@ def switch_view(v):
     return st("traj"), st("heat"), st("diag")
 
 
+# Re-apply the shared viewbox to the trajectory when it is opened (the heatmap
+# side is handled in update_heatmap_only). A Patch on the WebGL trajectory is
+# smooth — no re-init — so switching views keeps the same zoom without glitches.
+@app.callback(
+    Output("trajectory-plot", "figure", allow_duplicate=True),
+    Input("view-mode", "value"),
+    State("viewport-store", "data"),
+    prevent_initial_call=True,
+)
+def apply_viewport_traj(view, vp):
+    if view != "traj" or not vp or vp.get("reset"):
+        return no_update
+    patch = Patch()
+    if vp.get("xaxis"):
+        patch["layout"]["xaxis"]["range"] = vp["xaxis"]
+    if vp.get("yaxis"):
+        patch["layout"]["yaxis"]["range"] = vp["yaxis"]
+    return patch
+
+
 # The heatmap uses a 1:1 aspect lock (scaleanchor). Dash's Plotly.react update
 # path crashes on that with "axis scaling" when the figure is applied to a graph
 # that isn't at full size yet, and never recovers — so the heatmap stays blank.
@@ -2118,8 +2135,9 @@ app.clientside_callback(
     "function(hfig, view){setTimeout(function(){"
     "var hc=document.getElementById('heatmap-plot');"
     "var hg=hc&&hc.querySelector('.js-plotly-plot');"
-    "if(hg&&window.Plotly&&hg.data&&hg.data.length){"
-    "try{window.Plotly.newPlot(hg,hg.data,hg.layout,{scrollZoom:true,displayModeBar:true});}"
+    "if(hg&&window.Plotly&&hfig&&hfig.data&&hfig.data.length){"
+    "try{window.Plotly.newPlot(hg,hfig.data,hfig.layout,{scrollZoom:true,displayModeBar:true});"
+    "if(window.__attachHeatSync){hg.__heatSync=false;window.__attachHeatSync(hg);}}"
     "catch(e){}}"
     "['trajectory-plot','vel-histogram','disp-histogram','raw-trace-plot']"
     ".forEach(function(id){var c=document.getElementById(id);"
