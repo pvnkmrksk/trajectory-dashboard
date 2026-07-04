@@ -896,38 +896,53 @@ def _apply_axis_sync(fig, nrows, ncols, df, uirev="traj", rng=None):
 _ROI_SIDE_COLOR = {"left": "#1f77b4", "right": "#ff7f0e", "centre": "#6c757d"}
 
 
-def _add_roi_overlay(fig, group_names, ncols, rois_by_cfg, reach, counts=None):
-    """Draw each config's ROI targets (reach circle + centre dot) on its subplot,
-    plus an optional corner tally of left/right reached fractions. ROIs are drawn
-    as shapes so they add no traces and don't leak into animation frames."""
+def _subplot_axis(n: int) -> tuple[str, str]:
+    """1-based subplot number → its ('x'|'xN', 'y'|'yN') axis refs."""
+    return ("x" if n == 1 else f"x{n}"), ("y" if n == 1 else f"y{n}")
+
+
+def _roi_overlay_shapes(group_names, rois_by_cfg, reach) -> list:
+    """Reach circle + centre dot per ROI, as plain shape dicts (so the same list
+    can be applied at build time and blitted via Patch on the reach slider)."""
+    shapes = []
+    dot = max(0.4, reach * 0.08)
     for i, gname in enumerate(group_names):
         rlist = rois_by_cfg.get(gname)
         if not rlist:
             continue
-        r_, c_ = i // ncols + 1, i % ncols + 1
+        sx, sy = _subplot_axis(i + 1)
         for roi in rlist:
             col = _ROI_SIDE_COLOR.get(roi["side"], "#6c757d")
-            fig.add_shape(type="circle", x0=roi["x"] - reach, x1=roi["x"] + reach,
-                          y0=roi["z"] - reach, y1=roi["z"] + reach,
-                          line=dict(color=col, width=1.4, dash="dot"),
-                          fillcolor=col, opacity=0.12, layer="below",
-                          row=r_, col=c_)
-            dot = max(0.4, reach * 0.08)
-            fig.add_shape(type="circle", x0=roi["x"] - dot, x1=roi["x"] + dot,
-                          y0=roi["z"] - dot, y1=roi["z"] + dot,
-                          line=dict(color=col, width=0), fillcolor=col,
-                          opacity=0.95, layer="above", row=r_, col=c_)
-        if counts and gname in counts:
-            cc = counts[gname]
-            txt = (f"L {cc['left_reached']}/{cc['total']} "
-                   f"({100*cc['left_frac']:.0f}%)<br>"
-                   f"R {cc['right_reached']}/{cc['total']} "
-                   f"({100*cc['right_frac']:.0f}%)")
-            fig.add_annotation(text=txt, showarrow=False, xref="x domain",
-                               yref="y domain", x=0.02, y=0.98, xanchor="left",
-                               yanchor="top", align="left", font=dict(size=9),
-                               bgcolor="rgba(255,255,255,0.7)", bordercolor="#ccc",
-                               borderwidth=0.5, row=r_, col=c_)
+            shapes.append(dict(type="circle", xref=sx, yref=sy, layer="below",
+                x0=roi["x"] - reach, x1=roi["x"] + reach,
+                y0=roi["z"] - reach, y1=roi["z"] + reach, opacity=0.12,
+                fillcolor=col, line=dict(color=col, width=1.4, dash="dot")))
+            shapes.append(dict(type="circle", xref=sx, yref=sy, layer="above",
+                x0=roi["x"] - dot, x1=roi["x"] + dot,
+                y0=roi["z"] - dot, y1=roi["z"] + dot, opacity=0.95,
+                fillcolor=col, line=dict(color=col, width=0)))
+    return shapes
+
+
+def _roi_count_text(gname, counts) -> str:
+    cc = counts.get(gname) if counts else None
+    if not cc:
+        return ""
+    return (f"L {cc['left_reached']}/{cc['total']} ({100*cc['left_frac']:.0f}%)<br>"
+            f"R {cc['right_reached']}/{cc['total']} ({100*cc['right_frac']:.0f}%)")
+
+
+def _roi_count_annotations(group_names, counts) -> list:
+    """One corner-tally annotation per subplot (empty text when no counts). Fixed
+    slots — index n+i for group i — so the blit can update text by index."""
+    anns = []
+    for i, gname in enumerate(group_names):
+        sx, sy = _subplot_axis(i + 1)
+        anns.append(dict(text=_roi_count_text(gname, counts), showarrow=False,
+            xref=f"{sx} domain", yref=f"{sy} domain", x=0.02, y=0.98,
+            xanchor="left", yanchor="top", align="left", font=dict(size=9),
+            bgcolor="rgba(255,255,255,0.7)", bordercolor="#ccc", borderwidth=0.5))
+    return anns
 
 
 def build_trajectory_figure(df, group_by="config", pool_mode="separate",
@@ -1015,9 +1030,16 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
         if i < len(group_names):
             ann.update(hovertext=group_names[i], font=dict(size=12))
 
-    if show_rois and rois:
-        _add_roi_overlay(fig, group_names, ncols, rois,
-                         float(reach_radius or 3.0), counts=roi_counts)
+    # ROI overlay: reach circles (shapes) + a fixed count-annotation slot per
+    # subplot (index n+i), so the reach slider can blit both via Patch without a
+    # data rebuild. Slots are always reserved (empty when ROIs are off/rebased).
+    reach_v = float(reach_radius or 3.0)
+    overlay = bool(show_rois and rois)
+    if overlay:
+        fig.update_layout(shapes=_roi_overlay_shapes(group_names, rois, reach_v))
+    fig.update_layout(annotations=list(fig.layout.annotations)
+                      + _roi_count_annotations(group_names,
+                                               roi_counts if overlay else None))
 
     show_legend = color_by in ("individual", "vr")
     fig.update_layout(
@@ -2770,6 +2792,71 @@ def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_di
     if not rois:
         return _msg_figure("No ROI targets in these configs.")
     return build_roi_violin_figure(df_f, rois, float(reach) if reach else 3.0)
+
+
+# Reach slider / show toggle → BLIT the trajectory overlay: recompute reach
+# circles + corner counts and Patch just the figure's shapes + count annotations
+# (fixed slots at index n+i). No trace/data rebuild, so dragging the reach slider
+# is instant. (When tail-trim is on, the trimmed *data* still needs a Re-Plot.)
+@app.callback(
+    Output("trajectory-plot", "figure", allow_duplicate=True),
+    Input("roi-reach", "value"),
+    Input("roi-show", "value"),
+    State("store-glob", "data"),
+    State("group-by", "value"),
+    State("pool-mode", "value"),
+    State("subplot-ncols", "value"),
+    State("rebase-origin", "value"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("vel-histogram", "selectedData"),
+    State("disp-histogram", "selectedData"),
+    prevent_initial_call=True,
+)
+def update_roi_overlay(reach, roi_show, pattern, group_by, pool_mode, ncols, rebase,
+                       vel_thresh, min_disp, trim, jump_buf, cfg, vrs, fids, scenes,
+                       folders, vel_sel, disp_sel):
+    if not pattern:
+        return no_update
+    df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
+                                   cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
+    if df_sub is None or len(df_sub) == 0:
+        return no_update
+    ncols_val = int(ncols) if ncols and ncols >= 1 else 2
+    names = list(_group_frames(df_f, group_by, pool_mode, ncols_val).keys())
+    do_rebase = bool(rebase) and "on" in (rebase or [])
+    _, _, metas = _load_data(pattern)
+    rois = rois_by_config(metas)
+    reach_v = float(reach) if reach else 3.0
+    show = bool(roi_show) and "on" in (roi_show or []) and not do_rebase and bool(rois)
+    counts = roi_config_summary(roi_reached_table(df_f, rois, reach_v)) if show else None
+    patch = Patch()
+    patch["layout"]["shapes"] = _roi_overlay_shapes(names, rois, reach_v) if show else []
+    n = len(names)
+    for i, gname in enumerate(names):
+        patch["layout"]["annotations"][n + i]["text"] = _roi_count_text(gname, counts)
+    return patch
+
+
+# Toggling tail-trim changes the plotted *data*, so it triggers a full replot.
+@app.callback(
+    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    Input("roi-trim", "value"),
+    State("btn-plot", "n_clicks"),
+    State("store-glob", "data"),
+    prevent_initial_call=True,
+)
+def trim_triggers_replot(roi_trim, clicks, pattern):
+    if not pattern:
+        return no_update
+    return (clicks or 0) + 1
 
 
 # Polar is built lazily (only when its tab is open or a polar control changes) —
