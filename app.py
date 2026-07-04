@@ -1262,7 +1262,7 @@ def build_velocity_histogram(df, vel_threshold=None):
         height=190, margin=dict(l=40, r=10, t=28, b=25),
         xaxis_title="Velocity (units/s)", yaxis_title="Count",
         title=dict(text="Velocity (99th pctl)", font_size=11, x=0.5),
-        template="plotly_white", dragmode="select",
+        template="plotly_white", dragmode="pan",
     )
     return fig
 
@@ -1286,7 +1286,7 @@ def build_displacement_histogram(stats_df, min_disp=None):
         height=190, margin=dict(l=40, r=10, t=28, b=25),
         xaxis_title="Net displacement (units)", yaxis_title="Segments",
         title=dict(text="Displacement per segment", font_size=11, x=0.5),
-        template="plotly_white", dragmode="select",
+        template="plotly_white", dragmode="pan",
     )
     return fig
 
@@ -2002,20 +2002,12 @@ app.layout = html.Div([
                 # --- Diagnostics ---
                 html.Div([
                     html.Div([
-                        html.Div([
-                            dcc.Graph(id="vel-histogram", figure=_EMPTY,
-                                      config={"displayModeBar": False}),
-                            html.Div(id="vel-selection-info",
-                                     style={"fontSize": "10px", "color": "#666",
-                                            "textAlign": "center"}),
-                        ], style={"flex": "1", "minWidth": "0"}),
-                        html.Div([
-                            dcc.Graph(id="disp-histogram", figure=_EMPTY,
-                                      config={"displayModeBar": False}),
-                            html.Div(id="disp-selection-info",
-                                     style={"fontSize": "10px", "color": "#666",
-                                            "textAlign": "center"}),
-                        ], style={"flex": "1", "minWidth": "0"}),
+                        dcc.Graph(id="vel-histogram", figure=_EMPTY,
+                                  config={"displayModeBar": False},
+                                  style={"flex": "1", "minWidth": "0"}),
+                        dcc.Graph(id="disp-histogram", figure=_EMPTY,
+                                  config={"displayModeBar": False},
+                                  style={"flex": "1", "minWidth": "0"}),
                     ], style={"display": "flex", "gap": "6px"}),
                     dcc.Loading(
                         dcc.Graph(id="raw-trace-plot", figure=_EMPTY,
@@ -3025,29 +3017,6 @@ app.clientside_callback(
 )
 
 
-# Selection info for histograms
-@app.callback(
-    Output("vel-selection-info", "children"),
-    Input("vel-histogram", "selectedData"),
-    prevent_initial_call=True,
-)
-def vel_sel_info(sel):
-    if not sel or not sel.get("range"):
-        return "Drag to select velocity range"
-    rng = sel["range"]["x"]
-    return f"Selected: {rng[0]:.1f} – {rng[1]:.1f} (click Re-Plot to apply)"
-
-
-@app.callback(
-    Output("disp-selection-info", "children"),
-    Input("disp-histogram", "selectedData"),
-    prevent_initial_call=True,
-)
-def disp_sel_info(sel):
-    if not sel or not sel.get("range"):
-        return "Drag to select displacement range"
-    rng = sel["range"]["x"]
-    return f"Selected: {rng[0]:.1f} – {rng[1]:.1f} (click Re-Plot to apply)"
 
 
 # Pre-fill LUT editor with current configs → their auto-humanised names
