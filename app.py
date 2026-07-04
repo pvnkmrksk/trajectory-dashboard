@@ -1223,6 +1223,54 @@ def build_raw_trace_figure(df, columns, max_points=None):
     return fig
 
 
+def _msg_figure(text, height=440):
+    fig = go.Figure()
+    fig.add_annotation(text=text, showarrow=False, xref="paper", yref="paper",
+                       x=0.5, y=0.5, font_size=15)
+    fig.update_layout(height=height, template="plotly_white")
+    return fig
+
+
+def build_roi_violin_figure(df, rois_by_cfg, reach):
+    """Per-animal fraction of trials that reached the left vs right ROI, one pair
+    of violins per config with every visible animal as a scatter point. `df` is
+    already filtered to the visible subset, so the violins reflect exactly what
+    is toggled on."""
+    tbl = roi_reached_table(df, rois_by_cfg, reach)
+    if tbl is None or len(tbl) == 0:
+        return _msg_figure("No left/right ROI targets in these configs — "
+                           "nothing to count. Load Choice/BinaryChoice data.")
+    grp = tbl.groupby(["ConfigFile", "animal"], sort=False).agg(
+        n=("_seg_id", "size"),
+        frac_left=("reached_left", "mean"),
+        frac_right=("reached_right", "mean")).reset_index()
+    grp["label"] = grp["ConfigFile"].map(humanise_config)
+    order = sorted(grp["label"].unique())
+    n_animals = grp["animal"].nunique()
+
+    fig = go.Figure()
+    for side, color in (("left", _ROI_SIDE_COLOR["left"]),
+                        ("right", _ROI_SIDE_COLOR["right"])):
+        fig.add_trace(go.Violin(
+            x=grp["label"], y=grp["frac_" + side], name=side.capitalize(),
+            legendgroup=side, scalegroup=side, line_color=color, fillcolor=color,
+            opacity=0.5, points="all", pointpos=0, jitter=0.35,
+            marker=dict(size=5, opacity=0.75), box_visible=True,
+            meanline_visible=True, spanmode="hard",
+            customdata=grp["animal"],
+            hovertemplate=side + " frac=%{y:.2f}<br>%{customdata}<extra></extra>"))
+    fig.update_layout(
+        violinmode="group", template="plotly_white", height=470,
+        title=dict(text=f"Fraction of trials reaching each ROI "
+                        f"(reach {reach:g} u · {n_animals} animals)", font_size=13),
+        yaxis=dict(title="fraction of trials reaching", range=[-0.03, 1.03],
+                   zeroline=True),
+        xaxis=dict(title="config", categoryorder="array", categoryarray=order),
+        legend=dict(orientation="h", y=1.02, yanchor="bottom", x=1, xanchor="right"),
+        margin=dict(l=60, r=20, t=50, b=90))
+    return fig
+
+
 
 # ---------------------------------------------------------------------------
 # Dash App
@@ -1644,6 +1692,8 @@ app.layout = html.Div([
             dcc.RadioItems(id="view-mode", options=[
                 {"label": "Trajectories", "value": "traj"},
                 {"label": "Heatmap", "value": "heat"},
+                {"label": "ROI counts", "value": "roi"},
+                {"label": "Polar", "value": "polar"},
                 {"label": "Diagnostics", "value": "diag"},
             ], value="traj", inline=True,
                labelStyle={"marginRight": "16px", "cursor": "pointer"},
@@ -1722,6 +1772,28 @@ app.layout = html.Div([
                         overlay_style={"visibility": "visible", "opacity": 0.55,
                                        "transition": "opacity .2s"}),
                 ], id="view-diag", style={**_PANEL_STYLE, "visibility": "hidden"}),
+
+                # --- ROI counts (violins) ---
+                html.Div(
+                    dcc.Loading(
+                        dcc.Graph(id="roi-plot", figure=_EMPTY,
+                                  config={"displayModeBar": True},
+                                  style={"width": "100%"}),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s"}),
+                    id="view-roi", style={**_PANEL_STYLE, "visibility": "hidden"}),
+
+                # --- Polar ---
+                html.Div(
+                    dcc.Loading(
+                        dcc.Graph(id="polar-plot", figure=_EMPTY,
+                                  config={"displayModeBar": True},
+                                  style={"width": "100%"}),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s"}),
+                    id="view-polar", style={**_PANEL_STYLE, "visibility": "hidden"}),
             ], style={"position": "relative", "flex": "1", "minHeight": "0"}),
         ], style={"flex": "1", "padding": "4px 8px", "display": "flex",
                    "flexDirection": "column", "height": "calc(100vh - 46px)"}),
@@ -2151,6 +2223,7 @@ def _apply_viewport(fig, viewport, df):
     Output("data-summary", "children"),
     Output("vel-histogram", "figure", allow_duplicate=True),
     Output("disp-histogram", "figure", allow_duplicate=True),
+    Output("roi-plot", "figure", allow_duplicate=True),
     Input("btn-plot", "n_clicks"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
@@ -2191,16 +2264,16 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                  disp_selection, viewport, roi_show, roi_reach):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
-        return empty, empty, empty, "Load data first.", no_update, no_update
+        return empty, empty, empty, "Load data first.", no_update, no_update, no_update
 
     df_f, df_sub, stats_sub = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
 
     if df_sub is None:
-        return empty, empty, empty, "No data.", no_update, no_update
+        return empty, empty, empty, "No data.", no_update, no_update, no_update
     if len(df_sub) == 0:
-        return empty, empty, empty, "All filtered out.", no_update, no_update
+        return empty, empty, empty, "All filtered out.", no_update, no_update, no_update
 
     # Histograms reflect the subset before velocity/disp cuts
     df, _, metas = _load_data(pattern)
@@ -2227,8 +2300,11 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     want_rois = bool(roi_show) and "on" in (roi_show or []) and bool(rois)
     reach = float(roi_reach) if roi_reach else 3.0
     roi_counts = None
+    roi_fig = _msg_figure("Enable 'Show target ROIs' and load Choice/BinaryChoice "
+                          "data to see reached-fraction violins.")
     if want_rois:
         roi_counts = roi_config_summary(roi_reached_table(df_f, rois, reach))
+        roi_fig = build_roi_violin_figure(df_f, rois, reach)
 
     traj_fig = build_trajectory_figure(df_plot, group_by, pool_mode, ncols=ncols_val,
                                         color_by=color_by or "individual",
@@ -2262,7 +2338,7 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                f"{len(traj_fig.frames)} frames | "
                f"build {bt:.2f}s | colour: {color_by}")
 
-    return traj_fig, heat_fig, raw_fig, summary, vel_fig, disp_fig
+    return traj_fig, heat_fig, raw_fig, summary, vel_fig, disp_fig, roi_fig
 
 
 # Rebuild the heatmap on its own controls AND whenever the Heatmap view is
@@ -2411,12 +2487,56 @@ def sync_viewport(traj_relayout, heat_relayout):
     Output("view-traj", "style"),
     Output("view-heat", "style"),
     Output("view-diag", "style"),
+    Output("view-roi", "style"),
+    Output("view-polar", "style"),
     Input("view-mode", "value"),
 )
 def switch_view(v):
     def st(name):
         return {**_PANEL_STYLE, "visibility": "visible" if v == name else "hidden"}
-    return st("traj"), st("heat"), st("diag")
+    return st("traj"), st("heat"), st("diag"), st("roi"), st("polar")
+
+
+# Live-rebuild the ROI violins when the reach radius changes or the ROI tab is
+# opened — cheap enough (per-trial reached test on the filtered data) to feel
+# snappy without a full trajectory replot. The slider fires on release (mouseup).
+@app.callback(
+    Output("roi-plot", "figure", allow_duplicate=True),
+    Input("roi-reach", "value"),
+    Input("roi-show", "value"),
+    Input("view-mode", "value"),
+    State("store-glob", "data"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("vel-histogram", "selectedData"),
+    State("disp-histogram", "selectedData"),
+    prevent_initial_call=True,
+)
+def update_roi_view(reach, roi_show, view, pattern, vel_thresh, min_disp, trim,
+                    jump_buf, cfg, vrs, fids, scenes, folders, vel_sel, disp_sel):
+    if not pattern:
+        return no_update
+    if ctx.triggered_id == "view-mode" and view != "roi":
+        return no_update
+    if not (roi_show and "on" in roi_show):
+        return _msg_figure("Enable 'Show target ROIs + reached counts' to see "
+                           "reached-fraction violins.")
+    df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
+                                   cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
+    if df_sub is None or len(df_sub) == 0:
+        return no_update
+    _, _, metas = _load_data(pattern)
+    rois = rois_by_config(metas)
+    if not rois:
+        return _msg_figure("No ROI targets in these configs.")
+    return build_roi_violin_figure(df_f, rois, float(reach) if reach else 3.0)
 
 
 # Re-apply the shared viewbox to the trajectory when it is opened (the heatmap
@@ -2480,7 +2600,8 @@ app.clientside_callback(
     # wildly wrong aspect-locked range and fire a relayout that pollutes the
     # shared viewport -- that was the intermittent zoom-out-to-nothing glitch.
     "var _pan={'trajectory-plot':'view-traj','vel-histogram':'view-diag',"
-    "'disp-histogram':'view-diag','raw-trace-plot':'view-diag'};"
+    "'disp-histogram':'view-diag','raw-trace-plot':'view-diag',"
+    "'roi-plot':'view-roi','polar-plot':'view-polar'};"
     "Object.keys(_pan).forEach(function(id){var p=document.getElementById(_pan[id]);"
     "if(!p||getComputedStyle(p).visibility==='hidden')return;"
     "var c=document.getElementById(id);var g=c&&c.querySelector('.js-plotly-plot');"
