@@ -325,6 +325,47 @@ def roi_config_summary(table: pd.DataFrame) -> dict:
     return out
 
 
+def trim_after_roi_exit(df, rois_by_cfg, reach) -> pd.DataFrame:
+    """For each trial that ENTERS then LEAVES an ROI, drop every sample after the
+    first exit (keep the approach + first contact). Trials that never enter, or
+    enter and stay, are untouched. Vectorised per config."""
+    if df is None or len(df) == 0 or not rois_by_cfg:
+        return df
+    reach2 = float(reach) ** 2
+    keep = pd.Series(True, index=df.index)
+    for cfg, sub in df.groupby("ConfigFile", sort=False):
+        rois = rois_by_cfg.get(cfg)
+        if not rois:
+            continue
+        gx = sub["GameObjectPosX"].to_numpy()
+        gz = sub["GameObjectPosZ"].to_numpy()
+        inside = np.zeros(len(sub), bool)
+        for r in rois:
+            inside |= (gx - r["x"]) ** 2 + (gz - r["z"]) ** 2 <= reach2
+        if not inside.any():
+            continue
+        seg = sub["_seg_id"].to_numpy()
+        entered = pd.Series(inside, index=sub.index).groupby(seg, sort=False).cummax().to_numpy()
+        pos = sub.groupby("_seg_id", sort=False).cumcount().to_numpy()
+        exit_flag = entered & (~inside)
+        big = len(sub) + 1
+        expos = pd.Series(np.where(exit_flag, pos, big), index=sub.index)
+        first_exit = expos.groupby(seg, sort=False).transform("min").to_numpy()
+        keep.loc[sub.index] = pos <= first_exit
+    return df[keep.to_numpy()]
+
+
+def _maybe_trim(df_f, pattern, roi_trim, reach):
+    """Apply ROI tail-trim to a filtered frame when the toggle is on."""
+    if not (roi_trim and "on" in (roi_trim or [])) or df_f is None or len(df_f) == 0:
+        return df_f
+    _, _, metas = _load_data(pattern)
+    rois = rois_by_config(metas)
+    if not rois:
+        return df_f
+    return trim_after_roi_exit(df_f, rois, float(reach) if reach else 3.0)
+
+
 def load_csv_fast(filepath: str) -> pd.DataFrame | None:
     try:
         df = pd.read_csv(filepath, parse_dates=["Current Time"])
@@ -1712,9 +1753,15 @@ app.layout = html.Div([
             dcc.Slider(id="roi-reach", min=0.5, max=30, step=0.5, value=3,
                        marks={1: "1", 10: "10", 20: "20", 30: "30"},
                        tooltip={"placement": "bottom", "always_visible": True}),
+            dcc.Checklist(id="roi-trim",
+                          options=[{"label": " Trim trial tail after ROI exit",
+                                    "value": "on"}],
+                          value=[], style={"fontSize": "11px", "marginTop": "3px"}),
             html.Div("Targets auto-load from the scene configs (Choice / "
                      "BinaryChoice; polar or cartesian). A trial 'reaches' an ROI "
-                     "if its path comes within the radius. Left = −X, right = +X.",
+                     "if its path comes within the radius. Left = −X, right = +X. "
+                     "Tail-trim drops each trial's path after it first leaves an "
+                     "ROI it entered (keeps approach + first contact).",
                      style={"fontSize": "9px", "color": "#888", "marginTop": "2px"}),
 
             html.Hr(style={"margin": "6px 0"}),
@@ -2416,13 +2463,14 @@ def _apply_viewport(fig, viewport, df):
     State("viewport-store", "data"),
     State("roi-show", "value"),
     State("roi-reach", "value"),
+    State("roi-trim", "value"),
     prevent_initial_call=True,
 )
 def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                  group_by, pool_mode, color_by, animate, rebase, hm_binsize, hm_scale,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
                  scenes, folders, raw_cols, ncols, max_points, vel_selection,
-                 disp_selection, viewport, roi_show, roi_reach):
+                 disp_selection, viewport, roi_show, roi_reach, roi_trim):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
         return empty, empty, empty, "Load data first.", no_update, no_update, no_update
@@ -2435,6 +2483,8 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
         return empty, empty, empty, "No data.", no_update, no_update, no_update
     if len(df_sub) == 0:
         return empty, empty, empty, "All filtered out.", no_update, no_update, no_update
+
+    df_f = _maybe_trim(df_f, pattern, roi_trim, roi_reach)
 
     # Histograms reflect the subset before velocity/disp cuts
     df, _, metas = _load_data(pattern)
@@ -2541,13 +2591,15 @@ _LAST_HEAT_SIG: dict = {"v": None}
     State("vel-histogram", "selectedData"),
     State("disp-histogram", "selectedData"),
     State("viewport-store", "data"),
+    State("roi-trim", "value"),
+    State("roi-reach", "value"),
     prevent_initial_call=True,
 )
 def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_cmax,
                         hm_crange, view, pattern, vel_thresh,
                         min_disp, trim, jump_buf, group_by, pool_mode, ncols, rebase,
                         cfg, vrs, fids, scenes, folders,
-                        vel_selection, disp_selection, viewport):
+                        vel_selection, disp_selection, viewport, roi_trim, roi_reach):
     if not pattern:
         return no_update
     # If this fire came from switching views, only act when heatmap is shown.
@@ -2564,7 +2616,7 @@ def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_c
     sig = _sig_of([pattern, hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin,
                    hm_cmax, hm_crange, group_by, pool_mode, ncols, rebase, cfg,
                    vrs, fids, scenes, folders, vel_thresh, min_disp, trim, jump_buf,
-                   vel_selection, disp_selection, viewport])
+                   vel_selection, disp_selection, viewport, roi_trim, roi_reach])
     if ctx.triggered_id == "view-mode" and sig == _LAST_HEAT_SIG["v"]:
         return no_update
     df_f, df_sub, _ = _filtered_df(
@@ -2572,6 +2624,7 @@ def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_c
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
     if df_sub is None or len(df_sub) == 0:
         return no_update
+    df_f = _maybe_trim(df_f, pattern, roi_trim, roi_reach)
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
     if rebase and "on" in rebase:
         df_f = rebase_to_origin(df_f)
@@ -2665,6 +2718,7 @@ def switch_view(v):
     Output("roi-plot", "figure", allow_duplicate=True),
     Input("roi-reach", "value"),
     Input("roi-show", "value"),
+    Input("roi-trim", "value"),
     Input("view-mode", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
@@ -2680,8 +2734,8 @@ def switch_view(v):
     State("disp-histogram", "selectedData"),
     prevent_initial_call=True,
 )
-def update_roi_view(reach, roi_show, view, pattern, vel_thresh, min_disp, trim,
-                    jump_buf, cfg, vrs, fids, scenes, folders, vel_sel, disp_sel):
+def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_disp,
+                    trim, jump_buf, cfg, vrs, fids, scenes, folders, vel_sel, disp_sel):
     if not pattern:
         return no_update
     if ctx.triggered_id == "view-mode" and view != "roi":
@@ -2693,6 +2747,7 @@ def update_roi_view(reach, roi_show, view, pattern, vel_thresh, min_disp, trim,
                                    cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
     if df_sub is None or len(df_sub) == 0:
         return no_update
+    df_f = _maybe_trim(df_f, pattern, roi_trim, reach)
     _, _, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     if not rois:
@@ -2711,6 +2766,7 @@ def update_roi_view(reach, roi_show, view, pattern, vel_thresh, min_disp, trim,
     Input("polar-walk", "value"),
     Input("roi-reach", "value"),
     Input("roi-show", "value"),
+    Input("roi-trim", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
@@ -2731,9 +2787,9 @@ def update_roi_view(reach, roi_show, view, pattern, vel_thresh, min_disp, trim,
     prevent_initial_call=True,
 )
 def update_polar_view(view, polar_color, polar_moving, polar_walk, reach, roi_show,
-                      pattern, vel_thresh, min_disp, trim, jump_buf, group_by,
-                      pool_mode, ncols, max_points, rebase, cfg, vrs, fids, scenes,
-                      folders, vel_sel, disp_sel):
+                      roi_trim, pattern, vel_thresh, min_disp, trim, jump_buf,
+                      group_by, pool_mode, ncols, max_points, rebase, cfg, vrs, fids,
+                      scenes, folders, vel_sel, disp_sel):
     if not pattern or view != "polar":
         return no_update
     df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -2741,6 +2797,7 @@ def update_polar_view(view, polar_color, polar_moving, polar_walk, reach, roi_sh
     if df_sub is None or len(df_sub) == 0:
         return _msg_figure("All filtered out.")
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
+    df_f = _maybe_trim(df_f, pattern, roi_trim, reach)
     if rebase and "on" in rebase:
         df_f = rebase_to_origin(df_f)
     _, _, metas = _load_data(pattern)
