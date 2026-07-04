@@ -1437,7 +1437,9 @@ app.layout = html.Div([
                         dcc.Graph(id="trajectory-plot", figure=_EMPTY,
                                   config={"scrollZoom": True, "displayModeBar": True},
                                   style={"width": "100%"}),
-                        type="circle"),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s"}),
                 ], id="view-traj", style={**_PANEL_STYLE}),
 
                 # --- Heatmap ---
@@ -1446,7 +1448,9 @@ app.layout = html.Div([
                         dcc.Graph(id="heatmap-plot", figure=_EMPTY,
                                   config={"scrollZoom": True, "displayModeBar": True},
                                   style={"width": "100%"}),
-                        type="circle"),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s"}),
                     id="view-heat", style={**_PANEL_STYLE, "visibility": "hidden"}),
 
                 # --- Diagnostics ---
@@ -1470,7 +1474,9 @@ app.layout = html.Div([
                     dcc.Loading(
                         dcc.Graph(id="raw-trace-plot", figure=_EMPTY,
                                   config={"scrollZoom": True}),
-                        type="circle"),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s"}),
                 ], id="view-diag", style={**_PANEL_STYLE, "visibility": "hidden"}),
             ], style={"position": "relative", "flex": "1", "minHeight": "0"}),
         ], style={"flex": "1", "padding": "4px 8px", "display": "flex",
@@ -1863,6 +1869,37 @@ def _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
     return result
 
 
+def _apply_viewport(fig, viewport, df):
+    """Re-apply a stored shared viewbox to `fig`, but reject garbage ranges.
+
+    A scaleanchor plot that fires a relayout while briefly mis-sized can report a
+    range many times larger than the data — applying it zooms everything out to
+    an empty view. We only honour a stored range whose span is within a generous
+    multiple of the data's natural extent; anything wilder is treated as "no
+    viewbox" so the figure keeps its own sensible autoscale.
+    """
+    if not viewport or viewport.get("reset") or df is None or len(df) == 0:
+        return
+    try:
+        rx, rz = _shared_range(df)
+    except Exception:
+        rx = rz = None
+
+    def _ok(rng, natural):
+        if not rng or len(rng) != 2 or rng[0] is None or rng[1] is None:
+            return False
+        if natural is None:
+            return True
+        span = abs(rng[1] - rng[0])
+        nat = abs(natural[1] - natural[0]) or 1.0
+        return span <= nat * 8.0
+
+    if _ok(viewport.get("xaxis"), rx):
+        fig.update_xaxes(range=viewport["xaxis"])
+    if _ok(viewport.get("yaxis"), rz):
+        fig.update_yaxes(range=viewport["yaxis"])
+
+
 @app.callback(
     Output("trajectory-plot", "figure"),
     Output("heatmap-plot", "figure"),
@@ -1949,12 +1986,8 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     bt = time.time() - t0
 
     # Retain / restore the shared viewbox across replots and from the URL.
-    if viewport and not viewport.get("reset"):
-        for f in (traj_fig, heat_fig):
-            if viewport.get("xaxis"):
-                f.update_xaxes(range=viewport["xaxis"])
-            if viewport.get("yaxis"):
-                f.update_yaxes(range=viewport["yaxis"])
+    for f in (traj_fig, heat_fig):
+        _apply_viewport(f, viewport, df_plot)
 
     # Effective drawn points (post-decimation) for the summary
     n_traces = int(df_f["_seg_id"].nunique()) if len(df_f) else 0
@@ -1975,6 +2008,15 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
 # Rebuild the heatmap on its own controls AND whenever the Heatmap view is
 # opened. Re-pushing the figure to the now-visible graph is what makes it draw
 # reliably (a graph born in a hidden panel won't render an earlier figure push).
+#
+# On a *plain* tab switch where nothing that affects the heatmap changed, we
+# return no_update instead of rebuilding: the clientside callback paints the
+# already-correct figure on first reveal and merely resizes on later reveals, so
+# flipping tabs costs zero server work and zero re-init flash. A rebuild only
+# happens when a heatmap control, the filter, or the shared viewport changed.
+_LAST_HEAT_SIG: dict = {"v": None}
+
+
 @app.callback(
     Output("heatmap-plot", "figure", allow_duplicate=True),
     Input("heatmap-binsize", "value"),
@@ -2014,6 +2056,20 @@ def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_c
     # If this fire came from switching views, only act when heatmap is shown.
     if ctx.triggered_id == "view-mode" and view != "heat":
         return no_update
+    # Skip the rebuild on a plain tab switch when nothing relevant changed — this
+    # is what stops the heatmap re-initialising (and flashing) every time you
+    # open the tab. The clientside paints the existing figure on reveal.
+    def _sig_of(v):
+        try:
+            return json.dumps(v, sort_keys=True, default=str)
+        except Exception:
+            return repr(v)
+    sig = _sig_of([pattern, hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin,
+                   hm_cmax, hm_crange, group_by, pool_mode, ncols, rebase, cfg,
+                   vrs, fids, scenes, folders, vel_thresh, min_disp, trim, jump_buf,
+                   vel_selection, disp_selection, viewport])
+    if ctx.triggered_id == "view-mode" and sig == _LAST_HEAT_SIG["v"]:
+        return no_update
     df_f, df_sub, _ = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
@@ -2027,11 +2083,8 @@ def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_c
                                 bound_pct=hm_bound if hm_bound else 100,
                                 metric=hm_metric or "time",
                                 cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange)
-    if viewport and not viewport.get("reset"):
-        if viewport.get("xaxis"):
-            heat.update_xaxes(range=viewport["xaxis"])
-        if viewport.get("yaxis"):
-            heat.update_yaxes(range=viewport["yaxis"])
+    _apply_viewport(heat, viewport, df_f)
+    _LAST_HEAT_SIG["v"] = sig
     return heat
 
 
@@ -2129,21 +2182,49 @@ def apply_viewport_traj(view, vp):
 # The heatmap uses a 1:1 aspect lock (scaleanchor). Dash's Plotly.react update
 # path crashes on that with "axis scaling" when the figure is applied to a graph
 # that isn't at full size yet, and never recovers — so the heatmap stays blank.
-# A fresh Plotly.newPlot re-initialises cleanly and renders. Do that whenever the
-# heatmap figure changes or the Heatmap view is opened; resize the others.
+# A fresh Plotly.newPlot re-initialises cleanly and renders.
+#
+# But re-initialising on EVERY figure change and EVERY tab switch is what made
+# the heatmap flash. Instead we fingerprint the figure and only newPlot when:
+#   (a) the content actually changed, or
+#   (b) it's the first time the panel is revealed while VISIBLE (the initial draw
+#       may have happened while the panel was hidden — that paint isn't reliable).
+# A plain tab switch with an unchanged, already-visible figure just resizes — no
+# re-init, no flash. Genuine re-inits get a short opacity fade so they read as a
+# crossfade rather than a white flash.
 app.clientside_callback(
     "function(hfig, view){setTimeout(function(){"
     "var hc=document.getElementById('heatmap-plot');"
     "var hg=hc&&hc.querySelector('.js-plotly-plot');"
+    "var panel=document.getElementById('view-heat');"
+    "var vis=panel&&getComputedStyle(panel).visibility!=='hidden';"
+    "var fp='';try{var L=(hfig&&hfig.layout)||{};"
+    "fp=JSON.stringify((hfig&&hfig.data||[]).map(function(t){"
+    "return [t.type,(t.z&&t.z.length)||0,(t.x&&t.x.length)||0,t.zmin,t.zmax];}))"
+    "+'|'+(L.height||0)+'|'+JSON.stringify(L.xaxis&&L.xaxis.range)"
+    "+'|'+JSON.stringify(L.yaxis&&L.yaxis.range);}catch(e){}"
     "if(hg&&window.Plotly&&hfig&&hfig.data&&hfig.data.length){"
+    "var changed=hg.__hmfp!==fp;"
+    "var needPaint=changed||(!hg.__hmVis&&vis);"
+    "if(needPaint){"
+    "window.__hmSuppress=true;"
+    "try{hc.style.transition='opacity .16s';hc.style.opacity=changed?'0.3':'1';}catch(e){}"
     "try{window.Plotly.newPlot(hg,hfig.data,hfig.layout,{scrollZoom:true,displayModeBar:true});"
-    "if(window.__attachHeatSync){hg.__heatSync=false;window.__attachHeatSync(hg);}}"
-    "catch(e){}}"
-    "['trajectory-plot','vel-histogram','disp-histogram','raw-trace-plot']"
-    ".forEach(function(id){var c=document.getElementById(id);"
-    "var g=c&&c.querySelector('.js-plotly-plot');"
+    "hg.__hmfp=fp;hg.__hmVis=vis;"
+    "if(window.__attachHeatSync){hg.__heatSync=false;window.__attachHeatSync(hg);}}catch(e){}"
+    "try{requestAnimationFrame(function(){hc.style.opacity='1';});}catch(e){hc.style.opacity='1';}"
+    "setTimeout(function(){window.__hmSuppress=false;},250);"
+    "}else if(vis){try{window.Plotly.Plots.resize(hg);}catch(e){}}}"
+    # Resize ONLY the graph in the currently-visible panel. Resizing a hidden
+    # scaleanchor plot (or a global window 'resize') makes Plotly recompute a
+    # wildly wrong aspect-locked range and fire a relayout that pollutes the
+    # shared viewport -- that was the intermittent zoom-out-to-nothing glitch.
+    "var _pan={'trajectory-plot':'view-traj','vel-histogram':'view-diag',"
+    "'disp-histogram':'view-diag','raw-trace-plot':'view-diag'};"
+    "Object.keys(_pan).forEach(function(id){var p=document.getElementById(_pan[id]);"
+    "if(!p||getComputedStyle(p).visibility==='hidden')return;"
+    "var c=document.getElementById(id);var g=c&&c.querySelector('.js-plotly-plot');"
     "if(g&&window.Plotly&&window.Plotly.Plots){try{window.Plotly.Plots.resize(g);}catch(e){}}});"
-    "try{window.dispatchEvent(new Event('resize'));}catch(e){}"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
     Input("heatmap-plot", "figure"),

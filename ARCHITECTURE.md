@@ -117,11 +117,14 @@ transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
   size, then auto-triggers `update_plots`.
 - `update_plots` — the main replot (trajectory + heatmap + raw + summary + hists).
 - `update_heatmap_only` — fast heatmap-only rebuild on any heatmap control **or
-  view switch to heatmap** (reuses the filter cache; re-applies the viewbox).
+  view switch to heatmap** (reuses the filter cache; re-applies the viewbox via
+  `_apply_viewport`). On a view switch it returns `no_update` when nothing
+  relevant changed (signature cached in `_LAST_HEAT_SIG`) so tab-flipping is free.
 - `sync_viewport` — records the current viewbox into `viewport-store` (does NOT
   live-patch the other figure — that caused glitches). `apply_viewport_traj`
   re-applies it to the trajectory on view switch (heatmap side is done in
-  `update_heatmap_only`).
+  `update_heatmap_only`). Both apply through `_apply_viewport`, which drops
+  implausible (>8× data extent) ranges from a mis-sized relayout.
 - `switch_view` toggles panel `visibility`. Clientside callbacks drive playback,
   resize graphs shown for the first time, and `newPlot` the heatmap.
 - `export_html` rebuilds all figures server-side and emits one self-contained file.
@@ -145,16 +148,29 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
    *"Something went wrong with axis scaling"* in `setScale`, and it then never
    repaints. It happens **even without `scaleanchor`** (it's the subplot axis
    layout at a bad size). A fresh `Plotly.newPlot` re-initialises cleanly. **Fix:
-   a clientside callback re-runs `Plotly.newPlot(hg, hfig.data, hfig.layout)`
-   whenever the heatmap figure changes or the Heatmap view opens.** It must read
-   the **fresh figure prop `hfig`**, not the graph's own `hg.data` (which stays
-   stale because react crashed) — reading `hg.data` is exactly what caused the
-   "stale heatmap until hard reload" bug.
+   a clientside callback re-runs `Plotly.newPlot(hg, hfig.data, hfig.layout)`.**
+   It must read the **fresh figure prop `hfig`**, not the graph's own `hg.data`
+   (which stays stale because react crashed) — reading `hg.data` is exactly what
+   caused the "stale heatmap until hard reload" bug.
+   - **The newPlot is now fingerprint-guarded (do not revert to unconditional).**
+     It only re-inits when the figure content actually changed *or* on the first
+     reveal while the panel is visible; a plain tab switch with an unchanged
+     figure just `Plotly.Plots.resize`s (no flash). The fingerprint covers trace
+     shapes, `zmin/zmax`, height, and the axis ranges (so a viewport sync still
+     re-inits once). `update_heatmap_only` mirrors this server-side: it returns
+     `no_update` on a view-switch when its signature (`_LAST_HEAT_SIG`) is
+     unchanged, so flipping tabs costs zero server work.
 
 3. **WebGL (`Scattergl`) graphs created in a hidden panel never paint.** Hence
    the raw time-series plot uses SVG `go.Scatter` (smaller budget). Trajectory is
    WebGL but is the default-visible panel, so it's fine; a resize is nudged when
    it's shown after being created hidden.
+   - **Only resize the graph in the currently-*visible* panel** (and never a
+     global `window` `resize`). Resizing a hidden `scaleanchor` plot makes Plotly
+     recompute a wildly wrong aspect-locked range and fire a `relayout` that
+     poisons the shared viewport — that was the intermittent "everything zooms
+     out to an empty view" glitch. As a belt-and-braces guard, `_apply_viewport`
+     also rejects any stored range whose span is >8× the data's natural extent.
 
 4. **Panels hide with `visibility:hidden` + absolute positioning, not
    `display:none`.** `display:none` gives a graph 0 size at creation and it can't
@@ -165,13 +181,14 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
 
 ## 8. Known issues / glitches / limitations
 
-- **Heatmap "flash" on rebuild.** Because of §7.2 the heatmap does a full
-  `newPlot` on every update, so changing a heatmap control or reloading data
-  briefly re-inits the plot. Functionally correct, just not a silky in-place
-  transition. *Cleanest future fix:* find a figure/graph state where
-  `Plotly.react` doesn't throw on the subplot grid (or render the heatmap as a
-  single `Image`/`go.Heatmap` without `make_subplots`), which would let normal
-  Dash updates work and remove the whole newPlot/heatsync machinery.
+- **Heatmap "flash" on rebuild — largely resolved.** The heatmap now re-inits
+  only when its content actually changes (a heatmap control, the filter, or a
+  viewport sync), with a short opacity fade; tab switches are resize-only and
+  flash-free (§7.2). A genuine control change still does one `newPlot`
+  (unavoidable while the react-crash workaround stands). *Cleanest future fix
+  remains:* find a figure/graph state where `Plotly.react` doesn't throw on the
+  subplot grid (or render the heatmap without `make_subplots`), which would drop
+  the newPlot/heatsync machinery entirely.
 - **Heatmap→trajectory zoom sync depends on `assets/heatsync.js`.** newPlot drops
   Dash's relayout listener; the asset re-attaches one that writes `viewport-store`
   via `set_props`. If you refactor the heatmap rendering, keep or drop this in

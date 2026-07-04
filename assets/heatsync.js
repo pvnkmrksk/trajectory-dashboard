@@ -7,6 +7,11 @@ window.__attachHeatSync = function (hg) {
   hg.__heatSync = true;
   hg.on('plotly_relayout', function (ed) {
     if (!ed) return;
+    // Ignore relayout events fired by our own programmatic newPlot (autorange
+    // echoes). Recording those would pollute the shared viewport and make the
+    // heatmap rebuild/re-init on the next tab switch. Only real user zoom/pan,
+    // which happens outside this suppression window, is recorded.
+    if (window.__hmSuppress) return;
     var acc = {};
     Object.keys(ed).forEach(function (k) {
       if (k.indexOf('autorange') >= 0) { acc.reset = true; return; }

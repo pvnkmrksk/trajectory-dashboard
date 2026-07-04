@@ -5,3 +5,7 @@ __pycache__/
 venv/
 *.html
 trajectory_export_*.html
+
+# local dev artifacts
+/Data
+.claude/
