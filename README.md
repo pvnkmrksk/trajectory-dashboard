@@ -36,6 +36,17 @@ python app.py --port 8051 --host 0.0.0.0
   human-readable log labels (100 ms / 1 s / 10 s), percentile-bounded extent,
   metric = count / occupancy-seconds / % of time, explicit `cmin/cmax`
   (absolute or percentile). Zoom stays linked with the trajectory.
+- **ROI targets** auto-loaded from the scene configs (Choice/BinaryChoice; polar
+  `{radius,angle}` or cartesian `{x,y,z}`, Unity left-handed). Adjustable **reach
+  radius** slider, reach circles + per-subplot left/right **reached counts**
+  overlaid on the trajectories, and an optional **tail-trim** that drops each
+  trial's path after it first leaves an ROI it entered.
+- **ROI counts view**: per-animal fraction of trials reaching the left vs right
+  ROI as grouped violins with every visible animal as a scatter point.
+- **Polar view**: each trial's path as r (distance from origin) vs angle
+  (0° = forward, clockwise — same frame as the trajectories and ROIs), coloured
+  by instantaneous velocity or local tortuosity, with a moving-only (walk-speed)
+  toggle; ROI targets shown as rings.
 - **Diagnostics tab**: velocity + displacement histograms and raw time-series.
 - **Shareable URL**: every control *and the current zoom box* is in the URL.
 - **Export**: one self-contained `.html` with all panels and real data embedded.

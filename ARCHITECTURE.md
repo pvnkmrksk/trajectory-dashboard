@@ -175,7 +175,27 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
 4. **Panels hide with `visibility:hidden` + absolute positioning, not
    `display:none`.** `display:none` gives a graph 0 size at creation and it can't
    recover; `dcc.Tabs` is worse (it *remounts* and resets the figure to the
-   layout default). So all three views stay mounted and only toggle visibility.
+   layout default). So all five views stay mounted and only toggle visibility.
+
+5. **The Polar view fought three separate rendering bugs — keep all three fixes.**
+   - Use **SVG `go.Scatterpolar`, not `Scatterpolargl`.** WebGL polar crashes on
+     re-render (`Cannot read properties of undefined (reading '_scene')`), so the
+     polar uses SVG with a tighter point budget (`BUDGET_POLAR`).
+   - **Pass `r`/`theta`/`marker.color` as plain Python lists** (`.tolist()`), same
+     reason as the heatmap `z` (§7.1): Plotly-6 encodes numpy as typed-array
+     `bdata` that arrives empty through the clientside newPlot.
+   - **It needs a height-pinned clientside `newPlot`.** Born hidden, Dash's
+     `Plotly.react` updates the polar's traces but *not* the figure height (the
+     SVG stays at the placeholder size and the subplots collapse). A clientside
+     callback sets the container height to `figure.layout.height` and re-`newPlot`s
+     it; the polar `dcc.Graph` is `responsive=False`. It is NOT in the fit-to-
+     container resize map (that would flatten it).
+
+**Coordinate convention (ROIs + polar).** Unity is left-handed: objects at polar
+`(radius, angle°)` sit at `X = r·sin(angle)`, `Z = r·cos(angle)` (0° = forward/+Z
+= top of screen). Headings/polar use `theta = atan2(dx, dz)` so 0° = forward too,
+and the polar axis is `rotation=90, direction="clockwise"` — so the ROI overlay,
+the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
 
 ---
 
