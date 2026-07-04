@@ -294,15 +294,17 @@ def roi_reached_table(df, rois_by_cfg, reach) -> pd.DataFrame:
                 mr |= hit; has_r = True
         if not (has_l or has_r):
             continue
-        t = pd.DataFrame({"_seg_id": sub["_seg_id"].to_numpy(),
-                          "reached_left": ml, "reached_right": mr})
-        g = t.groupby("_seg_id", sort=False).agg(
-            reached_left=("reached_left", "any"),
-            reached_right=("reached_right", "any")).reset_index()
-        meta = sub.groupby("_seg_id", sort=False).agg(
-            ConfigFile=("ConfigFile", "first"), VR=("VR", "first"),
-            FlyID=("FlyID", "first")).reset_index()
-        parts.append(g.merge(meta, on="_seg_id"))
+        # Segments are contiguous (load-time sort), so per-trial ANY is a
+        # reduceat over the segment start indices — much faster than groupby.
+        seg = sub["_seg_id"].to_numpy()
+        starts = np.concatenate(([0], np.flatnonzero(seg[1:] != seg[:-1]) + 1))
+        parts.append(pd.DataFrame({
+            "_seg_id": seg[starts],
+            "ConfigFile": sub["ConfigFile"].to_numpy()[starts],
+            "VR": sub["VR"].to_numpy()[starts],
+            "FlyID": sub["FlyID"].to_numpy()[starts],
+            "reached_left": np.logical_or.reduceat(ml, starts),
+            "reached_right": np.logical_or.reduceat(mr, starts)}))
     if not parts:
         return pd.DataFrame(columns=_ROI_TABLE_COLS)
     out = pd.concat(parts, ignore_index=True)
@@ -1006,6 +1008,9 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
     if animate and records:
         # Frames only — playback is driven by a sticky HTML bar above the graph
         # (always visible regardless of scroll), via clientside Plotly.animate.
+        # Build frame traces as plain dicts, not go.Scattergl/go.Frame: Plotly's
+        # per-attribute validation on ~250 trace objects was ~1.2 s of pure
+        # overhead per replot (dicts cut it to a fraction).
         frames = []
         for fi in range(N_ANIM_FRAMES + 1):
             frac = fi / N_ANIM_FRAMES
@@ -1013,15 +1018,15 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
             for rec in records:
                 x, y, mc = _record_arrays(rec, frac)
                 if rec["mode"] == "markers":
-                    frame_traces.append(go.Scattergl(
-                        x=x, y=y, mode="markers", opacity=0.75,
+                    frame_traces.append(dict(
+                        type="scattergl", x=x, y=y, mode="markers", opacity=0.75,
                         marker=dict(size=3, color=mc, colorscale=SEQ_COLORSCALE,
                                     cmin=rec["cmin"], cmax=rec["cmax"])))
                 else:
-                    frame_traces.append(go.Scattergl(
-                        x=x, y=y, mode="lines", opacity=0.75,
+                    frame_traces.append(dict(
+                        type="scattergl", x=x, y=y, mode="lines", opacity=0.75,
                         line=dict(color=rec["color"], width=1.2)))
-            frames.append(go.Frame(data=frame_traces, name=str(fi)))
+            frames.append(dict(data=frame_traces, name=str(fi)))
         fig.frames = frames
 
     _apply_axis_sync(fig, nrows, ncols, df, uirev="traj_view")
@@ -1320,12 +1325,12 @@ def _msg_figure(text, height=440):
     return fig
 
 
-def build_roi_violin_figure(df, rois_by_cfg, reach):
+def build_roi_violin_figure(df, rois_by_cfg, reach, table=None):
     """Per-animal fraction of trials that reached the left vs right ROI, one pair
     of violins per config with every visible animal as a scatter point. `df` is
     already filtered to the visible subset, so the violins reflect exactly what
-    is toggled on."""
-    tbl = roi_reached_table(df, rois_by_cfg, reach)
+    is toggled on. Pass a precomputed `table` to avoid recomputing it."""
+    tbl = roi_reached_table(df, rois_by_cfg, reach) if table is None else table
     if tbl is None or len(tbl) == 0:
         return _msg_figure("No left/right ROI targets in these configs — "
                            "nothing to count. Load Choice/BinaryChoice data.")
@@ -2503,13 +2508,14 @@ def _apply_viewport(fig, viewport, df):
     State("roi-show", "value"),
     State("roi-reach", "value"),
     State("roi-trim", "value"),
+    State("view-mode", "value"),
     prevent_initial_call=True,
 )
 def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                  group_by, pool_mode, color_by, animate, rebase, hm_binsize, hm_scale,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
                  scenes, folders, raw_cols, ncols, max_points, vel_selection,
-                 disp_selection, viewport, roi_show, roi_reach, roi_trim):
+                 disp_selection, viewport, roi_show, roi_reach, roi_trim, view):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
         return empty, empty, empty, "Load data first.", no_update, no_update, no_update
@@ -2550,11 +2556,15 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     want_rois = bool(roi_show) and "on" in (roi_show or []) and bool(rois)
     reach = float(roi_reach) if roi_reach else 3.0
     roi_counts = None
-    roi_fig = _msg_figure("Enable 'Show target ROIs' and load Choice/BinaryChoice "
-                          "data to see reached-fraction violins.")
+    roi_fig = no_update            # the ROI violin is lazily built by its own tab
     if want_rois:
-        roi_counts = roi_config_summary(roi_reached_table(df_f, rois, reach))
-        roi_fig = build_roi_violin_figure(df_f, rois, reach)
+        # Reached table computed ONCE, shared by the overlay counts and (only when
+        # the ROI tab is actually open) the violins — avoids ~2s of duplicate work
+        # on every replot while on the trajectory tab.
+        table = roi_reached_table(df_f, rois, reach)
+        roi_counts = roi_config_summary(table)
+        if view == "roi":
+            roi_fig = build_roi_violin_figure(df_f, rois, reach, table=table)
 
     traj_fig = build_trajectory_figure(df_plot, group_by, pool_mode, ncols=ncols_val,
                                         color_by=color_by or "individual",
