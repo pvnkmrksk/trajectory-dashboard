@@ -12,6 +12,7 @@ Usage:
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import time
@@ -167,18 +168,100 @@ def _find_fly_metadata(csv_dir):
     return None
 
 
+def _loads_tolerant(text: str):
+    """json.loads, but forgiving of the trailing commas the Unity Choice configs
+    ship with (``{"a":1,}`` / ``[1,2,]``) — strict json.loads rejects those, which
+    silently dropped every ROI-bearing config from metadata."""
+    try:
+        return json.loads(text)
+    except Exception:
+        try:
+            return json.loads(re.sub(r",(\s*[}\]])", r"\1", text))
+        except Exception:
+            return None
+
+
 def load_folder_metadata(folder: str) -> dict:
     meta = {"folder": folder, "configs": {}, "fly_metadata": None}
     for f in Path(folder).glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-        except Exception:
+        data = _loads_tolerant(f.read_text())
+        if data is None:
             continue
         if "FlyMetaData" in f.name or "metadata" in f.name.lower():
             meta["fly_metadata"] = data
         elif "sequenceConfig" not in f.name:
             meta["configs"][f.name] = data
     return meta
+
+
+# ---------------------------------------------------------------------------
+# ROI geometry (targets pulled from the Choice-scene configs)
+# ---------------------------------------------------------------------------
+# Objects are placed in Unity's LEFT-HANDED ground plane at polar (radius, angle°):
+#   X = r*sin(angle),  Z = r*cos(angle)      [ = Euler(0,angle,0) * forward ]
+# so angle 0 = forward/+Z (up on screen), 90 = +X (right), 180 = -Z (down),
+# -90/270 = -X (left). Left ROI ⇔ X<0, right ROI ⇔ X>0. The same convention is
+# reused for headings/polar (theta = atan2(dx, dz)) so overlay, counts and polar
+# all agree.
+
+def roi_xz(radius: float, angle_deg: float) -> tuple[float, float]:
+    a = math.radians(angle_deg)
+    return radius * math.sin(a), radius * math.cos(a)
+
+
+def rois_from_config(cfg_data: dict) -> list[dict]:
+    """Extract ROI targets from one parsed config dict → list of
+    {x, z, angle, r, type, side, scale}.
+
+    Handles both placement styles Unity emits:
+      * polar     ``position: {radius, angle}``  (Choice/MormonBand scenes)
+      * cartesian ``position: {x, y, z}``        (BinaryChoice tree targets; y up)
+    """
+    out = []
+    objs = cfg_data.get("objects", []) if isinstance(cfg_data, dict) else []
+    for o in objs:
+        pos = o.get("position") or {}
+        if pos.get("radius") is not None and pos.get("angle") is not None:
+            r = float(pos["radius"]); a = float(pos["angle"])
+            if r <= 0:                  # radius 0 = at the animal → not a target
+                continue
+            x, z = roi_xz(r, a)
+        elif pos.get("x") is not None and pos.get("z") is not None:
+            x = float(pos["x"]); z = float(pos["z"])
+            r = math.hypot(x, z); a = math.degrees(math.atan2(x, z))
+        else:
+            continue
+        scale = o.get("scale") or {}
+        sc = abs(float(scale.get("x", 1) or 1))     # object half-size hint
+        side = "left" if x < -1e-6 else "right" if x > 1e-6 else "centre"
+        out.append({"x": x, "z": z, "angle": a, "r": r, "scale": sc,
+                    "type": o.get("type", "object"), "side": side})
+    return out
+
+
+def _short_config_name(fname: str) -> str:
+    """On-disk configs are ``<prefix>_ControlScene_Choice_X.json`` but the CSV's
+    ConfigFile column carries the short ``Choice_X.json`` (the sequenceConfig
+    reference). Normalise to the short form so ROIs key by ConfigFile."""
+    return fname.split("_ControlScene_")[-1] if "_ControlScene_" in fname else fname
+
+
+def rois_by_config(metas: list[dict]) -> dict[str, list[dict]]:
+    """Map ConfigFile (short name) → its ROI list, pooled across all folders."""
+    out: dict[str, list[dict]] = {}
+    for m in metas or []:
+        for fname, data in (m.get("configs") or {}).items():
+            key = _short_config_name(fname)
+            rois = rois_from_config(data)
+            if rois and key not in out:
+                out[key] = rois
+    return out
+
+
+def segment_reached(gx, gz, roi_x, roi_z, reach) -> bool:
+    """True if the (already per-segment) trajectory comes within `reach` of the
+    ROI centre at any sample."""
+    return bool(np.any((gx - roi_x) ** 2 + (gz - roi_z) ** 2 <= reach * reach))
 
 
 def load_csv_fast(filepath: str) -> pd.DataFrame | None:
