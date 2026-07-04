@@ -264,6 +264,67 @@ def segment_reached(gx, gz, roi_x, roi_z, reach) -> bool:
     return bool(np.any((gx - roi_x) ** 2 + (gz - roi_z) ** 2 <= reach * reach))
 
 
+_ROI_TABLE_COLS = ["_seg_id", "ConfigFile", "animal", "VR", "FlyID",
+                   "reached_left", "reached_right"]
+
+
+def roi_reached_table(df, rois_by_cfg, reach) -> pd.DataFrame:
+    """Per-trial (segment) reached flags for the left/right ROI of each trial's
+    config. Vectorised per config. `animal` = FlyID@VR (same animal across files
+    when both match — e.g. a crash + restart). Only configs that actually carry
+    a left and/or right ROI contribute rows."""
+    if df is None or len(df) == 0 or not rois_by_cfg:
+        return pd.DataFrame(columns=_ROI_TABLE_COLS)
+    reach2 = float(reach) ** 2
+    parts = []
+    for cfg, sub in df.groupby("ConfigFile", sort=False):
+        rois = rois_by_cfg.get(cfg)
+        if not rois:
+            continue
+        gx = sub["GameObjectPosX"].to_numpy()
+        gz = sub["GameObjectPosZ"].to_numpy()
+        ml = np.zeros(len(sub), bool)
+        mr = np.zeros(len(sub), bool)
+        has_l = has_r = False
+        for r in rois:
+            hit = (gx - r["x"]) ** 2 + (gz - r["z"]) ** 2 <= reach2
+            if r["side"] == "left":
+                ml |= hit; has_l = True
+            elif r["side"] == "right":
+                mr |= hit; has_r = True
+        if not (has_l or has_r):
+            continue
+        t = pd.DataFrame({"_seg_id": sub["_seg_id"].to_numpy(),
+                          "reached_left": ml, "reached_right": mr})
+        g = t.groupby("_seg_id", sort=False).agg(
+            reached_left=("reached_left", "any"),
+            reached_right=("reached_right", "any")).reset_index()
+        meta = sub.groupby("_seg_id", sort=False).agg(
+            ConfigFile=("ConfigFile", "first"), VR=("VR", "first"),
+            FlyID=("FlyID", "first")).reset_index()
+        parts.append(g.merge(meta, on="_seg_id"))
+    if not parts:
+        return pd.DataFrame(columns=_ROI_TABLE_COLS)
+    out = pd.concat(parts, ignore_index=True)
+    out["animal"] = out["FlyID"].astype(str) + "@" + out["VR"].astype(str)
+    return out[_ROI_TABLE_COLS]
+
+
+def roi_config_summary(table: pd.DataFrame) -> dict:
+    """Per-config totals for the subplot-corner tally."""
+    out = {}
+    if table is None or len(table) == 0:
+        return out
+    for cfg, sub in table.groupby("ConfigFile", sort=False):
+        tot = len(sub)
+        lr = int(sub["reached_left"].sum())
+        rr = int(sub["reached_right"].sum())
+        out[cfg] = {"total": tot, "left_reached": lr, "right_reached": rr,
+                    "left_frac": lr / tot if tot else 0.0,
+                    "right_frac": rr / tot if tot else 0.0}
+    return out
+
+
 def load_csv_fast(filepath: str) -> pd.DataFrame | None:
     try:
         df = pd.read_csv(filepath, parse_dates=["Current Time"])
@@ -765,9 +826,47 @@ def _apply_axis_sync(fig, nrows, ncols, df, uirev="traj", rng=None):
     fig.update_layout(uirevision=uirev)
 
 
+_ROI_SIDE_COLOR = {"left": "#1f77b4", "right": "#ff7f0e", "centre": "#6c757d"}
+
+
+def _add_roi_overlay(fig, group_names, ncols, rois_by_cfg, reach, counts=None):
+    """Draw each config's ROI targets (reach circle + centre dot) on its subplot,
+    plus an optional corner tally of left/right reached fractions. ROIs are drawn
+    as shapes so they add no traces and don't leak into animation frames."""
+    for i, gname in enumerate(group_names):
+        rlist = rois_by_cfg.get(gname)
+        if not rlist:
+            continue
+        r_, c_ = i // ncols + 1, i % ncols + 1
+        for roi in rlist:
+            col = _ROI_SIDE_COLOR.get(roi["side"], "#6c757d")
+            fig.add_shape(type="circle", x0=roi["x"] - reach, x1=roi["x"] + reach,
+                          y0=roi["z"] - reach, y1=roi["z"] + reach,
+                          line=dict(color=col, width=1.4, dash="dot"),
+                          fillcolor=col, opacity=0.12, layer="below",
+                          row=r_, col=c_)
+            dot = max(0.4, reach * 0.08)
+            fig.add_shape(type="circle", x0=roi["x"] - dot, x1=roi["x"] + dot,
+                          y0=roi["z"] - dot, y1=roi["z"] + dot,
+                          line=dict(color=col, width=0), fillcolor=col,
+                          opacity=0.95, layer="above", row=r_, col=c_)
+        if counts and gname in counts:
+            cc = counts[gname]
+            txt = (f"L {cc['left_reached']}/{cc['total']} "
+                   f"({100*cc['left_frac']:.0f}%)<br>"
+                   f"R {cc['right_reached']}/{cc['total']} "
+                   f"({100*cc['right_frac']:.0f}%)")
+            fig.add_annotation(text=txt, showarrow=False, xref="x domain",
+                               yref="y domain", x=0.02, y=0.98, xanchor="left",
+                               yanchor="top", align="left", font=dict(size=9),
+                               bgcolor="rgba(255,255,255,0.7)", bordercolor="#ccc",
+                               borderwidth=0.5, row=r_, col=c_)
+
+
 def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                             ncols=2, color_by="individual", animate=True,
-                            max_points=None):
+                            max_points=None, rois=None, reach_radius=3.0,
+                            show_rois=False, roi_counts=None):
     if df is None or len(df) == 0:
         fig = go.Figure()
         fig.add_annotation(text="No data after filtering", showarrow=False,
@@ -848,6 +947,10 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
     for i, ann in enumerate(fig.layout.annotations):
         if i < len(group_names):
             ann.update(hovertext=group_names[i], font=dict(size=12))
+
+    if show_rois and rois:
+        _add_roi_overlay(fig, group_names, ncols, rois,
+                         float(reach_radius or 3.0), counts=roi_counts)
 
     show_legend = color_by in ("individual", "vr")
     fig.update_layout(
@@ -1410,6 +1513,23 @@ app.layout = html.Div([
                      "cmin/cmax blank = auto; 'pct' reads them as data percentiles. "
                      "Occupancy floored at 100 ms. Bin/Bound/cmin/cmax apply on Enter or blur.",
                      style={"fontSize": "9px", "color": "#888"}),
+
+            html.Hr(style={"margin": "6px 0"}),
+
+            html.Label("ROI / Targets", style={"fontWeight": "bold", "fontSize": "12px"}),
+            dcc.Checklist(id="roi-show",
+                          options=[{"label": " Show target ROIs + reached counts",
+                                    "value": "on"}],
+                          value=["on"], style={"fontSize": "11px"}),
+            html.Label("Reach radius (units)", style={"fontSize": "10px",
+                                                       "marginTop": "4px"}),
+            dcc.Slider(id="roi-reach", min=0.5, max=30, step=0.5, value=3,
+                       marks={1: "1", 10: "10", 20: "20", 30: "30"},
+                       tooltip={"placement": "bottom", "always_visible": True}),
+            html.Div("Targets auto-load from the scene configs (Choice / "
+                     "BinaryChoice; polar or cartesian). A trial 'reaches' an ROI "
+                     "if its path comes within the radius. Left = −X, right = +X.",
+                     style={"fontSize": "9px", "color": "#888", "marginTop": "2px"}),
 
             html.Hr(style={"margin": "6px 0"}),
 
@@ -2060,13 +2180,15 @@ def _apply_viewport(fig, viewport, df):
     State("vel-histogram", "selectedData"),
     State("disp-histogram", "selectedData"),
     State("viewport-store", "data"),
+    State("roi-show", "value"),
+    State("roi-reach", "value"),
     prevent_initial_call=True,
 )
 def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                  group_by, pool_mode, color_by, animate, rebase, hm_binsize, hm_scale,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
                  scenes, folders, raw_cols, ncols, max_points, vel_selection,
-                 disp_selection, viewport):
+                 disp_selection, viewport, roi_show, roi_reach):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
         return empty, empty, empty, "Load data first.", no_update, no_update
@@ -2081,7 +2203,7 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
         return empty, empty, empty, "All filtered out.", no_update, no_update
 
     # Histograms reflect the subset before velocity/disp cuts
-    df, _, _ = _load_data(pattern)
+    df, _, metas = _load_data(pattern)
     mask = pd.Series(True, index=df.index)
     if cfg:     mask &= df["ConfigFile"].isin(cfg)
     if vrs:     mask &= df["VR"].isin(vrs)
@@ -2097,9 +2219,23 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     do_animate = bool(animate) and "on" in (animate or [])
     do_rebase = bool(rebase) and "on" in (rebase or [])
     df_plot = rebase_to_origin(df_f) if do_rebase else df_f
+
+    # ROIs auto-load from the scene configs. Overlay only makes sense in absolute
+    # coordinates, so it's suppressed when tracks are rebased to origin; reached
+    # counts are always computed on the real (non-rebased) filtered data.
+    rois = rois_by_config(metas)
+    want_rois = bool(roi_show) and "on" in (roi_show or []) and bool(rois)
+    reach = float(roi_reach) if roi_reach else 3.0
+    roi_counts = None
+    if want_rois:
+        roi_counts = roi_config_summary(roi_reached_table(df_f, rois, reach))
+
     traj_fig = build_trajectory_figure(df_plot, group_by, pool_mode, ncols=ncols_val,
                                         color_by=color_by or "individual",
-                                        animate=do_animate, max_points=max_points)
+                                        animate=do_animate, max_points=max_points,
+                                        rois=rois, reach_radius=reach,
+                                        show_rois=want_rois and not do_rebase,
+                                        roi_counts=roi_counts)
     heat_fig = build_heatmap_figure(df_plot, group_by, pool_mode, ncols=ncols_val,
                                      bin_size=hm_binsize, log_scale=(hm_scale == "log"),
                                      bound_pct=hm_bound if hm_bound else 100,
