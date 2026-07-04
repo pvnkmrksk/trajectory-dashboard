@@ -447,6 +447,31 @@ def smoothed_velocity(df: pd.DataFrame, window: int = 10, spike_pct: float = 99.
     return sm.reindex(df.index).to_numpy()
 
 
+def compute_tortuosity(df: pd.DataFrame, window: int = 15) -> np.ndarray:
+    """Per-row local tortuosity = (path length over the last `window` steps) /
+    (straight-line chord across that window), within each segment. 1 = straight,
+    higher = more winding. Vectorised."""
+    x = df["GameObjectPosX"].to_numpy()
+    z = df["GameObjectPosZ"].to_numpy()
+    seg = df["_seg_id"].to_numpy()
+    ddx = np.empty(len(df)); ddx[0] = 0.0; ddx[1:] = np.diff(x)
+    ddz = np.empty(len(df)); ddz[0] = 0.0; ddz[1:] = np.diff(z)
+    step = np.sqrt(ddx * ddx + ddz * ddz)
+    seg_start = np.empty(len(df), bool); seg_start[0] = True
+    seg_start[1:] = seg[1:] != seg[:-1]
+    step[seg_start] = 0.0
+    s = pd.Series(step, index=df.index)
+    path = (s.groupby(seg, sort=False).rolling(window, min_periods=2).sum()
+             .reset_index(level=0, drop=True).reindex(df.index).to_numpy())
+    xb = pd.Series(x, index=df.index).groupby(seg, sort=False).shift(window - 1).to_numpy()
+    zb = pd.Series(z, index=df.index).groupby(seg, sort=False).shift(window - 1).to_numpy()
+    chord = np.sqrt((x - xb) ** 2 + (z - zb) ** 2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tort = path / chord
+    tort[~np.isfinite(tort)] = np.nan
+    return np.clip(tort, 1.0, None)
+
+
 def compute_segment_stats(df: pd.DataFrame) -> pd.DataFrame:
     """Vectorised per-segment stats (no Python-level per-segment loop)."""
     if df is None or len(df) == 0:
@@ -582,6 +607,7 @@ MAX_ANIM_TRACES = 150
 BUDGET_GL = 300_000      # static WebGL trajectories
 BUDGET_SVG = 40_000      # animated trajectories (every frame is embedded → keep light)
 BUDGET_RAW = 25_000      # raw time-series plot
+BUDGET_POLAR = 30_000    # polar plot (SVG Scatterpolar)
 
 # Per-subplot pixel height. With a 2-col layout each subplot is ~half the main
 # width, so ~480px tall keeps each box roughly square; the page scrolls when
@@ -1271,6 +1297,118 @@ def build_roi_violin_figure(df, rois_by_cfg, reach):
     return fig
 
 
+def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
+                       color_by="velocity", moving_only=False, walk_thresh=None,
+                       max_points=None, rois=None, reach_radius=3.0, show_rois=False):
+    """Each trial's path in polar coordinates: r = distance from origin,
+    theta = atan2(X, Z) so 0° = forward/+Z (top of the plot, clockwise) — the
+    SAME left-handed frame as the trajectory view and the ROI targets. Colour by
+    instantaneous velocity or tortuosity; optionally keep only moving (walking)
+    samples above a speed threshold."""
+    if df is None or len(df) == 0:
+        return _msg_figure("No data after filtering")
+
+    groups = _group_frames(df, group_by, pool_mode, ncols)
+    names = list(groups.keys())
+    n = len(names)
+    nrows = max(1, (n + ncols - 1) // ncols)
+    specs = [[{"type": "polar"} for _ in range(ncols)] for _ in range(nrows)]
+    vspace = min(0.06, 0.5 / max(nrows, 1))
+    fig = make_subplots(rows=nrows, cols=ncols, specs=specs,
+                        subplot_titles=[humanise_config(t) for t in names],
+                        horizontal_spacing=0.06, vertical_spacing=vspace)
+
+    # Shared radial range from the data (WebGL polar doesn't auto-scale reliably,
+    # and a common range makes subplots comparable). 98th pct drops outliers.
+    r_all = np.hypot(df["GameObjectPosX"].to_numpy(), df["GameObjectPosZ"].to_numpy())
+    r_all = r_all[np.isfinite(r_all)]
+    rmax = float(np.percentile(r_all, 98)) if r_all.size else 1.0
+    rmax = max(rmax, 1.0)
+
+    # SVG polar (Scatterpolar): WebGL Scatterpolargl has broken scene management
+    # on re-render (crashes with a "_scene" error), so we use SVG and a tighter
+    # budget. Plenty for a density/heading view.
+    budget = int(max_points) if (max_points and max_points > 0) else BUDGET_POLAR
+    total_segs = sum(g["_seg_id"].nunique() for g in groups.values())
+    pts_lim = max(2, budget // max(total_segs, 1))
+
+    # Shared per-point colour series + scale across all subplots.
+    cser, cmin, cmax, cbar = None, None, None, ""
+    if color_by == "velocity":
+        vv = smoothed_velocity(df, 10)
+        f = vv[np.isfinite(vv)]
+        cser = pd.Series(vv, index=df.index)
+        cmin, cmax = 0.0, (float(np.percentile(f, 99)) if f.size else 1.0)
+        cbar = "Speed (u/s)"
+    elif color_by == "tortuosity":
+        tt = compute_tortuosity(df)
+        f = tt[np.isfinite(tt)]
+        cser = pd.Series(tt, index=df.index)
+        cmin, cmax = 1.0, (float(np.percentile(f, 95)) if f.size else 3.0)
+        cbar = "Tortuosity"
+
+    walk = float(walk_thresh) if (moving_only and walk_thresh) else None
+    sser = pd.Series(smoothed_velocity(df, 10), index=df.index) if walk is not None else None
+
+    for idx, gname in enumerate(names):
+        gdf = groups[gname]
+        row, col = idx // ncols + 1, idx % ncols + 1
+        gg = gdf.groupby("_seg_id", sort=False)
+        pos = gg.cumcount().to_numpy()
+        size = gg["_seg_id"].transform("size").to_numpy()
+        keep = (pos % np.maximum(1, size // pts_lim)) == 0
+        sub = gdf[keep]
+        x = sub["GameObjectPosX"].to_numpy(); z = sub["GameObjectPosZ"].to_numpy()
+        r = np.hypot(x, z)
+        th = np.degrees(np.arctan2(x, z))
+        seg = sub["_seg_id"].to_numpy()
+        if sser is not None:                       # blank the non-moving samples
+            m = sser.reindex(sub.index).to_numpy() < walk
+            r = r.astype(float); th = th.astype(float)
+            r[m] = np.nan; th[m] = np.nan
+        # Pass r/theta/colour as plain Python lists: Plotly-6 encodes numpy arrays
+        # as typed-array bdata, which the clientside newPlot (§7.3) can't decode —
+        # the trace would arrive empty. Lists serialise as ordinary JSON.
+        if cser is not None:
+            cv = cser.reindex(sub.index).to_numpy()
+            rr, tt2, cc = _nan_join(r, th, seg, cv)
+            fig.add_trace(go.Scatterpolar(
+                r=rr.tolist(), theta=tt2.tolist(), mode="markers",
+                hoverinfo="skip", showlegend=False,
+                marker=dict(size=2.6, color=cc.tolist(), colorscale=SEQ_COLORSCALE,
+                            cmin=cmin, cmax=cmax, showscale=(idx == 0),
+                            colorbar=dict(title=cbar, thickness=12, len=0.5))),
+                row=row, col=col)
+        else:
+            rr, tt2, _ = _nan_join(r, th, seg, None)
+            fig.add_trace(go.Scatterpolar(
+                r=rr.tolist(), theta=tt2.tolist(), mode="lines", hoverinfo="skip",
+                showlegend=False, line=dict(width=1, color="#1f77b4")),
+                row=row, col=col)
+
+        if show_rois and rois:
+            for roi in rois.get(gname, []):
+                rr_ = math.hypot(roi["x"], roi["z"])
+                th_ = math.degrees(math.atan2(roi["x"], roi["z"]))
+                fig.add_trace(go.Scatterpolar(
+                    r=[rr_], theta=[th_], mode="markers", showlegend=False,
+                    hovertemplate=f"{roi['side']} ROI<extra></extra>",
+                    marker=dict(size=11, symbol="circle-open",
+                                line=dict(width=2),
+                                color=_ROI_SIDE_COLOR.get(roi["side"], "#555"))),
+                    row=row, col=col)
+
+    # 0° at top, clockwise — matches the trajectory subplot orientation. Explicit
+    # radial range so WebGL points (and the ROI rings) are actually on-scale.
+    fig.update_polars(angularaxis=dict(rotation=90, direction="clockwise",
+                                       thetaunit="degrees"),
+                      radialaxis=dict(range=[0, rmax], angle=90, tickangle=90),
+                      bgcolor="white")
+    fig.update_layout(height=60 + nrows * 420, template="plotly_white",
+                      margin=dict(l=40, r=90, t=50, b=40), showlegend=False)
+    return fig
+
+
 
 # ---------------------------------------------------------------------------
 # Dash App
@@ -1581,6 +1719,29 @@ app.layout = html.Div([
 
             html.Hr(style={"margin": "6px 0"}),
 
+            html.Label("Polar", style={"fontWeight": "bold", "fontSize": "12px"}),
+            html.Label("Colour by", style={"fontSize": "10px"}),
+            dcc.RadioItems(id="polar-color", options=[
+                {"label": " Velocity", "value": "velocity"},
+                {"label": " Tortuosity", "value": "tortuosity"},
+                {"label": " Plain", "value": "none"},
+            ], value="velocity", inline=True, style={"fontSize": "10px"}),
+            dcc.Checklist(id="polar-moving",
+                          options=[{"label": " Moving samples only", "value": "on"}],
+                          value=[], style={"fontSize": "11px", "marginTop": "3px"}),
+            html.Label("Walk speed threshold (u/s)", style={"fontSize": "10px",
+                                                             "marginTop": "2px"}),
+            dcc.Input(id="polar-walk", type="number", value=50, min=0, step="any",
+                      debounce=True, style={"width": "100%", "fontSize": "11px",
+                                            "padding": "3px"}),
+            html.Div("Each trial's path as r (distance from origin) vs angle "
+                     "(0° = forward, clockwise — same frame as trajectories). "
+                     "Moving-only keeps samples above the walk speed; ROI targets "
+                     "appear as rings.",
+                     style={"fontSize": "9px", "color": "#888", "marginTop": "2px"}),
+
+            html.Hr(style={"margin": "6px 0"}),
+
             html.Label("Filters", style={"fontWeight": "bold", "fontSize": "12px"}),
             html.Div([
                 html.Label("Max velocity", style={"fontSize": "10px"}),
@@ -1787,7 +1948,7 @@ app.layout = html.Div([
                 # --- Polar ---
                 html.Div(
                     dcc.Loading(
-                        dcc.Graph(id="polar-plot", figure=_EMPTY,
+                        dcc.Graph(id="polar-plot", figure=_EMPTY, responsive=False,
                                   config={"displayModeBar": True},
                                   style={"width": "100%"}),
                         type="circle", delay_show=250, delay_hide=250,
@@ -2539,6 +2700,60 @@ def update_roi_view(reach, roi_show, view, pattern, vel_thresh, min_disp, trim,
     return build_roi_violin_figure(df_f, rois, float(reach) if reach else 3.0)
 
 
+# Polar is built lazily (only when its tab is open or a polar control changes) —
+# it's WebGL and heavy, and a WebGL plot created in a hidden panel won't paint,
+# so we push the figure while the panel is visible.
+@app.callback(
+    Output("polar-plot", "figure", allow_duplicate=True),
+    Input("view-mode", "value"),
+    Input("polar-color", "value"),
+    Input("polar-moving", "value"),
+    Input("polar-walk", "value"),
+    Input("roi-reach", "value"),
+    Input("roi-show", "value"),
+    State("store-glob", "data"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("group-by", "value"),
+    State("pool-mode", "value"),
+    State("subplot-ncols", "value"),
+    State("plot-points", "value"),
+    State("rebase-origin", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("vel-histogram", "selectedData"),
+    State("disp-histogram", "selectedData"),
+    prevent_initial_call=True,
+)
+def update_polar_view(view, polar_color, polar_moving, polar_walk, reach, roi_show,
+                      pattern, vel_thresh, min_disp, trim, jump_buf, group_by,
+                      pool_mode, ncols, max_points, rebase, cfg, vrs, fids, scenes,
+                      folders, vel_sel, disp_sel):
+    if not pattern or view != "polar":
+        return no_update
+    df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
+                                   cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
+    if df_sub is None or len(df_sub) == 0:
+        return _msg_figure("All filtered out.")
+    ncols_val = int(ncols) if ncols and ncols >= 1 else 2
+    if rebase and "on" in rebase:
+        df_f = rebase_to_origin(df_f)
+    _, _, metas = _load_data(pattern)
+    rois = rois_by_config(metas)
+    want_rois = bool(roi_show) and "on" in (roi_show or []) and bool(rois)
+    return build_polar_figure(
+        df_f, group_by, pool_mode, ncols=ncols_val,
+        color_by=polar_color or "velocity",
+        moving_only=bool(polar_moving) and "on" in (polar_moving or []),
+        walk_thresh=polar_walk, max_points=max_points, rois=rois,
+        reach_radius=float(reach) if reach else 3.0, show_rois=want_rois)
+
+
 # Re-apply the shared viewbox to the trajectory when it is opened (the heatmap
 # side is handled in update_heatmap_only). A Patch on the WebGL trajectory is
 # smooth — no re-init — so switching views keeps the same zoom without glitches.
@@ -2599,9 +2814,12 @@ app.clientside_callback(
     # scaleanchor plot (or a global window 'resize') makes Plotly recompute a
     # wildly wrong aspect-locked range and fire a relayout that pollutes the
     # shared viewport -- that was the intermittent zoom-out-to-nothing glitch.
+    # polar-plot is newPlot-managed (like the heatmap) and keeps its own tall
+    # multi-subplot height — resizing it to the container would flatten it, so it
+    # is deliberately NOT in this fit-to-container resize map.
     "var _pan={'trajectory-plot':'view-traj','vel-histogram':'view-diag',"
     "'disp-histogram':'view-diag','raw-trace-plot':'view-diag',"
-    "'roi-plot':'view-roi','polar-plot':'view-polar'};"
+    "'roi-plot':'view-roi'};"
     "Object.keys(_pan).forEach(function(id){var p=document.getElementById(_pan[id]);"
     "if(!p||getComputedStyle(p).visibility==='hidden')return;"
     "var c=document.getElementById(id);var g=c&&c.querySelector('.js-plotly-plot');"
@@ -2614,6 +2832,26 @@ app.clientside_callback(
 )
 
 
+# The polar plot is born in a hidden panel, and Dash's Plotly.react updates its
+# traces but NOT the figure height (the SVG stays at the placeholder size and the
+# subplots collapse). A fresh newPlot with the container pinned to the figure
+# height renders it correctly. SVG Scatterpolar makes newPlot safe here (the
+# WebGL variant crashed on re-render). Runs when the polar figure changes/opens.
+app.clientside_callback(
+    "function(pfig, view){if(view!=='polar')return '';setTimeout(function(){"
+    "var c=document.getElementById('polar-plot');"
+    "var g=c&&c.querySelector('.js-plotly-plot');"
+    "if(g&&window.Plotly&&pfig&&pfig.data&&pfig.data.length){"
+    "var h=(pfig.layout&&pfig.layout.height)||600;"
+    "try{c.style.height=h+'px';g.style.height=h+'px';"
+    "window.Plotly.newPlot(g,pfig.data,pfig.layout,{displayModeBar:true});}"
+    "catch(e){}}"
+    "},130);return '';}",
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("polar-plot", "figure"),
+    Input("view-mode", "value"),
+    prevent_initial_call=True,
+)
 
 
 # Selection info for histograms
