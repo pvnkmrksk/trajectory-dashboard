@@ -1053,36 +1053,77 @@ _META_CACHE: dict[str, list[dict]] = {}
 _LOAD_PROGRESS = {"done": 0, "total": 0, "active": False, "label": ""}
 
 
+_DROP_PRUNE = {".git", "node_modules", ".venv", "venv", "__pycache__",
+               ".next", "dist", "build", ".cache", "Library", ".Trash"}
+
+
+def _search_roots() -> list[str]:
+    """Sensible places a dropped data folder might live: the working dir and a
+    couple of ancestors (data usually sits in a sibling ``Data/`` tree, not under
+    the app dir). Optional env override for data kept elsewhere."""
+    cwd = os.path.abspath(os.getcwd())
+    roots = [cwd, os.path.dirname(cwd), os.path.dirname(os.path.dirname(cwd))]
+    env = os.environ.get("TRAJ_DATA_ROOT")
+    if env:
+        roots.insert(0, os.path.abspath(os.path.expanduser(env)))
+    seen, out = set(), []
+    for r in roots:
+        if r and r not in seen and os.path.isdir(r):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
 def resolve_dropped_folder(folder: str, files: list[str]) -> str | None:
     """
-    Turn a dropped folder (top name + relative CSV paths) into a glob pattern
-    by locating that folder on disk under the working directory.
+    Turn a dropped folder (top name + relative CSV paths) into a glob pattern by
+    locating that folder on disk. Browsers never expose the absolute path, so we
+    search the working dir *and nearby ancestors* (a bounded, pruned walk that
+    stops at the first confirmed match) — data commonly lives in a sibling
+    ``Data/`` tree, not under the app directory, which is why a cwd-only search
+    used to fail with "couldn't locate '<folder>' on disk".
     """
     files = [f for f in (files or []) if f.lower().endswith(".csv")]
     if not files:
         return None
     names = [f.rsplit("/", 1)[-1] for f in files]
     star = "*_VR*.csv" if any("_VR" in n for n in names) else "*.csv"
-
-    if not folder:
-        return None
     sample_sub = files[0].split("/", 1)[1] if "/" in files[0] else None
 
-    roots = [os.getcwd()]
-    cands = []
-    for root in roots:
-        for d in glob.glob(os.path.join(root, "**", folder), recursive=True):
-            if os.path.isdir(d):
-                if sample_sub is None or os.path.exists(os.path.join(d, sample_sub)):
-                    cands.append(d)
-    if not cands:
+    def _match(dirpath: str) -> bool:
+        if folder and os.path.basename(dirpath) != folder:
+            return False
+        if sample_sub is not None:
+            return os.path.exists(os.path.join(dirpath, sample_sub))
+        # No sub-path (flat folder): confirm it actually holds one of the CSVs.
+        return os.path.exists(os.path.join(dirpath, names[0]))
+
+    base = None
+    visited = 0
+    for root in _search_roots():
+        base_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, _ in os.walk(root):
+            visited += 1
+            if visited > 120_000:                 # hard cap so a miss can't hang
+                break
+            if dirpath.count(os.sep) - base_depth >= 8:
+                dirnames[:] = []                   # depth-limit the descent
+                continue
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d not in _DROP_PRUNE]
+            if _match(dirpath):
+                base = dirpath
+                break
+        if base:
+            break
+    if not base:
         return None
-    base = sorted(cands, key=len)[0]
+
     pat = os.path.join(base, "**", star)
     if not glob.glob(pat, recursive=True):
         pat = os.path.join(base, "**", "*.csv")
     cwd = os.getcwd()
-    return os.path.relpath(pat, cwd) if pat.startswith(cwd) else pat
+    return os.path.relpath(pat, cwd) if pat.startswith(cwd + os.sep) else pat
 
 
 def _load_data(pattern):
