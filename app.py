@@ -1338,112 +1338,129 @@ def build_roi_violin_figure(df, rois_by_cfg, reach):
     return fig
 
 
+def rayleigh_by_segment(df, moving_only=False, walk_thresh=None,
+                        color_by="velocity") -> pd.DataFrame:
+    """Per-trial Rayleigh (mean resultant) vector of the per-sample headings.
+    Returns _seg_id, ConfigFile, animal, R (0..1 concentration), theta_deg (mean
+    direction, Unity frame: 0=forward, via atan2(dx,dz)), and a per-trial colour
+    value (mean speed / tortuosity). Fully vectorised — no per-segment Python."""
+    cols = ["_seg_id", "ConfigFile", "animal", "R", "theta_deg", "cval"]
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=cols)
+    x = df["GameObjectPosX"].to_numpy(); z = df["GameObjectPosZ"].to_numpy()
+    seg = df["_seg_id"].to_numpy()
+    n = len(df)
+    dx = np.empty(n); dx[0] = np.nan; dx[1:] = np.diff(x)
+    dz = np.empty(n); dz[0] = np.nan; dz[1:] = np.diff(z)
+    seg_start = np.empty(n, bool); seg_start[0] = True
+    seg_start[1:] = seg[1:] != seg[:-1]
+    dx[seg_start] = np.nan; dz[seg_start] = np.nan
+    mag = np.hypot(dx, dz)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ux = dx / mag; uz = dz / mag                 # unit heading components
+    ux[~np.isfinite(ux)] = np.nan
+    uz[~np.isfinite(uz)] = np.nan
+
+    speed = None
+    if moving_only and walk_thresh:
+        speed = smoothed_velocity(df, 10)
+        slow = ~(speed >= float(walk_thresh))
+        ux[slow] = np.nan; uz[slow] = np.nan
+
+    if color_by == "velocity":
+        cvals = speed if speed is not None else smoothed_velocity(df, 10)
+    elif color_by == "tortuosity":
+        cvals = compute_tortuosity(df)
+    else:
+        cvals = np.full(n, np.nan)
+
+    agg = (pd.DataFrame({"_seg_id": seg, "ux": ux, "uz": uz, "cval": cvals})
+           .groupby("_seg_id", sort=False)
+           .agg(ux=("ux", "mean"), uz=("uz", "mean"), cval=("cval", "mean")))
+    R = np.hypot(agg["ux"].to_numpy(), agg["uz"].to_numpy())
+    theta = np.degrees(np.arctan2(agg["ux"].to_numpy(), agg["uz"].to_numpy()))
+    meta = df.groupby("_seg_id", sort=False).agg(
+        ConfigFile=("ConfigFile", "first"), VR=("VR", "first"),
+        FlyID=("FlyID", "first"))
+    out = pd.DataFrame({"_seg_id": agg.index, "R": R, "theta_deg": theta,
+                        "cval": agg["cval"].to_numpy()}).merge(
+        meta.reset_index(), on="_seg_id")
+    out["animal"] = out["FlyID"].astype(str) + "@" + out["VR"].astype(str)
+    return out[cols]
+
+
 def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                        color_by="velocity", moving_only=False, walk_thresh=None,
                        max_points=None, rois=None, reach_radius=3.0, show_rois=False):
-    """Each trial's path in polar coordinates: r = distance from origin,
-    theta = atan2(X, Z) so 0° = forward/+Z (top of the plot, clockwise) — the
-    SAME left-handed frame as the trajectory view and the ROI targets. Colour by
-    instantaneous velocity or tortuosity; optionally keep only moving (walking)
-    samples above a speed threshold."""
+    """One **Rayleigh mean-vector per trial**: angle = the trial's mean heading,
+    radius R (0..1) = how directed it was (0 = wandering, 1 = perfectly straight).
+    Unity left-handed frame (0° = forward, clockwise) so it lines up with the
+    trajectory view and the ROI directions. Colour = per-trial mean speed or
+    tortuosity. ROI target directions are drawn as reference spokes."""
     if df is None or len(df) == 0:
         return _msg_figure("No data after filtering")
+    ray = rayleigh_by_segment(df, moving_only, walk_thresh, color_by)
+    ray = ray.dropna(subset=["R", "theta_deg"])
+    if len(ray) == 0:
+        return _msg_figure("No headings to plot — lower the walk-speed threshold "
+                           "(it may be above every sample's speed).")
 
     groups = _group_frames(df, group_by, pool_mode, ncols)
     names = list(groups.keys())
     n = len(names)
     nrows = max(1, (n + ncols - 1) // ncols)
+    # seg -> subplot-group map (vectorised via concat of per-group index labels)
+    seg_group = pd.concat([pd.Series(gname, index=g["_seg_id"].unique())
+                           for gname, g in groups.items()]) if names else pd.Series(dtype=object)
+    ray = ray.assign(group=ray["_seg_id"].map(seg_group))
+
+    cmin = cmax = None; cbar = ""
+    if color_by in ("velocity", "tortuosity"):
+        cv = ray["cval"].to_numpy()
+        cv = cv[np.isfinite(cv)]
+        if color_by == "velocity":
+            cmin, cmax, cbar = 0.0, (float(np.percentile(cv, 99)) if cv.size else 1.0), "Mean speed (u/s)"
+        else:
+            cmin, cmax, cbar = 1.0, (float(np.percentile(cv, 95)) if cv.size else 3.0), "Mean tortuosity"
+
     specs = [[{"type": "polar"} for _ in range(ncols)] for _ in range(nrows)]
     vspace = min(0.06, 0.5 / max(nrows, 1))
     fig = make_subplots(rows=nrows, cols=ncols, specs=specs,
                         subplot_titles=[humanise_config(t) for t in names],
                         horizontal_spacing=0.06, vertical_spacing=vspace)
 
-    # Shared radial range from the data (WebGL polar doesn't auto-scale reliably,
-    # and a common range makes subplots comparable). 98th pct drops outliers.
-    r_all = np.hypot(df["GameObjectPosX"].to_numpy(), df["GameObjectPosZ"].to_numpy())
-    r_all = r_all[np.isfinite(r_all)]
-    rmax = float(np.percentile(r_all, 98)) if r_all.size else 1.0
-    rmax = max(rmax, 1.0)
-
-    # SVG polar (Scatterpolar): WebGL Scatterpolargl has broken scene management
-    # on re-render (crashes with a "_scene" error), so we use SVG and a tighter
-    # budget. Plenty for a density/heading view.
-    budget = int(max_points) if (max_points and max_points > 0) else BUDGET_POLAR
-    total_segs = sum(g["_seg_id"].nunique() for g in groups.values())
-    pts_lim = max(2, budget // max(total_segs, 1))
-
-    # Shared per-point colour series + scale across all subplots.
-    cser, cmin, cmax, cbar = None, None, None, ""
-    if color_by == "velocity":
-        vv = smoothed_velocity(df, 10)
-        f = vv[np.isfinite(vv)]
-        cser = pd.Series(vv, index=df.index)
-        cmin, cmax = 0.0, (float(np.percentile(f, 99)) if f.size else 1.0)
-        cbar = "Speed (u/s)"
-    elif color_by == "tortuosity":
-        tt = compute_tortuosity(df)
-        f = tt[np.isfinite(tt)]
-        cser = pd.Series(tt, index=df.index)
-        cmin, cmax = 1.0, (float(np.percentile(f, 95)) if f.size else 3.0)
-        cbar = "Tortuosity"
-
-    walk = float(walk_thresh) if (moving_only and walk_thresh) else None
-    sser = pd.Series(smoothed_velocity(df, 10), index=df.index) if walk is not None else None
-
     for idx, gname in enumerate(names):
-        gdf = groups[gname]
         row, col = idx // ncols + 1, idx % ncols + 1
-        gg = gdf.groupby("_seg_id", sort=False)
-        pos = gg.cumcount().to_numpy()
-        size = gg["_seg_id"].transform("size").to_numpy()
-        keep = (pos % np.maximum(1, size // pts_lim)) == 0
-        sub = gdf[keep]
-        x = sub["GameObjectPosX"].to_numpy(); z = sub["GameObjectPosZ"].to_numpy()
-        r = np.hypot(x, z)
-        th = np.degrees(np.arctan2(x, z))
-        seg = sub["_seg_id"].to_numpy()
-        if sser is not None:                       # blank the non-moving samples
-            m = sser.reindex(sub.index).to_numpy() < walk
-            r = r.astype(float); th = th.astype(float)
-            r[m] = np.nan; th[m] = np.nan
-        # Pass r/theta/colour as plain Python lists: Plotly-6 encodes numpy arrays
-        # as typed-array bdata, which the clientside newPlot (§7.3) can't decode —
-        # the trace would arrive empty. Lists serialise as ordinary JSON.
-        if cser is not None:
-            cv = cser.reindex(sub.index).to_numpy()
-            rr, tt2, cc = _nan_join(r, th, seg, cv)
-            fig.add_trace(go.Scatterpolar(
-                r=rr.tolist(), theta=tt2.tolist(), mode="markers",
-                hoverinfo="skip", showlegend=False,
-                marker=dict(size=2.6, color=cc.tolist(), colorscale=SEQ_COLORSCALE,
-                            cmin=cmin, cmax=cmax, showscale=(idx == 0),
-                            colorbar=dict(title=cbar, thickness=12, len=0.5))),
-                row=row, col=col)
-        else:
-            rr, tt2, _ = _nan_join(r, th, seg, None)
-            fig.add_trace(go.Scatterpolar(
-                r=rr.tolist(), theta=tt2.tolist(), mode="lines", hoverinfo="skip",
-                showlegend=False, line=dict(width=1, color="#1f77b4")),
-                row=row, col=col)
+        sub = ray[ray["group"] == gname]
 
+        # ROI direction spokes first (under the points).
         if show_rois and rois:
             for roi in rois.get(gname, []):
-                rr_ = math.hypot(roi["x"], roi["z"])
                 th_ = math.degrees(math.atan2(roi["x"], roi["z"]))
                 fig.add_trace(go.Scatterpolar(
-                    r=[rr_], theta=[th_], mode="markers", showlegend=False,
-                    hovertemplate=f"{roi['side']} ROI<extra></extra>",
-                    marker=dict(size=11, symbol="circle-open",
-                                line=dict(width=2),
-                                color=_ROI_SIDE_COLOR.get(roi["side"], "#555"))),
+                    r=[0, 1], theta=[th_, th_], mode="lines", showlegend=False,
+                    hoverinfo="skip", line=dict(width=1.4, dash="dot",
+                    color=_ROI_SIDE_COLOR.get(roi["side"], "#999"))),
                     row=row, col=col)
 
-    # 0° at top, clockwise — matches the trajectory subplot orientation. Explicit
-    # radial range so WebGL points (and the ROI rings) are actually on-scale.
+        marker = dict(size=6, opacity=0.8, line=dict(width=0.5, color="#333"))
+        if color_by in ("velocity", "tortuosity"):
+            marker.update(color=sub["cval"].tolist(), colorscale=SEQ_COLORSCALE,
+                          cmin=cmin, cmax=cmax, showscale=(idx == 0),
+                          colorbar=dict(title=cbar, thickness=12, len=0.5))
+        else:
+            marker.update(color="#1f77b4")
+        fig.add_trace(go.Scatterpolar(
+            r=sub["R"].tolist(), theta=sub["theta_deg"].tolist(), mode="markers",
+            marker=marker, showlegend=False, customdata=sub["animal"].tolist(),
+            hovertemplate="R=%{r:.2f} θ=%{theta:.0f}°<br>%{customdata}<extra></extra>"),
+            row=row, col=col)
+
+    # 0° at top, clockwise — matches the trajectory frame. R is a 0..1 unit disk.
     fig.update_polars(angularaxis=dict(rotation=90, direction="clockwise",
                                        thetaunit="degrees"),
-                      radialaxis=dict(range=[0, rmax], angle=90, tickangle=90),
+                      radialaxis=dict(range=[0, 1], angle=90, tickangle=90,
+                                      tickvals=[0.25, 0.5, 0.75, 1.0]),
                       bgcolor="white")
     fig.update_layout(height=60 + nrows * 420, template="plotly_white",
                       margin=dict(l=40, r=90, t=50, b=40), showlegend=False)
@@ -1778,7 +1795,7 @@ app.layout = html.Div([
                           value=[], style={"fontSize": "11px", "marginTop": "3px"}),
             html.Label("Walk speed threshold (u/s)", style={"fontSize": "10px",
                                                              "marginTop": "2px"}),
-            dcc.Input(id="polar-walk", type="number", value=50, min=0, step="any",
+            dcc.Input(id="polar-walk", type="number", value=1, min=0, step="any",
                       debounce=True, style={"width": "100%", "fontSize": "11px",
                                             "padding": "3px"}),
             html.Div("Each trial's path as r (distance from origin) vs angle "
