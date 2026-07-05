@@ -1,7 +1,7 @@
 // The heatmap is re-initialised via Plotly.newPlot (see the clientside callback),
 // which detaches Dash's own relayout listener. Re-attach a light handler so that
 // zooming/panning the heatmap records the viewbox into the shared viewport-store
-// (used to keep the trajectory in sync and to persist the zoom in the URL).
+// (used to keep trajectory/heatmap tabs in sync; URL writes read it as State).
 window.__attachHeatSync = function (hg) {
   if (!hg || hg.__heatSync) return;
   hg.__heatSync = true;
@@ -22,6 +22,7 @@ window.__attachHeatSync = function (hg) {
       }
     });
     var out = {};
+    out.source = 'heat';
     if (acc.reset) out.reset = true;
     if (acc.xaxis && acc.xaxis.indexOf(null) < 0) out.xaxis = acc.xaxis;
     if (acc.yaxis && acc.yaxis.indexOf(null) < 0) out.yaxis = acc.yaxis;

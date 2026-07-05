@@ -112,28 +112,50 @@ transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
 ## 6. Callback graph (what talks to what)
 
 - `restore_from_url` (fires **once**, guarded by `url-restored`) ⇄ `update_url`
-  (fires on every setting/zoom change — all controls are Inputs). Full
-  bidirectional URL state **including the viewbox** (`vbx0…vby1`) and the current
-  `view`. The once-guard breaks the echo loop.
+  (fires on settings/view changes, **not** live pan/zoom). Full bidirectional URL
+  state includes the last known viewbox (`vbx0…vby1`) and the current `view`, but
+  the viewbox is read as `State` so dragging a plot does not rewrite
+  `location.search`. The once-guard breaks the echo loop.
 - `on_folder_drop` ← `drop-data` (set by dropzone.js) → `resolve_dropped_folder`
   → glob + auto-load.
 - `start_progress`/`tick_progress` poll the `_LOAD_PROGRESS` global (works
   because the dev server is threaded).
 - `load_data_cb` populates filter options, histograms, the smart default bin
   size, then auto-triggers `update_plots`.
-- `update_plots` — the main replot (trajectory + heatmap + raw + summary + hists).
-- `update_heatmap_only` — fast heatmap-only rebuild on any heatmap control **or
-  view switch to heatmap** (reuses the filter cache; re-applies the viewbox via
-  `_apply_viewport`). On a view switch it returns `no_update` when nothing
-  relevant changed (signature cached in `_LAST_HEAT_SIG`) so tab-flipping is free.
-- `sync_viewport` — records the current viewbox into `viewport-store` (does NOT
-  live-patch the other figure — that caused glitches). `apply_viewport_traj`
+- `update_plots` — trajectory/raw/summary/hist rebuilds only when Trajectory or
+  Diagnostics is visible.
+- `update_heatmap_only` — fast heatmap-only rebuild on any heatmap control **while
+  the heatmap tab is visible** or on view switch to heatmap (reuses the filter
+  cache; applies the latest viewbox server-side when available, and a clientside
+  relayout applies restored/trajectory viewboxes without re-binning). It writes
+  the heatmap figure JSON to `heatmap-figure-store`, not to
+  `heatmap-plot.figure`, so Dash's `Plotly.react` path never applies the heatmap
+  subplot figure.
+- clientside viewport sync — records the current viewbox into `viewport-store`
+  (does NOT live-patch the other figure and does NOT call Python). This keeps
+  pan/zoom off the server and out of the URL-update loop. `apply_viewport_traj`
   re-applies it to the trajectory on view switch (heatmap side is done in
   `update_heatmap_only`). Both apply through `_apply_viewport`, which drops
   implausible (>8× data extent) ranges from a mis-sized relayout.
 - `switch_view` toggles panel `visibility`. Clientside callbacks drive playback,
   resize graphs shown for the first time, and `newPlot` the heatmap.
 - `export_html` rebuilds all figures server-side and emits one self-contained file.
+
+### Trigger contract
+
+Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
+
+| Control / event | What it may update | What it must not update |
+|---|---|---|
+| Load & Plot / dropped folder | Load/cache data, options, metadata, diagnostic histograms, auto thresholds, then bump `btn-plot` once | Heatmap/polar hidden graphs directly |
+| Re-Plot (`btn-plot`) | Trajectory, raw trace, summary, histograms; ROI only if ROI tab is visible; heatmap only if Heatmap tab is visible; polar only if Polar tab is visible | URL from pan/zoom; hidden heatmap `dcc.Graph.figure` |
+| Heatmap bin/bound/cmin/cmax | Heatmap store + variants only when Heatmap tab is visible | Trajectory/raw/ROI/polar |
+| Heatmap metric/scale | Clientside `Plotly.restyle` from the current binning variants | Server rebuild or `newPlot` |
+| ROI entered/trim while on heatmap | Heatmap store + current-mask variants only when Heatmap tab is visible | Trajectory/raw/ROI/polar |
+| Trajectory/heatmap pan/zoom | Clientside `viewport-store` only | URL writes, server rebuilds, live-patching hidden graphs |
+| View switch | Panel visibility; visible tab's lazy plot only | Rebuilding every tab |
+| ROI reach/show | Visible trajectory overlay patch; visible ROI tab rebuild | Hidden trajectory patches while another tab is active |
+| Polar controls / Re-Plot on Polar | Polar plot only | Trajectory/heatmap/raw |
 
 ---
 
@@ -154,10 +176,11 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
    *"Something went wrong with axis scaling"* in `setScale`, and it then never
    repaints. It happens **even without `scaleanchor`** (it's the subplot axis
    layout at a bad size). A fresh `Plotly.newPlot` re-initialises cleanly. **Fix:
-   a clientside callback re-runs `Plotly.newPlot(hg, hfig.data, hfig.layout)`.**
-   It must read the **fresh figure prop `hfig`**, not the graph's own `hg.data`
-   (which stays stale because react crashed) — reading `hg.data` is exactly what
-   caused the "stale heatmap until hard reload" bug.
+   the server writes the fresh heatmap figure to `heatmap-figure-store`; a
+   clientside callback re-runs `Plotly.newPlot(hg, hfig.data, hfig.layout)`.**
+   Do not restore a server Output to `heatmap-plot.figure`: even when the panel is
+   visible, Dash's `Plotly.react` path can throw the axis-scaling error before
+   the clientside newPlot gets a chance to recover.
    - **The newPlot is now fingerprint-guarded (do not revert to unconditional).**
      It only re-inits when the figure content actually changed *or* on the first
      reveal while the panel is visible; a plain tab switch with an unchanged

@@ -52,6 +52,7 @@ _USER_LUT: dict[str, str] = {}
 _AUTO_LUT: dict[str, str] = {}
 # When on, subplot titles show the raw config filename instead of a readable name.
 _SHOW_RAW_CONFIG: dict[str, bool] = {"on": False}
+_CONFIG_ORDER: dict[str, int] = {}
 
 
 def humanise_config(raw: str) -> str:
@@ -190,14 +191,21 @@ def _loads_tolerant(text: str):
 
 
 def load_folder_metadata(folder: str) -> dict:
-    meta = {"folder": folder, "configs": {}, "fly_metadata": None}
+    meta = {"folder": folder, "configs": {}, "sequence_order": [], "fly_metadata": None}
     for f in Path(folder).glob("*.json"):
         data = _loads_tolerant(f.read_text())
         if data is None:
             continue
         if "FlyMetaData" in f.name or "metadata" in f.name.lower():
             meta["fly_metadata"] = data
-        elif "sequenceConfig" not in f.name:
+        elif "sequenceConfig" in f.name:
+            order = []
+            for s in data.get("sequences", []) if isinstance(data, dict) else []:
+                cf = s.get("parameters", {}).get("configFile") if isinstance(s, dict) else None
+                if cf and cf not in order:
+                    order.append(cf)
+            meta["sequence_order"].extend(order)
+        else:
             meta["configs"][f.name] = data
     return meta
 
@@ -304,6 +312,26 @@ def _populate_auto_lut(metas: list[dict]) -> None:
             if name:
                 _AUTO_LUT[key] = name
     _save_config_lut()
+
+
+def _set_config_order(metas: list[dict]) -> None:
+    """Sequence-config order for subplot/filter option ordering.
+
+    Missing configs sort alphabetically after the known sequenceConfig entries.
+    """
+    _CONFIG_ORDER.clear()
+    for m in metas or []:
+        for cfg in m.get("sequence_order") or []:
+            _CONFIG_ORDER.setdefault(cfg, len(_CONFIG_ORDER))
+
+
+def _ordered_values(vals) -> list:
+    vals = [v for v in vals if pd.notna(v)]
+    if not vals:
+        return []
+    if _CONFIG_ORDER:
+        return sorted(vals, key=lambda v: (_CONFIG_ORDER.get(v, 10**9), humanise_config(str(v)).lower(), str(v)))
+    return sorted(vals, key=lambda v: humanise_config(str(v)).lower())
 
 
 _CONFIG_LUT_PATH = "config_names.json"
@@ -425,6 +453,63 @@ def time_to_target_table(df, rois_by_cfg, reach) -> pd.DataFrame:
                 parts.append(pd.DataFrame({
                     "ConfigFile": cfg, "side": side,
                     "_seg_id": seg[starts][reached], "t": first_t[reached]}))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+
+
+def heading_target_angle_table(df, rois_by_cfg, moving_thresh=None) -> pd.DataFrame:
+    """Per-sample signed heading error relative to the nearest target centre.
+
+    Angles are degrees in [-180, 180]. For each sample, compare the instantaneous
+    heading with the vector from the current position to each target centre, then
+    keep the target with the smallest absolute signed error. 0 means the animal
+    is heading directly at that target centre.
+    """
+    cols = ["ConfigFile", "side", "_seg_id", "angle_deg"]
+    if df is None or len(df) == 0 or not rois_by_cfg:
+        return pd.DataFrame(columns=cols)
+    x = df["GameObjectPosX"].to_numpy()
+    z = df["GameObjectPosZ"].to_numpy()
+    n = len(df)
+    seg = df["_seg_id"].to_numpy()
+    dx = np.empty(n); dz = np.empty(n)
+    dx[0] = np.nan; dz[0] = np.nan
+    dx[1:] = np.diff(x); dz[1:] = np.diff(z)
+    seg_start = np.empty(len(df), bool); seg_start[0] = True
+    seg_start[1:] = seg[1:] != seg[:-1]
+    dx[seg_start] = np.nan; dz[seg_start] = np.nan
+    speed = np.hypot(dx, dz)
+    valid = np.isfinite(speed) & (speed > 0)
+    if moving_thresh:
+        v = smoothed_velocity(df, 10)
+        valid &= v >= float(moving_thresh)
+
+    parts = []
+    cfg_arr = df["ConfigFile"].to_numpy()
+    for cfg, sub in df.groupby("ConfigFile", sort=False):
+        rois = [r for r in rois_by_cfg.get(cfg, []) if r["side"] in ("left", "right")]
+        if not rois:
+            continue
+        idx = np.flatnonzero(cfg_arr == cfg)
+        px = x[idx]; pz = z[idx]
+        hx = dx[idx]; hz = dz[idx]
+        m0 = valid[idx]
+        htheta = np.degrees(np.arctan2(hx, hz))
+        best = np.full(len(sub), np.nan)
+        best_abs = np.full(len(sub), np.inf)
+        best_side = np.full(len(sub), "", dtype=object)
+        for r in rois:
+            ttheta = np.degrees(np.arctan2(r["x"] - px, r["z"] - pz))
+            delta = ((htheta - ttheta + 180.0) % 360.0) - 180.0
+            use = np.abs(delta) < best_abs
+            best_abs[use] = np.abs(delta[use])
+            best[use] = delta[use]
+            best_side[use] = r["side"]
+        m = m0 & np.isfinite(best) & np.isin(best_side, ["left", "right"])
+        if m.any():
+            parts.append(pd.DataFrame({
+                "ConfigFile": cfg, "side": best_side[m],
+                "_seg_id": sub["_seg_id"].to_numpy()[m],
+                "angle_deg": best[m]}))
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
 
 
@@ -777,11 +862,15 @@ BUDGET_GL = 300_000      # static WebGL trajectories
 BUDGET_SVG = 40_000      # animated trajectories (every frame is embedded → keep light)
 BUDGET_RAW = 25_000      # raw time-series plot
 BUDGET_POLAR = 30_000    # polar plot (SVG Scatterpolar)
+_POLAR_RAY_CACHE: dict = {}
+_POLAR_RAY_CACHE_ORDER: list = []
+_POLAR_RAY_CACHE_MAX = 8
 
 # Per-subplot pixel height. With a 2-col layout each subplot is ~half the main
 # width, so ~480px tall keeps each box roughly square; the page scrolls when
 # there are many rows rather than squishing them.
 SUBPLOT_PX = 480
+SUBPLOT_PX_COMPACT = 390
 
 SEQ_COLORSCALE = "Viridis"
 
@@ -799,6 +888,11 @@ def _decimation_budget(n_traces, animate, max_points=None):
     return can_animate, (BUDGET_SVG if can_animate else BUDGET_GL)
 
 
+def _subplot_px(nrows, ncols):
+    """Keep common 2x2-ish views visible on one desktop screen; let larger grids scroll."""
+    return SUBPLOT_PX_COMPACT if ncols == 2 and nrows <= 2 else SUBPLOT_PX
+
+
 def _group_frames(df, group_by, pool_mode, ncols):
     col_map = {"config": "ConfigFile", "vr": "VR", "flyid": "FlyID",
                "scene": "SceneName", "file": "SourceFolder"}
@@ -806,8 +900,13 @@ def _group_frames(df, group_by, pool_mode, ncols):
         groups = {"All Data": df}
     else:
         gcol = col_map.get(group_by, "ConfigFile")
-        groups = ({str(k): v for k, v in df.groupby(gcol)}
-                  if gcol in df.columns else {"All Data": df})
+        if gcol not in df.columns:
+            groups = {"All Data": df}
+        elif gcol == "ConfigFile":
+            vals = _ordered_values(pd.unique(df[gcol]))
+            groups = {str(v): df[df[gcol] == v] for v in vals}
+        else:
+            groups = {str(k): v for k, v in df.groupby(gcol, sort=False)}
     return groups
 
 
@@ -965,7 +1064,11 @@ def _add_traj_trace(fig, td, TraceType, hover=True):
 
 
 def _square_range(xmin, xmax, zmin, zmax, pad=1.08):
-    span = max(xmax - xmin, zmax - zmin) * pad
+    span = max(float(xmax) - float(xmin), float(zmax) - float(zmin)) * pad
+    if not np.isfinite(span) or span <= 0:
+        vals = [v for v in (xmin, xmax, zmin, zmax) if np.isfinite(v)]
+        scale = max(1.0, max(abs(float(v)) for v in vals) if vals else 1.0)
+        span = scale * 0.2
     cx, cz = (xmin + xmax) / 2, (zmin + zmax) / 2
     return ([cx - span / 2, cx + span / 2], [cz - span / 2, cz + span / 2])
 
@@ -1174,7 +1277,7 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
 
     show_legend = color_by in ("individual", "vr")
     fig.update_layout(
-        height=60 + nrows * SUBPLOT_PX,
+        height=60 + nrows * _subplot_px(nrows, ncols),
         showlegend=show_legend,
         legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.01,
                     font_size=10, itemclick="toggle", itemdoubleclick="toggleothers"),
@@ -1250,6 +1353,10 @@ def _heatmap_edges(df, bin_size, bound_pct):
     rx, rz = rng
     bs = float(bin_size) if bin_size and bin_size > 0 else default_bin_size(df)
     span = max(rx[1] - rx[0], rz[1] - rz[0])
+    if not np.isfinite(bs) or bs <= 0:
+        bs = max(span / 20.0, 1.0)
+    if not np.isfinite(span) or span <= 0:
+        span = bs
     if span / bs > MAX_HEATMAP_BINS:        # only clamps in pathological cases
         bs = span / MAX_HEATMAP_BINS
     return np.arange(rx[0], rx[1] + bs, bs), np.arange(rz[0], rz[1] + bs, bs), rng
@@ -1364,7 +1471,7 @@ def _assemble_heatmap(bins, var, ncols, df):
     for i, ann in enumerate(fig.layout.annotations):
         if i < len(group_names):
             ann.update(hovertext=group_names[i], font=dict(size=12))
-    fig.update_layout(height=60 + nrows * SUBPLOT_PX,
+    fig.update_layout(height=60 + nrows * _subplot_px(nrows, ncols),
                       margin=dict(l=50, r=80, t=50, b=40), template="plotly_white",
                       dragmode="pan", showlegend=False)
     return fig
@@ -1408,34 +1515,21 @@ def build_heatmap_and_variants(df, group_by, pool_mode, ncols, bin_size, bound_p
 
 def build_heatmap_mask_variants(df_f, pattern, reach, group_by, pool_mode, ncols,
                                 bin_size, bound_pct, cmin, cmax, crange_mode,
-                                do_rebase):
-    """Base (unmasked) figure + a store keyed `e{0/1}_t{0/1}_{metric}_{scale}`
-    covering all four ROI-mask states (entered-only × tail-trim) × every
-    metric/scale — so the client can flip the entered/trim/metric/scale controls
-    with Plotly.restyle, no server round-trip, no re-init.
+                                do_rebase, entered_only=False, trim_tail=False):
+    """Current ROI-mask heatmap + metric/scale variants for that one state.
 
-    All states share ONE grid and the UNMASKED subplot set (a state with no data
-    in a subplot just gets an all-NaN tile), which is what makes them swappable.
-    The reached table + trims are computed once and reused across the four states.
+    Earlier builds precomputed all four entered-only × tail-trim states. That
+    made tab-open expensive on million-row folders and blocked the very plot the
+    user was trying to pan. ROI mask toggles now rebuild the current state; metric
+    and scale still swap clientside from this state's variants.
     """
     if df_f is None or len(df_f) == 0:
         return _msg_figure("No data after filtering"), {}
-    rois = rois_by_config(_load_data(pattern)[2])
     reach_v = float(reach) if reach else 3.0
-    if rois:
-        table = roi_reached_table(df_f, rois, reach_v)
-        ent = (set(table.loc[table["reached_left"] | table["reached_right"], "_seg_id"])
-               if len(table) else set())
-        df_ent = df_f[df_f["_seg_id"].isin(ent)]
-        df_trm = trim_after_roi_exit(df_f, rois, reach_v)
-        df_ent_trm = trim_after_roi_exit(df_ent, rois, reach_v) if len(df_ent) else df_ent
-    else:
-        df_ent = df_trm = df_ent_trm = df_f
-    masks = {(0, 0): df_f, (1, 0): df_ent, (0, 1): df_trm, (1, 1): df_ent_trm}
-    disp = {k: (rebase_to_origin(v) if (do_rebase and len(v)) else v)
-            for k, v in masks.items()}
-
-    base = disp[(0, 0)]
+    df_view, _ = _roi_apply(df_f, pattern, reach_v, entered_only, trim_tail)
+    base = rebase_to_origin(df_view) if (do_rebase and len(df_view)) else df_view
+    if len(base) == 0:
+        return _msg_figure("No data after ROI filtering"), {}
     xedges, yedges, rng = _heatmap_edges(base, bin_size, bound_pct)
     xc = (0.5 * (xedges[:-1] + xedges[1:])).tolist()
     yc = (0.5 * (yedges[:-1] + yedges[1:])).tolist()
@@ -1443,20 +1537,18 @@ def build_heatmap_mask_variants(df_f, pattern, reach, group_by, pool_mode, ncols
     nrows = max(1, (len(group_names) + ncols - 1) // ncols)
     dt = _median_dt(base)
 
-    store, base_bins = {}, None
-    for (e, t), dv in disp.items():
-        groups = _group_frames(dv, group_by, pool_mode, ncols) if len(dv) else {}
-        bins = dict(group_names=group_names, nrows=nrows, xc=xc, yc=yc, rng=rng,
-                    counts=_counts_for_groups(groups, group_names, xedges, yedges),
-                    dt=dt)
-        if e == 0 and t == 0:
-            base_bins = bins
-        for m in HEATMAP_METRICS:
-            for s in HEATMAP_SCALES:
-                store[f"e{e}_t{t}_{m}_{s}"] = _heatmap_variant(
-                    bins, log_scale=(s == "log"), metric=m, cmin=cmin, cmax=cmax,
-                    crange_mode=crange_mode)
-    base_fig = _assemble_heatmap(base_bins, store["e0_t0_time_lin"], ncols, base)
+    e, t = int(bool(entered_only)), int(bool(trim_tail))
+    groups = _group_frames(base, group_by, pool_mode, ncols)
+    bins = dict(group_names=group_names, nrows=nrows, xc=xc, yc=yc, rng=rng,
+                counts=_counts_for_groups(groups, group_names, xedges, yedges),
+                dt=dt)
+    store = {}
+    for m in HEATMAP_METRICS:
+        for s in HEATMAP_SCALES:
+            store[f"e{e}_t{t}_{m}_{s}"] = _heatmap_variant(
+                bins, log_scale=(s == "log"), metric=m, cmin=cmin, cmax=cmax,
+                crange_mode=crange_mode)
+    base_fig = _assemble_heatmap(bins, store[f"e{e}_t{t}_time_lin"], ncols, base)
     return base_fig, store
 
 
@@ -1549,12 +1641,61 @@ def _msg_figure(text, height=440):
     return fig
 
 
+def _add_iqr_markers(fig, data, value_col, labels, xpos, row):
+    """Overlay side-offset Q1-Q3 bars and median ticks on split violins."""
+    if data is None or len(data) == 0:
+        return
+    for side, color, off in (("left", _ROI_SIDE_COLOR["left"], -0.12),
+                             ("right", _ROI_SIDE_COLOR["right"], 0.12)):
+        sub = data[data["side"] == side]
+        if not len(sub):
+            continue
+        for lab, vals in sub.groupby("label", sort=False)[value_col]:
+            vals = vals.to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0 or lab not in xpos:
+                continue
+            q1, med, q3 = np.percentile(vals, [25, 50, 75])
+            x = xpos[lab] + off
+            fig.add_trace(go.Scatter(
+                x=[x, x], y=[q1, q3], mode="lines", showlegend=False,
+                hoverinfo="skip", line=dict(color=color, width=5)),
+                row=row, col=1)
+            fig.add_trace(go.Scatter(
+                x=[x - 0.07, x + 0.07], y=[med, med], mode="lines",
+                showlegend=False, hoverinfo="skip",
+                line=dict(color="#111", width=3)),
+                row=row, col=1)
+
+
+def _add_iqr_markers_center(fig, data, value_col, xpos, row, color="#555"):
+    if data is None or len(data) == 0:
+        return
+    for lab, vals in data.groupby("label", sort=False)[value_col]:
+        vals = vals.to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0 or lab not in xpos:
+            continue
+        q1, med, q3 = np.percentile(vals, [25, 50, 75])
+        x = xpos[lab]
+        fig.add_trace(go.Scatter(
+            x=[x, x], y=[q1, q3], mode="lines", showlegend=False,
+            hoverinfo="skip", line=dict(color=color, width=5)),
+            row=row, col=1)
+        fig.add_trace(go.Scatter(
+            x=[x - 0.09, x + 0.09], y=[med, med], mode="lines",
+            showlegend=False, hoverinfo="skip", line=dict(color="#111", width=3)),
+            row=row, col=1)
+
+
 def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
-    """Two stacked panels per the ROI tab:
+    """Stacked ROI diagnostics:
       1. Paired swarm — per-animal fraction of trials reaching left vs right, with
          faint left↔right pairing lines and a median bar per side.
       2. Split violin of time-to-reach the target (left half / right half), area
          proportional to the number of trials that reached (scalemode='count').
+      3. Violin of signed heading error to the nearest target centre
+         (0° = pointing at target, span -180..180°).
     `df` is already the filtered/visible subset; pass `table` to skip recompute."""
     tbl = roi_reached_table(df, rois_by_cfg, reach) if table is None else table
     if tbl is None or len(tbl) == 0:
@@ -1583,10 +1724,11 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
             mrx += [i + 0.04, i + 0.36, None]; mry += [med.loc[lab, "mr"]] * 2 + [None]
 
     lc, rc = _ROI_SIDE_COLOR["left"], _ROI_SIDE_COLOR["right"]
-    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.14, subplot_titles=(
+    fig = make_subplots(rows=3, cols=1, vertical_spacing=0.10, subplot_titles=(
         f"Fraction of trials reaching each ROI — per animal "
         f"(reach {reach:g} u · {n_animals} animals; bars = median)",
-        "Time to reach target (split violin; area ∝ trials reached)"))
+        "Time to reach target (split violin; area ∝ trials reached)",
+        "Heading error to nearest target centre (0° = target; bars = IQR/median)"))
 
     fig.add_trace(go.Scatter(x=px.tolist(), y=py.tolist(), mode="lines",
         line=dict(color="rgba(120,120,120,0.35)", width=1),
@@ -1613,23 +1755,61 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
             if not len(s):
                 continue
             fig.add_trace(go.Violin(
-                x=s["label"], y=s["t"], side=sd, scalemode="count", scalegroup="ttt",
+                x=s["label"].map(xpos), y=s["t"], side=sd, scalemode="count", scalegroup="ttt",
                 line_color=color, fillcolor=color, opacity=0.55, points=False,
-                meanline_visible=True, showlegend=False, spanmode="hard",
+                meanline_visible=False, box_visible=False, showlegend=False, spanmode="hard",
                 hovertemplate=side + " %{y:.1f}s<extra></extra>"), row=2, col=1)
-    fig.update_layout(template="plotly_white", height=760, violinmode="overlay",
+        _add_iqr_markers(fig, ttt, "t", labels, xpos, row=2)
+
+    ang = heading_target_angle_table(df, rois_by_cfg)
+    if len(ang):
+        ang["label"] = ang["ConfigFile"].map(humanise_config)
+        budget = 40_000
+        if len(ang) > budget:
+            ang = ang.iloc[np.linspace(0, len(ang) - 1, budget).astype(int)]
+        fig.add_trace(go.Violin(
+            x=ang["label"].map(xpos), y=ang["angle_deg"], scalemode="count",
+            scalegroup="angle", line_color="#495057", fillcolor="#6c757d",
+            opacity=0.45, points=False, meanline_visible=False,
+            box_visible=False, showlegend=False, span=[-180, 180],
+            hovertemplate="%{y:.0f}° to nearest target<extra></extra>"),
+            row=3, col=1)
+        _add_iqr_markers_center(fig, ang, "angle_deg", xpos, row=3)
+
+    fig.update_layout(template="plotly_white", height=980, violinmode="overlay",
         legend=dict(orientation="h", y=1.05, yanchor="bottom", x=1, xanchor="right"),
         margin=dict(l=60, r=20, t=50, b=80))
     fig.update_yaxes(title_text="fraction reaching", range=[-0.03, 1.03], row=1, col=1)
     fig.update_yaxes(title_text="time to reach (s)", rangemode="tozero", row=2, col=1)
+    fig.update_yaxes(title_text="heading error (deg)", range=[-180, 180],
+                     zeroline=True, zerolinewidth=1.5, zerolinecolor="#555",
+                     row=3, col=1)
     fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
                      ticktext=labels, range=[-0.6, len(labels) - 0.4], row=1, col=1)
-    fig.update_xaxes(title_text="config", row=2, col=1)
+    fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
+                     ticktext=labels, range=[-0.6, len(labels) - 0.4],
+                     title_text="config", row=2, col=1)
+    fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
+                     ticktext=labels, range=[-0.6, len(labels) - 0.4],
+                     title_text="config", row=3, col=1)
     return fig
 
 
+def _ray_cache_key(df, moving_only, walk_thresh, color_by):
+    return (id(df), len(df), bool(moving_only),
+            round(float(walk_thresh or 0), 6), color_by or "none")
+
+
+def _cache_ray(key, val):
+    _POLAR_RAY_CACHE[key] = val
+    _POLAR_RAY_CACHE_ORDER.append(key)
+    while len(_POLAR_RAY_CACHE_ORDER) > _POLAR_RAY_CACHE_MAX:
+        _POLAR_RAY_CACHE.pop(_POLAR_RAY_CACHE_ORDER.pop(0), None)
+    return val
+
+
 def rayleigh_by_segment(df, moving_only=False, walk_thresh=None,
-                        color_by="velocity") -> pd.DataFrame:
+                        color_by="velocity", use_cache=True) -> pd.DataFrame:
     """Per-trial Rayleigh (mean resultant) vector of the per-sample headings.
     Returns _seg_id, ConfigFile, animal, R (0..1 concentration), theta_deg (mean
     direction, Unity frame: 0=forward, via atan2(dx,dz)), and a per-trial colour
@@ -1637,6 +1817,9 @@ def rayleigh_by_segment(df, moving_only=False, walk_thresh=None,
     cols = ["_seg_id", "ConfigFile", "animal", "R", "theta_deg", "cval"]
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
+    key = _ray_cache_key(df, moving_only, walk_thresh, color_by)
+    if use_cache and key in _POLAR_RAY_CACHE:
+        return _POLAR_RAY_CACHE[key]
     x = df["GameObjectPosX"].to_numpy(); z = df["GameObjectPosZ"].to_numpy()
     seg = df["_seg_id"].to_numpy()
     n = len(df)
@@ -1676,7 +1859,14 @@ def rayleigh_by_segment(df, moving_only=False, walk_thresh=None,
                         "cval": agg["cval"].to_numpy()}).merge(
         meta.reset_index(), on="_seg_id")
     out["animal"] = out["FlyID"].astype(str) + "@" + out["VR"].astype(str)
-    return out[cols]
+    return _cache_ray(key, out[cols]) if use_cache else out[cols]
+
+
+def precache_polar_rays(df, walk_thresh, color_by):
+    if df is None or len(df) == 0:
+        return
+    rayleigh_by_segment(df, False, walk_thresh, color_by)
+    rayleigh_by_segment(df, True, walk_thresh, color_by)
 
 
 def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
@@ -1854,7 +2044,9 @@ def resolve_dropped_folder(folder: str, files: list[str]) -> str | None:
 def _load_data(pattern):
     key = pattern.strip()
     if key in _DATA_CACHE:
-        return _DATA_CACHE[key], _STATS_CACHE.get(key), _META_CACHE.get(key, [])
+        metas = _META_CACHE.get(key, [])
+        _set_config_order(metas)
+        return _DATA_CACHE[key], _STATS_CACHE.get(key), metas
 
     files = find_csv_files(pattern)
     _LOAD_PROGRESS.update(done=0, total=len(files), active=True, label="scanning")
@@ -1887,6 +2079,7 @@ def _load_data(pattern):
                     "Current Time"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     stats = compute_segment_stats(df)
+    _set_config_order(metas)
     _populate_auto_lut(metas)           # readable config names from objects
     _DATA_CACHE[key] = df
     _STATS_CACHE[key] = stats
@@ -2344,6 +2537,7 @@ app.layout = html.Div([
     # Stores
     dcc.Store(id="store-glob"),
     dcc.Store(id="viewport-store"),
+    dcc.Store(id="heatmap-figure-store"),
     dcc.Store(id="heatmap-variants"),
     dcc.Store(id="auto-thresholds"),
     dcc.Store(id="drop-data"),
@@ -2428,7 +2622,7 @@ def restore_from_url(search, already):
 
     anim = (["on"] if p["anim"][0] == "1" else []) if "anim" in p else no_update
     rebase = (["on"] if p["rebase"][0] == "1" else []) if "rebase" in p else no_update
-    view = p["view"][0] if p.get("view", [""])[0] in ("traj", "heat", "diag") else no_update
+    view = p["view"][0] if p.get("view", [""])[0] in ("traj", "heat", "roi", "polar", "diag") else no_update
 
     vp = no_update
     if all(k in p for k in ("vbx0", "vbx1", "vby0", "vby1")):
@@ -2524,7 +2718,6 @@ def tick_progress(n, barstyle, trackstyle):
 @app.callback(
     Output("url", "search"),
     Input("btn-plot", "n_clicks"),
-    Input("viewport-store", "data"),
     Input("glob-input", "value"),
     Input("vel-threshold", "value"),
     Input("min-disp", "value"),
@@ -2551,11 +2744,15 @@ def tick_progress(n, barstyle, trackstyle):
     Input("subplot-ncols", "value"),
     Input("plot-points", "value"),
     Input("view-mode", "value"),
+    State("viewport-store", "data"),
+    State("url-restored", "data"),
     prevent_initial_call=True,
 )
-def update_url(n, vp, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
+def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
                hbin, hscale, hbound, hmetric, hcmin, hcmax, hcrange,
-               fcfg, fvr, ffly, fscn, ffld, raw, ncols, pts, view):
+               fcfg, fvr, ffly, fscn, ffld, raw, ncols, pts, view, vp, restored):
+    if not restored:
+        return no_update
     params = {}
     if g:
         params["glob"] = g
@@ -2624,7 +2821,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize):
     def opts(col):
         if col not in df.columns:
             return []
-        vals = sorted(df[col].unique())
+        vals = _ordered_values(df[col].unique()) if col == "ConfigFile" else sorted(df[col].unique())
         if col == "ConfigFile":
             return [{"label": humanise_config(v), "value": v, "title": v} for v in vals]
         return [{"label": str(v), "value": v} for v in vals]
@@ -2694,27 +2891,97 @@ def apply_auto_thresholds(vel_auto, disp_auto, auto, clicks, pattern):
     return vel_val, _on(vel_auto), disp_val, _on(disp_auto), bump
 
 
-def _exclusion_summary(df_sub, stats_sub, vel_thresh, min_disp, walk):
-    """Small text: how many points/trials the active filters remove, and what
-    fraction of samples are moving (≥ walk speed). Computed on the pre-cut subset."""
-    v = velocity_all(df_sub)
-    v = v[np.isfinite(v)]
+def _filter_summary(df_sub, vel_thresh, min_disp, trim, jump_buf,
+                    polar_moving=None, walk=None):
+    """Report active filters with counts from the actual filter pipeline."""
+    if df_sub is None or len(df_sub) == 0:
+        return ""
     parts = []
-    if vel_thresh and v.size:
-        nv = int((v > float(vel_thresh)).sum())
-        parts.append(f"vel over {float(vel_thresh):g}: {nv:,} pts ({100*nv/v.size:.1f}%)")
-    else:
-        parts.append("no vel cut")
-    if min_disp and stats_sub is not None and len(stats_sub):
-        below = int((stats_sub["displacement"] < float(min_disp)).sum())
-        parts.append(f"disp under {float(min_disp):g}: {below} trials "
-                     f"({100*below/len(stats_sub):.1f}%)")
-    else:
-        parts.append("no disp cut")
-    w = float(walk) if walk else None
-    if w and v.size:
-        parts.append(f"moving (≥{w:g}): {100*(v >= w).sum()/v.size:.0f}%")
-    return "Excluded — " + " · ".join(parts)
+    cur = df_sub
+    start_n = len(cur)
+
+    if vel_thresh is not None and vel_thresh > 0:
+        vel = velocity_all(cur)
+        spikes = np.nan_to_num(vel, nan=0.0) > float(vel_thresh)
+        removed = 0
+        if spikes.any():
+            seg = cur["_seg_id"].to_numpy()
+            t = cur["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64") / 1e9
+            keep = _dilate_keep(seg, t, spikes, float(jump_buf or 0.1))
+            removed = int((~keep).sum())
+            cur = cur[keep]
+        parts.append(
+            f"velocity > {float(vel_thresh):g} u/s"
+            f" (+/-{float(jump_buf or 0.1):g}s): {removed:,}/{start_n:,} pts"
+            f" ({100*removed/max(start_n, 1):.1f}%)")
+
+    if min_disp is not None and min_disp > 0 and len(cur):
+        stats = compute_segment_stats(cur)
+        before = int(cur["_seg_id"].nunique())
+        bad = (stats["displacement"] < float(min_disp)) if len(stats) else pd.Series([], dtype=bool)
+        bad_ids = set(stats.loc[bad, "seg_id"]) if len(stats) else set()
+        removed_trials = len(bad_ids)
+        if bad_ids:
+            cur = cur[~cur["_seg_id"].isin(bad_ids)]
+        parts.append(
+            f"displacement < {float(min_disp):g}: {removed_trials:,}/{before:,} trials"
+            f" ({100*removed_trials/max(before, 1):.1f}%)")
+
+    if trim is not None and trim > 0 and len(cur):
+        before_pts = len(cur)
+        before_trials = int(cur["_seg_id"].nunique())
+        g = cur.groupby("_seg_id", sort=False)
+        pos = g.cumcount()
+        size = g["_seg_id"].transform("size")
+        keep = (pos >= int(trim)) & (pos < size - int(trim))
+        removed = int((~keep).sum())
+        parts.append(
+            f"trim {int(trim)} samples/side: {removed:,}/{before_pts:,} pts"
+            f" across {before_trials:,} trials ({100*removed/max(before_pts, 1):.1f}%)")
+
+    if _on(polar_moving) and walk is not None and walk > 0:
+        v = velocity_all(df_sub)
+        v = v[np.isfinite(v)]
+        if v.size:
+            moving = int((v >= float(walk)).sum())
+            parts.append(
+                f"polar moving-only >= {float(walk):g} u/s: {moving:,}/{v.size:,} samples"
+                f" ({100*moving/v.size:.0f}%)")
+
+    return ("Active filters — " + " · ".join(parts)) if parts else "Active filters — none"
+
+
+@app.callback(
+    Output("exclusion-info", "children", allow_duplicate=True),
+    Input("store-glob", "data"),
+    Input("btn-plot", "n_clicks"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("vel-histogram", "selectedData"),
+    State("disp-histogram", "selectedData"),
+    State("polar-moving", "value"),
+    State("polar-walk", "value"),
+    prevent_initial_call=True,
+)
+def update_filter_summary(pattern, n_plot, vel_thresh, min_disp, trim, jump_buf,
+                          cfg, vrs, fids, scenes, folders, vel_sel, disp_sel,
+                          polar_moving, polar_walk):
+    if not pattern:
+        return no_update
+    _, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
+                                cfg, vrs, fids, scenes, folders,
+                                vel_sel, disp_sel)
+    if df_sub is None or len(df_sub) == 0:
+        return ""
+    return _filter_summary(df_sub, vel_thresh, min_disp, trim, jump_buf,
+                           polar_moving, polar_walk)
 
 
 _FILTER_CACHE: dict = {}        # signature -> (df_f, df_sub, stats_sub)
@@ -2771,6 +3038,7 @@ def _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
     if vel_selection and vel_selection.get("range"):
         rng = vel_selection["range"]["x"]
         df_sub = filter_by_stat_range(df_sub, stats_sub, "peak_velocity", rng[0], rng[1])
+    stats_sub = compute_segment_stats(df_sub) if len(df_sub) else stats_sub
 
     df_f = apply_filters(df_sub, vel_thresh, min_disp, trim, jump_buf or 0.1)
     result = (df_f, df_sub, stats_sub)
@@ -2823,6 +3091,7 @@ def _apply_viewport(fig, viewport, df):
     Output("roi-plot", "figure", allow_duplicate=True),
     Output("exclusion-info", "children"),
     Input("btn-plot", "n_clicks"),
+    Input("view-mode", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
@@ -2855,19 +3124,25 @@ def _apply_viewport(fig, viewport, df):
     State("roi-reach", "value"),
     State("roi-trim", "value"),
     State("roi-entered", "value"),
-    State("view-mode", "value"),
+    State("polar-moving", "value"),
     State("polar-walk", "value"),
     prevent_initial_call=True,
 )
-def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
+def update_plots(n, view, pattern, vel_thresh, min_disp, trim, jump_buf,
                  group_by, pool_mode, color_by, animate, rebase, hm_binsize, hm_scale,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
                  scenes, folders, raw_cols, ncols, max_points, vel_selection,
                  disp_selection, viewport, roi_show, roi_reach, roi_trim, roi_entered,
-                 view, polar_walk):
+                 polar_moving, polar_walk):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
         return empty, empty, "Load data first.", no_update, no_update, no_update, ""
+    # Main builder owns only the regular trajectory and diagnostic raw views.
+    # Heatmap, ROI and polar are lazy visible-tab callbacks so a harmless tab
+    # switch or heatmap control cannot rebuild every plot.
+    if view not in ("traj", "diag"):
+        return (no_update, no_update, no_update, no_update, no_update,
+                no_update, no_update)
 
     df_f, df_sub, stats_sub = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -2879,19 +3154,23 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
         return empty, empty, "All filtered out.", no_update, no_update, no_update, ""
 
     # Non-invasive exclusion tally (what the filters remove; fraction moving).
-    exclusion = _exclusion_summary(df_sub, stats_sub, vel_thresh, min_disp, polar_walk)
+    exclusion = _filter_summary(df_sub, vel_thresh, min_disp, trim, jump_buf,
+                                polar_moving, polar_walk)
 
-    # Histograms reflect the subset before velocity/disp cuts
     df, _, metas = _load_data(pattern)
-    mask = pd.Series(True, index=df.index)
-    if cfg:     mask &= df["ConfigFile"].isin(cfg)
-    if vrs:     mask &= df["VR"].isin(vrs)
-    if fids:    mask &= df["FlyID"].isin(fids)
-    if scenes:  mask &= df["SceneName"].isin(scenes)
-    if folders: mask &= df["SourceFolder"].isin(folders)
-    df_hist = df[mask]
-    vel_fig = build_velocity_histogram(df_hist, vel_thresh)
-    disp_fig = build_displacement_histogram(compute_segment_stats(df_hist), min_disp)
+    vel_fig = no_update
+    disp_fig = no_update
+    if view in ("traj", "diag"):
+        # Histograms reflect the subset before velocity/disp cuts.
+        mask = pd.Series(True, index=df.index)
+        if cfg:     mask &= df["ConfigFile"].isin(cfg)
+        if vrs:     mask &= df["VR"].isin(vrs)
+        if fids:    mask &= df["FlyID"].isin(fids)
+        if scenes:  mask &= df["SceneName"].isin(scenes)
+        if folders: mask &= df["SourceFolder"].isin(folders)
+        df_hist = df[mask]
+        vel_fig = build_velocity_histogram(df_hist, vel_thresh)
+        disp_fig = build_displacement_histogram(compute_segment_stats(df_hist), min_disp)
 
     t0 = time.time()
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
@@ -2908,41 +3187,52 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     want_rois = _on(roi_show) and bool(rois)
     df_view, table = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
     roi_counts = roi_config_summary(table) if (want_rois and table is not None) else None
-    # Record the mask state this trajectory reflects, so returning to the traj tab
-    # after fiddling masks on another tab rebuilds only when it actually changed.
-    _mask_on = _on(roi_trim) or _on(roi_entered)
-    _LAST_TRAJ_SIG["v"] = (tuple(roi_trim or []), tuple(roi_entered or []),
-                           reach if _mask_on else None)
     roi_fig = no_update            # the ROI violin is lazily built by its own tab
     if want_rois and view == "roi" and table is not None:
-        roi_fig = build_roi_swarm_figure(df_f, rois, reach, table=table)
+        roi_fig = build_roi_swarm_figure(df_view, rois, reach)
 
     df_plot = rebase_to_origin(df_view) if do_rebase else df_view
 
-    traj_fig = build_trajectory_figure(df_plot, group_by, pool_mode, ncols=ncols_val,
-                                        color_by=color_by or "individual",
-                                        animate=do_animate, max_points=max_points,
-                                        rois=rois, reach_radius=reach,
-                                        show_rois=want_rois and not do_rebase,
-                                        roi_counts=roi_counts)
-    raw_fig = build_raw_trace_figure(
-        df_view, raw_cols or ["GameObjectPosX", "GameObjectPosZ"], max_points=max_points)
+    traj_fig = no_update
+    raw_fig = no_update
+    drawn = None
+    n_frames = None
+    if view == "traj":
+        traj_fig = build_trajectory_figure(df_plot, group_by, pool_mode,
+                                            ncols=ncols_val,
+                                            color_by=color_by or "individual",
+                                            animate=do_animate,
+                                            max_points=max_points,
+                                            rois=rois, reach_radius=reach,
+                                            show_rois=want_rois and not do_rebase,
+                                            roi_counts=roi_counts)
+        _apply_viewport(traj_fig, viewport, df_plot)
+        drawn = sum(len(t.x) for t in traj_fig.data
+                    if getattr(t, "x", None) is not None)
+        n_frames = len(traj_fig.frames)
+        # Record the mask state this trajectory reflects, so returning to the
+        # traj tab rebuilds only when it actually changed.
+        _mask_on = _on(roi_trim) or _on(roi_entered)
+        _LAST_TRAJ_SIG["v"] = (tuple(roi_trim or []), tuple(roi_entered or []),
+                               reach if _mask_on else None)
+    if view == "diag":
+        raw_fig = build_raw_trace_figure(
+            df_view, raw_cols or ["GameObjectPosX", "GameObjectPosZ"],
+            max_points=max_points)
     bt = time.time() - t0
-
-    # Retain / restore the shared viewbox across replots and from the URL.
-    _apply_viewport(traj_fig, viewport, df_plot)
 
     # Effective drawn points (post-decimation) for the summary
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
-    drawn = sum(len(t.x) for t in traj_fig.data if getattr(t, "x", None) is not None)
     budget_str = (f"{int(max_points):,}" if (max_points and max_points > 0)
                   else (f"anim {BUDGET_SVG//1000}k" if do_animate else f"{BUDGET_GL//1000}k"))
+    drawn_str = f"~{drawn:,} ({budget_str})" if drawn is not None else "not rebuilt"
+    frame_str = str(n_frames) if n_frames is not None else "—"
 
     n_segs_before = df_sub["_seg_id"].nunique()
     summary = (f"{len(df_view):,}/{len(df_sub):,} pts | "
                f"{n_traces}/{n_segs_before} segs | "
-               f"drawn ~{drawn:,} ({budget_str}) | "
-               f"{len(traj_fig.frames)} frames | "
+               f"drawn {drawn_str} | "
+               f"{frame_str} frames | "
                f"build {bt:.2f}s | colour: {color_by}")
 
     return traj_fig, raw_fig, summary, vel_fig, disp_fig, roi_fig, exclusion
@@ -2961,8 +3251,9 @@ _LAST_HEAT_SIG: dict = {"v": None}
 
 
 @app.callback(
-    Output("heatmap-plot", "figure", allow_duplicate=True),
+    Output("heatmap-figure-store", "data", allow_duplicate=True),
     Output("heatmap-variants", "data", allow_duplicate=True),
+    Output("data-summary", "children", allow_duplicate=True),
     Input("heatmap-binsize", "value"),
     Input("heatmap-bound", "value"),
     Input("heatmap-cmin", "value"),
@@ -2970,8 +3261,10 @@ _LAST_HEAT_SIG: dict = {"v": None}
     Input("heatmap-crange", "value"),
     Input("view-mode", "value"),
     Input("btn-plot", "n_clicks"),
+    Input("store-glob", "data"),
     Input("roi-reach", "value"),
-    State("store-glob", "data"),
+    Input("roi-entered", "value"),
+    Input("roi-trim", "value"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
     State("trim-samples", "value"),
@@ -2991,19 +3284,21 @@ _LAST_HEAT_SIG: dict = {"v": None}
     prevent_initial_call=True,
 )
 def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
-                        n_plot, roi_reach, pattern, vel_thresh, min_disp, trim,
-                        jump_buf, group_by, pool_mode, ncols, rebase, cfg, vrs, fids,
-                        scenes, folders, vel_selection, disp_selection, viewport):
+                        n_plot, pattern, roi_reach, roi_entered, roi_trim,
+                        vel_thresh, min_disp, trim, jump_buf, group_by, pool_mode,
+                        ncols, rebase, cfg, vrs, fids, scenes, folders,
+                        vel_selection, disp_selection, viewport):
     if not pattern:
-        return no_update, no_update
-    if ctx.triggered_id == "view-mode" and view != "heat":
-        return no_update, no_update
-    # Signature covers only what changes the BINNING or the mask geometry (bins,
-    # bound, colour range, filter, reach, rebase). It deliberately excludes the
-    # ROI entered/trim toggles and metric/scale — those swap client-side between
-    # the precomputed variants — and the viewport (a zoom shouldn't re-bin). So a
-    # mask/metric/scale flip, a tab switch, or an entered/trim replot all hit this
-    # unchanged signature and skip the (expensive) rebuild entirely.
+        return no_update, no_update, no_update
+    # Do not push a real heatmap figure into the hidden graph. Plotly.react can
+    # throw "Something went wrong with axis scaling" when applying subplot
+    # heatmaps to a hidden/settling panel; opening the Heatmap tab is the safe
+    # moment to build and push it, where the clientside newPlot takes over.
+    if view != "heat":
+        return no_update, no_update, no_update
+    # Signature covers only what changes the binning, mask geometry, grouping or
+    # filtered data. It deliberately excludes metric/scale (client restyle) and
+    # viewport (client relayout) so pan/zoom and colour-mode swaps do not re-bin.
     def _sig_of(v):
         try:
             return json.dumps(v, sort_keys=True, default=str)
@@ -3012,22 +3307,31 @@ def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
     sig = _sig_of([pattern, hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange,
                    group_by, pool_mode, ncols, rebase, cfg, vrs, fids, scenes,
                    folders, vel_thresh, min_disp, trim, jump_buf, vel_selection,
-                   disp_selection, roi_reach])
+                   disp_selection, roi_reach, roi_entered, roi_trim])
     if sig == _LAST_HEAT_SIG["v"]:
-        return no_update, no_update
+        return no_update, no_update, no_update
     df_f, df_sub, _ = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
     if df_sub is None or len(df_sub) == 0:
-        return no_update, no_update
+        return no_update, no_update, no_update
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
+    reach_v = float(roi_reach) if roi_reach else 3.0
+    df_view, _ = _roi_apply(df_f, pattern, reach_v, _on(roi_entered), _on(roi_trim))
     heat, variants = build_heatmap_mask_variants(
-        df_f, pattern, roi_reach, group_by, pool_mode, ncols_val,
+        df_f, pattern, reach_v, group_by, pool_mode, ncols_val,
         bin_size=hm_binsize, bound_pct=hm_bound if hm_bound else 100,
-        cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange, do_rebase=_on(rebase))
+        cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange, do_rebase=_on(rebase),
+        entered_only=_on(roi_entered), trim_tail=_on(roi_trim))
     _apply_viewport(heat, viewport, df_f)
     _LAST_HEAT_SIG["v"] = sig
-    return heat, variants
+    n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
+    n_segs_before = int(df_sub["_seg_id"].nunique()) if len(df_sub) else 0
+    summary = (f"Heatmap {len(df_view):,}/{len(df_sub):,} pts | "
+               f"{n_traces}/{n_segs_before} segs | "
+               f"bin {hm_binsize or default_bin_size(df_view):g} u | "
+               f"build current visible tab")
+    return heat.to_plotly_json(), variants, summary
 
 
 # Sync zoom/pan between trajectory and heatmap tabs (shared viewport)
@@ -3055,36 +3359,54 @@ def _extract_axis_ranges(relayout):
     return {k: v for k, v in out.items() if None not in v}
 
 
-def _range_patch(ranges):
-    patch = Patch()
-    if ranges.get("reset"):
-        patch["layout"]["xaxis"]["autorange"] = True
-        patch["layout"]["yaxis"]["autorange"] = True
-    else:
-        if "xaxis" in ranges:
-            patch["layout"]["xaxis"]["range"] = ranges["xaxis"]
-        if "yaxis" in ranges:
-            patch["layout"]["yaxis"]["range"] = ranges["yaxis"]
-    return patch
-
-
-@app.callback(
+# Viewport sync is clientside so pan/zoom never queues Python callbacks. It only
+# records the latest viewbox in dcc.Store; figures are not patched live.
+app.clientside_callback(
+    "function(trajRelayout, heatRelayout){"
+    "var cb=window.dash_clientside&&window.dash_clientside.callback_context;"
+    "var trig=(cb&&cb.triggered&&cb.triggered[0]&&cb.triggered[0].prop_id)||'';"
+    "var r=trig.indexOf('heatmap-plot')===0?heatRelayout:trajRelayout;"
+    "var no=window.dash_clientside.no_update;"
+    "if(!r)return no;"
+    "if(window.__hmSuppress&&trig.indexOf('heatmap-plot')===0)return no;"
+    "var ks=Object.keys(r);"
+    "var src=trig.indexOf('heatmap-plot')===0?'heat':'traj';"
+    "for(var i=0;i<ks.length;i++){if(ks[i].slice(-9)==='autorange'||r.autosize){return {source:src,reset:true};}}"
+    "var out={source:src};"
+    "ks.forEach(function(k){var m=k.match(/^(x|y)axis\\d*\\.range\\[(0|1)\\]$/);"
+    "if(!m)return;var ax=m[1]==='x'?'xaxis':'yaxis';"
+    "if(!out[ax])out[ax]=[null,null];out[ax][parseInt(m[2])]=r[k];});"
+    "if(out.xaxis&&(out.xaxis[0]===null||out.xaxis[1]===null))delete out.xaxis;"
+    "if(out.yaxis&&(out.yaxis[0]===null||out.yaxis[1]===null))delete out.yaxis;"
+    "return (out.xaxis||out.yaxis)?out:no;}",
     Output("viewport-store", "data"),
     Input("trajectory-plot", "relayoutData"),
     Input("heatmap-plot", "relayoutData"),
     prevent_initial_call=True,
 )
-def sync_viewport(traj_relayout, heat_relayout):
-    # Only RECORD the current viewbox. We deliberately do NOT patch the other
-    # figure live: only one panel is visible at a time, and patching the hidden
-    # heatmap forced a full re-init (newPlot) that produced zoom glitches. The
-    # stored viewbox is re-applied to whichever panel is opened next.
-    trigger = ctx.triggered_id
-    relayout = traj_relayout if trigger == "trajectory-plot" else heat_relayout
-    ranges = _extract_axis_ranges(relayout)
-    if not ranges:
-        return no_update
-    return ranges
+
+
+# Re-apply a stored trajectory/or-restored viewbox to the heatmap on reveal,
+# clientside only. Ignore viewport events that came from the heatmap itself so a
+# live pan/zoom gesture is not followed by a redundant relayout of the same plot.
+app.clientside_callback(
+    "function(view, vp, hfig){"
+    "var cb=window.dash_clientside&&window.dash_clientside.callback_context;"
+    "var trig=(cb&&cb.triggered&&cb.triggered[0]&&cb.triggered[0].prop_id)||'';"
+    "if(view!=='heat'||!vp||vp.reset)return '';"
+    "if(trig.indexOf('viewport-store')===0&&vp.source==='heat')return '';"
+    "setTimeout(function(){var g=document.querySelector('#heatmap-plot .js-plotly-plot');"
+    "if(!g||!window.Plotly)return;var u={};"
+    "if(vp.xaxis)u['xaxis.range']=vp.xaxis;if(vp.yaxis)u['yaxis.range']=vp.yaxis;"
+    "if(!Object.keys(u).length)return;window.__hmSuppress=true;"
+    "try{window.Plotly.relayout(g,u);}catch(e){}"
+    "setTimeout(function(){window.__hmSuppress=false;},180);},120);return '';}",
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("view-mode", "value"),
+    Input("viewport-store", "data"),
+    Input("heatmap-figure-store", "data"),
+    prevent_initial_call=True,
+)
 
 
 # Show exactly one mounted panel (graphs are never unmounted, so their figures
@@ -3108,11 +3430,14 @@ def switch_view(v):
 # snappy without a full trajectory replot. The slider fires on release (mouseup).
 @app.callback(
     Output("roi-plot", "figure", allow_duplicate=True),
+    Output("data-summary", "children", allow_duplicate=True),
+    Input("btn-plot", "n_clicks"),
     Input("roi-reach", "value"),
     Input("roi-show", "value"),
     Input("roi-trim", "value"),
+    Input("roi-entered", "value"),
     Input("view-mode", "value"),
-    State("store-glob", "data"),
+    Input("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
     State("trim-samples", "value"),
@@ -3126,26 +3451,35 @@ def switch_view(v):
     State("disp-histogram", "selectedData"),
     prevent_initial_call=True,
 )
-def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_disp,
-                    trim, jump_buf, cfg, vrs, fids, scenes, folders, vel_sel, disp_sel):
+def update_roi_view(n_plot, reach, roi_show, roi_trim, roi_entered, view, pattern,
+                    vel_thresh, min_disp, trim, jump_buf, cfg, vrs, fids,
+                    scenes, folders, vel_sel, disp_sel):
     if not pattern:
-        return no_update
-    if ctx.triggered_id == "view-mode" and view != "roi":
-        return no_update
+        return no_update, no_update
+    if view != "roi":
+        return no_update, no_update
     if not (roi_show and "on" in roi_show):
-        return _msg_figure("Enable 'Show target ROIs + reached counts' to see "
-                           "reached-fraction violins.")
+        return (_msg_figure("Enable 'Show target ROIs + reached counts' to see "
+                            "reached-fraction violins."),
+                "ROI diagnostics disabled.")
     df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
                                    cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
     if df_sub is None or len(df_sub) == 0:
-        return no_update
+        return no_update, no_update
     # Violins use the UNMASKED data so each fraction's denominator is all trials
     # in the config (independent of the entered-only / trim view toggles).
     _, _, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     if not rois:
-        return _msg_figure("No ROI targets in these configs.")
-    return build_roi_swarm_figure(df_f, rois, float(reach) if reach else 3.0)
+        return _msg_figure("No ROI targets in these configs."), "No ROI targets."
+    reach_v = float(reach) if reach else 3.0
+    df_view, _ = _roi_apply(df_f, pattern, reach_v, _on(roi_entered), _on(roi_trim))
+    n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
+    n_before = int(df_sub["_seg_id"].nunique()) if len(df_sub) else 0
+    summary = (f"ROI {len(df_view):,}/{len(df_sub):,} pts | "
+               f"{n_traces}/{n_before} segs | reach {reach_v:g} u | "
+               f"heading angle = nearest target centre")
+    return build_roi_swarm_figure(df_view, rois, reach_v), summary
 
 
 # Reach slider / show toggle → BLIT the trajectory overlay: recompute reach
@@ -3156,6 +3490,7 @@ def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_di
     Output("trajectory-plot", "figure", allow_duplicate=True),
     Input("roi-reach", "value"),
     Input("roi-show", "value"),
+    Input("view-mode", "value"),
     State("store-glob", "data"),
     State("group-by", "value"),
     State("pool-mode", "value"),
@@ -3176,10 +3511,11 @@ def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_di
     State("roi-trim", "value"),
     prevent_initial_call=True,
 )
-def update_roi_overlay(reach, roi_show, pattern, group_by, pool_mode, ncols, rebase,
-                       vel_thresh, min_disp, trim, jump_buf, cfg, vrs, fids, scenes,
-                       folders, vel_sel, disp_sel, roi_entered, roi_trim):
-    if not pattern:
+def update_roi_overlay(reach, roi_show, view, pattern, group_by, pool_mode, ncols,
+                       rebase, vel_thresh, min_disp, trim, jump_buf, cfg, vrs,
+                       fids, scenes, folders, vel_sel, disp_sel, roi_entered,
+                       roi_trim):
+    if not pattern or view != "traj":
         return no_update
     df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
                                    cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
@@ -3202,13 +3538,9 @@ def update_roi_overlay(reach, roi_show, pattern, group_by, pool_mode, ncols, reb
         patch["layout"]["annotations"][n + i]["text"] = _roi_count_text(gname, counts)
     return patch
 
-
-# The ROI masks change the plotted DATA, but the heatmap swaps them client-side.
-# So a mask toggle only needs to rebuild the *trajectory* — and only when the
-# trajectory is actually on screen. While you're on the heatmap (or any other
-# tab) toggling entered/trim does NOT replot anything: no spinner, no wait. When
-# you return to the trajectory it rebuilds once, iff the mask changed since it was
-# last drawn (compared against _LAST_TRAJ_SIG, which update_plots records).
+# The ROI masks change the plotted trajectory data. They also rebuild the
+# heatmap when the heatmap tab is visible. This callback only nudges the
+# trajectory, and only when it is actually on screen.
 _LAST_TRAJ_SIG: dict = {"v": None}
 
 
@@ -3257,6 +3589,8 @@ def toggle_raw_config(val, clicks, pattern):
 @app.callback(
     Output("polar-plot", "figure", allow_duplicate=True),
     Input("view-mode", "value"),
+    Input("btn-plot", "n_clicks"),
+    Input("store-glob", "data"),
     Input("polar-color", "value"),
     Input("polar-moving", "value"),
     Input("polar-walk", "value"),
@@ -3264,7 +3598,6 @@ def toggle_raw_config(val, clicks, pattern):
     Input("roi-show", "value"),
     Input("roi-trim", "value"),
     Input("roi-entered", "value"),
-    State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
     State("trim-samples", "value"),
@@ -3283,10 +3616,11 @@ def toggle_raw_config(val, clicks, pattern):
     State("disp-histogram", "selectedData"),
     prevent_initial_call=True,
 )
-def update_polar_view(view, polar_color, polar_moving, polar_walk, reach, roi_show,
-                      roi_trim, roi_entered, pattern, vel_thresh, min_disp, trim,
-                      jump_buf, group_by, pool_mode, ncols, max_points, rebase, cfg,
-                      vrs, fids, scenes, folders, vel_sel, disp_sel):
+def update_polar_view(view, n_plot, pattern, polar_color, polar_moving, polar_walk,
+                      reach, roi_show, roi_trim, roi_entered, vel_thresh,
+                      min_disp, trim, jump_buf, group_by, pool_mode, ncols,
+                      max_points, rebase, cfg, vrs, fids, scenes, folders,
+                      vel_sel, disp_sel):
     if not pattern or view != "polar":
         return no_update
     df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -3300,6 +3634,7 @@ def update_polar_view(view, polar_color, polar_moving, polar_walk, reach, roi_sh
     _, _, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     want_rois = bool(roi_show) and "on" in (roi_show or []) and bool(rois)
+    precache_polar_rays(df_f, polar_walk, polar_color or "velocity")
     return build_polar_figure(
         df_f, group_by, pool_mode, ncols=ncols_val,
         color_by=polar_color or "velocity",
@@ -3397,7 +3732,7 @@ app.clientside_callback(
     "if(g&&window.Plotly&&window.Plotly.Plots){try{window.Plotly.Plots.resize(g);}catch(e){}}});"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
-    Input("heatmap-plot", "figure"),
+    Input("heatmap-figure-store", "data"),
     Input("view-mode", "value"),
     Input("heatmap-metric", "value"),
     Input("heatmap-scale", "value"),

@@ -42,10 +42,24 @@
     var defLabel = label ? label.textContent : 'Drop a data folder here';
     var defSub = sub ? sub.textContent : '';
 
-    // React instantly to a drag: grow + highlight the zone so it's an obvious,
-    // larger target. On drop, flip to a "Processing…" state right away — the
-    // backend path resolution + load progress bar follow.
+    var overlay = document.createElement('div');
+    overlay.id = 'drop-overlay';
+    overlay.innerHTML = '<div><div style="font-size:42px;line-height:1">📁</div>' +
+      '<div style="font-size:22px;font-weight:700;margin-top:8px">Drop folder to load</div>' +
+      '<div style="font-size:13px;opacity:.8;margin-top:4px">the whole tab is a drop target</div></div>';
+    overlay.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:9999', 'display:none',
+      'align-items:center', 'justify-content:center', 'text-align:center',
+      'background:rgba(13,110,253,.12)', 'backdrop-filter:blur(1px)',
+      'border:5px dashed #0d6efd', 'color:#123', 'pointer-events:none'
+    ].join(';');
+    document.body.appendChild(overlay);
+    var dragDepth = 0;
+
+    // React instantly to a drag: the sidebar zone still highlights, while a
+    // fixed overlay makes the entire browser tab a receiver.
     function hi(on) {
+      overlay.style.display = on ? 'flex' : 'none';
       zone.style.transition = 'all .12s ease';
       zone.style.background = on ? '#e6ecff' : '#f4f6fb';
       zone.style.borderColor = on ? '#0d6efd' : '#aac';
@@ -76,14 +90,25 @@
         }
       }).observe(track, { attributes: true, attributeFilter: ['style'] });
     }
+    function dragOn(e) {
+      e.preventDefault(); e.stopPropagation();
+      if (e.type === 'dragenter') dragDepth++;
+      hi(true);
+    }
+    function dragOff(e) {
+      e.preventDefault(); e.stopPropagation();
+      if (e.type === 'dragleave') dragDepth = Math.max(0, dragDepth - 1);
+      if (e.type === 'dragend' || dragDepth === 0) hi(false);
+    }
     ['dragenter', 'dragover'].forEach(function (ev) {
-      zone.addEventListener(ev, function (e) { e.preventDefault(); e.stopPropagation(); hi(true); });
+      document.addEventListener(ev, dragOn, false);
     });
     ['dragleave', 'dragend'].forEach(function (ev) {
-      zone.addEventListener(ev, function (e) { e.preventDefault(); e.stopPropagation(); hi(false); });
+      document.addEventListener(ev, dragOff, false);
     });
 
-    zone.addEventListener('drop', function (e) {
+    function handleDrop(e) {
+      dragDepth = 0;
       e.preventDefault(); e.stopPropagation(); hi(false); busy('Processing…');
       var items = e.dataTransfer.items;
       var files = [], folderName = '', pending = 0, done = false;
@@ -132,7 +157,8 @@
       }
       roots.forEach(function (r) { walk(r, ''); });
       setTimeout(function () { if (pending === 0) finish(); }, 80);
-    });
+    }
+    document.addEventListener('drop', handleDrop, false);
   }
 
   if (document.readyState !== 'loading') init();
