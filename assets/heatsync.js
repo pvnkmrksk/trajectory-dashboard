@@ -1,17 +1,11 @@
-// The heatmap is re-initialised via Plotly.newPlot (see the clientside callback),
-// which detaches Dash's own relayout listener. Re-attach a light handler so that
-// zooming/panning the heatmap records the viewbox into the shared viewport-store
-// (used to keep trajectory/heatmap tabs in sync; URL writes read it as State).
-window.__attachHeatSync = function (hg) {
-  if (!hg || hg.__heatSync) return;
-  hg.__heatSync = true;
-  hg.on('plotly_relayout', function (ed) {
+(function () {
+  var pendingViewport = null;
+  var viewportTimer = null;
+  var lastViewportSig = '';
+  var DEBOUNCE_MS = 450;
+
+  function normaliseRelayout(source, ed) {
     if (!ed) return;
-    // Ignore relayout events fired by our own programmatic newPlot (autorange
-    // echoes). Recording those would pollute the shared viewport and make the
-    // heatmap rebuild/re-init on the next tab switch. Only real user zoom/pan,
-    // which happens outside this suppression window, is recorded.
-    if (window.__hmSuppress) return;
     var acc = {};
     Object.keys(ed).forEach(function (k) {
       if (k.indexOf('autorange') >= 0) { acc.reset = true; return; }
@@ -21,14 +15,43 @@ window.__attachHeatSync = function (hg) {
         (acc[ax] = acc[ax] || [null, null])[+m[2]] = ed[k];
       }
     });
-    var out = {};
-    out.source = 'heat';
+    var out = { source: source };
     if (acc.reset) out.reset = true;
     if (acc.xaxis && acc.xaxis.indexOf(null) < 0) out.xaxis = acc.xaxis;
     if (acc.yaxis && acc.yaxis.indexOf(null) < 0) out.yaxis = acc.yaxis;
-    if ((out.xaxis || out.yaxis || out.reset) &&
-        window.dash_clientside && window.dash_clientside.set_props) {
-      window.dash_clientside.set_props('viewport-store', { data: out });
-    }
-  });
-};
+    return (out.xaxis || out.yaxis || out.reset) ? out : null;
+  }
+
+  function queueViewport(source, ed) {
+    if (source === 'heat' && window.__hmSuppress) return;
+    var out = normaliseRelayout(source, ed);
+    if (!out || !window.dash_clientside || !window.dash_clientside.set_props) return;
+    pendingViewport = out;
+    clearTimeout(viewportTimer);
+    viewportTimer = setTimeout(function () {
+      if (!pendingViewport) return;
+      var sig = JSON.stringify(pendingViewport);
+      if (sig !== lastViewportSig) {
+        lastViewportSig = sig;
+        window.dash_clientside.set_props('viewport-store', { data: pendingViewport });
+      }
+      pendingViewport = null;
+    }, DEBOUNCE_MS);
+  }
+
+  window.__attachViewportSync = function (gd, source) {
+    if (!gd || gd.__vpSyncSource === source) return;
+    gd.__vpSyncSource = source;
+    gd.on('plotly_relayout', function (ed) {
+      queueViewport(source, ed);
+    });
+  };
+
+  // The heatmap is re-initialised via Plotly.newPlot, which detaches event
+  // listeners. Re-attach the same debounced viewport listener after each newPlot.
+  window.__attachHeatSync = function (hg) {
+    if (!hg || hg.__heatSync) return;
+    hg.__heatSync = true;
+    window.__attachViewportSync(hg, 'heat');
+  };
+})();

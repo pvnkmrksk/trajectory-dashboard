@@ -98,8 +98,10 @@ transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
   hidden anchor trace supplies the Viridis colourbar). Velocity is
   rolling-smoothed (10 frames) and spike-clipped.
 - **Layout**: 2-col grid, `SUBPLOT_PX=480` per subplot → the figure is its
-  natural full height and the panel scrolls (no squishing). 1:1 aspect on
-  trajectories via `scaleanchor` (see §7 for why the heatmap can't use it).
+  natural full height and the panel scrolls (no squishing). Subplot vertical
+  spacing is deliberately tight so Plotly drag rectangles are easy to hit. 1:1
+  aspect on trajectories via `scaleanchor` (see §7 for why the heatmap can't use
+  it).
 - **Heatmap**: `build_heatmap_figure` bins X/Z with `np.histogram2d`.
   `bin_size` is in **data units** (blank → `default_bin_size` ≈ 1/20 of the
   95th-pct extent); `bound_pct` clips the extent to a central percentile;
@@ -131,12 +133,13 @@ transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
   the heatmap figure JSON to `heatmap-figure-store`, not to
   `heatmap-plot.figure`, so Dash's `Plotly.react` path never applies the heatmap
   subplot figure.
-- clientside viewport sync — records the current viewbox into `viewport-store`
-  (does NOT live-patch the other figure and does NOT call Python). This keeps
-  pan/zoom off the server and out of the URL-update loop. `apply_viewport_traj`
-  re-applies it to the trajectory on view switch (heatmap side is done in
-  `update_heatmap_only`). Both apply through `_apply_viewport`, which drops
-  implausible (>8× data extent) ranges from a mis-sized relayout.
+- debounced asset-level viewport sync — `assets/heatsync.js` attaches directly to
+  Plotly `plotly_relayout` and writes `viewport-store` only after an idle delay.
+  The plots' `relayoutData` props are NOT Dash callback Inputs. This keeps live
+  pan/wheel gestures out of Dash's callback scheduler and out of the URL-update
+  loop. `apply_viewport_traj` re-applies stored ranges to the trajectory on view
+  switch; heatmap applies only close, overlapping ranges so a stale URL viewbox
+  cannot make the binned heatmap a tiny island inside a mostly blank plot.
 - `switch_view` toggles panel `visibility`. Clientside callbacks drive playback,
   resize graphs shown for the first time, and `newPlot` the heatmap.
 - `export_html` rebuilds all figures server-side and emits one self-contained file.
@@ -152,7 +155,7 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Heatmap bin/bound/cmin/cmax | Heatmap store + variants only when Heatmap tab is visible | Trajectory/raw/ROI/polar |
 | Heatmap metric/scale | Clientside `Plotly.restyle` from the current binning variants | Server rebuild or `newPlot` |
 | ROI entered/trim while on heatmap | Heatmap store + current-mask variants only when Heatmap tab is visible | Trajectory/raw/ROI/polar |
-| Trajectory/heatmap pan/zoom | Clientside `viewport-store` only | URL writes, server rebuilds, live-patching hidden graphs |
+| Trajectory/heatmap pan/zoom | Debounced asset-level `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
 | View switch | Panel visibility; visible tab's lazy plot only | Rebuilding every tab |
 | ROI reach/show | Visible trajectory overlay patch; visible ROI tab rebuild | Hidden trajectory patches while another tab is active |
 | Polar controls / Re-Plot on Polar | Polar plot only | Trajectory/heatmap/raw |
@@ -199,7 +202,8 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
      recompute a wildly wrong aspect-locked range and fire a `relayout` that
      poisons the shared viewport — that was the intermittent "everything zooms
      out to an empty view" glitch. As a belt-and-braces guard, `_apply_viewport`
-     also rejects any stored range whose span is >8× the data's natural extent.
+     rejects broad stored ranges, and heatmaps validate against the binned figure
+     range rather than the raw data extent.
 
 4. **Panels hide with `visibility:hidden` + absolute positioning, not
    `display:none`.** `display:none` gives a graph 0 size at creation and it can't

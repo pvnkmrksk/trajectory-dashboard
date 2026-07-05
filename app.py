@@ -893,6 +893,11 @@ def _subplot_px(nrows, ncols):
     return SUBPLOT_PX_COMPACT if ncols == 2 and nrows <= 2 else SUBPLOT_PX
 
 
+def _subplot_spacing(nrows):
+    """Small vertical gaps keep multi-row Plotly drag targets easy to hit."""
+    return min(0.035, 0.10 / max(int(nrows) - 1, 1))
+
+
 def _group_frames(df, group_by, pool_mode, ncols):
     col_map = {"config": "ConfigFile", "vr": "VR", "flyid": "FlyID",
                "scene": "SceneName", "file": "SourceFolder"}
@@ -1194,7 +1199,8 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
     titles = [humanise_config(t) for t in group_names]
 
     fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=titles,
-                        horizontal_spacing=0.05, vertical_spacing=0.07)
+                        horizontal_spacing=0.05,
+                        vertical_spacing=_subplot_spacing(nrows))
 
     # Point budget. Animation uses a tighter budget because the figure embeds
     # every frame; static (animate off) can afford the full WebGL budget.
@@ -1459,7 +1465,8 @@ def _assemble_heatmap(bins, var, ncols, df):
     group_names, nrows = bins["group_names"], bins["nrows"]
     fig = make_subplots(rows=nrows, cols=ncols,
                         subplot_titles=[humanise_config(t) for t in group_names],
-                        horizontal_spacing=0.05, vertical_spacing=0.07)
+                        horizontal_spacing=0.05,
+                        vertical_spacing=_subplot_spacing(nrows))
     for idx, (z, cd) in enumerate(zip(var["z"], var["customdata"])):
         fig.add_trace(
             go.Heatmap(x=bins["xc"], y=bins["yc"], z=z, customdata=cd,
@@ -2474,7 +2481,8 @@ app.layout = html.Div([
                                   style={"width": "100%"}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
-                                       "transition": "opacity .2s"}),
+                                       "transition": "opacity .2s",
+                                       "pointerEvents": "none"}),
                 ], id="view-traj", style={**_PANEL_STYLE}),
 
                 # --- Heatmap ---
@@ -2485,7 +2493,8 @@ app.layout = html.Div([
                                   style={"width": "100%"}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
-                                       "transition": "opacity .2s"}),
+                                       "transition": "opacity .2s",
+                                       "pointerEvents": "none"}),
                     id="view-heat", style={**_PANEL_STYLE, "visibility": "hidden"}),
 
                 # --- Diagnostics ---
@@ -2503,7 +2512,8 @@ app.layout = html.Div([
                                   config={"scrollZoom": True}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
-                                       "transition": "opacity .2s"}),
+                                       "transition": "opacity .2s",
+                                       "pointerEvents": "none"}),
                 ], id="view-diag", style={**_PANEL_STYLE, "visibility": "hidden"}),
 
                 # --- ROI counts (violins) ---
@@ -2514,7 +2524,8 @@ app.layout = html.Div([
                                   style={"width": "100%"}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
-                                       "transition": "opacity .2s"}),
+                                       "transition": "opacity .2s",
+                                       "pointerEvents": "none"}),
                     id="view-roi", style={**_PANEL_STYLE, "visibility": "hidden"}),
 
                 # --- Polar ---
@@ -2525,7 +2536,8 @@ app.layout = html.Div([
                                   style={"width": "100%"}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
-                                       "transition": "opacity .2s"}),
+                                       "transition": "opacity .2s",
+                                       "pointerEvents": "none"}),
                     id="view-polar", style={**_PANEL_STYLE, "visibility": "hidden"}),
             ], style={"position": "relative", "flex": "1", "minHeight": "0",
                       "minWidth": "0"}),
@@ -3051,7 +3063,7 @@ def _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
     return result
 
 
-def _apply_viewport(fig, viewport, df):
+def _apply_viewport(fig, viewport, df, max_span_mult=3.0):
     """Re-apply a stored shared viewbox to `fig`, but reject garbage ranges.
 
     A scaleanchor plot that fires a relayout while briefly mis-sized can report a
@@ -3074,11 +3086,45 @@ def _apply_viewport(fig, viewport, df):
             return True
         span = abs(rng[1] - rng[0])
         nat = abs(natural[1] - natural[0]) or 1.0
-        return span <= nat * 8.0
+        return span <= nat * float(max_span_mult)
 
     if _ok(viewport.get("xaxis"), rx):
         fig.update_xaxes(range=viewport["xaxis"])
     if _ok(viewport.get("yaxis"), rz):
+        fig.update_yaxes(range=viewport["yaxis"])
+
+
+def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
+    """Apply a viewport only if it is close to the figure's own current range.
+
+    Heatmap bounds can be clipped (`hbound`), so validating against the raw data
+    extent can accept a stale, much broader viewbox that leaves the actual
+    heatmap as a tiny island and makes wheel-zoom feel like it vanished.
+    """
+    if not viewport or viewport.get("reset"):
+        return
+
+    def _layout_range(axis_name):
+        ax = getattr(fig.layout, axis_name, None)
+        rng = getattr(ax, "range", None) if ax is not None else None
+        return list(rng) if rng and len(rng) == 2 else None
+
+    def _ok(vp_rng, natural):
+        if not vp_rng or len(vp_rng) != 2 or natural is None:
+            return False
+        span = abs(float(vp_rng[1]) - float(vp_rng[0]))
+        nat = abs(float(natural[1]) - float(natural[0])) or 1.0
+        if span > nat * float(max_span_mult):
+            return False
+        lo = max(min(vp_rng), min(natural))
+        hi = min(max(vp_rng), max(natural))
+        return hi > lo
+
+    xr = _layout_range("xaxis")
+    yr = _layout_range("yaxis")
+    if _ok(viewport.get("xaxis"), xr):
+        fig.update_xaxes(range=viewport["xaxis"])
+    if _ok(viewport.get("yaxis"), yr):
         fig.update_yaxes(range=viewport["yaxis"])
 
 
@@ -3323,7 +3369,7 @@ def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
         bin_size=hm_binsize, bound_pct=hm_bound if hm_bound else 100,
         cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange, do_rebase=_on(rebase),
         entered_only=_on(roi_entered), trim_tail=_on(roi_trim))
-    _apply_viewport(heat, viewport, df_f)
+    _apply_viewport_to_current_range(heat, viewport, max_span_mult=1.5)
     _LAST_HEAT_SIG["v"] = sig
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
     n_segs_before = int(df_sub["_seg_id"].nunique()) if len(df_sub) else 0
@@ -3359,33 +3405,6 @@ def _extract_axis_ranges(relayout):
     return {k: v for k, v in out.items() if None not in v}
 
 
-# Viewport sync is clientside so pan/zoom never queues Python callbacks. It only
-# records the latest viewbox in dcc.Store; figures are not patched live.
-app.clientside_callback(
-    "function(trajRelayout, heatRelayout){"
-    "var cb=window.dash_clientside&&window.dash_clientside.callback_context;"
-    "var trig=(cb&&cb.triggered&&cb.triggered[0]&&cb.triggered[0].prop_id)||'';"
-    "var r=trig.indexOf('heatmap-plot')===0?heatRelayout:trajRelayout;"
-    "var no=window.dash_clientside.no_update;"
-    "if(!r)return no;"
-    "if(window.__hmSuppress&&trig.indexOf('heatmap-plot')===0)return no;"
-    "var ks=Object.keys(r);"
-    "var src=trig.indexOf('heatmap-plot')===0?'heat':'traj';"
-    "for(var i=0;i<ks.length;i++){if(ks[i].slice(-9)==='autorange'||r.autosize){return {source:src,reset:true};}}"
-    "var out={source:src};"
-    "ks.forEach(function(k){var m=k.match(/^(x|y)axis\\d*\\.range\\[(0|1)\\]$/);"
-    "if(!m)return;var ax=m[1]==='x'?'xaxis':'yaxis';"
-    "if(!out[ax])out[ax]=[null,null];out[ax][parseInt(m[2])]=r[k];});"
-    "if(out.xaxis&&(out.xaxis[0]===null||out.xaxis[1]===null))delete out.xaxis;"
-    "if(out.yaxis&&(out.yaxis[0]===null||out.yaxis[1]===null))delete out.yaxis;"
-    "return (out.xaxis||out.yaxis)?out:no;}",
-    Output("viewport-store", "data"),
-    Input("trajectory-plot", "relayoutData"),
-    Input("heatmap-plot", "relayoutData"),
-    prevent_initial_call=True,
-)
-
-
 # Re-apply a stored trajectory/or-restored viewbox to the heatmap on reveal,
 # clientside only. Ignore viewport events that came from the heatmap itself so a
 # live pan/zoom gesture is not followed by a redundant relayout of the same plot.
@@ -3397,7 +3416,12 @@ app.clientside_callback(
     "if(trig.indexOf('viewport-store')===0&&vp.source==='heat')return '';"
     "setTimeout(function(){var g=document.querySelector('#heatmap-plot .js-plotly-plot');"
     "if(!g||!window.Plotly)return;var u={};"
-    "if(vp.xaxis)u['xaxis.range']=vp.xaxis;if(vp.yaxis)u['yaxis.range']=vp.yaxis;"
+    "function ok(r,cur){if(!r||!cur)return false;"
+    "var s=Math.abs(r[1]-r[0]), n=Math.abs(cur[1]-cur[0])||1;"
+    "if(s>1.5*n)return false;return Math.min(r[1],cur[1])>Math.max(r[0],cur[0]);}"
+    "var lx=g.layout||{};"
+    "if(ok(vp.xaxis,lx.xaxis&&lx.xaxis.range))u['xaxis.range']=vp.xaxis;"
+    "if(ok(vp.yaxis,lx.yaxis&&lx.yaxis.range))u['yaxis.range']=vp.yaxis;"
     "if(!Object.keys(u).length)return;window.__hmSuppress=true;"
     "try{window.Plotly.relayout(g,u);}catch(e){}"
     "setTimeout(function(){window.__hmSuppress=false;},180);},120);return '';}",
@@ -3661,6 +3685,21 @@ def apply_viewport_traj(view, vp):
     if vp.get("yaxis"):
         patch["layout"]["yaxis"]["range"] = vp["yaxis"]
     return patch
+
+
+# Attach a debounced Plotly relayout listener directly to the visible
+# trajectory graph. This avoids feeding every drag/wheel event through Dash's
+# `relayoutData` callback machinery while the gesture is in progress.
+app.clientside_callback(
+    "function(fig, view){setTimeout(function(){"
+    "var g=document.querySelector('#trajectory-plot .js-plotly-plot');"
+    "if(g&&window.__attachViewportSync){window.__attachViewportSync(g,'traj');}"
+    "},120);return '';}",
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("trajectory-plot", "figure"),
+    Input("view-mode", "value"),
+    prevent_initial_call=True,
+)
 
 
 # The heatmap uses a 1:1 aspect lock (scaleanchor). Dash's Plotly.react update
