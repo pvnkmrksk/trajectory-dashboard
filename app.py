@@ -394,6 +394,40 @@ def roi_config_summary(table: pd.DataFrame) -> dict:
     return out
 
 
+def time_to_target_table(df, rois_by_cfg, reach) -> pd.DataFrame:
+    """Per trial that reached a side: seconds from the trial's start to the first
+    sample within the reach radius of that side's ROI. Vectorised per config."""
+    cols = ["ConfigFile", "side", "_seg_id", "t"]
+    if df is None or len(df) == 0 or not rois_by_cfg:
+        return pd.DataFrame(columns=cols)
+    reach2 = float(reach) ** 2
+    parts = []
+    for cfg, sub in df.groupby("ConfigFile", sort=False):
+        rois = rois_by_cfg.get(cfg)
+        if not rois:
+            continue
+        gx = sub["GameObjectPosX"].to_numpy(); gz = sub["GameObjectPosZ"].to_numpy()
+        t = sub["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64") / 1e9
+        seg = sub["_seg_id"].to_numpy()
+        starts = np.concatenate(([0], np.flatnonzero(seg[1:] != seg[:-1]) + 1))
+        lens = np.diff(np.concatenate((starts, [len(sub)])))
+        rel_t = t - np.repeat(t[starts], lens)     # seconds since each trial's start
+        for side in ("left", "right"):
+            centers = [r for r in rois if r["side"] == side]
+            if not centers:
+                continue
+            inside = np.zeros(len(sub), bool)
+            for r in centers:
+                inside |= (gx - r["x"]) ** 2 + (gz - r["z"]) ** 2 <= reach2
+            first_t = np.minimum.reduceat(np.where(inside, rel_t, np.inf), starts)
+            reached = np.isfinite(first_t)
+            if reached.any():
+                parts.append(pd.DataFrame({
+                    "ConfigFile": cfg, "side": side,
+                    "_seg_id": seg[starts][reached], "t": first_t[reached]}))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+
+
 def trim_after_roi_exit(df, rois_by_cfg, reach) -> pd.DataFrame:
     """For each trial that ENTERS then LEAVES an ROI, drop every sample after the
     first exit (keep the approach + first contact). Trials that never enter, or
@@ -1516,10 +1550,12 @@ def _msg_figure(text, height=440):
 
 
 def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
-    """Per-animal fraction of trials reaching the left vs right ROI as a paired
-    swarm: one jittered point per animal per side, a faint line pairing each
-    animal's left↔right, and a median bar for each side. `df` is already filtered
-    to the visible subset. Pass a precomputed `table` to skip recomputation."""
+    """Two stacked panels per the ROI tab:
+      1. Paired swarm — per-animal fraction of trials reaching left vs right, with
+         faint left↔right pairing lines and a median bar per side.
+      2. Split violin of time-to-reach the target (left half / right half), area
+         proportional to the number of trials that reached (scalemode='count').
+    `df` is already the filtered/visible subset; pass `table` to skip recompute."""
     tbl = roi_reached_table(df, rois_by_cfg, reach) if table is None else table
     if tbl is None or len(tbl) == 0:
         return _msg_figure("No left/right ROI targets in these configs — "
@@ -1537,14 +1573,9 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     jit = lambda: (rng.random(len(grp)) - 0.5) * 0.18
     lx, rx = base - 0.2 + jit(), base + 0.2 + jit()
     ly, ry = grp["frac_left"].to_numpy(), grp["frac_right"].to_numpy()
-
-    # pairing lines: (left)-(right)-(gap) per animal
     px = np.empty(len(grp) * 3); px[0::3], px[1::3], px[2::3] = lx, rx, np.nan
     py = np.empty(len(grp) * 3); py[0::3], py[1::3], py[2::3] = ly, ry, np.nan
-
-    # median bars per config/side
-    med = grp.groupby("label").agg(ml=("frac_left", "median"),
-                                   mr=("frac_right", "median"))
+    med = grp.groupby("label").agg(ml=("frac_left", "median"), mr=("frac_right", "median"))
     mlx, mly, mrx, mry = [], [], [], []
     for lab, i in xpos.items():
         if lab in med.index:
@@ -1552,38 +1583,48 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
             mrx += [i + 0.04, i + 0.36, None]; mry += [med.loc[lab, "mr"]] * 2 + [None]
 
     lc, rc = _ROI_SIDE_COLOR["left"], _ROI_SIDE_COLOR["right"]
-    fig = go.Figure()
+    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.14, subplot_titles=(
+        f"Fraction of trials reaching each ROI — per animal "
+        f"(reach {reach:g} u · {n_animals} animals; bars = median)",
+        "Time to reach target (split violin; area ∝ trials reached)"))
+
     fig.add_trace(go.Scatter(x=px.tolist(), y=py.tolist(), mode="lines",
-                             line=dict(color="rgba(120,120,120,0.35)", width=1),
-                             hoverinfo="skip", showlegend=False))
-    fig.add_trace(go.Scatter(x=lx.tolist(), y=ly.tolist(), mode="markers",
-                             name="Left", legendgroup="left",
-                             marker=dict(color=lc, size=6, opacity=0.75,
-                                         line=dict(width=0.5, color="#333")),
-                             customdata=grp["animal"],
-                             hovertemplate="Left %{y:.2f}<br>%{customdata}<extra></extra>"))
-    fig.add_trace(go.Scatter(x=rx.tolist(), y=ry.tolist(), mode="markers",
-                             name="Right", legendgroup="right",
-                             marker=dict(color=rc, size=6, opacity=0.75,
-                                         line=dict(width=0.5, color="#333")),
-                             customdata=grp["animal"],
-                             hovertemplate="Right %{y:.2f}<br>%{customdata}<extra></extra>"))
+        line=dict(color="rgba(120,120,120,0.35)", width=1),
+        hoverinfo="skip", showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=lx.tolist(), y=ly.tolist(), mode="markers", name="Left",
+        legendgroup="left", marker=dict(color=lc, size=6, opacity=0.75,
+        line=dict(width=0.5, color="#333")), customdata=grp["animal"],
+        hovertemplate="Left %{y:.2f}<br>%{customdata}<extra></extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=rx.tolist(), y=ry.tolist(), mode="markers", name="Right",
+        legendgroup="right", marker=dict(color=rc, size=6, opacity=0.75,
+        line=dict(width=0.5, color="#333")), customdata=grp["animal"],
+        hovertemplate="Right %{y:.2f}<br>%{customdata}<extra></extra>"), row=1, col=1)
     fig.add_trace(go.Scatter(x=mlx, y=mly, mode="lines", showlegend=False,
-                             line=dict(color=lc, width=3), hoverinfo="skip"))
+        line=dict(color=lc, width=3), hoverinfo="skip"), row=1, col=1)
     fig.add_trace(go.Scatter(x=mrx, y=mry, mode="lines", showlegend=False,
-                             line=dict(color=rc, width=3), hoverinfo="skip"))
-    fig.update_layout(
-        template="plotly_white", height=470,
-        title=dict(text=f"Fraction of trials reaching each ROI — per animal "
-                        f"(reach {reach:g} u · {n_animals} animals; bars = median)",
-                   font_size=13),
-        yaxis=dict(title="fraction of trials reaching", range=[-0.03, 1.03],
-                   zeroline=True),
-        xaxis=dict(title="config", tickmode="array",
-                   tickvals=list(range(len(labels))), ticktext=labels,
-                   range=[-0.6, len(labels) - 0.4]),
-        legend=dict(orientation="h", y=1.02, yanchor="bottom", x=1, xanchor="right"),
-        margin=dict(l=60, r=20, t=50, b=90))
+        line=dict(color=rc, width=3), hoverinfo="skip"), row=1, col=1)
+
+    # --- panel 2: time-to-target split violin ---
+    ttt = time_to_target_table(df, rois_by_cfg, reach)
+    if len(ttt):
+        ttt["label"] = ttt["ConfigFile"].map(humanise_config)
+        for side, sd, color in (("left", "negative", lc), ("right", "positive", rc)):
+            s = ttt[ttt["side"] == side]
+            if not len(s):
+                continue
+            fig.add_trace(go.Violin(
+                x=s["label"], y=s["t"], side=sd, scalemode="count", scalegroup="ttt",
+                line_color=color, fillcolor=color, opacity=0.55, points=False,
+                meanline_visible=True, showlegend=False, spanmode="hard",
+                hovertemplate=side + " %{y:.1f}s<extra></extra>"), row=2, col=1)
+    fig.update_layout(template="plotly_white", height=760, violinmode="overlay",
+        legend=dict(orientation="h", y=1.05, yanchor="bottom", x=1, xanchor="right"),
+        margin=dict(l=60, r=20, t=50, b=80))
+    fig.update_yaxes(title_text="fraction reaching", range=[-0.03, 1.03], row=1, col=1)
+    fig.update_yaxes(title_text="time to reach (s)", rangemode="tozero", row=2, col=1)
+    fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
+                     ticktext=labels, range=[-0.6, len(labels) - 0.4], row=1, col=1)
+    fig.update_xaxes(title_text="config", row=2, col=1)
     return fig
 
 
@@ -2293,9 +2334,11 @@ app.layout = html.Div([
                         overlay_style={"visibility": "visible", "opacity": 0.55,
                                        "transition": "opacity .2s"}),
                     id="view-polar", style={**_PANEL_STYLE, "visibility": "hidden"}),
-            ], style={"position": "relative", "flex": "1", "minHeight": "0"}),
+            ], style={"position": "relative", "flex": "1", "minHeight": "0",
+                      "minWidth": "0"}),
         ], style={"flex": "1", "padding": "4px 8px", "display": "flex",
-                   "flexDirection": "column", "height": "calc(100vh - 46px)"}),
+                   "flexDirection": "column", "height": "calc(100vh - 46px)",
+                   "minWidth": "0", "overflow": "hidden"}),
     ], style={"display": "flex", "height": "calc(100vh - 46px)"}),
 
     # Stores
@@ -3382,6 +3425,22 @@ app.clientside_callback(
     "},130);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
     Input("polar-plot", "figure"),
+    Input("view-mode", "value"),
+    prevent_initial_call=True,
+)
+
+
+# The ROI-counts plot is lazily built (SVG, born hidden), so its figure arrives
+# after the generic reveal-resize has already run — leaving it drawn at a narrow
+# width. Resize it once its own figure lands.
+app.clientside_callback(
+    "function(fig, view){if(view!=='roi')return '';"
+    "function rs(){var g=document.querySelector('#roi-plot .js-plotly-plot');"
+    "if(g&&window.Plotly&&window.Plotly.Plots){try{window.Plotly.Plots.resize(g);}"
+    "catch(e){}}}"
+    "[150,450,900].forEach(function(d){setTimeout(rs,d);});return '';}",
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("roi-plot", "figure"),
     Input("view-mode", "value"),
     prevent_initial_call=True,
 )
