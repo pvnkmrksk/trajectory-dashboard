@@ -2680,6 +2680,11 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     want_rois = _on(roi_show) and bool(rois)
     df_view, table = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
     roi_counts = roi_config_summary(table) if (want_rois and table is not None) else None
+    # Record the mask state this trajectory reflects, so returning to the traj tab
+    # after fiddling masks on another tab rebuilds only when it actually changed.
+    _mask_on = _on(roi_trim) or _on(roi_entered)
+    _LAST_TRAJ_SIG["v"] = (tuple(roi_trim or []), tuple(roi_entered or []),
+                           reach if _mask_on else None)
     roi_fig = no_update            # the ROI violin is lazily built by its own tab
     if want_rois and view == "roi" and table is not None:
         roi_fig = build_roi_violin_figure(df_f, rois, reach, table=table)
@@ -2970,17 +2975,32 @@ def update_roi_overlay(reach, roi_show, pattern, group_by, pool_mode, ncols, reb
     return patch
 
 
-# Toggling either ROI view-mask changes the plotted *data*, so trigger a replot.
+# The ROI masks change the plotted DATA, but the heatmap swaps them client-side.
+# So a mask toggle only needs to rebuild the *trajectory* — and only when the
+# trajectory is actually on screen. While you're on the heatmap (or any other
+# tab) toggling entered/trim does NOT replot anything: no spinner, no wait. When
+# you return to the trajectory it rebuilds once, iff the mask changed since it was
+# last drawn (compared against _LAST_TRAJ_SIG, which update_plots records).
+_LAST_TRAJ_SIG: dict = {"v": None}
+
+
 @app.callback(
     Output("btn-plot", "n_clicks", allow_duplicate=True),
     Input("roi-trim", "value"),
     Input("roi-entered", "value"),
+    Input("roi-reach", "value"),
+    Input("view-mode", "value"),
     State("btn-plot", "n_clicks"),
     State("store-glob", "data"),
     prevent_initial_call=True,
 )
-def roi_mask_triggers_replot(roi_trim, roi_entered, clicks, pattern):
-    if not pattern:
+def traj_mask_refresh(roi_trim, roi_entered, roi_reach, view, clicks, pattern):
+    if not pattern or view != "traj":
+        return no_update
+    mask_on = _on(roi_trim) or _on(roi_entered)
+    sig = (tuple(roi_trim or []), tuple(roi_entered or []),
+           roi_reach if mask_on else None)
+    if sig == _LAST_TRAJ_SIG["v"]:      # nothing that affects the trajectory changed
         return no_update
     return (clicks or 0) + 1
 
