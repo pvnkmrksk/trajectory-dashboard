@@ -92,6 +92,7 @@
     }
     function dragOn(e) {
       e.preventDefault(); e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
       if (e.type === 'dragenter') dragDepth++;
       hi(true);
     }
@@ -101,10 +102,10 @@
       if (e.type === 'dragend' || dragDepth === 0) hi(false);
     }
     ['dragenter', 'dragover'].forEach(function (ev) {
-      document.addEventListener(ev, dragOn, false);
+      document.addEventListener(ev, dragOn, true);
     });
     ['dragleave', 'dragend'].forEach(function (ev) {
-      document.addEventListener(ev, dragOff, false);
+      document.addEventListener(ev, dragOff, true);
     });
 
     function handleDrop(e) {
@@ -158,7 +159,7 @@
       roots.forEach(function (r) { walk(r, ''); });
       setTimeout(function () { if (pending === 0) finish(); }, 80);
     }
-    document.addEventListener('drop', handleDrop, false);
+    document.addEventListener('drop', handleDrop, true);
   }
 
   if (document.readyState !== 'loading') init();

@@ -274,6 +274,45 @@ def rois_by_config(metas: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
+def _canonical_side_targets(rois_by_cfg) -> dict[str, list[dict]]:
+    """Representative left/right target centres from the loaded config set."""
+    out = {}
+    for side in ("left", "right"):
+        vals = [r for rois in (rois_by_cfg or {}).values()
+                for r in rois if r.get("side") == side]
+        if vals:
+            out[side] = [dict(x=float(np.median([r["x"] for r in vals])),
+                              z=float(np.median([r["z"] for r in vals])),
+                              side=side, inferred=True)]
+    return out
+
+
+def _heading_targets_for_config(cfg, rois_by_cfg, canonical) -> dict[str, list[dict]]:
+    """Left/right heading targets for a config, with inferred missing sides.
+
+    Choice/none-like configs sometimes lack one or both physical target objects,
+    but for heading diagnostics we still want the same left/right reference frame.
+    Missing targets come from the loaded config set; if only one side exists, the
+    opposite side is mirrored in X as a last-resort imagined counterpart.
+    """
+    actual = {side: [r for r in (rois_by_cfg.get(cfg, []) if rois_by_cfg else [])
+                     if r.get("side") == side]
+              for side in ("left", "right")}
+    out = {side: list(actual[side]) for side in ("left", "right") if actual[side]}
+    for side, other in (("left", "right"), ("right", "left")):
+        if side in out:
+            continue
+        if canonical.get(side):
+            out[side] = [dict(canonical[side][0])]
+        elif actual.get(other):
+            r = actual[other][0]
+            out[side] = [dict(r, x=-float(r["x"]), side=side, inferred=True)]
+        elif canonical.get(other):
+            r = canonical[other][0]
+            out[side] = [dict(r, x=-float(r["x"]), side=side, inferred=True)]
+    return out
+
+
 # Readable stimulus name per object type. Extend as new stimuli appear.
 _OBJECT_NAME = {
     "tree01": "tree", "tree01_windy": "windytree", "tree01_upside": "upsidetree",
@@ -372,7 +411,7 @@ def roi_reached_table(df, rois_by_cfg, reach) -> pd.DataFrame:
         return pd.DataFrame(columns=_ROI_TABLE_COLS)
     reach2 = float(reach) ** 2
     parts = []
-    for cfg, sub in df.groupby("ConfigFile", sort=False):
+    for cfg, sub in df.groupby("ConfigFile", sort=False, observed=True):
         rois = rois_by_cfg.get(cfg)
         if not rois:
             continue
@@ -430,7 +469,7 @@ def time_to_target_table(df, rois_by_cfg, reach) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     reach2 = float(reach) ** 2
     parts = []
-    for cfg, sub in df.groupby("ConfigFile", sort=False):
+    for cfg, sub in df.groupby("ConfigFile", sort=False, observed=True):
         rois = rois_by_cfg.get(cfg)
         if not rois:
             continue
@@ -457,12 +496,12 @@ def time_to_target_table(df, rois_by_cfg, reach) -> pd.DataFrame:
 
 
 def heading_target_angle_table(df, rois_by_cfg, moving_thresh=None) -> pd.DataFrame:
-    """Per-sample signed heading error relative to the nearest target centre.
+    """Per-sample signed heading error relative to left and right target centres.
 
-    Angles are degrees in [-180, 180]. For each sample, compare the instantaneous
-    heading with the vector from the current position to each target centre, then
-    keep the target with the smallest absolute signed error. 0 means the animal
-    is heading directly at that target centre.
+    Angles are degrees in [-180, 180]. Each valid sample contributes separately
+    to the left and right target distributions. Configs without explicit targets
+    use inferred left/right centres from the loaded config set, so "none" or
+    one-target trials still share the same target-reference frame.
     """
     cols = ["ConfigFile", "side", "_seg_id", "angle_deg"]
     if df is None or len(df) == 0 or not rois_by_cfg:
@@ -485,43 +524,44 @@ def heading_target_angle_table(df, rois_by_cfg, moving_thresh=None) -> pd.DataFr
 
     parts = []
     cfg_arr = df["ConfigFile"].to_numpy()
-    for cfg, sub in df.groupby("ConfigFile", sort=False):
-        rois = [r for r in rois_by_cfg.get(cfg, []) if r["side"] in ("left", "right")]
-        if not rois:
+    canonical = _canonical_side_targets(rois_by_cfg)
+    for cfg, sub in df.groupby("ConfigFile", sort=False, observed=True):
+        side_targets = _heading_targets_for_config(cfg, rois_by_cfg, canonical)
+        if not side_targets:
             continue
         idx = np.flatnonzero(cfg_arr == cfg)
         px = x[idx]; pz = z[idx]
         hx = dx[idx]; hz = dz[idx]
         m0 = valid[idx]
         htheta = np.degrees(np.arctan2(hx, hz))
-        best = np.full(len(sub), np.nan)
-        best_abs = np.full(len(sub), np.inf)
-        best_side = np.full(len(sub), "", dtype=object)
-        for r in rois:
-            ttheta = np.degrees(np.arctan2(r["x"] - px, r["z"] - pz))
-            delta = ((htheta - ttheta + 180.0) % 360.0) - 180.0
-            use = np.abs(delta) < best_abs
-            best_abs[use] = np.abs(delta[use])
-            best[use] = delta[use]
-            best_side[use] = r["side"]
-        m = m0 & np.isfinite(best) & np.isin(best_side, ["left", "right"])
-        if m.any():
-            parts.append(pd.DataFrame({
-                "ConfigFile": cfg, "side": best_side[m],
-                "_seg_id": sub["_seg_id"].to_numpy()[m],
-                "angle_deg": best[m]}))
+        for side in ("left", "right"):
+            targets = side_targets.get(side) or []
+            if not targets:
+                continue
+            best = np.full(len(sub), np.nan)
+            best_abs = np.full(len(sub), np.inf)
+            for r in targets:
+                ttheta = np.degrees(np.arctan2(r["x"] - px, r["z"] - pz))
+                delta = ((htheta - ttheta + 180.0) % 360.0) - 180.0
+                use = np.abs(delta) < best_abs
+                best_abs[use] = np.abs(delta[use])
+                best[use] = delta[use]
+            m = m0 & np.isfinite(best)
+            if m.any():
+                parts.append(pd.DataFrame({
+                    "ConfigFile": cfg, "side": side,
+                    "_seg_id": sub["_seg_id"].to_numpy()[m],
+                    "angle_deg": best[m]}))
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
 
 
-def trim_after_roi_exit(df, rois_by_cfg, reach) -> pd.DataFrame:
-    """For each trial that ENTERS then LEAVES an ROI, drop every sample after the
-    first exit (keep the approach + first contact). Trials that never enter, or
-    enter and stay, are untouched. Vectorised per config."""
+def roi_exit_keep_mask(df, rois_by_cfg, reach) -> np.ndarray:
+    """Boolean mask for keeping samples through the first post-ROI exit."""
     if df is None or len(df) == 0 or not rois_by_cfg:
-        return df
+        return np.ones(0 if df is None else len(df), bool)
     reach2 = float(reach) ** 2
     keep = pd.Series(True, index=df.index)
-    for cfg, sub in df.groupby("ConfigFile", sort=False):
+    for cfg, sub in df.groupby("ConfigFile", sort=False, observed=True):
         rois = rois_by_cfg.get(cfg)
         if not rois:
             continue
@@ -540,11 +580,75 @@ def trim_after_roi_exit(df, rois_by_cfg, reach) -> pd.DataFrame:
         expos = pd.Series(np.where(exit_flag, pos, big), index=sub.index)
         first_exit = expos.groupby(seg, sort=False).transform("min").to_numpy()
         keep.loc[sub.index] = pos <= first_exit
-    return df[keep.to_numpy()]
+    return keep.to_numpy()
+
+
+def trim_after_roi_exit(df, rois_by_cfg, reach) -> pd.DataFrame:
+    """For each trial that ENTERS then LEAVES an ROI, drop every sample after the
+    first exit (keep the approach + first contact). Trials that never enter, or
+    enter and stay, are untouched. Vectorised per config."""
+    if df is None or len(df) == 0 or not rois_by_cfg:
+        return df
+    return df[roi_exit_keep_mask(df, rois_by_cfg, reach)]
 
 
 def _on(v):
     return bool(v) and "on" in (v or [])
+
+
+def _jump_buffer_seconds(v) -> float:
+    """Jump buffer UI is milliseconds; old URLs/direct calls may pass seconds."""
+    if v in (None, ""):
+        return 0.1
+    try:
+        f = float(v)
+    except Exception:
+        return 0.1
+    # Back-compat: historical URLs used jb=0.1 for 100 ms.
+    return f / 1000.0 if f > 10 else f
+
+
+def _compact_count(n) -> str:
+    n = 0 if n is None else float(n)
+    a = abs(n)
+    if a >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if a >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{int(n)}"
+
+
+_ROI_MASK_CACHE: dict = {}
+_ROI_MASK_CACHE_ORDER: list = []
+_ROI_MASK_CACHE_MAX = 8
+
+
+def _roi_mask_key(df, pattern, reach):
+    return (id(df), len(df), pattern, round(float(reach or 3.0), 6))
+
+
+def _roi_masks(df_f, pattern, reach):
+    """Cached ROI reached table + per-row masks for a filtered frame."""
+    key = _roi_mask_key(df_f, pattern, reach)
+    if key in _ROI_MASK_CACHE:
+        return _ROI_MASK_CACHE[key]
+    rois = rois_by_config(_load_data(pattern)[2])
+    if not rois:
+        return None, set(), np.ones(0 if df_f is None else len(df_f), bool), None
+    reach_v = float(reach) if reach else 3.0
+    table = roi_reached_table(df_f, rois, reach_v)
+    entered_ids = set()
+    if table is not None and len(table):
+        entered_ids = set(table.loc[
+            table["reached_left"] | table["reached_right"], "_seg_id"])
+    trim_keep = roi_exit_keep_mask(df_f, rois, reach_v)
+    result = (table, entered_ids, trim_keep, rois)
+    _ROI_MASK_CACHE[key] = result
+    _ROI_MASK_CACHE_ORDER.append(key)
+    if len(_ROI_MASK_CACHE_ORDER) > _ROI_MASK_CACHE_MAX:
+        old = _ROI_MASK_CACHE_ORDER.pop(0)
+        _ROI_MASK_CACHE.pop(old, None)
+    return result
 
 
 def _roi_apply(df_f, pattern, reach, entered_only, trim):
@@ -559,16 +663,15 @@ def _roi_apply(df_f, pattern, reach, entered_only, trim):
     if df_f is None or len(df_f) == 0:
         return df_f, None
     reach_v = float(reach) if reach else 3.0
-    rois = rois_by_config(_load_data(pattern)[2])
+    table, entered_ids, trim_keep, rois = _roi_masks(df_f, pattern, reach_v)
     if not rois:
         return df_f, None
-    table = roi_reached_table(df_f, rois, reach_v)
-    df_view = df_f
-    if entered_only and len(table):
-        entered = table.loc[table["reached_left"] | table["reached_right"], "_seg_id"]
-        df_view = df_f[df_f["_seg_id"].isin(set(entered))]
+    keep = np.ones(len(df_f), bool)
+    if entered_only and entered_ids:
+        keep &= df_f["_seg_id"].isin(entered_ids).to_numpy()
     if trim:
-        df_view = trim_after_roi_exit(df_view, rois, reach_v)
+        keep &= trim_keep
+    df_view = df_f[keep] if (entered_only or trim) else df_f
     return df_view, table
 
 
@@ -644,6 +747,22 @@ def load_csv_fast(filepath: str) -> pd.DataFrame | None:
     df["_seg_id"] = (df["SourceFile"] + "_T"
                      + df["CurrentTrial"].astype("int64").astype(str) + "_S"
                      + df["CurrentStep"].astype("int64").astype(str))
+    base_keep = {
+        "Current Time", "CurrentTrial", "CurrentStep", "GameObjectPosX",
+        "GameObjectPosZ", "ConfigFile", "SceneName", "VR", "FlyID", "Sex",
+        "SourceFolder", "SourceFile", "_seg_id",
+    }
+    numeric_keep = {
+        c for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c]) and c not in base_keep
+        and not df[c].isna().all()
+    }
+    keep_cols = [c for c in df.columns if c in (base_keep | numeric_keep)]
+    df = df[keep_cols]
+    for c in ("ConfigFile", "SceneName", "VR", "FlyID", "Sex",
+              "SourceFolder", "SourceFile"):
+        if c in df.columns:
+            df[c] = df[c].astype("category")
     return df
 
 
@@ -1632,11 +1751,12 @@ def build_raw_trace_figure(df, columns, max_points=None):
             continue
         fig.add_trace(
             go.Scatter(x=sub["Current Time"], y=sub[col], mode="lines",
+                       opacity=0.55,
                        line=dict(width=1, color=COLORS[i % len(COLORS)]), name=col),
             row=i + 1, col=1,
         )
     fig.update_layout(height=max(180, n * 140), margin=dict(l=50, r=10, t=25, b=20),
-                       template="plotly_white", showlegend=False)
+                       template="plotly_white", showlegend=False, dragmode="pan")
     return fig
 
 
@@ -1701,7 +1821,7 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
          faint left↔right pairing lines and a median bar per side.
       2. Split violin of time-to-reach the target (left half / right half), area
          proportional to the number of trials that reached (scalemode='count').
-      3. Violin of signed heading error to the nearest target centre
+      3. Split violin of signed heading error to left/right target centres
          (0° = pointing at target, span -180..180°).
     `df` is already the filtered/visible subset; pass `table` to skip recompute."""
     tbl = roi_reached_table(df, rois_by_cfg, reach) if table is None else table
@@ -1710,7 +1830,10 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
                            "nothing to count. Load Choice/BinaryChoice data.")
     grp = tbl.groupby(["ConfigFile", "animal"], sort=False).agg(
         frac_left=("reached_left", "mean"),
-        frac_right=("reached_right", "mean")).reset_index()
+        frac_right=("reached_right", "mean"),
+        reach_left=("reached_left", "sum"),
+        reach_right=("reached_right", "sum"),
+        trials=("_seg_id", "size")).reset_index()
     grp["label"] = grp["ConfigFile"].map(humanise_config)
     labels = sorted(grp["label"].unique())
     xpos = {lab: i for i, lab in enumerate(labels)}
@@ -1734,20 +1857,26 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     fig = make_subplots(rows=3, cols=1, vertical_spacing=0.10, subplot_titles=(
         f"Fraction of trials reaching each ROI — per animal "
         f"(reach {reach:g} u · {n_animals} animals; bars = median)",
-        "Time to reach target (split violin; area ∝ trials reached)",
-        "Heading error to nearest target centre (0° = target; bars = IQR/median)"))
+        "Time to reach target (split violin; area ∝ trials reached; box = median/IQR)",
+        "Heading error to left/right target centres (split violin; box = median/IQR)"))
 
     fig.add_trace(go.Scatter(x=px.tolist(), y=py.tolist(), mode="lines",
         line=dict(color="rgba(120,120,120,0.35)", width=1),
         hoverinfo="skip", showlegend=False), row=1, col=1)
+    left_cd = grp[["animal", "reach_left", "trials"]].to_numpy()
+    right_cd = grp[["animal", "reach_right", "trials"]].to_numpy()
     fig.add_trace(go.Scatter(x=lx.tolist(), y=ly.tolist(), mode="markers", name="Left",
         legendgroup="left", marker=dict(color=lc, size=6, opacity=0.75,
-        line=dict(width=0.5, color="#333")), customdata=grp["animal"],
-        hovertemplate="Left %{y:.2f}<br>%{customdata}<extra></extra>"), row=1, col=1)
+        line=dict(width=0.5, color="#333")), customdata=left_cd,
+        hovertemplate=("Left %{customdata[1]:.0f}/%{customdata[2]:.0f} trials"
+                       "<br>fraction %{y:.2f}<br>%{customdata[0]}<extra></extra>")),
+        row=1, col=1)
     fig.add_trace(go.Scatter(x=rx.tolist(), y=ry.tolist(), mode="markers", name="Right",
         legendgroup="right", marker=dict(color=rc, size=6, opacity=0.75,
-        line=dict(width=0.5, color="#333")), customdata=grp["animal"],
-        hovertemplate="Right %{y:.2f}<br>%{customdata}<extra></extra>"), row=1, col=1)
+        line=dict(width=0.5, color="#333")), customdata=right_cd,
+        hovertemplate=("Right %{customdata[1]:.0f}/%{customdata[2]:.0f} trials"
+                       "<br>fraction %{y:.2f}<br>%{customdata[0]}<extra></extra>")),
+        row=1, col=1)
     fig.add_trace(go.Scatter(x=mlx, y=mly, mode="lines", showlegend=False,
         line=dict(color=lc, width=3), hoverinfo="skip"), row=1, col=1)
     fig.add_trace(go.Scatter(x=mrx, y=mry, mode="lines", showlegend=False,
@@ -1764,9 +1893,8 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
             fig.add_trace(go.Violin(
                 x=s["label"].map(xpos), y=s["t"], side=sd, scalemode="count", scalegroup="ttt",
                 line_color=color, fillcolor=color, opacity=0.55, points=False,
-                meanline_visible=False, box_visible=False, showlegend=False, spanmode="hard",
+                meanline_visible=False, box_visible=True, showlegend=False, spanmode="hard",
                 hovertemplate=side + " %{y:.1f}s<extra></extra>"), row=2, col=1)
-        _add_iqr_markers(fig, ttt, "t", labels, xpos, row=2)
 
     ang = heading_target_angle_table(df, rois_by_cfg)
     if len(ang):
@@ -1774,18 +1902,22 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
         budget = 40_000
         if len(ang) > budget:
             ang = ang.iloc[np.linspace(0, len(ang) - 1, budget).astype(int)]
-        fig.add_trace(go.Violin(
-            x=ang["label"].map(xpos), y=ang["angle_deg"], scalemode="count",
-            scalegroup="angle", line_color="#495057", fillcolor="#6c757d",
-            opacity=0.45, points=False, meanline_visible=False,
-            box_visible=False, showlegend=False, span=[-180, 180],
-            hovertemplate="%{y:.0f}° to nearest target<extra></extra>"),
-            row=3, col=1)
-        _add_iqr_markers_center(fig, ang, "angle_deg", xpos, row=3)
+        for side, sd, color in (("left", "negative", lc), ("right", "positive", rc)):
+            s = ang[ang["side"] == side]
+            if not len(s):
+                continue
+            fig.add_trace(go.Violin(
+                x=s["label"].map(xpos), y=s["angle_deg"], side=sd,
+                scalemode="count", scalegroup="angle", line_color=color,
+                fillcolor=color, opacity=0.45, points=False,
+                meanline_visible=False, box_visible=True, showlegend=False,
+                span=[-180, 180],
+                hovertemplate=side + " %{y:.0f}°<extra></extra>"),
+                row=3, col=1)
 
     fig.update_layout(template="plotly_white", height=980, violinmode="overlay",
         legend=dict(orientation="h", y=1.05, yanchor="bottom", x=1, xanchor="right"),
-        margin=dict(l=60, r=20, t=50, b=80))
+        margin=dict(l=60, r=20, t=50, b=80), dragmode="pan")
     fig.update_yaxes(title_text="fraction reaching", range=[-0.03, 1.03], row=1, col=1)
     fig.update_yaxes(title_text="time to reach (s)", rangemode="tozero", row=2, col=1)
     fig.update_yaxes(title_text="heading error (deg)", range=[-180, 180],
@@ -1799,6 +1931,7 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
                      ticktext=labels, range=[-0.6, len(labels) - 0.4],
                      title_text="config", row=3, col=1)
+    fig.update_xaxes(matches="x")
     return fig
 
 
@@ -2086,6 +2219,10 @@ def _load_data(pattern):
                     "Current Time"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     stats = compute_segment_stats(df)
+    for c in ("ConfigFile", "SceneName", "VR", "FlyID", "Sex",
+              "SourceFolder", "SourceFile"):
+        if c in df.columns:
+            df[c] = df[c].astype("category")
     _set_config_order(metas)
     _populate_auto_lut(metas)           # readable config names from objects
     _DATA_CACHE[key] = df
@@ -2100,6 +2237,8 @@ def _load_data(pattern):
 # ---------------------------------------------------------------------------
 
 _EMPTY = go.Figure().update_layout(height=190, template="plotly_white")
+_INPUT_STYLE = {"width": "100%", "fontSize": "11px", "padding": "3px",
+                "boxSizing": "border-box"}
 
 # Each view panel fills the panels-wrapper and is hidden via `visibility` so its
 # graph keeps full dimensions (Plotly never sees a 0-size container).
@@ -2144,7 +2283,7 @@ app.layout = html.Div([
             dcc.Input(id="glob-input", type="text", value="", debounce=True,
                       placeholder="Data/2025*/*_VR*.csv",
                       style={"width": "100%", "padding": "4px", "fontSize": "11px",
-                             "fontFamily": "monospace"}),
+                             "fontFamily": "monospace", "boxSizing": "border-box"}),
             html.Button("Load & Plot", id="btn-load", n_clicks=0,
                         style={"width": "100%", "marginTop": "3px", "padding": "5px",
                                "background": "#0d6efd", "color": "white", "border": "none",
@@ -2212,13 +2351,13 @@ app.layout = html.Div([
                     html.Label("Bin size (units)", style={"fontSize": "10px"}),
                     dcc.Input(id="heatmap-binsize", type="number", value=None, min=0,
                               step="any", debounce=True, placeholder="auto",
-                              style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                              style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
                 html.Div([
                     html.Label("Bound %", style={"fontSize": "10px"}),
                     dcc.Input(id="heatmap-bound", type="number", value=98, min=50,
                               max=100, step="any", debounce=True,
-                              style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                              style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
             ], style={"display": "flex", "gap": "6px"}),
             html.Div([
@@ -2243,13 +2382,13 @@ app.layout = html.Div([
                     html.Label("cmin", style={"fontSize": "10px"}),
                     dcc.Input(id="heatmap-cmin", type="number", value=None,
                               placeholder="auto", step="any", debounce=True,
-                              style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                              style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
                 html.Div([
                     html.Label("cmax", style={"fontSize": "10px"}),
                     dcc.Input(id="heatmap-cmax", type="number", value=None,
                               placeholder="auto", step="any", debounce=True,
-                              style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                              style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
                 html.Div([
                     html.Label("as", style={"fontSize": "10px"}),
@@ -2307,8 +2446,7 @@ app.layout = html.Div([
             html.Label("Walk speed threshold (u/s)", style={"fontSize": "10px",
                                                              "marginTop": "2px"}),
             dcc.Input(id="polar-walk", type="number", value=1, min=0, step="any",
-                      debounce=True, style={"width": "100%", "fontSize": "11px",
-                                            "padding": "3px"}),
+                      debounce=True, style=_INPUT_STYLE),
             html.Div("Each trial's path as r (distance from origin) vs angle "
                      "(0° = forward, clockwise — same frame as trajectories). "
                      "Moving-only keeps samples above the walk speed; ROI targets "
@@ -2318,13 +2456,13 @@ app.layout = html.Div([
             html.Hr(style={"margin": "6px 0"}),
 
             html.Label("Filters", style={"fontWeight": "bold", "fontSize": "12px"}),
-            html.Div("Applied on Re-Plot; every plot & stat uses this filtered "
-                     "set.", style={"fontSize": "9px", "color": "#888"}),
+            html.Div("Filters apply on Re-Plot.",
+                     style={"fontSize": "9px", "color": "#888"}),
             html.Div([
-                html.Label("Max velocity", style={"fontSize": "10px"}),
+                html.Label("Max velocity (units/s)", style={"fontSize": "10px"}),
                 dcc.Input(id="vel-threshold", type="number", value=None,
-                          placeholder="blank = no cut",
-                          style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                          placeholder="blank = no cut", debounce=True,
+                          style=_INPUT_STYLE),
                 dcc.Checklist(id="vel-auto",
                               options=[{"label": " auto (99th pct)", "value": "on"}],
                               value=["on"], style={"fontSize": "9px"}),
@@ -2332,8 +2470,8 @@ app.layout = html.Div([
             html.Div([
                 html.Label("Min displacement", style={"fontSize": "10px"}),
                 dcc.Input(id="min-disp", type="number", value=None,
-                          placeholder="blank = no cut",
-                          style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                          placeholder="blank = no cut", debounce=True,
+                          style=_INPUT_STYLE),
                 dcc.Checklist(id="disp-auto",
                               options=[{"label": " auto (5% of median)", "value": "on"}],
                               value=["on"], style={"fontSize": "9px"}),
@@ -2341,12 +2479,12 @@ app.layout = html.Div([
             html.Div([
                 html.Label("Trim samples", style={"fontSize": "10px"}),
                 dcc.Input(id="trim-samples", type="number", value=100,
-                          style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                          debounce=True, style=_INPUT_STYLE),
             ], style={"marginBottom": "3px"}),
             html.Div([
-                html.Label("Jump buffer (s)", style={"fontSize": "10px"}),
-                dcc.Input(id="jump-buffer", type="number", value=0.1, step=0.01,
-                          style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                html.Label("Spike buffer (ms)", style={"fontSize": "10px"}),
+                dcc.Input(id="jump-buffer", type="number", value=100, min=0,
+                          step=10, debounce=True, style=_INPUT_STYLE),
             ], style={"marginBottom": "3px"}),
 
             html.Button("Re-Plot", id="btn-plot", n_clicks=0,
@@ -2381,11 +2519,11 @@ app.layout = html.Div([
                                                   "fontWeight": "bold"}),
                 html.Label("Subplot cols", style={"fontSize": "10px", "marginTop": "3px"}),
                 dcc.Input(id="subplot-ncols", type="number", value=2, min=1, max=6,
-                          style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                          debounce=True, style=_INPUT_STYLE),
                 html.Label("Max plot points", style={"fontSize": "10px", "marginTop": "3px"}),
                 dcc.Input(id="plot-points", type="number", value=None, min=500,
-                          placeholder="auto (dynamic)",
-                          style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                          placeholder="auto (dynamic)", debounce=True,
+                          style=_INPUT_STYLE),
                 html.Div("Blank = auto-decimate to a browser-safe budget.",
                          style={"fontSize": "9px", "color": "#888"}),
                 html.Label("Raw trace cols", style={"fontSize": "10px", "marginTop": "3px"}),
@@ -2423,6 +2561,7 @@ app.layout = html.Div([
             ]),
 
         ], style={"width": "255px", "padding": "8px", "overflowY": "auto",
+                   "overflowX": "hidden",
                    "borderRight": "1px solid #ddd", "background": "#fafafa",
                    "flexShrink": "0", "height": "calc(100vh - 46px)"}),
 
@@ -2520,7 +2659,7 @@ app.layout = html.Div([
                 html.Div(
                     dcc.Loading(
                         dcc.Graph(id="roi-plot", figure=_EMPTY,
-                                  config={"displayModeBar": True},
+                                  config={"scrollZoom": True, "displayModeBar": True},
                                   style={"width": "100%"}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
@@ -2532,7 +2671,7 @@ app.layout = html.Div([
                 html.Div(
                     dcc.Loading(
                         dcc.Graph(id="polar-plot", figure=_EMPTY, responsive=False,
-                                  config={"displayModeBar": True},
+                                  config={"scrollZoom": True, "displayModeBar": True},
                                   style={"width": "100%"}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
@@ -2626,6 +2765,17 @@ def restore_from_url(search, already):
         except Exception:
             return no_update
 
+    def jump_ms():
+        if "jb" not in p:
+            return no_update
+        try:
+            v = float(p["jb"][0])
+            # Historical URLs stored seconds (0.1). The control now shows ms.
+            out = v * 1000 if v <= 10 else v
+            return int(out) if float(out).is_integer() else out
+        except Exception:
+            return no_update
+
     def s(k):
         return p[k][0] if k in p else no_update
 
@@ -2645,7 +2795,7 @@ def restore_from_url(search, already):
             vp = no_update
 
     return (
-        s("glob"), num("vel"), num("disp"), num("trim"), num("jb"),
+        s("glob"), num("vel"), num("disp"), num("trim"), jump_ms(),
         s("groupby"), s("pool"), s("color"), anim, rebase,
         num("hbin"), s("hscale"), num("hbound"), s("hmetric"),
         num("hcmin"), num("hcmax"), s("hcrange"),
@@ -2916,15 +3066,16 @@ def _filter_summary(df_sub, vel_thresh, min_disp, trim, jump_buf,
         vel = velocity_all(cur)
         spikes = np.nan_to_num(vel, nan=0.0) > float(vel_thresh)
         removed = 0
+        buf_s = _jump_buffer_seconds(jump_buf)
         if spikes.any():
             seg = cur["_seg_id"].to_numpy()
             t = cur["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64") / 1e9
-            keep = _dilate_keep(seg, t, spikes, float(jump_buf or 0.1))
+            keep = _dilate_keep(seg, t, spikes, buf_s)
             removed = int((~keep).sum())
             cur = cur[keep]
         parts.append(
-            f"velocity > {float(vel_thresh):g} u/s"
-            f" (+/-{float(jump_buf or 0.1):g}s): {removed:,}/{start_n:,} pts"
+            f"vel > {float(vel_thresh):g} units/s"
+            f" (buffer {buf_s * 1000:g} ms): {_compact_count(removed)}/{_compact_count(start_n)} pts"
             f" ({100*removed/max(start_n, 1):.1f}%)")
 
     if min_disp is not None and min_disp > 0 and len(cur):
@@ -2936,7 +3087,7 @@ def _filter_summary(df_sub, vel_thresh, min_disp, trim, jump_buf,
         if bad_ids:
             cur = cur[~cur["_seg_id"].isin(bad_ids)]
         parts.append(
-            f"displacement < {float(min_disp):g}: {removed_trials:,}/{before:,} trials"
+            f"disp < {float(min_disp):g}: {_compact_count(removed_trials)}/{_compact_count(before)} trials"
             f" ({100*removed_trials/max(before, 1):.1f}%)")
 
     if trim is not None and trim > 0 and len(cur):
@@ -2948,8 +3099,8 @@ def _filter_summary(df_sub, vel_thresh, min_disp, trim, jump_buf,
         keep = (pos >= int(trim)) & (pos < size - int(trim))
         removed = int((~keep).sum())
         parts.append(
-            f"trim {int(trim)} samples/side: {removed:,}/{before_pts:,} pts"
-            f" across {before_trials:,} trials ({100*removed/max(before_pts, 1):.1f}%)")
+            f"trim {int(trim)} samples/side: {_compact_count(removed)}/{_compact_count(before_pts)} pts"
+            f" across {_compact_count(before_trials)} trials ({100*removed/max(before_pts, 1):.1f}%)")
 
     if _on(polar_moving) and walk is not None and walk > 0:
         v = velocity_all(df_sub)
@@ -2957,10 +3108,10 @@ def _filter_summary(df_sub, vel_thresh, min_disp, trim, jump_buf,
         if v.size:
             moving = int((v >= float(walk)).sum())
             parts.append(
-                f"polar moving-only >= {float(walk):g} u/s: {moving:,}/{v.size:,} samples"
+                f"polar moving >= {float(walk):g} units/s: {_compact_count(moving)}/{_compact_count(v.size)} samples"
                 f" ({100*moving/v.size:.0f}%)")
 
-    return ("Active filters — " + " · ".join(parts)) if parts else "Active filters — none"
+    return ("Excluded - " + " · ".join(parts)) if parts else "Active filters - none"
 
 
 @app.callback(
@@ -3007,7 +3158,7 @@ def _filter_signature(pattern, vel_thresh, min_disp, trim, jump_buf,
         return tuple(sel["range"]["x"]) if sel and sel.get("range") else None
     def lst(v):
         return tuple(sorted(v)) if v else None
-    return (pattern, vel_thresh, min_disp, trim, jump_buf,
+    return (pattern, vel_thresh, min_disp, trim, round(_jump_buffer_seconds(jump_buf), 6),
             lst(cfg), lst(vrs), lst(fids), lst(scenes), lst(folders),
             rng(vel_selection), rng(disp_selection))
 
@@ -3052,7 +3203,8 @@ def _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
         df_sub = filter_by_stat_range(df_sub, stats_sub, "peak_velocity", rng[0], rng[1])
     stats_sub = compute_segment_stats(df_sub) if len(df_sub) else stats_sub
 
-    df_f = apply_filters(df_sub, vel_thresh, min_disp, trim, jump_buf or 0.1)
+    df_f = apply_filters(df_sub, vel_thresh, min_disp, trim,
+                         _jump_buffer_seconds(jump_buf))
     result = (df_f, df_sub, stats_sub)
 
     _FILTER_CACHE[sig] = result
@@ -3275,8 +3427,8 @@ def update_plots(n, view, pattern, vel_thresh, min_disp, trim, jump_buf,
     frame_str = str(n_frames) if n_frames is not None else "—"
 
     n_segs_before = df_sub["_seg_id"].nunique()
-    summary = (f"{len(df_view):,}/{len(df_sub):,} pts | "
-               f"{n_traces}/{n_segs_before} segs | "
+    summary = (f"{_compact_count(len(df_view))}/{_compact_count(len(df_sub))} pts | "
+               f"{_compact_count(n_traces)}/{_compact_count(n_segs_before)} segs | "
                f"drawn {drawn_str} | "
                f"{frame_str} frames | "
                f"build {bt:.2f}s | colour: {color_by}")
@@ -3352,7 +3504,8 @@ def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
             return repr(v)
     sig = _sig_of([pattern, hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange,
                    group_by, pool_mode, ncols, rebase, cfg, vrs, fids, scenes,
-                   folders, vel_thresh, min_disp, trim, jump_buf, vel_selection,
+                   folders, vel_thresh, min_disp, trim,
+                   round(_jump_buffer_seconds(jump_buf), 6), vel_selection,
                    disp_selection, roi_reach, roi_entered, roi_trim])
     if sig == _LAST_HEAT_SIG["v"]:
         return no_update, no_update, no_update
@@ -3363,7 +3516,8 @@ def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
         return no_update, no_update, no_update
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
     reach_v = float(roi_reach) if roi_reach else 3.0
-    df_view, _ = _roi_apply(df_f, pattern, reach_v, _on(roi_entered), _on(roi_trim))
+    df_view, _ = _roi_apply(df_f, pattern, reach_v,
+                            _on(roi_entered), _on(roi_trim))
     heat, variants = build_heatmap_mask_variants(
         df_f, pattern, reach_v, group_by, pool_mode, ncols_val,
         bin_size=hm_binsize, bound_pct=hm_bound if hm_bound else 100,
@@ -3373,8 +3527,8 @@ def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
     _LAST_HEAT_SIG["v"] = sig
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
     n_segs_before = int(df_sub["_seg_id"].nunique()) if len(df_sub) else 0
-    summary = (f"Heatmap {len(df_view):,}/{len(df_sub):,} pts | "
-               f"{n_traces}/{n_segs_before} segs | "
+    summary = (f"Heatmap {_compact_count(len(df_view))}/{_compact_count(len(df_sub))} pts | "
+               f"{_compact_count(n_traces)}/{_compact_count(n_segs_before)} segs | "
                f"bin {hm_binsize or default_bin_size(df_view):g} u | "
                f"build current visible tab")
     return heat.to_plotly_json(), variants, summary
@@ -3490,20 +3644,21 @@ def update_roi_view(n_plot, reach, roi_show, roi_trim, roi_entered, view, patter
                                    cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
     if df_sub is None or len(df_sub) == 0:
         return no_update, no_update
-    # Violins use the UNMASKED data so each fraction's denominator is all trials
-    # in the config (independent of the entered-only / trim view toggles).
+    # Fraction counts reuse the unmasked reached table; time/heading panels use
+    # df_view so they respect entered-only / trim visibility toggles.
     _, _, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     if not rois:
         return _msg_figure("No ROI targets in these configs."), "No ROI targets."
     reach_v = float(reach) if reach else 3.0
-    df_view, _ = _roi_apply(df_f, pattern, reach_v, _on(roi_entered), _on(roi_trim))
+    df_view, table = _roi_apply(df_f, pattern, reach_v,
+                                _on(roi_entered), _on(roi_trim))
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
     n_before = int(df_sub["_seg_id"].nunique()) if len(df_sub) else 0
-    summary = (f"ROI {len(df_view):,}/{len(df_sub):,} pts | "
-               f"{n_traces}/{n_before} segs | reach {reach_v:g} u | "
-               f"heading angle = nearest target centre")
-    return build_roi_swarm_figure(df_view, rois, reach_v), summary
+    summary = (f"ROI {_compact_count(len(df_view))}/{_compact_count(len(df_sub))} pts | "
+               f"{_compact_count(n_traces)}/{_compact_count(n_before)} segs | reach {reach_v:g} u | "
+               f"heading error = left/right target centres")
+    return build_roi_swarm_figure(df_view, rois, reach_v, table=table), summary
 
 
 # Reach slider / show toggle → BLIT the trajectory overlay: recompute reach
@@ -3755,20 +3910,6 @@ app.clientside_callback(
     "window.Plotly.restyle(hg,{z:v.z,customdata:v.customdata},vi);"
     "window.Plotly.restyle(hg,{zmin:v.zmin,zmax:v.zmax,hovertemplate:v.hovertemplate});"
     "window.Plotly.restyle(hg,{colorbar:[v.colorbar]},[0]);}}catch(e){}}"
-    # Resize ONLY the graph in the currently-visible panel. Resizing a hidden
-    # scaleanchor plot (or a global window 'resize') makes Plotly recompute a
-    # wildly wrong aspect-locked range and fire a relayout that pollutes the
-    # shared viewport -- that was the intermittent zoom-out-to-nothing glitch.
-    # polar-plot is newPlot-managed (like the heatmap) and keeps its own tall
-    # multi-subplot height — resizing it to the container would flatten it, so it
-    # is deliberately NOT in this fit-to-container resize map.
-    "var _pan={'trajectory-plot':'view-traj','vel-histogram':'view-diag',"
-    "'disp-histogram':'view-diag','raw-trace-plot':'view-diag',"
-    "'roi-plot':'view-roi'};"
-    "Object.keys(_pan).forEach(function(id){var p=document.getElementById(_pan[id]);"
-    "if(!p||getComputedStyle(p).visibility==='hidden')return;"
-    "var c=document.getElementById(id);var g=c&&c.querySelector('.js-plotly-plot');"
-    "if(g&&window.Plotly&&window.Plotly.Plots){try{window.Plotly.Plots.resize(g);}catch(e){}}});"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
     Input("heatmap-figure-store", "data"),
@@ -3778,6 +3919,32 @@ app.clientside_callback(
     Input("roi-entered", "value"),
     Input("roi-trim", "value"),
     State("heatmap-variants", "data"),
+    prevent_initial_call=True,
+)
+
+
+# Resize only the graph in the panel that just became visible or just received a
+# fresh figure. This is deliberately separate from heatmap/polar newPlot logic:
+# resizing hidden scaleanchor plots can emit bogus relayout ranges and make zoom
+# feel broken.
+app.clientside_callback(
+    "function(view,tfig,rfig,vfig,dfig,roifig){"
+    "function rs(id,panel){var p=document.getElementById(panel);"
+    "if(!p||getComputedStyle(p).visibility==='hidden')return;"
+    "var c=document.getElementById(id);var g=c&&c.querySelector('.js-plotly-plot');"
+    "if(g&&window.Plotly&&window.Plotly.Plots){try{window.Plotly.Plots.resize(g);}catch(e){}}}"
+    "setTimeout(function(){"
+    "if(view==='traj')rs('trajectory-plot','view-traj');"
+    "if(view==='diag'){rs('vel-histogram','view-diag');rs('disp-histogram','view-diag');rs('raw-trace-plot','view-diag');}"
+    "if(view==='roi')rs('roi-plot','view-roi');"
+    "},140);return '';}",
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("view-mode", "value"),
+    Input("trajectory-plot", "figure"),
+    Input("raw-trace-plot", "figure"),
+    Input("vel-histogram", "figure"),
+    Input("disp-histogram", "figure"),
+    Input("roi-plot", "figure"),
     prevent_initial_call=True,
 )
 
