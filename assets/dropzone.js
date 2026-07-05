@@ -33,12 +33,48 @@
         if (rp.toLowerCase().endsWith('.csv')) files.push(rp);
         if (!folder && rp.indexOf('/') >= 0) folder = rp.split('/')[0];
       }
+      if (files.length && zone.__setBusy) zone.__setBusy();
       send(folder, files);
     });
 
+    var label = document.getElementById('drop-label');
+    var sub = document.getElementById('drop-sub');
+    var defLabel = label ? label.textContent : 'Drop a data folder here';
+    var defSub = sub ? sub.textContent : '';
+
+    // React instantly to a drag: grow + highlight the zone so it's an obvious,
+    // larger target. On drop, flip to a "Processing…" state right away — the
+    // backend path resolution + load progress bar follow.
     function hi(on) {
+      zone.style.transition = 'all .12s ease';
       zone.style.background = on ? '#e6ecff' : '#f4f6fb';
       zone.style.borderColor = on ? '#0d6efd' : '#aac';
+      zone.style.minHeight = on ? '150px' : '92px';
+      zone.style.transform = on ? 'scale(1.02)' : 'scale(1)';
+      zone.style.boxShadow = on ? '0 4px 16px rgba(13,110,253,0.25)' : 'none';
+      if (label && !zone.__busy) label.textContent = on ? 'Drop to load' : defLabel;
+    }
+    function busy(msg) {
+      zone.__busy = true;
+      zone.style.background = '#fff8e6';
+      zone.style.borderColor = '#f0ad4e';
+      zone.style.minHeight = '92px';
+      zone.style.transform = 'scale(1)';
+      zone.style.boxShadow = 'none';
+      if (label) label.textContent = '⏳ ' + (msg || 'Processing…');
+      if (sub) sub.textContent = 'locating the folder on disk…';
+    }
+    zone.__setBusy = busy;
+    // Clear the busy state once loading actually starts (progress bar shows).
+    var track = document.getElementById('load-progress-track');
+    if (track) {
+      new MutationObserver(function () {
+        if (getComputedStyle(track).display !== 'none') {
+          zone.__busy = false;
+          if (label) label.textContent = defLabel;
+          if (sub) sub.textContent = defSub;
+        }
+      }).observe(track, { attributes: true, attributeFilter: ['style'] });
     }
     ['dragenter', 'dragover'].forEach(function (ev) {
       zone.addEventListener(ev, function (e) { e.preventDefault(); e.stopPropagation(); hi(true); });
@@ -48,7 +84,7 @@
     });
 
     zone.addEventListener('drop', function (e) {
-      e.preventDefault(); e.stopPropagation(); hi(false);
+      e.preventDefault(); e.stopPropagation(); hi(false); busy('Processing…');
       var items = e.dataTransfer.items;
       var files = [], folderName = '', pending = 0, done = false;
 

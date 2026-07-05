@@ -1663,15 +1663,6 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                            for gname, g in groups.items()]) if names else pd.Series(dtype=object)
     ray = ray.assign(group=ray["_seg_id"].map(seg_group))
 
-    cmin = cmax = None; cbar = ""
-    if color_by in ("velocity", "tortuosity"):
-        cv = ray["cval"].to_numpy()
-        cv = cv[np.isfinite(cv)]
-        if color_by == "velocity":
-            cmin, cmax, cbar = 0.0, (float(np.percentile(cv, 99)) if cv.size else 1.0), "Mean speed (u/s)"
-        else:
-            cmin, cmax, cbar = 1.0, (float(np.percentile(cv, 95)) if cv.size else 3.0), "Mean tortuosity"
-
     specs = [[{"type": "polar"} for _ in range(ncols)] for _ in range(nrows)]
     vspace = min(0.06, 0.5 / max(nrows, 1))
     fig = make_subplots(rows=nrows, cols=ncols, specs=specs,
@@ -1682,7 +1673,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
         row, col = idx // ncols + 1, idx % ncols + 1
         sub = ray[ray["group"] == gname]
 
-        # ROI direction spokes first (under the points).
+        # ROI target directions (dotted spokes), under the lines.
         if show_rois and rois:
             for roi in rois.get(gname, []):
                 th_ = math.degrees(math.atan2(roi["x"], roi["z"]))
@@ -1692,18 +1683,30 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                     color=_ROI_SIDE_COLOR.get(roi["side"], "#999"))),
                     row=row, col=col)
 
-        marker = dict(size=6, opacity=0.8, line=dict(width=0.5, color="#333"))
-        if color_by in ("velocity", "tortuosity"):
-            marker.update(color=sub["cval"].tolist(), colorscale=SEQ_COLORSCALE,
-                          cmin=cmin, cmax=cmax, showscale=(idx == 0),
-                          colorbar=dict(title=cbar, thickness=12, len=0.5))
-        else:
-            marker.update(color="#1f77b4")
+        R = sub["R"].to_numpy(); th = sub["theta_deg"].to_numpy()
+        # one radial LINE per trial: centre → (R, θ)
+        rr = np.empty(len(sub) * 3); rr[0::3], rr[1::3], rr[2::3] = 0.0, R, np.nan
+        tt = np.empty(len(sub) * 3); tt[0::3], tt[1::3], tt[2::3] = th, th, np.nan
         fig.add_trace(go.Scatterpolar(
-            r=sub["R"].tolist(), theta=sub["theta_deg"].tolist(), mode="markers",
-            marker=marker, showlegend=False, customdata=sub["animal"].tolist(),
-            hovertemplate="R=%{r:.2f} θ=%{theta:.0f}°<br>%{customdata}<extra></extra>"),
+            r=rr.tolist(), theta=tt.tolist(), mode="lines", showlegend=False,
+            hoverinfo="skip", line=dict(color="rgba(46,160,80,0.4)", width=1)),
             row=row, col=col)
+
+        # population mean resultant vector (bold) + Rayleigh significance mark
+        thr = np.radians(th)
+        vx, vz = R * np.sin(thr), R * np.cos(thr)
+        mvx, mvz = float(np.nanmean(vx)), float(np.nanmean(vz))
+        Rpop = math.hypot(mvx, mvz)
+        thpop = math.degrees(math.atan2(mvx, mvz))
+        fig.add_trace(go.Scatterpolar(
+            r=[0, Rpop], theta=[thpop, thpop], mode="lines", showlegend=False,
+            hovertemplate=f"mean R={Rpop:.2f} θ={thpop:.0f}°<extra></extra>",
+            line=dict(color="#0b6b2e", width=3)), row=row, col=col)
+        p = math.exp(-len(sub) * Rpop * Rpop) if len(sub) else 1.0
+        star = "***" if p < 1e-3 else "**" if p < 1e-2 else "*" if p < 5e-2 else ""
+        if star:
+            ann = fig.layout.annotations[idx]
+            ann.update(text=f"{ann.text} {star}")
 
     # 0° at top, clockwise — matches the trajectory frame. R is a 0..1 unit disk.
     fig.update_polars(angularaxis=dict(rotation=90, direction="clockwise",
@@ -1952,7 +1955,7 @@ app.layout = html.Div([
             ], value="individual", clearable=False, style={"fontSize": "11px"}),
             dcc.Checklist(id="animate-toggle",
                           options=[{"label": " Playback animation", "value": "on"}],
-                          value=["on"], style={"fontSize": "11px", "marginTop": "3px"}),
+                          value=[], style={"fontSize": "11px", "marginTop": "3px"}),
             dcc.Checklist(id="rebase-origin",
                           options=[{"label": " Start each track at origin (0,0)", "value": "on"}],
                           value=[], style={"fontSize": "11px", "marginTop": "1px"}),
