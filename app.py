@@ -392,12 +392,6 @@ def _save_config_lut() -> None:
         pass
 
 
-def segment_reached(gx, gz, roi_x, roi_z, reach) -> bool:
-    """True if the (already per-segment) trajectory comes within `reach` of the
-    ROI centre at any sample."""
-    return bool(np.any((gx - roi_x) ** 2 + (gz - roi_z) ** 2 <= reach * reach))
-
-
 _ROI_TABLE_COLS = ["_seg_id", "ConfigFile", "animal", "VR", "FlyID",
                    "reached_left", "reached_right"]
 
@@ -451,7 +445,7 @@ def roi_config_summary(table: pd.DataFrame) -> dict:
     out = {}
     if table is None or len(table) == 0:
         return out
-    for cfg, sub in table.groupby("ConfigFile", sort=False):
+    for cfg, sub in table.groupby("ConfigFile", sort=False, observed=True):
         tot = len(sub)
         lr = int(sub["reached_left"].sum())
         rr = int(sub["reached_right"].sum())
@@ -667,7 +661,7 @@ def _roi_apply(df_f, pattern, reach, entered_only, trim):
     if not rois:
         return df_f, None
     keep = np.ones(len(df_f), bool)
-    if entered_only and entered_ids:
+    if entered_only:
         keep &= df_f["_seg_id"].isin(entered_ids).to_numpy()
     if trim:
         keep &= trim_keep
@@ -1350,7 +1344,7 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
         cmin = records[0]["cmin"] if records[0]["cmin"] is not None else 0.0
         cmax = records[0]["cmax"] if records[0]["cmax"] is not None else 1.0
         title = {"trial": "Trial", "local_time": "Local time",
-                 "velocity": "Speed (u/s)"}[color_by]
+                 "velocity": "Speed (units/s)"}[color_by]
         fig.add_trace(go.Scattergl(
             x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
             marker=dict(colorscale=SEQ_COLORSCALE, cmin=cmin, cmax=cmax,
@@ -1768,53 +1762,6 @@ def _msg_figure(text, height=440):
     return fig
 
 
-def _add_iqr_markers(fig, data, value_col, labels, xpos, row):
-    """Overlay side-offset Q1-Q3 bars and median ticks on split violins."""
-    if data is None or len(data) == 0:
-        return
-    for side, color, off in (("left", _ROI_SIDE_COLOR["left"], -0.12),
-                             ("right", _ROI_SIDE_COLOR["right"], 0.12)):
-        sub = data[data["side"] == side]
-        if not len(sub):
-            continue
-        for lab, vals in sub.groupby("label", sort=False)[value_col]:
-            vals = vals.to_numpy(dtype=float)
-            vals = vals[np.isfinite(vals)]
-            if vals.size == 0 or lab not in xpos:
-                continue
-            q1, med, q3 = np.percentile(vals, [25, 50, 75])
-            x = xpos[lab] + off
-            fig.add_trace(go.Scatter(
-                x=[x, x], y=[q1, q3], mode="lines", showlegend=False,
-                hoverinfo="skip", line=dict(color=color, width=5)),
-                row=row, col=1)
-            fig.add_trace(go.Scatter(
-                x=[x - 0.07, x + 0.07], y=[med, med], mode="lines",
-                showlegend=False, hoverinfo="skip",
-                line=dict(color="#111", width=3)),
-                row=row, col=1)
-
-
-def _add_iqr_markers_center(fig, data, value_col, xpos, row, color="#555"):
-    if data is None or len(data) == 0:
-        return
-    for lab, vals in data.groupby("label", sort=False)[value_col]:
-        vals = vals.to_numpy(dtype=float)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0 or lab not in xpos:
-            continue
-        q1, med, q3 = np.percentile(vals, [25, 50, 75])
-        x = xpos[lab]
-        fig.add_trace(go.Scatter(
-            x=[x, x], y=[q1, q3], mode="lines", showlegend=False,
-            hoverinfo="skip", line=dict(color=color, width=5)),
-            row=row, col=1)
-        fig.add_trace(go.Scatter(
-            x=[x - 0.09, x + 0.09], y=[med, med], mode="lines",
-            showlegend=False, hoverinfo="skip", line=dict(color="#111", width=3)),
-            row=row, col=1)
-
-
 def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     """Stacked ROI diagnostics:
       1. Paired swarm — per-animal fraction of trials reaching left vs right, with
@@ -1828,7 +1775,7 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     if tbl is None or len(tbl) == 0:
         return _msg_figure("No left/right ROI targets in these configs — "
                            "nothing to count. Load Choice/BinaryChoice data.")
-    grp = tbl.groupby(["ConfigFile", "animal"], sort=False).agg(
+    grp = tbl.groupby(["ConfigFile", "animal"], sort=False, observed=True).agg(
         frac_left=("reached_left", "mean"),
         frac_right=("reached_right", "mean"),
         reach_left=("reached_left", "sum"),
@@ -1912,7 +1859,7 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
                 fillcolor=color, opacity=0.45, points=False,
                 meanline_visible=False, box_visible=True, showlegend=False,
                 span=[-180, 180],
-                hovertemplate=side + " %{y:.0f}°<extra></extra>"),
+                hovertemplate=side + " %{y:.0f}° from target centre<extra></extra>"),
                 row=3, col=1)
 
     fig.update_layout(template="plotly_white", height=980, violinmode="overlay",
@@ -2443,7 +2390,7 @@ app.layout = html.Div([
             dcc.Checklist(id="polar-moving",
                           options=[{"label": " Moving samples only", "value": "on"}],
                           value=[], style={"fontSize": "11px", "marginTop": "3px"}),
-            html.Label("Walk speed threshold (u/s)", style={"fontSize": "10px",
+            html.Label("Walk speed threshold (units/s)", style={"fontSize": "10px",
                                                              "marginTop": "2px"}),
             dcc.Input(id="polar-walk", type="number", value=1, min=0, step="any",
                       debounce=True, style=_INPUT_STYLE),
@@ -2477,15 +2424,17 @@ app.layout = html.Div([
                               value=["on"], style={"fontSize": "9px"}),
             ], style={"marginBottom": "3px"}),
             html.Div([
-                html.Label("Trim samples", style={"fontSize": "10px"}),
-                dcc.Input(id="trim-samples", type="number", value=100,
-                          debounce=True, style=_INPUT_STYLE),
-            ], style={"marginBottom": "3px"}),
-            html.Div([
-                html.Label("Spike buffer (ms)", style={"fontSize": "10px"}),
-                dcc.Input(id="jump-buffer", type="number", value=100, min=0,
-                          step=10, debounce=True, style=_INPUT_STYLE),
-            ], style={"marginBottom": "3px"}),
+                html.Div([
+                    html.Label("Trim edge samples", style={"fontSize": "10px"}),
+                    dcc.Input(id="trim-samples", type="number", value=100,
+                              debounce=True, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label("Spike buffer (ms)", style={"fontSize": "10px"}),
+                    dcc.Input(id="jump-buffer", type="number", value=100, min=0,
+                              step=10, debounce=True, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "6px", "marginBottom": "3px"}),
 
             html.Button("Re-Plot", id="btn-plot", n_clicks=0,
                         style={"width": "100%", "marginTop": "4px", "padding": "5px",
@@ -3532,31 +3481,6 @@ def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
                f"bin {hm_binsize or default_bin_size(df_view):g} u | "
                f"build current visible tab")
     return heat.to_plotly_json(), variants, summary
-
-
-# Sync zoom/pan between trajectory and heatmap tabs (shared viewport)
-def _extract_axis_ranges(relayout):
-    """
-    Return {"xaxis": [lo,hi], "yaxis": [lo,hi]} from a relayoutData payload.
-
-    Robust to zooming on any subplot: with matched axes Plotly may report
-    e.g. 'xaxis3.range[0]'. We collapse any x*/y* axis range onto the master
-    xaxis/yaxis (which propagates back to all via `matches`).
-    """
-    if not relayout:
-        return {}
-    if any(k.endswith("autorange") for k in relayout) or relayout.get("autosize"):
-        return {"reset": True}
-    out = {}
-    for key, val in relayout.items():
-        m = re.match(r"^(x|y)axis\d*\.range\[(0|1)\]$", key)
-        if not m:
-            continue
-        axis = "xaxis" if m.group(1) == "x" else "yaxis"
-        idx = int(m.group(2))
-        out.setdefault(axis, [None, None])[idx] = val
-    # Only keep complete ranges
-    return {k: v for k, v in out.items() if None not in v}
 
 
 # Re-apply a stored trajectory/or-restored viewbox to the heatmap on reveal,

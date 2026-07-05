@@ -1,15 +1,17 @@
 # Agent instructions
 
-Single-file Dash app (`app.py`; identical to `Plotting/dashboard.py`) for VR
-trajectory analysis.
+Single-file Dash app (`app.py`) for VR trajectory analysis. A sibling
+`Plotting/dashboard.py` exists but can lag; treat this repo's `app.py` as the
+current source of truth unless explicitly asked to sync the sibling copy.
 
 **Read [ARCHITECTURE.md](ARCHITECTURE.md) first.** It has the file map, data
 model, callback graph, the rendering gotchas (§7), known issues (§8), and the
 verify workflow (§9). [README.md](README.md) covers features.
 
 Before editing:
-- A *segment* is `_seg_id = SourceFolder+VR+Trial+Step`. Never regroup by
-  `(Trial, Step)` alone.
+- A *segment* is `_seg_id = SourceFile+CurrentTrial+CurrentStep`, built after
+  numeric coercion/formatting of trial and step. Never regroup by `(Trial, Step)`
+  alone.
 - Keep everything **vectorised**; rely on the load-time sort
   (`groupby(..., sort=False)`, no per-segment re-sorting).
 - Trajectories are merged into few NaN-separated traces — don't emit one per
@@ -27,3 +29,6 @@ After editing:
   builder/callback directly. UI/rendering: drive Chrome over CDP (ARCHITECTURE §9).
 - New persisted control → add to BOTH `update_url` and `restore_from_url` (keep
   return arity in sync); secondary Outputs need `allow_duplicate=True`.
+- ROI view notes: fraction counts use the unmasked filtered trial table, while
+  time-to-target and heading-error panels use the visible ROI-filtered subset.
+  `_roi_masks()` caches entered/trim masks per filtered frame and reach radius.

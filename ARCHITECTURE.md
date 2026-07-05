@@ -1,9 +1,9 @@
 # Architecture & context — Trajectory Dashboard
 
 > One-stop context for a developer or coding agent. Read this instead of scanning
-> all ~2400 lines. The app is a **single file** (`app.py`, mirrored as
-> `dashboard.py` in the sibling `Plotting/` project — they are identical bar the
-> `python app.py` vs `python dashboard.py` line). Keep the two in sync.
+> all ~4k lines. The app is a **single file** (`app.py`). A sibling
+> `Plotting/dashboard.py` exists but currently lags this repo; treat this
+> repo's `app.py` as source of truth unless explicitly asked to sync the copy.
 
 ---
 
@@ -46,15 +46,15 @@ Plotly 6 matter — see the rendering gotchas in §7.)
 
 | Lines (~) | Section | Key functions |
 |---|---|---|
-| 28–131 | **Config name humaniser** | `humanise_config` + `_MANUAL_LUT` + live `_USER_LUT`. Regex rules turn messy config filenames into readable subplot titles. |
-| 133–251 | **Data loading** | `find_csv_files`, `load_csv_fast` (1 CSV → tidy df with `_seg_id`+metadata), `_load_data` (concat, cache, progress). |
-| 252–411 | **Filtering / stats** | `velocity_all` (vectorised per-row speed), `smoothed_velocity`, `compute_segment_stats`, `apply_filters`, `filter_by_stat_range`, `_dilate_keep`. |
-| 413–1039 | **Plotting** | colour resolution + `_prepare_merged_groups`; `build_trajectory_figure`, `build_heatmap_figure`, histograms, `build_raw_trace_figure`; `_apply_axis_sync`, `_shared_range`/`_robust_range`, `rebase_to_origin`, `default_bin_size`, heatmap metric/colourbar helpers. |
-| 1041–1127 | **Dash app + caches** | `app`, `_DATA_CACHE`, `_STATS_CACHE`, `_LOAD_PROGRESS`, `resolve_dropped_folder`, `_load_data`. |
-| 1128–1489 | **Layout** | sidebar (glob/drop-zone/filters/colour/heatmap/advanced/LUT/metadata) + main area (radio view-switch + 3 absolutely-positioned panels + `dcc.Store`s). |
-| 1490–2322 | **Callbacks** | URL state, drop-folder, progress, load, `update_plots`, `update_heatmap_only`, viewport sync, view switch, selection info, LUT, export. |
-| 2323–2369 | **Clientside** | playback (Play/Pause/slider → `Plotly.animate`), heatmap `newPlot` re-init + resize, view-switch resize. |
-| 2371–end | **`__main__`** | CLI (`--glob/--port/--host/--debug`), optional pre-load. |
+| 28-390 | **Config + data helpers + ROI geometry** | `humanise_config`, tolerant JSON loaders, ROI extraction, readable config LUT. |
+| 395-670 | **ROI tables/masks + CSV loading** | `roi_reached_table`, `time_to_target_table`, `heading_target_angle_table`, `_roi_masks`, `_roi_apply`, `load_csv_fast`. |
+| 763-947 | **Filtering / stats** | `velocity_all`, `smoothed_velocity`, `compute_segment_stats`, `apply_filters`, `filter_by_stat_range`, `_dilate_keep`. |
+| 948-2040 | **Plotting** | `_prepare_merged_groups`, `build_trajectory_figure`, heatmap builders + variants, histograms, raw trace, ROI split violins, polar rays. |
+| 2041-2181 | **Dash app + data caches** | `app`, `_DATA_CACHE`, `_FILTER_CACHE`, `_ROI_MASK_CACHE`, `_POLAR_RAY_CACHE`, `resolve_dropped_folder`, `_load_data`. |
+| 2182-2649 | **Layout** | sidebar controls + five mounted panels (`traj`, `heat`, `roi`, `polar`, `diag`) hidden via `visibility`. |
+| 2650-4056 | **Callbacks** | URL state, drop-folder, progress, load, auto thresholds, filter summary, visible-tab plot builders, viewport sync, LUT, export. |
+| 4057-4126 | **Clientside playback/guards** | playback bar and scaleanchor blow-up guard. Other clientside callbacks sit next to their server callback section. |
+| 4127-end | **`__main__`** | CLI (`--glob/--port/--host/--debug`), optional pre-load. |
 
 Assets (Dash auto-serves `/assets`):
 - `assets/dropzone.js` — folder drag-and-drop → `set_props('drop-data', …)`.
@@ -71,7 +71,8 @@ glob / dropped folder
          └─ _filtered_df(...)                        cached in _FILTER_CACHE (last 4)
             ├─ subset by config/vr/fly/scene/folder + histogram range-selections
             └─ apply_filters: velocity-jump (time-buffered), min-displacement, trim
-               └─ build_* figures → dcc.Graph
+               └─ _roi_apply(...)                    cached masks in _ROI_MASK_CACHE
+                  └─ build_* figures → dcc.Graph / figure stores
 ```
 
 **Everything downstream assumes the load-time time-sort** and uses
@@ -81,6 +82,10 @@ perf killer).
 `apply_filters` is fully vectorised: the velocity-jump buffer is a
 `np.searchsorted` "dilation" (`_dilate_keep`), displacement/trim are groupby
 transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
+
+`_jump_buffer_seconds` keeps old URL values like `jb=0.1` compatible with the
+current millisecond UI (`100`), and `_filter_signature` normalises both to the
+same cache key.
 
 ---
 
@@ -108,6 +113,11 @@ transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
   `metric ∈ {count, time=count×median_dt seconds, percent}`; `log_scale` with
   human tick labels (`_log_colorbar`/`_fmt_metric`); `cmin/cmax` blank→auto,
   absolute or `crange_mode="percentile"`; occupancy floored at 100 ms.
+- **ROI tab**: one figure with three synced-x panels: per-animal fraction
+  reaching left/right (hover includes reached/trials), time-to-target split
+  violins, and heading-error split violins. Plotly native violin boxes show
+  median/IQR. Heading error is computed separately for left and right target
+  centres; missing sides use inferred centres from the loaded config set.
 
 ---
 
@@ -126,6 +136,9 @@ transforms. This took a 3.8M-row replot from ~30 s to ~4 s.
   size, then auto-triggers `update_plots`.
 - `update_plots` — trajectory/raw/summary/hist rebuilds only when Trajectory or
   Diagnostics is visible.
+- `_filtered_df` normalizes jump-buffer units for cache keys (`100` ms and old
+  `0.1` second URLs share a signature). `_roi_masks` caches reached table,
+  entered segment ids, and trim masks for fast ROI toggles.
 - `update_heatmap_only` — fast heatmap-only rebuild on any heatmap control **while
   the heatmap tab is visible** or on view switch to heatmap (reuses the filter
   cache; applies the latest viewbox server-side when available, and a clientside
@@ -156,7 +169,7 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Heatmap metric/scale | Clientside `Plotly.restyle` from the current binning variants | Server rebuild or `newPlot` |
 | ROI entered/trim while on heatmap | Heatmap store + current-mask variants only when Heatmap tab is visible | Trajectory/raw/ROI/polar |
 | Trajectory/heatmap pan/zoom | Debounced asset-level `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
-| View switch | Panel visibility; visible tab's lazy plot only | Rebuilding every tab |
+| View switch | Panel visibility; visible tab's lazy plot only; visible-graph resize only | Rebuilding every tab; resizing hidden scaleanchor graphs |
 | ROI reach/show | Visible trajectory overlay patch; visible ROI tab rebuild | Hidden trajectory patches while another tab is active |
 | Polar controls / Re-Plot on Polar | Polar plot only | Trajectory/heatmap/raw |
 
@@ -253,9 +266,10 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
   animated selections the embedded frames make the figure JSON heavy (~tens of
   MB). Animation auto-uses the tighter `BUDGET_SVG`; still, prefer "Playback off"
   for the biggest datasets or lower "Max plot points".
-- **Drag-drop can only resolve folders under the working directory.** Browsers
-  don't expose absolute paths; `resolve_dropped_folder` searches `cwd`. Data
-  elsewhere → type/paste a path. Status line says when it can't locate a folder.
+- **Drag-drop can only resolve folders under searched local roots.** Browsers
+  don't expose absolute paths; `resolve_dropped_folder` searches the working dir,
+  nearby ancestors, and optional `TRAJ_DATA_ROOT`. Data elsewhere → type/paste a
+  path. Status line says when it can't locate a folder.
 - **Two copies of the code** (`Plotting/dashboard.py` and `trajectory-dashboard/
   app.py`) can drift. Decide on one source of truth.
 - **`raw-columns` default** doesn't always stick in the control; `update_plots`
@@ -265,12 +279,12 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
 
 ---
 
-## 9. How to verify UI changes (no browser MCP needed)
+## 9. How to verify UI changes
 
-Server-side callbacks: `import dashboard as d; d._load_data("<glob>")` then call
-the builder/callback directly and assert on the returned figure. For anything
-that only shows up in the browser (rendering, clientside, drag-drop), drive
-Chrome over the DevTools Protocol:
+Server-side callbacks: `import app; app._load_data("<glob>")` then call the
+builder/callback directly and assert on the returned figure. For anything that
+only shows up in the browser (rendering, clientside, drag-drop), use the
+available browser plugin or drive Chrome over the DevTools Protocol:
 
 ```bash
 Google\ Chrome --remote-debugging-port=9222 "--remote-allow-origins=*" \
@@ -284,6 +298,9 @@ Always confirm `GET /_dash-dependencies` returns **200** after editing callbacks
 (catches duplicate-output / missing-id errors). New persisted controls must be
 added to BOTH `update_url` and `restore_from_url` (keep the return arity in
 sync); secondary Outputs need `allow_duplicate=True`.
+
+See [HANDOFF.md](HANDOFF.md) for the current SmallSubScale smoke test and the
+browser checks that caught the recent Plotly drag/pan regression.
 
 ---
 
