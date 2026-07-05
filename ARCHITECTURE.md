@@ -207,13 +207,16 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
 
 ## 8. Known issues / glitches / limitations
 
-- **Heatmap "flash" on rebuild — largely resolved.** The heatmap now re-inits
-  only when its content actually changes (a heatmap control, the filter, or a
-  viewport sync), with a short opacity fade; tab switches are resize-only and
-  flash-free (§7.2). A genuine control change still does one `newPlot`
-  (unavoidable while the react-crash workaround stands). *Cleanest future fix
-  remains:* find a figure/graph state where `Plotly.react` doesn't throw on the
-  subplot grid (or render the heatmap without `make_subplots`), which would drop
+- **Heatmap "flash" on rebuild — largely resolved.** The heatmap re-inits only on
+  a real *binning* change (bin size/bound/cmin/cmax, filter, viewport sync), with
+  a short opacity fade; tab switches are resize-only (§7.2). **Metric/scale swaps
+  are instant, in-place, flash-free:** every metric×scale variant is precomputed
+  at bin time (`build_heatmap_and_variants` → `heatmap-variants` store, ~0.7 MB)
+  and the clientside `Plotly.restyle`s z/customdata/zmin/zmax/colorbar — no server
+  round-trip, no newPlot. metric/scale are therefore NOT server inputs; the
+  fingerprint tracks binning only (no zmin/zmax). *Residual:* toggling lin↔log
+  still does one newPlot (metric swaps don't); harmless but not yet flash-free.
+  *Cleanest future fix remains:* a `Plotly.react`-safe subplot state that drops
   the newPlot/heatsync machinery entirely.
 - **Heatmap→trajectory zoom sync depends on `assets/heatsync.js`.** newPlot drops
   Dash's relayout listener; the asset re-attaches one that writes `viewport-store`
