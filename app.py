@@ -48,13 +48,21 @@ _MANUAL_LUT: dict[str, str] = {
 
 # User-supplied overrides (edited live via the LUT editor). Checked first.
 _USER_LUT: dict[str, str] = {}
+# Names auto-derived from the config's OBJECTS at load (tree vs empty, …).
+_AUTO_LUT: dict[str, str] = {}
+# When on, subplot titles show the raw config filename instead of a readable name.
+_SHOW_RAW_CONFIG: dict[str, bool] = {"on": False}
 
 
 def humanise_config(raw: str) -> str:
+    if _SHOW_RAW_CONFIG["on"]:
+        return raw
     if raw in _USER_LUT:
         return _USER_LUT[raw]
     if raw in _MANUAL_LUT:
         return _MANUAL_LUT[raw]
+    if raw in _AUTO_LUT:
+        return _AUTO_LUT[raw]
 
     name = raw.replace(".json", "")
 
@@ -256,6 +264,65 @@ def rois_by_config(metas: list[dict]) -> dict[str, list[dict]]:
             if rois and key not in out:
                 out[key] = rois
     return out
+
+
+# Readable stimulus name per object type. Extend as new stimuli appear.
+_OBJECT_NAME = {
+    "tree01": "tree", "tree01_windy": "windytree", "tree01_upside": "upsidetree",
+    "MormonBand": "band", "": "empty",
+}
+
+
+def _object_name(t: str) -> str:
+    if t in _OBJECT_NAME:
+        return _OBJECT_NAME[t]
+    if not t:
+        return "empty"
+    return (t.replace("01", "").replace("_windy", " windy")
+             .replace("_upside", " upside").replace("_", " ").strip() or "empty")
+
+
+def config_display_name(cfg_data) -> str | None:
+    """Readable name from the config's OBJECTS, e.g. 'tree vs empty' — sorted
+    left→right by X, so the (mirror-only) flip in the filename is irrelevant."""
+    rois = rois_from_config(cfg_data)
+    if not rois:
+        return None
+    names = [_object_name(r["type"]) for r in sorted(rois, key=lambda r: r["x"])]
+    return " vs ".join(names) if len(names) > 1 else names[0]
+
+
+def _populate_auto_lut(metas: list[dict]) -> None:
+    """Fill _AUTO_LUT (config filename → object-derived name) and persist the
+    combined LUT to config_names.json so edits/labels survive restarts."""
+    for m in metas or []:
+        for fname, data in (m.get("configs") or {}).items():
+            key = _short_config_name(fname)
+            if key in _AUTO_LUT:
+                continue
+            name = config_display_name(data)
+            if name:
+                _AUTO_LUT[key] = name
+    _save_config_lut()
+
+
+_CONFIG_LUT_PATH = "config_names.json"
+
+
+def _load_config_lut() -> None:
+    """Load a previously-saved config-name LUT into the user overrides."""
+    data = _loads_tolerant(Path(_CONFIG_LUT_PATH).read_text()) if os.path.exists(_CONFIG_LUT_PATH) else None
+    if isinstance(data, dict):
+        _USER_LUT.update({str(k): str(v) for k, v in data.items()})
+
+
+def _save_config_lut() -> None:
+    """Persist the sanitised names (auto + manual + user edits) to disk."""
+    merged = {**_AUTO_LUT, **_MANUAL_LUT, **_USER_LUT}
+    try:
+        Path(_CONFIG_LUT_PATH).write_text(json.dumps(merged, indent=2, sort_keys=True))
+    except Exception:
+        pass
 
 
 def segment_reached(gx, gz, roi_x, roi_z, reach) -> bool:
@@ -1448,41 +1515,73 @@ def _msg_figure(text, height=440):
     return fig
 
 
-def build_roi_violin_figure(df, rois_by_cfg, reach, table=None):
-    """Per-animal fraction of trials that reached the left vs right ROI, one pair
-    of violins per config with every visible animal as a scatter point. `df` is
-    already filtered to the visible subset, so the violins reflect exactly what
-    is toggled on. Pass a precomputed `table` to avoid recomputing it."""
+def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
+    """Per-animal fraction of trials reaching the left vs right ROI as a paired
+    swarm: one jittered point per animal per side, a faint line pairing each
+    animal's left↔right, and a median bar for each side. `df` is already filtered
+    to the visible subset. Pass a precomputed `table` to skip recomputation."""
     tbl = roi_reached_table(df, rois_by_cfg, reach) if table is None else table
     if tbl is None or len(tbl) == 0:
         return _msg_figure("No left/right ROI targets in these configs — "
                            "nothing to count. Load Choice/BinaryChoice data.")
     grp = tbl.groupby(["ConfigFile", "animal"], sort=False).agg(
-        n=("_seg_id", "size"),
         frac_left=("reached_left", "mean"),
         frac_right=("reached_right", "mean")).reset_index()
     grp["label"] = grp["ConfigFile"].map(humanise_config)
-    order = sorted(grp["label"].unique())
+    labels = sorted(grp["label"].unique())
+    xpos = {lab: i for i, lab in enumerate(labels)}
     n_animals = grp["animal"].nunique()
 
+    base = grp["label"].map(xpos).to_numpy().astype(float)
+    rng = np.random.default_rng(0)
+    jit = lambda: (rng.random(len(grp)) - 0.5) * 0.18
+    lx, rx = base - 0.2 + jit(), base + 0.2 + jit()
+    ly, ry = grp["frac_left"].to_numpy(), grp["frac_right"].to_numpy()
+
+    # pairing lines: (left)-(right)-(gap) per animal
+    px = np.empty(len(grp) * 3); px[0::3], px[1::3], px[2::3] = lx, rx, np.nan
+    py = np.empty(len(grp) * 3); py[0::3], py[1::3], py[2::3] = ly, ry, np.nan
+
+    # median bars per config/side
+    med = grp.groupby("label").agg(ml=("frac_left", "median"),
+                                   mr=("frac_right", "median"))
+    mlx, mly, mrx, mry = [], [], [], []
+    for lab, i in xpos.items():
+        if lab in med.index:
+            mlx += [i - 0.36, i - 0.04, None]; mly += [med.loc[lab, "ml"]] * 2 + [None]
+            mrx += [i + 0.04, i + 0.36, None]; mry += [med.loc[lab, "mr"]] * 2 + [None]
+
+    lc, rc = _ROI_SIDE_COLOR["left"], _ROI_SIDE_COLOR["right"]
     fig = go.Figure()
-    for side, color in (("left", _ROI_SIDE_COLOR["left"]),
-                        ("right", _ROI_SIDE_COLOR["right"])):
-        fig.add_trace(go.Violin(
-            x=grp["label"], y=grp["frac_" + side], name=side.capitalize(),
-            legendgroup=side, scalegroup=side, line_color=color, fillcolor=color,
-            opacity=0.5, points="all", pointpos=0, jitter=0.35,
-            marker=dict(size=5, opacity=0.75), box_visible=True,
-            meanline_visible=True, spanmode="hard",
-            customdata=grp["animal"],
-            hovertemplate=side + " frac=%{y:.2f}<br>%{customdata}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=px.tolist(), y=py.tolist(), mode="lines",
+                             line=dict(color="rgba(120,120,120,0.35)", width=1),
+                             hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=lx.tolist(), y=ly.tolist(), mode="markers",
+                             name="Left", legendgroup="left",
+                             marker=dict(color=lc, size=6, opacity=0.75,
+                                         line=dict(width=0.5, color="#333")),
+                             customdata=grp["animal"],
+                             hovertemplate="Left %{y:.2f}<br>%{customdata}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=rx.tolist(), y=ry.tolist(), mode="markers",
+                             name="Right", legendgroup="right",
+                             marker=dict(color=rc, size=6, opacity=0.75,
+                                         line=dict(width=0.5, color="#333")),
+                             customdata=grp["animal"],
+                             hovertemplate="Right %{y:.2f}<br>%{customdata}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=mlx, y=mly, mode="lines", showlegend=False,
+                             line=dict(color=lc, width=3), hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=mrx, y=mry, mode="lines", showlegend=False,
+                             line=dict(color=rc, width=3), hoverinfo="skip"))
     fig.update_layout(
-        violinmode="group", template="plotly_white", height=470,
-        title=dict(text=f"Fraction of trials reaching each ROI "
-                        f"(reach {reach:g} u · {n_animals} animals)", font_size=13),
+        template="plotly_white", height=470,
+        title=dict(text=f"Fraction of trials reaching each ROI — per animal "
+                        f"(reach {reach:g} u · {n_animals} animals; bars = median)",
+                   font_size=13),
         yaxis=dict(title="fraction of trials reaching", range=[-0.03, 1.03],
                    zeroline=True),
-        xaxis=dict(title="config", categoryorder="array", categoryarray=order),
+        xaxis=dict(title="config", tickmode="array",
+                   tickvals=list(range(len(labels))), ticktext=labels,
+                   range=[-0.6, len(labels) - 0.4]),
         legend=dict(orientation="h", y=1.02, yanchor="bottom", x=1, xanchor="right"),
         margin=dict(l=60, r=20, t=50, b=90))
     return fig
@@ -1625,6 +1724,8 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
 app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Trajectory Dashboard"
 
+_load_config_lut()      # restore any saved / hand-edited config names
+
 _DATA_CACHE: dict[str, pd.DataFrame] = {}
 _STATS_CACHE: dict[str, pd.DataFrame] = {}
 _META_CACHE: dict[str, list[dict]] = {}
@@ -1742,6 +1843,7 @@ def _load_data(pattern):
                     "Current Time"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     stats = compute_segment_stats(df)
+    _populate_auto_lut(metas)           # readable config names from objects
     _DATA_CACHE[key] = df
     _STATS_CACHE[key] = stats
     _META_CACHE[key] = metas
@@ -1829,6 +1931,14 @@ app.layout = html.Div([
                 {"label": "Separate subplots", "value": "separate"},
                 {"label": "Pool into one", "value": "pooled"},
             ], value="separate", style={"fontSize": "11px", "marginTop": "3px"}),
+            dcc.Checklist(id="show-raw-config",
+                          options=[{"label": " Show raw config filenames",
+                                    "value": "on"}],
+                          value=[], style={"fontSize": "11px", "marginTop": "3px"}),
+            html.Div("Titles default to readable stimulus names from the config "
+                     "objects (e.g. 'tree vs empty'); flip/noflip is mirror "
+                     "symmetry and is hidden. Edit names in the Advanced LUT.",
+                     style={"fontSize": "9px", "color": "#888"}),
 
             html.Hr(style={"margin": "6px 0"}),
 
@@ -2687,7 +2797,7 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                            reach if _mask_on else None)
     roi_fig = no_update            # the ROI violin is lazily built by its own tab
     if want_rois and view == "roi" and table is not None:
-        roi_fig = build_roi_violin_figure(df_f, rois, reach, table=table)
+        roi_fig = build_roi_swarm_figure(df_f, rois, reach, table=table)
 
     df_plot = rebase_to_origin(df_view) if do_rebase else df_view
 
@@ -2917,7 +3027,7 @@ def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_di
     rois = rois_by_config(metas)
     if not rois:
         return _msg_figure("No ROI targets in these configs.")
-    return build_roi_violin_figure(df_f, rois, float(reach) if reach else 3.0)
+    return build_roi_swarm_figure(df_f, rois, float(reach) if reach else 3.0)
 
 
 # Reach slider / show toggle → BLIT the trajectory overlay: recompute reach
@@ -3001,6 +3111,24 @@ def traj_mask_refresh(roi_trim, roi_entered, roi_reach, view, clicks, pattern):
     sig = (tuple(roi_trim or []), tuple(roi_entered or []),
            roi_reach if mask_on else None)
     if sig == _LAST_TRAJ_SIG["v"]:      # nothing that affects the trajectory changed
+        return no_update
+    return (clicks or 0) + 1
+
+
+# Raw-filename vs readable-name toggle: flips the global, invalidates the cached
+# figure signatures (subplot titles change), and replots.
+@app.callback(
+    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    Input("show-raw-config", "value"),
+    State("btn-plot", "n_clicks"),
+    State("store-glob", "data"),
+    prevent_initial_call=True,
+)
+def toggle_raw_config(val, clicks, pattern):
+    _SHOW_RAW_CONFIG["on"] = _on(val)
+    _LAST_HEAT_SIG["v"] = None
+    _LAST_TRAJ_SIG["v"] = None
+    if not pattern:
         return no_update
     return (clicks or 0) + 1
 
@@ -3371,6 +3499,29 @@ app.clientside_callback(
     "padding:'4px 10px 2px', background:'#fff', borderBottom:'1px solid #e3e6ee'};}",
     Output("anim-bar", "style"),
     Input("trajectory-plot", "figure"),
+)
+
+
+# Fix the occasional scaleanchor blow-up: the WebGL trajectory can render its
+# aspect-locked axes at a huge range if it's first drawn before its container is
+# sized (data ends up a speck at ±16000). Detect it — rendered span ≫ the range
+# the figure asked for — and autorange back to the data extent. Only fires on the
+# rare blow-up, so a genuine zoom is left alone.
+app.clientside_callback(
+    "function(tfig, view){if(view!=='traj')return '';setTimeout(function(){"
+    "var c=document.getElementById('trajectory-plot');"
+    "var g=c&&c.querySelector('.js-plotly-plot');"
+    "if(g&&window.Plotly&&tfig&&tfig.layout){"
+    "var L=tfig.layout;var xr=L.xaxis&&L.xaxis.range;"
+    "var rx=g.layout&&g.layout.xaxis&&g.layout.xaxis.range;"
+    "if(xr&&rx&&Math.abs(rx[1]-rx[0])>3*Math.abs(xr[1]-xr[0])){"
+    "try{window.Plotly.relayout(g,{'xaxis.autorange':true,'yaxis.autorange':true});}"
+    "catch(e){}}}"
+    "},160);return '';}",
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("trajectory-plot", "figure"),
+    Input("view-mode", "value"),
+    prevent_initial_call=True,
 )
 
 

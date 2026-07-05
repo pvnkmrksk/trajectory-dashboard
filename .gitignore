@@ -9,3 +9,5 @@ trajectory_export_*.html
 # local dev artifacts
 /Data
 .claude/
+
+config_names.json
