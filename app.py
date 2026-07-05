@@ -1143,30 +1143,44 @@ def _log_colorbar(mmin, mmax, metric):
     return vals, text
 
 
-def _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct):
-    """The expensive, metric-independent part: 2-D histogram (raw counts) per
-    subplot. All metric/scale variants derive from this, so it's computed once."""
-    groups = _group_frames(df, group_by, pool_mode, ncols)
-    group_names = list(groups.keys())
-    n = len(group_names)
-    nrows = max(1, (n + ncols - 1) // ncols)
+def _heatmap_edges(df, bin_size, bound_pct):
+    """Shared bin edges + range for a heatmap (metric-independent)."""
     rng = _robust_range(df, bound_pct) if bound_pct and bound_pct < 100 else _shared_range(df)
     rx, rz = rng
     bs = float(bin_size) if bin_size and bin_size > 0 else default_bin_size(df)
     span = max(rx[1] - rx[0], rz[1] - rz[0])
     if span / bs > MAX_HEATMAP_BINS:        # only clamps in pathological cases
         bs = span / MAX_HEATMAP_BINS
-    xedges = np.arange(rx[0], rx[1] + bs, bs)
-    yedges = np.arange(rz[0], rz[1] + bs, bs)
-    xc = 0.5 * (xedges[:-1] + xedges[1:])
-    yc = 0.5 * (yedges[:-1] + yedges[1:])
-    counts = []
+    return np.arange(rx[0], rx[1] + bs, bs), np.arange(rz[0], rz[1] + bs, bs), rng
+
+
+def _counts_for_groups(groups, group_names, xedges, yedges):
+    """Raw-count matrix per group name (all-zero tile when a group is absent), so
+    every ROI-mask state shares the SAME grid + subplot set and stays swappable."""
+    empty = np.zeros((len(yedges) - 1, len(xedges) - 1))
+    out = []
     for gname in group_names:
-        gdf = groups[gname]
+        gdf = groups.get(gname)
+        if gdf is None or len(gdf) == 0:
+            out.append(empty.copy())
+            continue
         H, _, _ = np.histogram2d(gdf["GameObjectPosX"].values,
                                  gdf["GameObjectPosZ"].values,
                                  bins=[xedges, yedges])
-        counts.append(H.T.astype(float))    # [row=y, col=x] raw counts
+        out.append(H.T.astype(float))       # [row=y, col=x] raw counts
+    return out
+
+
+def _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct):
+    """The expensive, metric-independent part: 2-D histogram (raw counts) per
+    subplot. All metric/scale variants derive from this, so it's computed once."""
+    groups = _group_frames(df, group_by, pool_mode, ncols)
+    group_names = list(groups.keys())
+    nrows = max(1, (len(group_names) + ncols - 1) // ncols)
+    xedges, yedges, rng = _heatmap_edges(df, bin_size, bound_pct)
+    counts = _counts_for_groups(groups, group_names, xedges, yedges)
+    xc = 0.5 * (xedges[:-1] + xedges[1:])
+    yc = 0.5 * (yedges[:-1] + yedges[1:])
     return dict(group_names=group_names, nrows=nrows, xc=xc.tolist(),
                 yc=yc.tolist(), rng=rng, counts=counts, dt=_median_dt(df))
 
@@ -1289,6 +1303,60 @@ def build_heatmap_and_variants(df, group_by, pool_mode, ncols, bin_size, bound_p
                            cmax=cmax, crange_mode=crange_mode)
     fig = _assemble_heatmap(bins, cur, ncols, df)
     return fig, _all_variants_from_bins(bins, cmin, cmax, crange_mode)
+
+
+def build_heatmap_mask_variants(df_f, pattern, reach, group_by, pool_mode, ncols,
+                                bin_size, bound_pct, cmin, cmax, crange_mode,
+                                do_rebase):
+    """Base (unmasked) figure + a store keyed `e{0/1}_t{0/1}_{metric}_{scale}`
+    covering all four ROI-mask states (entered-only × tail-trim) × every
+    metric/scale — so the client can flip the entered/trim/metric/scale controls
+    with Plotly.restyle, no server round-trip, no re-init.
+
+    All states share ONE grid and the UNMASKED subplot set (a state with no data
+    in a subplot just gets an all-NaN tile), which is what makes them swappable.
+    The reached table + trims are computed once and reused across the four states.
+    """
+    if df_f is None or len(df_f) == 0:
+        return _msg_figure("No data after filtering"), {}
+    rois = rois_by_config(_load_data(pattern)[2])
+    reach_v = float(reach) if reach else 3.0
+    if rois:
+        table = roi_reached_table(df_f, rois, reach_v)
+        ent = (set(table.loc[table["reached_left"] | table["reached_right"], "_seg_id"])
+               if len(table) else set())
+        df_ent = df_f[df_f["_seg_id"].isin(ent)]
+        df_trm = trim_after_roi_exit(df_f, rois, reach_v)
+        df_ent_trm = trim_after_roi_exit(df_ent, rois, reach_v) if len(df_ent) else df_ent
+    else:
+        df_ent = df_trm = df_ent_trm = df_f
+    masks = {(0, 0): df_f, (1, 0): df_ent, (0, 1): df_trm, (1, 1): df_ent_trm}
+    disp = {k: (rebase_to_origin(v) if (do_rebase and len(v)) else v)
+            for k, v in masks.items()}
+
+    base = disp[(0, 0)]
+    xedges, yedges, rng = _heatmap_edges(base, bin_size, bound_pct)
+    xc = (0.5 * (xedges[:-1] + xedges[1:])).tolist()
+    yc = (0.5 * (yedges[:-1] + yedges[1:])).tolist()
+    group_names = list(_group_frames(base, group_by, pool_mode, ncols).keys())
+    nrows = max(1, (len(group_names) + ncols - 1) // ncols)
+    dt = _median_dt(base)
+
+    store, base_bins = {}, None
+    for (e, t), dv in disp.items():
+        groups = _group_frames(dv, group_by, pool_mode, ncols) if len(dv) else {}
+        bins = dict(group_names=group_names, nrows=nrows, xc=xc, yc=yc, rng=rng,
+                    counts=_counts_for_groups(groups, group_names, xedges, yedges),
+                    dt=dt)
+        if e == 0 and t == 0:
+            base_bins = bins
+        for m in HEATMAP_METRICS:
+            for s in HEATMAP_SCALES:
+                store[f"e{e}_t{t}_{m}_{s}"] = _heatmap_variant(
+                    bins, log_scale=(s == "log"), metric=m, cmin=cmin, cmax=cmax,
+                    crange_mode=crange_mode)
+    base_fig = _assemble_heatmap(base_bins, store["e0_t0_time_lin"], ncols, base)
+    return base_fig, store
 
 
 def build_velocity_histogram(df, vel_threshold=None):
@@ -2525,13 +2593,11 @@ def _apply_viewport(fig, viewport, df):
 
 @app.callback(
     Output("trajectory-plot", "figure"),
-    Output("heatmap-plot", "figure"),
     Output("raw-trace-plot", "figure"),
     Output("data-summary", "children"),
     Output("vel-histogram", "figure", allow_duplicate=True),
     Output("disp-histogram", "figure", allow_duplicate=True),
     Output("roi-plot", "figure", allow_duplicate=True),
-    Output("heatmap-variants", "data", allow_duplicate=True),
     Input("btn-plot", "n_clicks"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
@@ -2576,16 +2642,16 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                  view):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
-        return empty, empty, empty, "Load data first.", no_update, no_update, no_update, no_update
+        return empty, empty, "Load data first.", no_update, no_update, no_update
 
     df_f, df_sub, stats_sub = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
 
     if df_sub is None:
-        return empty, empty, empty, "No data.", no_update, no_update, no_update, no_update
+        return empty, empty, "No data.", no_update, no_update, no_update
     if len(df_sub) == 0:
-        return empty, empty, empty, "All filtered out.", no_update, no_update, no_update, no_update
+        return empty, empty, "All filtered out.", no_update, no_update, no_update
 
     # Histograms reflect the subset before velocity/disp cuts
     df, _, metas = _load_data(pattern)
@@ -2626,18 +2692,12 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                                         rois=rois, reach_radius=reach,
                                         show_rois=want_rois and not do_rebase,
                                         roi_counts=roi_counts)
-    heat_fig, heat_variants = build_heatmap_and_variants(
-        df_plot, group_by, pool_mode, ncols_val,
-        bin_size=hm_binsize, log_scale=(hm_scale == "log"),
-        bound_pct=hm_bound if hm_bound else 100, metric=hm_metric or "time",
-        cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange)
     raw_fig = build_raw_trace_figure(
         df_view, raw_cols or ["GameObjectPosX", "GameObjectPosZ"], max_points=max_points)
     bt = time.time() - t0
 
     # Retain / restore the shared viewbox across replots and from the URL.
-    for f in (traj_fig, heat_fig):
-        _apply_viewport(f, viewport, df_plot)
+    _apply_viewport(traj_fig, viewport, df_plot)
 
     # Effective drawn points (post-decimation) for the summary
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
@@ -2652,7 +2712,7 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                f"{len(traj_fig.frames)} frames | "
                f"build {bt:.2f}s | colour: {color_by}")
 
-    return traj_fig, heat_fig, raw_fig, summary, vel_fig, disp_fig, roi_fig, heat_variants
+    return traj_fig, raw_fig, summary, vel_fig, disp_fig, roi_fig
 
 
 # Rebuild the heatmap on its own controls AND whenever the Heatmap view is
@@ -2676,8 +2736,8 @@ _LAST_HEAT_SIG: dict = {"v": None}
     Input("heatmap-cmax", "value"),
     Input("heatmap-crange", "value"),
     Input("view-mode", "value"),
-    State("heatmap-scale", "value"),
-    State("heatmap-metric", "value"),
+    Input("btn-plot", "n_clicks"),
+    Input("roi-reach", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
@@ -2695,26 +2755,22 @@ _LAST_HEAT_SIG: dict = {"v": None}
     State("vel-histogram", "selectedData"),
     State("disp-histogram", "selectedData"),
     State("viewport-store", "data"),
-    State("roi-trim", "value"),
-    State("roi-reach", "value"),
-    State("roi-entered", "value"),
     prevent_initial_call=True,
 )
-def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax,
-                        hm_crange, view, hm_scale, hm_metric, pattern, vel_thresh,
-                        min_disp, trim, jump_buf, group_by, pool_mode, ncols, rebase,
-                        cfg, vrs, fids, scenes, folders,
-                        vel_selection, disp_selection, viewport, roi_trim, roi_reach,
-                        roi_entered):
+def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange, view,
+                        n_plot, roi_reach, pattern, vel_thresh, min_disp, trim,
+                        jump_buf, group_by, pool_mode, ncols, rebase, cfg, vrs, fids,
+                        scenes, folders, vel_selection, disp_selection, viewport):
     if not pattern:
         return no_update, no_update
-    # If this fire came from switching views, only act when heatmap is shown.
     if ctx.triggered_id == "view-mode" and view != "heat":
         return no_update, no_update
-    # Skip the rebuild on a plain tab switch when nothing relevant changed — this
-    # is what stops the heatmap re-initialising (and flashing) every time you
-    # open the tab. metric/scale are deliberately NOT here: they no longer rebuild
-    # the figure at all — the client swaps between precomputed variants instantly.
+    # Signature covers only what changes the BINNING or the mask geometry (bins,
+    # bound, colour range, filter, reach, rebase). It deliberately excludes the
+    # ROI entered/trim toggles and metric/scale — those swap client-side between
+    # the precomputed variants — and the viewport (a zoom shouldn't re-bin). So a
+    # mask/metric/scale flip, a tab switch, or an entered/trim replot all hit this
+    # unchanged signature and skip the (expensive) rebuild entirely.
     def _sig_of(v):
         try:
             return json.dumps(v, sort_keys=True, default=str)
@@ -2723,23 +2779,19 @@ def update_heatmap_only(hm_binsize, hm_bound, hm_cmin, hm_cmax,
     sig = _sig_of([pattern, hm_binsize, hm_bound, hm_cmin, hm_cmax, hm_crange,
                    group_by, pool_mode, ncols, rebase, cfg, vrs, fids, scenes,
                    folders, vel_thresh, min_disp, trim, jump_buf, vel_selection,
-                   disp_selection, viewport, roi_trim, roi_reach, roi_entered])
-    if ctx.triggered_id == "view-mode" and sig == _LAST_HEAT_SIG["v"]:
+                   disp_selection, roi_reach])
+    if sig == _LAST_HEAT_SIG["v"]:
         return no_update, no_update
     df_f, df_sub, _ = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
     if df_sub is None or len(df_sub) == 0:
         return no_update, no_update
-    df_f, _ = _roi_apply(df_f, pattern, roi_reach, _on(roi_entered), _on(roi_trim))
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
-    if rebase and "on" in rebase:
-        df_f = rebase_to_origin(df_f)
-    heat, variants = build_heatmap_and_variants(
-        df_f, group_by, pool_mode, ncols_val,
-        bin_size=hm_binsize, log_scale=(hm_scale == "log"),
-        bound_pct=hm_bound if hm_bound else 100, metric=hm_metric or "time",
-        cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange)
+    heat, variants = build_heatmap_mask_variants(
+        df_f, pattern, roi_reach, group_by, pool_mode, ncols_val,
+        bin_size=hm_binsize, bound_pct=hm_bound if hm_bound else 100,
+        cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange, do_rebase=_on(rebase))
     _apply_viewport(heat, viewport, df_f)
     _LAST_HEAT_SIG["v"] = sig
     return heat, variants
@@ -3024,7 +3076,7 @@ def apply_viewport_traj(view, vp):
 # re-init, no flash. Genuine re-inits get a short opacity fade so they read as a
 # crossfade rather than a white flash.
 app.clientside_callback(
-    "function(hfig, view, metric, scale, variants){setTimeout(function(){"
+    "function(hfig, view, metric, scale, entered, trim, variants){setTimeout(function(){"
     "var hc=document.getElementById('heatmap-plot');"
     "var hg=hc&&hc.querySelector('.js-plotly-plot');"
     "var panel=document.getElementById('view-heat');"
@@ -3054,7 +3106,10 @@ app.clientside_callback(
     # Swap in the current metric/scale variant IN PLACE (Plotly.restyle) — instant,
     # no re-init, no flash. Every metric×scale was precomputed at bin time, so
     # flipping the metric/scale radios only touches z/zmin/zmax/colorbar here.
-    "try{var key=(metric||'time')+'_'+(scale||'lin');var v=variants&&variants[key];"
+    "try{var e=(entered&&entered.indexOf('on')>=0)?1:0;"
+    "var t=(trim&&trim.indexOf('on')>=0)?1:0;"
+    "var key='e'+e+'_t'+t+'_'+(metric||'time')+'_'+(scale||'lin');"
+    "var v=variants&&variants[key];"
     "if(v&&hg&&hg.data&&hg.data.length){"
     "var vi=v.z.map(function(_,i){return i;});"
     "window.Plotly.restyle(hg,{z:v.z,customdata:v.customdata},vi);"
@@ -3080,6 +3135,8 @@ app.clientside_callback(
     Input("view-mode", "value"),
     Input("heatmap-metric", "value"),
     Input("heatmap-scale", "value"),
+    Input("roi-entered", "value"),
+    Input("roi-trim", "value"),
     State("heatmap-variants", "data"),
     prevent_initial_call=True,
 )
