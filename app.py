@@ -2077,16 +2077,25 @@ app.layout = html.Div([
             html.Hr(style={"margin": "6px 0"}),
 
             html.Label("Filters", style={"fontWeight": "bold", "fontSize": "12px"}),
+            html.Div("Applied on Re-Plot; every plot & stat uses this filtered "
+                     "set.", style={"fontSize": "9px", "color": "#888"}),
             html.Div([
                 html.Label("Max velocity", style={"fontSize": "10px"}),
                 dcc.Input(id="vel-threshold", type="number", value=None,
-                          placeholder="e.g. 500",
+                          placeholder="blank = no cut",
                           style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                dcc.Checklist(id="vel-auto",
+                              options=[{"label": " auto (99th pct)", "value": "on"}],
+                              value=["on"], style={"fontSize": "9px"}),
             ], style={"marginBottom": "3px"}),
             html.Div([
                 html.Label("Min displacement", style={"fontSize": "10px"}),
-                dcc.Input(id="min-disp", type="number", value=None, placeholder="e.g. 5",
+                dcc.Input(id="min-disp", type="number", value=None,
+                          placeholder="blank = no cut",
                           style={"width": "100%", "fontSize": "11px", "padding": "3px"}),
+                dcc.Checklist(id="disp-auto",
+                              options=[{"label": " auto (5% of median)", "value": "on"}],
+                              value=["on"], style={"fontSize": "9px"}),
             ], style={"marginBottom": "3px"}),
             html.Div([
                 html.Label("Trim samples", style={"fontSize": "10px"}),
@@ -2182,6 +2191,9 @@ app.layout = html.Div([
             html.Div(id="data-summary",
                      style={"fontSize": "11px", "padding": "3px 8px", "background": "#e9ecef",
                             "borderRadius": "3px", "margin": "0 0 3px 0", "flexShrink": "0"}),
+            html.Div(id="exclusion-info",
+                     style={"fontSize": "10px", "color": "#777", "padding": "0 8px 2px",
+                            "flexShrink": "0"}),
 
             # View switch.
             dcc.RadioItems(id="view-mode", options=[
@@ -2290,6 +2302,7 @@ app.layout = html.Div([
     dcc.Store(id="store-glob"),
     dcc.Store(id="viewport-store"),
     dcc.Store(id="heatmap-variants"),
+    dcc.Store(id="auto-thresholds"),
     dcc.Store(id="drop-data"),
     dcc.Store(id="url-restored", data=False),
     dcc.Interval(id="autoload-interval", interval=500, max_intervals=1),
@@ -2539,6 +2552,7 @@ def update_url(n, vp, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
     Output("disp-histogram", "figure"),
     Output("heatmap-binsize", "value", allow_duplicate=True),
     Output("btn-plot", "n_clicks"),
+    Output("auto-thresholds", "data"),
     Input("btn-load", "n_clicks"),
     State("glob-input", "value"),
     State("btn-plot", "n_clicks"),
@@ -2548,7 +2562,7 @@ def update_url(n, vp, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
 def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize):
     empty = go.Figure().update_layout(height=190, template="plotly_white")
     nope = ("No pattern.", None, [], [], [], [], [], [], "", empty, empty,
-            no_update, no_update)
+            no_update, no_update, None)
     if not pattern:
         return nope
 
@@ -2558,7 +2572,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize):
 
     if df is None or len(df) == 0:
         return (f"No data for: {pattern}", None, [], [], [], [], [], [], "",
-                empty, empty, no_update, no_update)
+                empty, empty, no_update, no_update, None)
 
     n_files = df["SourceFile"].nunique()
     n_segs = df["_seg_id"].nunique()
@@ -2593,6 +2607,13 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize):
     vel_fig = build_velocity_histogram(df)
     disp_fig = build_displacement_histogram(stats)
 
+    # Auto filter defaults: 99th-pct velocity, and 5% of the median net
+    # displacement (a scale-free "barely moved" cut). Stored for the auto boxes.
+    vv = velocity_all(df); vv = vv[np.isfinite(vv)]
+    disp = stats["displacement"].to_numpy() if stats is not None and len(stats) else np.array([])
+    auto = {"vel": round(float(np.percentile(vv, 99)), 3) if vv.size else None,
+            "disp": round(float(0.05 * np.median(disp)), 3) if disp.size else None}
+
     # Smart default bin size on a fresh load; respect any value already set
     # (e.g. restored from the URL).
     binsize_out = no_update if (cur_binsize not in (None, "")) else default_bin_size(df)
@@ -2603,8 +2624,54 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize):
         opts("SourceFolder"), col_opts,
         "\n".join(meta_parts) or "No metadata",
         vel_fig, disp_fig, binsize_out,
-        (plot_clicks or 0) + 1,
+        (plot_clicks or 0) + 1, auto,
     )
+
+
+# Auto thresholds: when a box is ticked, fill its field with the computed value
+# and disable it; when unticked, re-enable it (blank = no cut). Also triggers a
+# re-filter so the change actually reaches the plots.
+@app.callback(
+    Output("vel-threshold", "value"),
+    Output("vel-threshold", "disabled"),
+    Output("min-disp", "value"),
+    Output("min-disp", "disabled"),
+    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    Input("vel-auto", "value"),
+    Input("disp-auto", "value"),
+    Input("auto-thresholds", "data"),
+    State("btn-plot", "n_clicks"),
+    State("store-glob", "data"),
+    prevent_initial_call=True,
+)
+def apply_auto_thresholds(vel_auto, disp_auto, auto, clicks, pattern):
+    vel_val = (auto or {}).get("vel") if _on(vel_auto) else no_update
+    disp_val = (auto or {}).get("disp") if _on(disp_auto) else no_update
+    bump = (clicks or 0) + 1 if pattern else no_update
+    return vel_val, _on(vel_auto), disp_val, _on(disp_auto), bump
+
+
+def _exclusion_summary(df_sub, stats_sub, vel_thresh, min_disp, walk):
+    """Small text: how many points/trials the active filters remove, and what
+    fraction of samples are moving (≥ walk speed). Computed on the pre-cut subset."""
+    v = velocity_all(df_sub)
+    v = v[np.isfinite(v)]
+    parts = []
+    if vel_thresh and v.size:
+        nv = int((v > float(vel_thresh)).sum())
+        parts.append(f"vel over {float(vel_thresh):g}: {nv:,} pts ({100*nv/v.size:.1f}%)")
+    else:
+        parts.append("no vel cut")
+    if min_disp and stats_sub is not None and len(stats_sub):
+        below = int((stats_sub["displacement"] < float(min_disp)).sum())
+        parts.append(f"disp under {float(min_disp):g}: {below} trials "
+                     f"({100*below/len(stats_sub):.1f}%)")
+    else:
+        parts.append("no disp cut")
+    w = float(walk) if walk else None
+    if w and v.size:
+        parts.append(f"moving (≥{w:g}): {100*(v >= w).sum()/v.size:.0f}%")
+    return "Excluded — " + " · ".join(parts)
 
 
 _FILTER_CACHE: dict = {}        # signature -> (df_f, df_sub, stats_sub)
@@ -2711,6 +2778,7 @@ def _apply_viewport(fig, viewport, df):
     Output("vel-histogram", "figure", allow_duplicate=True),
     Output("disp-histogram", "figure", allow_duplicate=True),
     Output("roi-plot", "figure", allow_duplicate=True),
+    Output("exclusion-info", "children"),
     Input("btn-plot", "n_clicks"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
@@ -2745,6 +2813,7 @@ def _apply_viewport(fig, viewport, df):
     State("roi-trim", "value"),
     State("roi-entered", "value"),
     State("view-mode", "value"),
+    State("polar-walk", "value"),
     prevent_initial_call=True,
 )
 def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -2752,19 +2821,22 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
                  scenes, folders, raw_cols, ncols, max_points, vel_selection,
                  disp_selection, viewport, roi_show, roi_reach, roi_trim, roi_entered,
-                 view):
+                 view, polar_walk):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
-        return empty, empty, "Load data first.", no_update, no_update, no_update
+        return empty, empty, "Load data first.", no_update, no_update, no_update, ""
 
     df_f, df_sub, stats_sub = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
 
     if df_sub is None:
-        return empty, empty, "No data.", no_update, no_update, no_update
+        return empty, empty, "No data.", no_update, no_update, no_update, ""
     if len(df_sub) == 0:
-        return empty, empty, "All filtered out.", no_update, no_update, no_update
+        return empty, empty, "All filtered out.", no_update, no_update, no_update, ""
+
+    # Non-invasive exclusion tally (what the filters remove; fraction moving).
+    exclusion = _exclusion_summary(df_sub, stats_sub, vel_thresh, min_disp, polar_walk)
 
     # Histograms reflect the subset before velocity/disp cuts
     df, _, metas = _load_data(pattern)
@@ -2830,7 +2902,7 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                f"{len(traj_fig.frames)} frames | "
                f"build {bt:.2f}s | colour: {color_by}")
 
-    return traj_fig, raw_fig, summary, vel_fig, disp_fig, roi_fig
+    return traj_fig, raw_fig, summary, vel_fig, disp_fig, roi_fig, exclusion
 
 
 # Rebuild the heatmap on its own controls AND whenever the Heatmap view is
