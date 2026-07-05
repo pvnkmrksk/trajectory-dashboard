@@ -357,15 +357,33 @@ def trim_after_roi_exit(df, rois_by_cfg, reach) -> pd.DataFrame:
     return df[keep.to_numpy()]
 
 
-def _maybe_trim(df_f, pattern, roi_trim, reach):
-    """Apply ROI tail-trim to a filtered frame when the toggle is on."""
-    if not (roi_trim and "on" in (roi_trim or [])) or df_f is None or len(df_f) == 0:
-        return df_f
-    _, _, metas = _load_data(pattern)
-    rois = rois_by_config(metas)
+def _on(v):
+    return bool(v) and "on" in (v or [])
+
+
+def _roi_apply(df_f, pattern, reach, entered_only, trim):
+    """Return (df_view, table).
+
+    `table` is the UNMASKED per-trial reached table — counts/violins use it so the
+    denominator is always the full number of trials in each config. `df_view` is
+    the frame the trajectory/heatmap/polar actually draw: optionally restricted to
+    whole trials that entered an ROI (entered_only) and then tail-trimmed. Both
+    operate per whole trial (segment), so masks never bleed between trials.
+    """
+    if df_f is None or len(df_f) == 0:
+        return df_f, None
+    reach_v = float(reach) if reach else 3.0
+    rois = rois_by_config(_load_data(pattern)[2])
     if not rois:
-        return df_f
-    return trim_after_roi_exit(df_f, rois, float(reach) if reach else 3.0)
+        return df_f, None
+    table = roi_reached_table(df_f, rois, reach_v)
+    df_view = df_f
+    if entered_only and len(table):
+        entered = table.loc[table["reached_left"] | table["reached_right"], "_seg_id"]
+        df_view = df_f[df_f["_seg_id"].isin(set(entered))]
+    if trim:
+        df_view = trim_after_roi_exit(df_view, rois, reach_v)
+    return df_view, table
 
 
 def load_csv_fast(filepath: str) -> pd.DataFrame | None:
@@ -1797,10 +1815,14 @@ app.layout = html.Div([
             dcc.Slider(id="roi-reach", min=0.5, max=30, step=0.5, value=3,
                        marks={1: "1", 10: "10", 20: "20", 30: "30"},
                        tooltip={"placement": "bottom", "always_visible": True}),
+            dcc.Checklist(id="roi-entered",
+                          options=[{"label": " Only trials that entered an ROI",
+                                    "value": "on"}],
+                          value=[], style={"fontSize": "11px", "marginTop": "3px"}),
             dcc.Checklist(id="roi-trim",
                           options=[{"label": " Trim trial tail after ROI exit",
                                     "value": "on"}],
-                          value=[], style={"fontSize": "11px", "marginTop": "3px"}),
+                          value=[], style={"fontSize": "11px", "marginTop": "1px"}),
             html.Div("Targets auto-load from the scene configs (Choice / "
                      "BinaryChoice; polar or cartesian). A trial 'reaches' an ROI "
                      "if its path comes within the radius. Left = −X, right = +X. "
@@ -2500,6 +2522,7 @@ def _apply_viewport(fig, viewport, df):
     State("roi-show", "value"),
     State("roi-reach", "value"),
     State("roi-trim", "value"),
+    State("roi-entered", "value"),
     State("view-mode", "value"),
     prevent_initial_call=True,
 )
@@ -2507,7 +2530,8 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                  group_by, pool_mode, color_by, animate, rebase, hm_binsize, hm_scale,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
                  scenes, folders, raw_cols, ncols, max_points, vel_selection,
-                 disp_selection, viewport, roi_show, roi_reach, roi_trim, view):
+                 disp_selection, viewport, roi_show, roi_reach, roi_trim, roi_entered,
+                 view):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     if not pattern:
         return empty, empty, empty, "Load data first.", no_update, no_update, no_update
@@ -2520,8 +2544,6 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
         return empty, empty, empty, "No data.", no_update, no_update, no_update
     if len(df_sub) == 0:
         return empty, empty, empty, "All filtered out.", no_update, no_update, no_update
-
-    df_f = _maybe_trim(df_f, pattern, roi_trim, roi_reach)
 
     # Histograms reflect the subset before velocity/disp cuts
     df, _, metas = _load_data(pattern)
@@ -2539,24 +2561,22 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
     do_animate = bool(animate) and "on" in (animate or [])
     do_rebase = bool(rebase) and "on" in (rebase or [])
-    df_plot = rebase_to_origin(df_f) if do_rebase else df_f
 
-    # ROIs auto-load from the scene configs. Overlay only makes sense in absolute
-    # coordinates, so it's suppressed when tracks are rebased to origin; reached
-    # counts are always computed on the real (non-rebased) filtered data.
+    # ROI masking + counts. The reached table (and the counts/violins built from
+    # it) use the UNMASKED filtered data, so the denominator is always the total
+    # number of trials in each config. df_view is what the trajectory, heatmap and
+    # raw plot draw: optionally restricted to whole trials that entered an ROI,
+    # then tail-trimmed — the heatmap therefore respects the exact same subset.
     rois = rois_by_config(metas)
-    want_rois = bool(roi_show) and "on" in (roi_show or []) and bool(rois)
     reach = float(roi_reach) if roi_reach else 3.0
-    roi_counts = None
+    want_rois = _on(roi_show) and bool(rois)
+    df_view, table = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
+    roi_counts = roi_config_summary(table) if (want_rois and table is not None) else None
     roi_fig = no_update            # the ROI violin is lazily built by its own tab
-    if want_rois:
-        # Reached table computed ONCE, shared by the overlay counts and (only when
-        # the ROI tab is actually open) the violins — avoids ~2s of duplicate work
-        # on every replot while on the trajectory tab.
-        table = roi_reached_table(df_f, rois, reach)
-        roi_counts = roi_config_summary(table)
-        if view == "roi":
-            roi_fig = build_roi_violin_figure(df_f, rois, reach, table=table)
+    if want_rois and view == "roi" and table is not None:
+        roi_fig = build_roi_violin_figure(df_f, rois, reach, table=table)
+
+    df_plot = rebase_to_origin(df_view) if do_rebase else df_view
 
     traj_fig = build_trajectory_figure(df_plot, group_by, pool_mode, ncols=ncols_val,
                                         color_by=color_by or "individual",
@@ -2570,7 +2590,7 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
                                      metric=hm_metric or "time",
                                      cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange)
     raw_fig = build_raw_trace_figure(
-        df_f, raw_cols or ["GameObjectPosX", "GameObjectPosZ"], max_points=max_points)
+        df_view, raw_cols or ["GameObjectPosX", "GameObjectPosZ"], max_points=max_points)
     bt = time.time() - t0
 
     # Retain / restore the shared viewbox across replots and from the URL.
@@ -2578,13 +2598,13 @@ def update_plots(n, pattern, vel_thresh, min_disp, trim, jump_buf,
         _apply_viewport(f, viewport, df_plot)
 
     # Effective drawn points (post-decimation) for the summary
-    n_traces = int(df_f["_seg_id"].nunique()) if len(df_f) else 0
+    n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
     drawn = sum(len(t.x) for t in traj_fig.data if getattr(t, "x", None) is not None)
     budget_str = (f"{int(max_points):,}" if (max_points and max_points > 0)
                   else (f"anim {BUDGET_SVG//1000}k" if do_animate else f"{BUDGET_GL//1000}k"))
 
     n_segs_before = df_sub["_seg_id"].nunique()
-    summary = (f"{len(df_f):,}/{len(df_sub):,} pts | "
+    summary = (f"{len(df_view):,}/{len(df_sub):,} pts | "
                f"{n_traces}/{n_segs_before} segs | "
                f"drawn ~{drawn:,} ({budget_str}) | "
                f"{len(traj_fig.frames)} frames | "
@@ -2634,13 +2654,15 @@ _LAST_HEAT_SIG: dict = {"v": None}
     State("viewport-store", "data"),
     State("roi-trim", "value"),
     State("roi-reach", "value"),
+    State("roi-entered", "value"),
     prevent_initial_call=True,
 )
 def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_cmax,
                         hm_crange, view, pattern, vel_thresh,
                         min_disp, trim, jump_buf, group_by, pool_mode, ncols, rebase,
                         cfg, vrs, fids, scenes, folders,
-                        vel_selection, disp_selection, viewport, roi_trim, roi_reach):
+                        vel_selection, disp_selection, viewport, roi_trim, roi_reach,
+                        roi_entered):
     if not pattern:
         return no_update
     # If this fire came from switching views, only act when heatmap is shown.
@@ -2657,7 +2679,8 @@ def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_c
     sig = _sig_of([pattern, hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin,
                    hm_cmax, hm_crange, group_by, pool_mode, ncols, rebase, cfg,
                    vrs, fids, scenes, folders, vel_thresh, min_disp, trim, jump_buf,
-                   vel_selection, disp_selection, viewport, roi_trim, roi_reach])
+                   vel_selection, disp_selection, viewport, roi_trim, roi_reach,
+                   roi_entered])
     if ctx.triggered_id == "view-mode" and sig == _LAST_HEAT_SIG["v"]:
         return no_update
     df_f, df_sub, _ = _filtered_df(
@@ -2665,7 +2688,7 @@ def update_heatmap_only(hm_binsize, hm_scale, hm_bound, hm_metric, hm_cmin, hm_c
         cfg, vrs, fids, scenes, folders, vel_selection, disp_selection)
     if df_sub is None or len(df_sub) == 0:
         return no_update
-    df_f = _maybe_trim(df_f, pattern, roi_trim, roi_reach)
+    df_f, _ = _roi_apply(df_f, pattern, roi_reach, _on(roi_entered), _on(roi_trim))
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
     if rebase and "on" in rebase:
         df_f = rebase_to_origin(df_f)
@@ -2788,7 +2811,8 @@ def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_di
                                    cfg, vrs, fids, scenes, folders, vel_sel, disp_sel)
     if df_sub is None or len(df_sub) == 0:
         return no_update
-    df_f = _maybe_trim(df_f, pattern, roi_trim, reach)
+    # Violins use the UNMASKED data so each fraction's denominator is all trials
+    # in the config (independent of the entered-only / trim view toggles).
     _, _, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     if not rois:
@@ -2820,11 +2844,13 @@ def update_roi_view(reach, roi_show, roi_trim, view, pattern, vel_thresh, min_di
     State("filter-folders", "value"),
     State("vel-histogram", "selectedData"),
     State("disp-histogram", "selectedData"),
+    State("roi-entered", "value"),
+    State("roi-trim", "value"),
     prevent_initial_call=True,
 )
 def update_roi_overlay(reach, roi_show, pattern, group_by, pool_mode, ncols, rebase,
                        vel_thresh, min_disp, trim, jump_buf, cfg, vrs, fids, scenes,
-                       folders, vel_sel, disp_sel):
+                       folders, vel_sel, disp_sel, roi_entered, roi_trim):
     if not pattern:
         return no_update
     df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -2832,13 +2858,15 @@ def update_roi_overlay(reach, roi_show, pattern, group_by, pool_mode, ncols, reb
     if df_sub is None or len(df_sub) == 0:
         return no_update
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
-    names = list(_group_frames(df_f, group_by, pool_mode, ncols_val).keys())
-    do_rebase = bool(rebase) and "on" in (rebase or [])
-    _, _, metas = _load_data(pattern)
-    rois = rois_by_config(metas)
     reach_v = float(reach) if reach else 3.0
-    show = bool(roi_show) and "on" in (roi_show or []) and not do_rebase and bool(rois)
-    counts = roi_config_summary(roi_reached_table(df_f, rois, reach_v)) if show else None
+    do_rebase = _on(rebase)
+    rois = rois_by_config(_load_data(pattern)[2])
+    # Match the trajectory's subplot set: same view masking, counts (full
+    # denominator) from the unmasked table.
+    df_view, table = _roi_apply(df_f, pattern, reach_v, _on(roi_entered), _on(roi_trim))
+    names = list(_group_frames(df_view, group_by, pool_mode, ncols_val).keys())
+    show = _on(roi_show) and not do_rebase and bool(rois)
+    counts = roi_config_summary(table) if (show and table is not None) else None
     patch = Patch()
     patch["layout"]["shapes"] = _roi_overlay_shapes(names, rois, reach_v) if show else []
     n = len(names)
@@ -2847,15 +2875,16 @@ def update_roi_overlay(reach, roi_show, pattern, group_by, pool_mode, ncols, reb
     return patch
 
 
-# Toggling tail-trim changes the plotted *data*, so it triggers a full replot.
+# Toggling either ROI view-mask changes the plotted *data*, so trigger a replot.
 @app.callback(
     Output("btn-plot", "n_clicks", allow_duplicate=True),
     Input("roi-trim", "value"),
+    Input("roi-entered", "value"),
     State("btn-plot", "n_clicks"),
     State("store-glob", "data"),
     prevent_initial_call=True,
 )
-def trim_triggers_replot(roi_trim, clicks, pattern):
+def roi_mask_triggers_replot(roi_trim, roi_entered, clicks, pattern):
     if not pattern:
         return no_update
     return (clicks or 0) + 1
@@ -2873,6 +2902,7 @@ def trim_triggers_replot(roi_trim, clicks, pattern):
     Input("roi-reach", "value"),
     Input("roi-show", "value"),
     Input("roi-trim", "value"),
+    Input("roi-entered", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
@@ -2893,9 +2923,9 @@ def trim_triggers_replot(roi_trim, clicks, pattern):
     prevent_initial_call=True,
 )
 def update_polar_view(view, polar_color, polar_moving, polar_walk, reach, roi_show,
-                      roi_trim, pattern, vel_thresh, min_disp, trim, jump_buf,
-                      group_by, pool_mode, ncols, max_points, rebase, cfg, vrs, fids,
-                      scenes, folders, vel_sel, disp_sel):
+                      roi_trim, roi_entered, pattern, vel_thresh, min_disp, trim,
+                      jump_buf, group_by, pool_mode, ncols, max_points, rebase, cfg,
+                      vrs, fids, scenes, folders, vel_sel, disp_sel):
     if not pattern or view != "polar":
         return no_update
     df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -2903,7 +2933,7 @@ def update_polar_view(view, polar_color, polar_moving, polar_walk, reach, roi_sh
     if df_sub is None or len(df_sub) == 0:
         return _msg_figure("All filtered out.")
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
-    df_f = _maybe_trim(df_f, pattern, roi_trim, reach)
+    df_f, _ = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
     if rebase and "on" in rebase:
         df_f = rebase_to_origin(df_f)
     _, _, metas = _load_data(pattern)
