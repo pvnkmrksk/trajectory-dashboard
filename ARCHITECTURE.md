@@ -26,10 +26,16 @@ Plotly 6 matter — see the rendering gotchas in §7.)
 - Sibling JSON is auto-detected per folder: `*_ControlScene_sequenceConfig.json`
   maps `CurrentStep → ConfigFile` (the treatment); `*FlyMetaData.json` maps
   `VR → FlyID/Sex`.
-- **A _segment_ is the atomic unit:** `_seg_id = SourceFolder + VR + CurrentTrial
-  + CurrentStep`. Everything groups/filters by this. **Never** group by
-  `(Trial, Step)` alone — different files reuse the same numbers and would merge
-  unrelated tracks. This was a real early bug.
+- **A _segment_ is the atomic unit:** `_seg_id = SourceFile + CurrentTrial +
+  CurrentStep`, built **after** numeric coercion from the **integer** trial/step.
+  Everything groups/filters by this. Two gotchas, both real bugs: (a) never key on
+  `(Trial, Step)` alone — different files reuse the numbers; keying on `SourceFile`
+  also keeps a crash+restart CSV distinct. (b) The raw trial/step text mixes int
+  and float (`"0"` vs `"0.0"`) within one file, so building the id with
+  `.astype(str)` on the pre-coercion values split one trial into two ids that
+  interleaved after the time-sort and inflated every per-trial count ~5×. Coerce
+  first, format as int. (Animal identity — `FlyID@VR` — is a *separate* grouping
+  that intentionally merges files.)
 - **Velocity is in raw position-units per second, NOT cm/s.** Values are large
   (median ~thousands). Histograms cap at the 99th percentile; the velocity
   colour mode drops reset-spikes above the 99.5th pct before smoothing.
