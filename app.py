@@ -444,13 +444,20 @@ def load_csv_fast(filepath: str) -> pd.DataFrame | None:
     df["SourceFolder"] = os.path.basename(csv_dir)
     df["SourceFile"] = csv_base
 
-    df["_seg_id"] = (df["SourceFolder"] + "_" + df["VR"].astype(str) + "_T"
-                     + df["CurrentTrial"].astype(str) + "_S"
-                     + df["CurrentStep"].astype(str))
-
     for c in ["CurrentTrial", "CurrentStep", "GameObjectPosX", "GameObjectPosZ"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df.dropna(subset=required, inplace=True)
+
+    # Build _seg_id from the INTEGER trial/step, AFTER numeric coercion. The raw
+    # columns can mix int/float text within one file ("0" vs "0.0"); .astype(str)
+    # on that splits a single real trial into two ids ("T0_S2" and "T0.0_S2.0")
+    # that then interleave by time — which ballooned the per-config trial count
+    # ~5x. Key on SourceFile so a crash+restart (a second CSV whose trial numbers
+    # restart from 0) stays a distinct run; animal identity (FlyID@VR) still
+    # merges the two files, which is a separate grouping.
+    df["_seg_id"] = (df["SourceFile"] + "_T"
+                     + df["CurrentTrial"].astype("int64").astype(str) + "_S"
+                     + df["CurrentStep"].astype("int64").astype(str))
     return df
 
 
@@ -1630,8 +1637,11 @@ def _load_data(pattern):
 
     _LOAD_PROGRESS.update(label="concatenating")
     df = pd.concat(dfs, ignore_index=True)
-    df.sort_values(["SourceFolder", "VR", "CurrentTrial", "CurrentStep", "Current Time"],
-                   inplace=True)
+    # Sort by SourceFile (not just folder+VR) so a restart file's rows don't
+    # interleave by time with the original's — keeps every _seg_id contiguous,
+    # which the vectorised segment reductions rely on.
+    df.sort_values(["SourceFolder", "SourceFile", "CurrentTrial", "CurrentStep",
+                    "Current Time"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     stats = compute_segment_stats(df)
     _DATA_CACHE[key] = df
