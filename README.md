@@ -15,16 +15,19 @@ This repo is intentionally simple: it is a single Dash app (`app.py`) plus
 static browser assets. There is no package build step. Use `uv` to create a
 clean virtual environment and install exactly what `requirements.txt` declares.
 
-Install `uv` first:
+Install `uv` first — copy the block for your OS:
+
+**macOS / Linux**
 
 ```bash
-# macOS / Linux, official standalone installer
 curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-# optional macOS alternative
-brew install uv
+Optional macOS alternative: `brew install uv`
 
-# Windows PowerShell
+**Windows (PowerShell)**
+
+```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
@@ -34,16 +37,17 @@ Restart your shell if the installer asks you to, then verify:
 uv --version
 ```
 
-Set up the repo:
+Clone and set up the repo (same on macOS, Linux, and Windows):
 
 ```bash
-cd /path/to/trajectory-dashboard
-
-# Known-good local runtime is Python 3.10. uv can install it if needed.
+git clone https://github.com/pvnkmrksk/trajectory-dashboard.git
+cd trajectory-dashboard
 uv python install 3.10
 uv venv --python 3.10
 uv pip install -r requirements.txt
 ```
+
+Known-good local runtime is Python 3.10; `uv python install` fetches it if needed.
 
 Run the dashboard:
 
