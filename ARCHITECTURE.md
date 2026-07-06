@@ -59,6 +59,10 @@ Plotly 6 matter — see the rendering gotchas in §7.)
 Assets (Dash auto-serves `/assets`):
 - `assets/dropzone.js` — folder drag-and-drop → `set_props('drop-data', …)`.
 - `assets/heatsync.js` — re-attaches a relayout→`viewport-store` handler after the heatmap is `newPlot`-ed (Dash's own listener is lost on newPlot).
+- `assets/plot_wheel_guard.js` — prevents page/panel scroll while the pointer is
+  over Plotly's central wheel-zoom plane; margins still scroll normally.
+- `assets/config_order.js` — drag-to-reorder the full loaded config subplot order
+  via `config-order-store` (independent of active filters).
 
 ---
 
@@ -112,7 +116,13 @@ same cache key.
   95th-pct extent); `bound_pct` clips the extent to a central percentile;
   `metric ∈ {count, time=count×median_dt seconds, percent}`; `log_scale` with
   human tick labels (`_log_colorbar`/`_fmt_metric`); `cmin/cmax` blank→auto,
-  absolute or `crange_mode="percentile"`; occupancy floored at 100 ms.
+  absolute or `crange_mode="percentile"`; occupancy floored at 100 ms. When ROIs
+  are available and paths are not rebased, the heatmap overlays faint target
+  outlines and per-ROI occupancy labels in the active metric; metric/scale swaps
+  restyle those labels clientside from the variant store.
+- **Diagnostics**: velocity/displacement histograms include the full filtered
+  data, with the initial x viewbox set to the current 99th percentile. Autoscale
+  or zoom out reveals the tail; the modebar is visible in Diagnostics.
 - **ROI tab**: one figure with three synced-x panels: per-animal fraction
   reaching left/right (hover includes reached/trials), time-to-target split
   violins, and heading-error split violins. Plotly native violin boxes show
@@ -134,6 +144,9 @@ same cache key.
   because the dev server is threaded).
 - `load_data_cb` populates filter options, histograms, the smart default bin
   size, then auto-triggers `update_plots`.
+- `render_config_order_list`/`apply_config_order` expose all loaded configs as a
+  draggable order list. The default order uses the sequenceConfig with the best
+  coverage; missing configs remain alphabetic at the bottom.
 - `update_plots` — trajectory/raw/summary/hist rebuilds only when Trajectory or
   Diagnostics is visible.
 - `_filtered_df` normalizes jump-buffer units for cache keys (`100` ms and old

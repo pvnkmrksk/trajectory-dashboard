@@ -356,12 +356,32 @@ def _populate_auto_lut(metas: list[dict]) -> None:
 def _set_config_order(metas: list[dict]) -> None:
     """Sequence-config order for subplot/filter option ordering.
 
-    Missing configs sort alphabetically after the known sequenceConfig entries.
+    Prefer the sequenceConfig that covers the most loaded configs. Missing
+    configs sort alphabetically after the known sequenceConfig entries.
     """
     _CONFIG_ORDER.clear()
+    all_cfgs = set()
+    candidates = []
     for m in metas or []:
+        cfgs = {_short_config_name(k) for k in (m.get("configs") or {}).keys()}
+        cfgs.update(m.get("sequence_order") or [])
+        all_cfgs.update(cfgs)
+        order = []
+        seen = set()
         for cfg in m.get("sequence_order") or []:
-            _CONFIG_ORDER.setdefault(cfg, len(_CONFIG_ORDER))
+            if cfg not in seen:
+                seen.add(cfg)
+                order.append(cfg)
+        if order:
+            candidates.append(order)
+
+    if not candidates:
+        return
+
+    best = max(candidates,
+               key=lambda order: (len(set(order) & all_cfgs), len(order)))
+    for cfg in best:
+        _CONFIG_ORDER.setdefault(cfg, len(_CONFIG_ORDER))
 
 
 def _ordered_values(vals) -> list:
@@ -1497,17 +1517,113 @@ def _median_dt(df) -> float:
 def _fmt_metric(v: float, metric: str) -> str:
     """Human-readable tick label for a metric value."""
     if metric == "percent":
-        return f"{v:g}%"
+        return f"{v:.3g}%"
     if metric == "time":
         if v >= 600:
-            return f"{round(v/60):g}m"
+            return f"{v/60:.3g}m"
         if v >= 1:
-            return f"{v:g}s"
-        return f"{v*1000:g}ms"
+            return f"{v:.3g}s"
+        return f"{v*1000:.3g}ms"
     # count
     if v >= 1000:
-        return f"{v/1000:g}k"
-    return f"{v:g}"
+        return f"{v/1000:.3g}k"
+    return f"{v:.3g}"
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    h = str(hex_color or "#666").lstrip("#")
+    if len(h) != 6:
+        return f"rgba(102,102,102,{alpha:g})"
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha:g})"
+
+
+def _roi_metric_value(count: float, total: float, metric: str, dt: float) -> float:
+    if metric == "time":
+        return float(count) * float(dt)
+    if metric == "percent":
+        return 100.0 * float(count) / max(float(total), 1.0)
+    return float(count)
+
+
+def _heatmap_roi_label(stat: dict, metric: str, dt: float) -> str:
+    side = str(stat.get("side", "") or "?")[:1].upper()
+    total = float(stat.get("total", 0.0) or 0.0)
+    count = float(stat.get("count", 0.0) or 0.0)
+    frac = 100.0 * count / max(total, 1.0)
+    val = _roi_metric_value(count, total, metric, dt)
+    if metric == "count":
+        return f"{side} {_fmt_metric(val, metric)} samples ({frac:.1f}%)"
+    if metric == "percent":
+        return f"{side} {_fmt_metric(val, metric)}"
+    return f"{side} {_fmt_metric(val, metric)} ({frac:.1f}%)"
+
+
+def _heatmap_roi_stats(group_items, rois_by_cfg, reach) -> list[list[dict]]:
+    """Per-subplot ROI occupancy in raw samples, matching each row's config."""
+    if not rois_by_cfg:
+        return [[] for _ in group_items]
+    reach2 = float(reach or 3.0) ** 2
+    out = []
+    for _, gdf in group_items:
+        total = int(len(gdf)) if gdf is not None else 0
+        by_sig = {}
+        if total and "ConfigFile" in gdf:
+            for cfg, sub in gdf.groupby("ConfigFile", sort=False, observed=True):
+                rois = rois_by_cfg.get(str(cfg)) or []
+                if not rois:
+                    continue
+                gx = sub["GameObjectPosX"].to_numpy()
+                gz = sub["GameObjectPosZ"].to_numpy()
+                for roi in rois:
+                    side = roi.get("side")
+                    if side not in ("left", "right", "centre"):
+                        continue
+                    sig = (side, round(float(roi["x"]), 4), round(float(roi["z"]), 4))
+                    stat = by_sig.setdefault(sig, {
+                        "side": side, "x": float(roi["x"]), "z": float(roi["z"]),
+                        "count": 0, "total": total,
+                    })
+                    hit = (gx - stat["x"]) ** 2 + (gz - stat["z"]) ** 2 <= reach2
+                    stat["count"] += int(hit.sum())
+        out.append(list(by_sig.values()))
+    return out
+
+
+def _heatmap_roi_shapes(group_roi_stats, reach) -> list[dict]:
+    shapes = []
+    for i, stats in enumerate(group_roi_stats or []):
+        sx, sy = _subplot_axis(i + 1)
+        for stat in stats:
+            col = _ROI_SIDE_COLOR.get(stat.get("side"), "#6c757d")
+            x, z = float(stat["x"]), float(stat["z"])
+            shapes.append(dict(
+                type="circle", xref=sx, yref=sy, layer="above",
+                x0=x - reach, x1=x + reach, y0=z - reach, y1=z + reach,
+                fillcolor="rgba(0,0,0,0)", opacity=0.32,
+                line=dict(color=_rgba(col, 0.72), width=1.1, dash="dot"),
+            ))
+    return shapes
+
+
+def _heatmap_roi_annotations(group_roi_stats, roi_texts) -> list[dict]:
+    anns = []
+    text_i = 0
+    for i, stats in enumerate(group_roi_stats or []):
+        sx, sy = _subplot_axis(i + 1)
+        for stat in stats:
+            col = _ROI_SIDE_COLOR.get(stat.get("side"), "#6c757d")
+            anns.append(dict(
+                name="hm-roi", text=roi_texts[text_i] if text_i < len(roi_texts) else "",
+                showarrow=False, xref=sx, yref=sy,
+                x=float(stat["x"]), y=float(stat["z"]),
+                xanchor="center", yanchor="middle",
+                font=dict(size=9, color=_rgba(col, 0.95)),
+                bgcolor="rgba(255,255,255,0.45)",
+                bordercolor=_rgba(col, 0.35), borderwidth=0.4,
+            ))
+            text_i += 1
+    return anns
 
 
 def _log_colorbar(mmin, mmax, metric):
@@ -1566,18 +1682,24 @@ def _counts_for_groups(groups, group_names, xedges, yedges):
     return out
 
 
-def _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct):
+def _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
+                  rois_by_cfg=None, reach_radius=3.0):
     """The expensive, metric-independent part: 2-D histogram (raw counts) per
     subplot. All metric/scale variants derive from this, so it's computed once."""
     groups = _group_frames(df, group_by, pool_mode, ncols)
+    group_items = list(groups.items())
     group_names = list(groups.keys())
     nrows = max(1, (len(group_names) + ncols - 1) // ncols)
     xedges, yedges, rng = _heatmap_edges(df, bin_size, bound_pct)
     counts = _counts_for_groups(groups, group_names, xedges, yedges)
     xc = 0.5 * (xedges[:-1] + xedges[1:])
     yc = 0.5 * (yedges[:-1] + yedges[1:])
+    reach_v = float(reach_radius or 3.0)
     return dict(group_names=group_names, nrows=nrows, xc=xc.tolist(),
-                yc=yc.tolist(), rng=rng, counts=counts, dt=_median_dt(df))
+                yc=yc.tolist(), rng=rng, counts=counts, dt=_median_dt(df),
+                reach=reach_v,
+                roi_stats=_heatmap_roi_stats(group_items, rois_by_cfg,
+                                             reach_v))
 
 
 def _heatmap_variant(bins, metric, log_scale, cmin=None, cmax=None,
@@ -1636,8 +1758,13 @@ def _heatmap_variant(bins, metric, log_scale, cmin=None, cmax=None,
         z_list.append(z.tolist())
         cd_list.append(M.tolist())
     hov = "x=%{x:.1f} z=%{y:.1f}<br>%{customdata:.3g} " + unit + "<extra></extra>"
+    roi_texts = [
+        _heatmap_roi_label(stat, metric, dt)
+        for stats in bins.get("roi_stats", [])
+        for stat in stats
+    ]
     return dict(z=z_list, customdata=cd_list, zmin=zmin, zmax=zmax,
-                colorbar=cbar, hovertemplate=hov)
+                colorbar=cbar, hovertemplate=hov, roi_texts=roi_texts)
 
 
 def _assemble_heatmap(bins, var, ncols, df):
@@ -1659,6 +1786,12 @@ def _assemble_heatmap(bins, var, ncols, df):
     for i, ann in enumerate(fig.layout.annotations):
         if i < len(group_names):
             ann.update(hovertext=group_names[i], font=dict(size=12))
+    if bins.get("roi_stats"):
+        fig.update_layout(
+            shapes=_heatmap_roi_shapes(bins["roi_stats"], bins.get("reach", 3.0)),
+            annotations=list(fig.layout.annotations)
+            + _heatmap_roi_annotations(bins["roi_stats"], var.get("roi_texts", [])),
+        )
     fig.update_layout(height=60 + nrows * _subplot_px(nrows, ncols),
                       margin=dict(l=50, r=80, t=50, b=40), template="plotly_white",
                       dragmode="pan", showlegend=False)
@@ -1667,10 +1800,12 @@ def _assemble_heatmap(bins, var, ncols, df):
 
 def build_heatmap_figure(df, group_by="config", pool_mode="separate", ncols=2,
                          bin_size=20.0, log_scale=False, bound_pct=98.0,
-                         metric="count", cmin=None, cmax=None, crange_mode="value"):
+                         metric="count", cmin=None, cmax=None, crange_mode="value",
+                         rois=None, reach_radius=3.0):
     if df is None or len(df) == 0:
         return _msg_figure("No data after filtering")
-    bins = _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct)
+    bins = _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
+                         rois_by_cfg=rois, reach_radius=reach_radius)
     var = _heatmap_variant(bins, log_scale=log_scale, metric=metric, cmin=cmin,
                            cmax=cmax, crange_mode=crange_mode)
     return _assemble_heatmap(bins, var, ncols, df)
@@ -1689,12 +1824,14 @@ def _all_variants_from_bins(bins, cmin, cmax, crange_mode):
 
 
 def build_heatmap_and_variants(df, group_by, pool_mode, ncols, bin_size, bound_pct,
-                               metric, log_scale, cmin, cmax, crange_mode):
+                               metric, log_scale, cmin, cmax, crange_mode,
+                               rois=None, reach_radius=3.0):
     """(figure for the current metric/scale, {all metric×scale variants}) — bins
     ONCE and reuses it, so the store of swap-in data is essentially free."""
     if df is None or len(df) == 0:
         return _msg_figure("No data after filtering"), {}
-    bins = _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct)
+    bins = _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
+                         rois_by_cfg=rois, reach_radius=reach_radius)
     cur = _heatmap_variant(bins, log_scale=log_scale, metric=metric, cmin=cmin,
                            cmax=cmax, crange_mode=crange_mode)
     fig = _assemble_heatmap(bins, cur, ncols, df)
@@ -1727,9 +1864,11 @@ def build_heatmap_mask_variants(df_f, pattern, reach, group_by, pool_mode, ncols
 
     e, t = int(bool(entered_only)), int(bool(trim_tail))
     groups = _group_frames(base, group_by, pool_mode, ncols)
+    rois = None if do_rebase else rois_by_config(_load_data(pattern)[2])
     bins = dict(group_names=group_names, nrows=nrows, xc=xc, yc=yc, rng=rng,
                 counts=_counts_for_groups(groups, group_names, xedges, yedges),
-                dt=dt)
+                dt=dt, reach=reach_v,
+                roi_stats=_heatmap_roi_stats(list(groups.items()), rois, reach_v))
     store = {}
     for m in HEATMAP_METRICS:
         for s in HEATMAP_SCALES:
@@ -1750,10 +1889,9 @@ def build_velocity_histogram(df, vel_threshold=None):
         return go.Figure().update_layout(height=190, template="plotly_white")
 
     cap = np.quantile(vel, 0.99)
-    vel_show = vel[vel <= cap]
 
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=vel_show, nbinsx=120, marker_color="#1f77b4",
+    fig.add_trace(go.Histogram(x=vel, nbinsx=120, marker_color="#1f77b4",
                                 opacity=0.85, name="Velocity"))
     if vel_threshold and vel_threshold > 0:
         fig.add_vline(x=vel_threshold, line_dash="dash", line_color="red", line_width=2)
@@ -1765,9 +1903,10 @@ def build_velocity_histogram(df, vel_threshold=None):
     fig.update_layout(
         height=190, margin=dict(l=40, r=10, t=28, b=25),
         xaxis_title="Velocity (units/s)", yaxis_title="Count",
-        title=dict(text="Velocity (99th pctl)", font_size=11, x=0.5),
-        template="plotly_white", dragmode="pan",
+        title=dict(text="Velocity (full; initial 99th pctl)", font_size=11, x=0.5),
+        template="plotly_white", dragmode="zoom",
     )
+    fig.update_xaxes(range=[0, cap] if cap > 0 else None)
     return fig
 
 
@@ -1778,6 +1917,9 @@ def build_displacement_histogram(stats_df, min_disp=None):
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=stats_df["displacement"], nbinsx=50,
                                 marker_color="#2ca02c", opacity=0.85, name="Disp"))
+    disp = stats_df["displacement"].to_numpy()
+    disp = disp[np.isfinite(disp)]
+    cap = float(np.quantile(disp, 0.99)) if disp.size else None
     if min_disp and min_disp > 0:
         fig.add_vline(x=min_disp, line_dash="dash", line_color="red", line_width=2)
         n_below = (stats_df["displacement"] < min_disp).sum()
@@ -1789,9 +1931,12 @@ def build_displacement_histogram(stats_df, min_disp=None):
     fig.update_layout(
         height=190, margin=dict(l=40, r=10, t=28, b=25),
         xaxis_title="Net displacement (units)", yaxis_title="Segments",
-        title=dict(text="Displacement per segment", font_size=11, x=0.5),
-        template="plotly_white", dragmode="pan",
+        title=dict(text="Displacement per segment (full; initial 99th pctl)",
+                   font_size=11, x=0.5),
+        template="plotly_white", dragmode="zoom",
     )
+    if cap and cap > 0:
+        fig.update_xaxes(range=[0, cap])
     return fig
 
 
@@ -2516,6 +2661,13 @@ app.layout = html.Div([
             html.Label("Configs", style={"fontSize": "10px"}),
             dcc.Dropdown(id="filter-configs", multi=True, placeholder="All",
                          style={"fontSize": "10px"}),
+            html.Details([
+                html.Summary("Plot order", style={"fontSize": "10px", "cursor": "pointer"}),
+                html.Ol(id="config-order-list", style={
+                    "margin": "4px 0 0 16px", "padding": "0", "fontSize": "9px",
+                    "maxHeight": "150px", "overflowY": "auto",
+                }),
+            ], style={"marginTop": "3px"}),
             html.Label("VRs", style={"fontSize": "10px", "marginTop": "2px"}),
             dcc.Dropdown(id="filter-vrs", multi=True, placeholder="All",
                          style={"fontSize": "10px"}),
@@ -2657,15 +2809,15 @@ app.layout = html.Div([
                 html.Div([
                     html.Div([
                         dcc.Graph(id="vel-histogram", figure=_EMPTY,
-                                  config={"displayModeBar": False},
+                                  config={"scrollZoom": True, "displayModeBar": True},
                                   style={"flex": "1", "minWidth": "0"}),
                         dcc.Graph(id="disp-histogram", figure=_EMPTY,
-                                  config={"displayModeBar": False},
+                                  config={"scrollZoom": True, "displayModeBar": True},
                                   style={"flex": "1", "minWidth": "0"}),
                     ], style={"display": "flex", "gap": "6px"}),
                     dcc.Loading(
                         dcc.Graph(id="raw-trace-plot", figure=_EMPTY,
-                                  config={"scrollZoom": True}),
+                                  config={"scrollZoom": True, "displayModeBar": True}),
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
                                        "transition": "opacity .2s",
@@ -2707,6 +2859,7 @@ app.layout = html.Div([
     dcc.Store(id="viewport-store"),
     dcc.Store(id="heatmap-figure-store"),
     dcc.Store(id="heatmap-variants"),
+    dcc.Store(id="config-order-store"),
     dcc.Store(id="auto-thresholds"),
     dcc.Store(id="drop-data"),
     dcc.Store(id="url-restored", data=False),
@@ -3047,6 +3200,51 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize):
     )
 
 
+@app.callback(
+    Output("config-order-list", "children"),
+    Input("filter-configs", "options"),
+)
+def render_config_order_list(options):
+    children = []
+    for opt in options or []:
+        value = opt.get("value")
+        label = opt.get("label", value)
+        children.append(html.Li(
+            str(label), draggable="true", **{"data-cfg": value},
+            style={
+                "cursor": "grab", "padding": "2px 4px", "marginBottom": "2px",
+                "border": "1px solid #dde2ee", "borderRadius": "3px",
+                "background": "#fff", "lineHeight": "1.2",
+            }))
+    return children
+
+
+@app.callback(
+    Output("filter-configs", "options", allow_duplicate=True),
+    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    Input("config-order-store", "data"),
+    State("filter-configs", "options"),
+    State("btn-plot", "n_clicks"),
+    State("store-glob", "data"),
+    prevent_initial_call=True,
+)
+def apply_config_order(order_data, options, clicks, pattern):
+    order = (order_data or {}).get("order") or []
+    if not order or not options:
+        return no_update, no_update
+    rank = {str(v): i for i, v in enumerate(order)}
+    _CONFIG_ORDER.clear()
+    for cfg in order:
+        _CONFIG_ORDER.setdefault(str(cfg), len(_CONFIG_ORDER))
+    _LAST_HEAT_SIG["v"] = None
+
+    def key(opt):
+        value = str(opt.get("value"))
+        return (rank.get(value, 10**9), humanise_config(value).lower(), value)
+
+    return sorted(options, key=key), (clicks or 0) + 1 if pattern else no_update
+
+
 # Auto thresholds: when a box is ticked, fill its field with the computed value
 # and disable it; when unticked, re-enable it (blank = no cut). Also triggers a
 # re-filter so the change actually reaches the plots.
@@ -3376,16 +3574,22 @@ def update_plots(n, view, pattern, vel_thresh, min_disp, trim, jump_buf,
     vel_fig = no_update
     disp_fig = no_update
     if view in ("traj", "diag"):
-        # Histograms reflect the subset before velocity/disp cuts.
-        mask = pd.Series(True, index=df.index)
-        if cfg:     mask &= df["ConfigFile"].isin(cfg)
-        if vrs:     mask &= df["VR"].isin(vrs)
-        if fids:    mask &= df["FlyID"].isin(fids)
-        if scenes:  mask &= df["SceneName"].isin(scenes)
-        if folders: mask &= df["SourceFolder"].isin(folders)
-        df_hist = df[mask]
-        vel_fig = build_velocity_histogram(df_hist, vel_thresh)
-        disp_fig = build_displacement_histogram(compute_segment_stats(df_hist), min_disp)
+        if view == "diag":
+            # Diagnostics should show exactly the data currently in play.
+            vel_fig = build_velocity_histogram(df_f, vel_thresh)
+            disp_fig = build_displacement_histogram(compute_segment_stats(df_f), min_disp)
+        else:
+            # On the trajectory tab the histograms remain threshold-pickers, so
+            # they reflect the subset before velocity/displacement cuts.
+            mask = pd.Series(True, index=df.index)
+            if cfg:     mask &= df["ConfigFile"].isin(cfg)
+            if vrs:     mask &= df["VR"].isin(vrs)
+            if fids:    mask &= df["FlyID"].isin(fids)
+            if scenes:  mask &= df["SceneName"].isin(scenes)
+            if folders: mask &= df["SourceFolder"].isin(folders)
+            df_hist = df[mask]
+            vel_fig = build_velocity_histogram(df_hist, vel_thresh)
+            disp_fig = build_displacement_histogram(compute_segment_stats(df_hist), min_disp)
 
     t0 = time.time()
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
@@ -3878,6 +4082,8 @@ app.clientside_callback(
     # triggered a needless newPlot flash on the *next* swap.
     "fp=JSON.stringify((hfig&&hfig.data||[]).map(function(t){"
     "return [t.type,(t.z&&t.z.length)||0,(t.x&&t.x.length)||0];}))"
+    "+'|'+JSON.stringify((L.shapes||[]).map(function(s){return [s.x0,s.x1,s.y0,s.y1,s.xref,s.yref];}))"
+    "+'|'+((L.annotations||[]).length)"
     "+'|'+(L.height||0)+'|'+JSON.stringify(L.xaxis&&L.xaxis.range)"
     "+'|'+JSON.stringify(L.yaxis&&L.yaxis.range);}catch(e){}"
     "if(hg&&window.Plotly&&hfig&&hfig.data&&hfig.data.length){"
@@ -3903,7 +4109,12 @@ app.clientside_callback(
     "var vi=v.z.map(function(_,i){return i;});"
     "window.Plotly.restyle(hg,{z:v.z,customdata:v.customdata},vi);"
     "window.Plotly.restyle(hg,{zmin:v.zmin,zmax:v.zmax,hovertemplate:v.hovertemplate});"
-    "window.Plotly.restyle(hg,{colorbar:[v.colorbar]},[0]);}}catch(e){}}"
+    "window.Plotly.restyle(hg,{colorbar:[v.colorbar]},[0]);"
+    "if(v.roi_texts&&hg.layout&&hg.layout.annotations){"
+    "var j=0;var anns=hg.layout.annotations.map(function(a){"
+    "var b=Object.assign({},a);if(b.name==='hm-roi'){b.text=v.roi_texts[j++]||'';}return b;});"
+    "window.Plotly.relayout(hg,{annotations:anns});}"
+    "}}catch(e){}}"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
     Input("heatmap-figure-store", "data"),

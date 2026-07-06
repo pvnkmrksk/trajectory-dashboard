@@ -69,6 +69,8 @@ alone. Velocity is in **position units/second**, not cm/s (values are large).
 app.py               # the whole application (single file, sectioned)
 assets/dropzone.js   # folder drag-and-drop
 assets/heatsync.js   # heatmap zoom→viewport sync after newPlot
+assets/plot_wheel_guard.js # Plotly wheel zoom without page scroll
+assets/config_order.js     # draggable config subplot order list
 requirements.txt
 ARCHITECTURE.md      # deep context for humans and coding agents  ← read this
 AGENTS.md            # short agent entry point
