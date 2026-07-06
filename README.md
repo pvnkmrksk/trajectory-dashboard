@@ -31,7 +31,20 @@ Optional macOS alternative: `brew install uv`
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Restart your shell if the installer asks you to, then verify:
+Make `uv` available in the current shell without restarting:
+
+```bash
+# bash/zsh/sh after the standalone installer
+source "$HOME/.local/bin/env" 2>/dev/null || export PATH="$HOME/.local/bin:$PATH"
+```
+
+For the same no-restart PATH refresh in Windows PowerShell:
+
+```powershell
+$env:Path = "$HOME\.local\bin;$env:Path"
+```
+
+Then verify:
 
 ```bash
 uv --version
