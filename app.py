@@ -1250,13 +1250,44 @@ def _subplot_axis(n: int) -> tuple[str, str]:
     return ("x" if n == 1 else f"x{n}"), ("y" if n == 1 else f"y{n}")
 
 
-def _roi_overlay_shapes(group_names, rois_by_cfg, reach) -> list:
+def _group_config_keys(gname, gdf, known_keys) -> list[str]:
+    keys = []
+    seen = set()
+    if gname in known_keys:
+        keys.append(gname)
+        seen.add(gname)
+    if gdf is not None and "ConfigFile" in gdf:
+        for val in pd.unique(gdf["ConfigFile"].dropna()):
+            key = str(val)
+            if key in known_keys and key not in seen:
+                keys.append(key)
+                seen.add(key)
+    return keys
+
+
+def _rois_for_group(gname, gdf, rois_by_cfg) -> list[dict]:
+    """ROI centres represented by this subplot, de-duplicated across configs."""
+    out = []
+    seen = set()
+    for cfg in _group_config_keys(gname, gdf, rois_by_cfg or {}):
+        for roi in (rois_by_cfg.get(cfg) or []):
+            sig = (roi.get("side"),
+                   round(float(roi.get("x", 0.0)), 4),
+                   round(float(roi.get("z", 0.0)), 4))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(roi)
+    return out
+
+
+def _roi_overlay_shapes(group_items, rois_by_cfg, reach) -> list:
     """Reach circle + centre dot per ROI, as plain shape dicts (so the same list
     can be applied at build time and blitted via Patch on the reach slider)."""
     shapes = []
     dot = max(0.4, reach * 0.08)
-    for i, gname in enumerate(group_names):
-        rlist = rois_by_cfg.get(gname)
+    for i, (gname, gdf) in enumerate(group_items):
+        rlist = _rois_for_group(gname, gdf, rois_by_cfg)
         if not rlist:
             continue
         sx, sy = _subplot_axis(i + 1)
@@ -1273,24 +1304,59 @@ def _roi_overlay_shapes(group_names, rois_by_cfg, reach) -> list:
     return shapes
 
 
-def _roi_count_text(gname, counts) -> str:
-    cc = counts.get(gname) if counts else None
-    if not cc:
-        return ""
-    return (f"L {cc['left_reached']}/{cc['total']} ({100*cc['left_frac']:.0f}%)<br>"
-            f"R {cc['right_reached']}/{cc['total']} ({100*cc['right_frac']:.0f}%)")
+def _roi_count_texts(gname, gdf, counts) -> tuple[str, str]:
+    if counts is None:
+        return "", ""
+
+    if isinstance(counts, pd.DataFrame):
+        if len(counts) == 0 or gdf is None or len(gdf) == 0 or "_seg_id" not in gdf:
+            return "", ""
+        segs = pd.unique(gdf["_seg_id"])
+        sub = counts[counts["_seg_id"].isin(segs)]
+        if len(sub) == 0:
+            return "", ""
+        total = len(sub)
+        left = int(sub["reached_left"].sum())
+        right = int(sub["reached_right"].sum())
+        return (f"L {left}/{total} ({100 * left / total:.0f}%)",
+                f"R {right}/{total} ({100 * right / total:.0f}%)")
+
+    # Backwards-compatible path for callers that still pass roi_config_summary().
+    rows = []
+    for cfg in _group_config_keys(gname, gdf, counts):
+        cc = counts.get(cfg)
+        if cc:
+            rows.append(cc)
+    if not rows:
+        return "", ""
+    total = sum(int(r["total"]) for r in rows)
+    if total <= 0:
+        return "", ""
+    left = sum(int(r["left_reached"]) for r in rows)
+    right = sum(int(r["right_reached"]) for r in rows)
+    return (f"L {left}/{total} ({100 * left / total:.0f}%)",
+            f"R {right}/{total} ({100 * right / total:.0f}%)")
 
 
-def _roi_count_annotations(group_names, counts) -> list:
-    """One corner-tally annotation per subplot (empty text when no counts). Fixed
-    slots — index n+i for group i — so the blit can update text by index."""
+def _roi_count_annotations(group_items, counts) -> list:
+    """Left/right corner-tally annotations per subplot. Fixed slots — index
+    n+2*i / n+2*i+1 for group i — so the reach slider can Patch text by index."""
     anns = []
-    for i, gname in enumerate(group_names):
+    for i, (gname, gdf) in enumerate(group_items):
         sx, sy = _subplot_axis(i + 1)
-        anns.append(dict(text=_roi_count_text(gname, counts), showarrow=False,
-            xref=f"{sx} domain", yref=f"{sy} domain", x=0.02, y=0.98,
-            xanchor="left", yanchor="top", align="left", font=dict(size=9),
-            bgcolor="rgba(255,255,255,0.7)", bordercolor="#ccc", borderwidth=0.5))
+        left_txt, right_txt = _roi_count_texts(gname, gdf, counts)
+        anns.append(dict(text=left_txt, showarrow=False,
+            xref=f"{sx} domain", yref=f"{sy} domain", x=0.01, y=0.98,
+            xanchor="left", yanchor="top", align="left",
+            font=dict(size=10, color=_ROI_SIDE_COLOR["left"]),
+            bgcolor="rgba(255,255,255,0.76)",
+            bordercolor=_ROI_SIDE_COLOR["left"], borderwidth=0.6))
+        anns.append(dict(text=right_txt, showarrow=False,
+            xref=f"{sx} domain", yref=f"{sy} domain", x=0.99, y=0.98,
+            xanchor="right", yanchor="top", align="right",
+            font=dict(size=10, color=_ROI_SIDE_COLOR["right"]),
+            bgcolor="rgba(255,255,255,0.76)",
+            bordercolor=_ROI_SIDE_COLOR["right"], borderwidth=0.6))
     return anns
 
 
@@ -1306,6 +1372,7 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
         return fig
 
     groups = _group_frames(df, group_by, pool_mode, ncols)
+    group_items = list(groups.items())
     group_names = list(groups.keys())
     n = len(group_names)
     nrows = max(1, (n + ncols - 1) // ncols)
@@ -1383,15 +1450,16 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
         if i < len(group_names):
             ann.update(hovertext=group_names[i], font=dict(size=12))
 
-    # ROI overlay: reach circles (shapes) + a fixed count-annotation slot per
-    # subplot (index n+i), so the reach slider can blit both via Patch without a
-    # data rebuild. Slots are always reserved (empty when ROIs are off/rebased).
+    # ROI overlay: reach circles (shapes) + fixed left/right count-annotation
+    # slots per subplot (index n+2*i / n+2*i+1), so the reach slider can blit
+    # both via Patch without a data rebuild. Slots are always reserved (empty
+    # when ROIs are off/rebased).
     reach_v = float(reach_radius or 3.0)
     overlay = bool(show_rois and rois)
     if overlay:
-        fig.update_layout(shapes=_roi_overlay_shapes(group_names, rois, reach_v))
+        fig.update_layout(shapes=_roi_overlay_shapes(group_items, rois, reach_v))
     fig.update_layout(annotations=list(fig.layout.annotations)
-                      + _roi_count_annotations(group_names,
+                      + _roi_count_annotations(group_items,
                                                roi_counts if overlay else None))
 
     show_legend = color_by in ("individual", "vr")
@@ -3324,16 +3392,16 @@ def update_plots(n, view, pattern, vel_thresh, min_disp, trim, jump_buf,
     do_animate = bool(animate) and "on" in (animate or [])
     do_rebase = bool(rebase) and "on" in (rebase or [])
 
-    # ROI masking + counts. The reached table (and the counts/violins built from
-    # it) use the UNMASKED filtered data, so the denominator is always the total
-    # number of trials in each config. df_view is what the trajectory, heatmap and
-    # raw plot draw: optionally restricted to whole trials that entered an ROI,
-    # then tail-trimmed — the heatmap therefore respects the exact same subset.
+    # ROI masking + counts. The reached table is built from the UNMASKED
+    # filtered data; trajectory corner labels intersect it with each subplot's
+    # visible segments, while the ROI tab uses the unmasked table. df_view is
+    # what trajectory/heatmap/raw draw: optionally restricted to whole trials
+    # that entered an ROI, then tail-trimmed.
     rois = rois_by_config(metas)
     reach = float(roi_reach) if roi_reach else 3.0
     want_rois = _on(roi_show) and bool(rois)
     df_view, table = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
-    roi_counts = roi_config_summary(table) if (want_rois and table is not None) else None
+    roi_counts = table if (want_rois and table is not None) else None
     roi_fig = no_update            # the ROI violin is lazily built by its own tab
     if want_rois and view == "roi" and table is not None:
         roi_fig = build_roi_swarm_figure(df_view, rois, reach)
@@ -3628,17 +3696,19 @@ def update_roi_overlay(reach, roi_show, view, pattern, group_by, pool_mode, ncol
     reach_v = float(reach) if reach else 3.0
     do_rebase = _on(rebase)
     rois = rois_by_config(_load_data(pattern)[2])
-    # Match the trajectory's subplot set: same view masking, counts (full
-    # denominator) from the unmasked table.
+    # Match the trajectory's subplot set: same view masking, with labels derived
+    # from the unmasked reached table intersected with visible segments.
     df_view, table = _roi_apply(df_f, pattern, reach_v, _on(roi_entered), _on(roi_trim))
-    names = list(_group_frames(df_view, group_by, pool_mode, ncols_val).keys())
+    group_items = list(_group_frames(df_view, group_by, pool_mode, ncols_val).items())
     show = _on(roi_show) and not do_rebase and bool(rois)
-    counts = roi_config_summary(table) if (show and table is not None) else None
+    counts = table if (show and table is not None) else None
     patch = Patch()
-    patch["layout"]["shapes"] = _roi_overlay_shapes(names, rois, reach_v) if show else []
-    n = len(names)
-    for i, gname in enumerate(names):
-        patch["layout"]["annotations"][n + i]["text"] = _roi_count_text(gname, counts)
+    patch["layout"]["shapes"] = _roi_overlay_shapes(group_items, rois, reach_v) if show else []
+    n = len(group_items)
+    for i, (gname, gdf) in enumerate(group_items):
+        left_txt, right_txt = _roi_count_texts(gname, gdf, counts)
+        patch["layout"]["annotations"][n + 2 * i]["text"] = left_txt
+        patch["layout"]["annotations"][n + 2 * i + 1]["text"] = right_txt
     return patch
 
 # The ROI masks change the plotted trajectory data. They also rebuild the
