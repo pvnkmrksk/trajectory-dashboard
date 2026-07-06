@@ -118,16 +118,19 @@ same cache key.
   human tick labels (`_log_colorbar`/`_fmt_metric`); `cmin/cmax` blank→auto,
   absolute or `crange_mode="percentile"`; occupancy floored at 100 ms. When ROIs
   are available and paths are not rebased, the heatmap overlays faint target
-  outlines and per-ROI occupancy labels in the active metric; metric/scale swaps
-  restyle those labels clientside from the variant store.
+  rings and puts left/right ROI occupancy labels in each subplot's top corners
+  using the active metric; metric/scale swaps restyle those labels clientside
+  from the variant store.
 - **Diagnostics**: velocity/displacement histograms include the full filtered
   data, with the initial x viewbox set to the current 99th percentile. Autoscale
   or zoom out reveals the tail; the modebar is visible in Diagnostics.
-- **ROI tab**: one figure with three synced-x panels: per-animal fraction
-  reaching left/right (hover includes reached/trials), time-to-target split
-  violins, and heading-error split violins. Plotly native violin boxes show
-  median/IQR. Heading error is computed separately for left and right target
-  centres; missing sides use inferred centres from the loaded config set.
+- **ROI tab**: one figure with four synced-x panels: per-animal fraction
+  reaching left/right (hover includes reached/trials), per-animal residence time
+  inside each ROI, time-to-target split violins, and instantaneous heading-error
+  split violins. The violins have explicit median/IQR line overlays, not native
+  boxes. Heading error is each sample's movement heading minus the bearing from
+  that same sample to the left/right target centre; missing sides use inferred
+  centres from the loaded config set.
 
 ---
 

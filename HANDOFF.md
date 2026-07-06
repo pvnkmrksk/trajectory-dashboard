@@ -4,9 +4,10 @@ Last updated: 2026-07-06
 
 ## Current State
 
-- `main` includes the ROI/polar/filter/interaction work through commit
-  `6eccf62`; the current working changes add heatmap ROI occupancy overlays,
-  diagnostic polish, wheel-scroll containment, and config-order drag support.
+- `main` includes the ROI/polar/filter/interaction work through the latest
+  committed dashboard refinement pass. Current behavior includes heatmap ROI
+  occupancy overlays, diagnostic polish, wheel-scroll containment, config-order
+  drag support, and the expanded ROI tab.
 - The app remains a single-file Dash app in `app.py`; assets are
   `assets/dropzone.js`, `assets/heatsync.js`, `assets/plot_wheel_guard.js`, and
   `assets/config_order.js`.
@@ -22,9 +23,10 @@ Last updated: 2026-07-06
 - Heatmap figures are written to `heatmap-figure-store`; the browser paints them
   with guarded `Plotly.newPlot`. Do not wire heatmap updates back to
   `heatmap-plot.figure` without re-verifying the Plotly-6 axis-scaling bug.
-- Heatmap ROI overlays are layout shapes/annotations on top of the binned figure.
-  Labels use the current heatmap metric (`time`, `count`, `%`) and are swapped
-  clientside from `heatmap-variants` alongside `z`/`customdata`.
+- Heatmap ROI overlays use faint target rings on the binned figure plus
+  left/right occupancy labels in the top corners of each subplot. Labels use the
+  current heatmap metric (`time`, `count`, `%`) and are swapped clientside from
+  `heatmap-variants` alongside `z`/`customdata`.
 - Visible-panel resize is separated from heatmap/polar `newPlot`; hidden
   scaleanchor graphs must not be resized.
 - Diagnostics histograms include all filtered data but start zoomed to the
@@ -32,8 +34,10 @@ Last updated: 2026-07-06
 - Config subplot order is draggable from the sidebar's full loaded config list;
   default order chooses the sequenceConfig with the best config coverage.
 - ROI masks are cached by `_roi_masks()` per filtered frame and reach radius.
-  Fraction-reaching counts use the unmasked filtered trial table; time-to-target
-  and heading-error panels use the visible ROI-filtered subset.
+  The ROI tab shows fraction-reaching and residence-time swarms plus
+  time-to-target and instantaneous heading-error violins on the visible filtered
+  subset. The violin median/IQR markers are explicit line traces, not native
+  boxes.
 - Jump buffer UI is milliseconds. Old URLs with `jb=0.1` are restored as
   `100` ms and normalized to the same filter cache signature.
 
@@ -67,8 +71,9 @@ Browser checks that caught recent regressions:
 - `/_dash-dependencies` returns `200`.
 - Heatmap, trajectory, and ROI tabs hit Plotly's own drag rectangles
   (`nsewdrag drag`) and axis tick labels change after a real drag.
-- Heatmap view shows faint ROI outlines/metric labels when ROIs are available;
-  switching `time/count/%` changes both the colourbar and ROI label units.
+- Heatmap view shows faint ROI rings and top-corner metric labels when ROIs are
+  available; switching `time/count/%` changes both the colourbar and ROI label
+  units.
 - Browser console has no warnings/errors after tab switches.
 - The exclusion line for the SmallSubScale URL reads with actual params, e.g.
   `vel > 8.607 units/s (buffer 100 ms)`, `disp < 0.026`, and trim counts.

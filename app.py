@@ -509,6 +509,66 @@ def time_to_target_table(df, rois_by_cfg, reach) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
 
 
+_ROI_RESIDENCE_COLS = ["_seg_id", "ConfigFile", "animal", "VR", "FlyID",
+                       "residence_left", "residence_right"]
+
+
+def roi_residence_table(df, rois_by_cfg, reach) -> pd.DataFrame:
+    """Per-trial seconds spent inside left/right ROI. Trials that never enter
+    contribute zero, so per-animal means are directly comparable to the reached
+    fraction swarm."""
+    if df is None or len(df) == 0 or not rois_by_cfg:
+        return pd.DataFrame(columns=_ROI_RESIDENCE_COLS)
+    reach2 = float(reach) ** 2
+    parts = []
+    for cfg, sub in df.groupby("ConfigFile", sort=False, observed=True):
+        rois = rois_by_cfg.get(cfg)
+        if not rois:
+            continue
+        gx = sub["GameObjectPosX"].to_numpy()
+        gz = sub["GameObjectPosZ"].to_numpy()
+        seg = sub["_seg_id"].to_numpy()
+        starts = np.concatenate(([0], np.flatnonzero(seg[1:] != seg[:-1]) + 1))
+
+        t = sub["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64") / 1e9
+        dt = np.empty(len(sub), dtype=float)
+        if len(sub) > 1:
+            same_next = seg[1:] == seg[:-1]
+            raw_dt = np.diff(t)
+            good = same_next & np.isfinite(raw_dt) & (raw_dt > 0)
+            fallback = float(np.median(raw_dt[good])) if good.any() else _median_dt(sub)
+            dt[:-1] = np.where(good, raw_dt, fallback)
+            dt[-1] = fallback
+        else:
+            dt[0] = _median_dt(sub)
+
+        dwell = {}
+        for side in ("left", "right"):
+            centers = [r for r in rois if r["side"] == side]
+            if not centers:
+                continue
+            inside = np.zeros(len(sub), bool)
+            for r in centers:
+                inside |= (gx - r["x"]) ** 2 + (gz - r["z"]) ** 2 <= reach2
+            dwell[side] = np.add.reduceat(np.where(inside, dt, 0.0), starts)
+        if not dwell:
+            continue
+        parts.append(pd.DataFrame({
+            "_seg_id": seg[starts],
+            "ConfigFile": sub["ConfigFile"].to_numpy()[starts],
+            "VR": sub["VR"].to_numpy()[starts],
+            "FlyID": sub["FlyID"].to_numpy()[starts],
+            "residence_left": dwell.get("left", np.zeros(len(starts))),
+            "residence_right": dwell.get("right", np.zeros(len(starts))),
+        }))
+
+    if not parts:
+        return pd.DataFrame(columns=_ROI_RESIDENCE_COLS)
+    out = pd.concat(parts, ignore_index=True)
+    out["animal"] = out["FlyID"].astype(str) + "@" + out["VR"].astype(str)
+    return out[_ROI_RESIDENCE_COLS]
+
+
 def heading_target_angle_table(df, rois_by_cfg, moving_thresh=None) -> pd.DataFrame:
     """Per-sample signed heading error relative to left and right target centres.
 
@@ -1546,10 +1606,9 @@ def _roi_metric_value(count: float, total: float, metric: str, dt: float) -> flo
     return float(count)
 
 
-def _heatmap_roi_label(stat: dict, metric: str, dt: float) -> str:
-    side = str(stat.get("side", "") or "?")[:1].upper()
-    total = float(stat.get("total", 0.0) or 0.0)
-    count = float(stat.get("count", 0.0) or 0.0)
+def _heatmap_roi_label(side_name: str, count: float, total: float,
+                       metric: str, dt: float) -> str:
+    side = str(side_name or "?")[:1].upper()
     frac = 100.0 * count / max(total, 1.0)
     val = _roi_metric_value(count, total, metric, dt)
     if metric == "count":
@@ -1557,6 +1616,21 @@ def _heatmap_roi_label(stat: dict, metric: str, dt: float) -> str:
     if metric == "percent":
         return f"{side} {_fmt_metric(val, metric)}"
     return f"{side} {_fmt_metric(val, metric)} ({frac:.1f}%)"
+
+
+def _heatmap_roi_corner_texts(group_roi_stats, metric: str, dt: float) -> list[str]:
+    texts = []
+    for stats in group_roi_stats or []:
+        total = max((float(s.get("total", 0.0) or 0.0) for s in stats), default=0.0)
+        by_side = {"left": 0.0, "right": 0.0}
+        for stat in stats:
+            side = stat.get("side")
+            if side in by_side:
+                by_side[side] += float(stat.get("count", 0.0) or 0.0)
+        for side in ("left", "right"):
+            texts.append(_heatmap_roi_label(side, by_side[side], total, metric, dt)
+                         if total and by_side[side] else "")
+    return texts
 
 
 def _heatmap_roi_stats(group_items, rois_by_cfg, reach) -> list[list[dict]]:
@@ -1608,21 +1682,23 @@ def _heatmap_roi_shapes(group_roi_stats, reach) -> list[dict]:
 
 def _heatmap_roi_annotations(group_roi_stats, roi_texts) -> list[dict]:
     anns = []
-    text_i = 0
-    for i, stats in enumerate(group_roi_stats or []):
+    for i, _stats in enumerate(group_roi_stats or []):
         sx, sy = _subplot_axis(i + 1)
-        for stat in stats:
-            col = _ROI_SIDE_COLOR.get(stat.get("side"), "#6c757d")
+        left_txt = roi_texts[2 * i] if 2 * i < len(roi_texts) else ""
+        right_txt = roi_texts[2 * i + 1] if 2 * i + 1 < len(roi_texts) else ""
+        for side, text, x, anchor in (
+            ("left", left_txt, 0.01, "left"),
+            ("right", right_txt, 0.99, "right"),
+        ):
+            col = _ROI_SIDE_COLOR[side]
             anns.append(dict(
-                name="hm-roi", text=roi_texts[text_i] if text_i < len(roi_texts) else "",
-                showarrow=False, xref=sx, yref=sy,
-                x=float(stat["x"]), y=float(stat["z"]),
-                xanchor="center", yanchor="middle",
-                font=dict(size=9, color=_rgba(col, 0.95)),
-                bgcolor="rgba(255,255,255,0.45)",
-                bordercolor=_rgba(col, 0.35), borderwidth=0.4,
+                name=f"hm-roi-{side}", text=text, showarrow=False,
+                xref=f"{sx} domain", yref=f"{sy} domain",
+                x=x, y=1.025, xanchor=anchor, yanchor="bottom",
+                align=anchor, font=dict(size=10, color=_rgba(col, 0.95)),
+                bgcolor="rgba(255,255,255,0)",
+                bordercolor="rgba(0,0,0,0)", borderwidth=0,
             ))
-            text_i += 1
     return anns
 
 
@@ -1758,11 +1834,7 @@ def _heatmap_variant(bins, metric, log_scale, cmin=None, cmax=None,
         z_list.append(z.tolist())
         cd_list.append(M.tolist())
     hov = "x=%{x:.1f} z=%{y:.1f}<br>%{customdata:.3g} " + unit + "<extra></extra>"
-    roi_texts = [
-        _heatmap_roi_label(stat, metric, dt)
-        for stats in bins.get("roi_stats", [])
-        for stat in stats
-    ]
+    roi_texts = _heatmap_roi_corner_texts(bins.get("roi_stats", []), metric, dt)
     return dict(z=z_list, customdata=cd_list, zmin=zmin, zmax=zmax,
                 colorbar=cbar, hovertemplate=hov, roi_texts=roi_texts)
 
@@ -1891,7 +1963,7 @@ def build_velocity_histogram(df, vel_threshold=None):
     cap = np.quantile(vel, 0.99)
 
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=vel, nbinsx=120, marker_color="#1f77b4",
+    fig.add_trace(go.Histogram(x=vel, nbinsx=220, marker_color="#1f77b4",
                                 opacity=0.85, name="Velocity"))
     if vel_threshold and vel_threshold > 0:
         fig.add_vline(x=vel_threshold, line_dash="dash", line_color="red", line_width=2)
@@ -1915,7 +1987,7 @@ def build_displacement_histogram(stats_df, min_disp=None):
         return go.Figure().update_layout(height=190, template="plotly_white")
 
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=stats_df["displacement"], nbinsx=50,
+    fig.add_trace(go.Histogram(x=stats_df["displacement"], nbinsx=120,
                                 marker_color="#2ca02c", opacity=0.85, name="Disp"))
     disp = stats_df["displacement"].to_numpy()
     disp = disp[np.isfinite(disp)]
@@ -1979,9 +2051,10 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     """Stacked ROI diagnostics:
       1. Paired swarm — per-animal fraction of trials reaching left vs right, with
          faint left↔right pairing lines and a median bar per side.
-      2. Split violin of time-to-reach the target (left half / right half), area
+      2. Paired swarm — per-animal mean residence time inside each ROI.
+      3. Split violin of time-to-reach the target (left half / right half), area
          proportional to the number of trials that reached (scalemode='count').
-      3. Split violin of signed heading error to left/right target centres
+      4. Split violin of instantaneous heading minus target bearing
          (0° = pointing at target, span -180..180°).
     `df` is already the filtered/visible subset; pass `table` to skip recompute."""
     tbl = roi_reached_table(df, rois_by_cfg, reach) if table is None else table
@@ -1998,28 +2071,53 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     labels = sorted(grp["label"].unique())
     xpos = {lab: i for i, lab in enumerate(labels)}
     n_animals = grp["animal"].nunique()
-
-    base = grp["label"].map(xpos).to_numpy().astype(float)
-    rng = np.random.default_rng(0)
-    jit = lambda: (rng.random(len(grp)) - 0.5) * 0.18
-    lx, rx = base - 0.2 + jit(), base + 0.2 + jit()
-    ly, ry = grp["frac_left"].to_numpy(), grp["frac_right"].to_numpy()
-    px = np.empty(len(grp) * 3); px[0::3], px[1::3], px[2::3] = lx, rx, np.nan
-    py = np.empty(len(grp) * 3); py[0::3], py[1::3], py[2::3] = ly, ry, np.nan
-    med = grp.groupby("label").agg(ml=("frac_left", "median"), mr=("frac_right", "median"))
-    mlx, mly, mrx, mry = [], [], [], []
-    for lab, i in xpos.items():
-        if lab in med.index:
-            mlx += [i - 0.36, i - 0.04, None]; mly += [med.loc[lab, "ml"]] * 2 + [None]
-            mrx += [i + 0.04, i + 0.36, None]; mry += [med.loc[lab, "mr"]] * 2 + [None]
-
     lc, rc = _ROI_SIDE_COLOR["left"], _ROI_SIDE_COLOR["right"]
-    fig = make_subplots(rows=3, cols=1, vertical_spacing=0.10, subplot_titles=(
+    rng = np.random.default_rng(0)
+
+    def _paired_arrays(src, left_col, right_col):
+        base = src["label"].map(xpos).to_numpy().astype(float)
+        jit_l = (rng.random(len(src)) - 0.5) * 0.18
+        jit_r = (rng.random(len(src)) - 0.5) * 0.18
+        lx, rx = base - 0.2 + jit_l, base + 0.2 + jit_r
+        ly, ry = src[left_col].to_numpy(), src[right_col].to_numpy()
+        px = np.empty(len(src) * 3); px[0::3], px[1::3], px[2::3] = lx, rx, np.nan
+        py = np.empty(len(src) * 3); py[0::3], py[1::3], py[2::3] = ly, ry, np.nan
+        return lx, rx, ly, ry, px, py
+
+    def _median_segments(src, left_col, right_col):
+        med = src.groupby("label").agg(ml=(left_col, "median"),
+                                       mr=(right_col, "median"))
+        mlx, mly, mrx, mry = [], [], [], []
+        for lab, i in xpos.items():
+            if lab in med.index:
+                mlx += [i - 0.36, i - 0.04, None]; mly += [med.loc[lab, "ml"]] * 2 + [None]
+                mrx += [i + 0.04, i + 0.36, None]; mry += [med.loc[lab, "mr"]] * 2 + [None]
+        return mlx, mly, mrx, mry
+
+    def _add_quantile_lines(src, value_col, row, color, side):
+        x0, x1 = (-0.36, -0.04) if side == "left" else (0.04, 0.36)
+        side_src = src[src["side"] == side]
+        for lab, vals in side_src.groupby("label", sort=False)[value_col]:
+            vals = vals.to_numpy()
+            vals = vals[np.isfinite(vals)]
+            if not len(vals) or lab not in xpos:
+                continue
+            q1, med, q3 = np.percentile(vals, [25, 50, 75])
+            for y, width, alpha in ((q1, 1.4, 0.45), (med, 2.8, 0.95), (q3, 1.4, 0.45)):
+                fig.add_trace(go.Scatter(
+                    x=[xpos[lab] + x0, xpos[lab] + x1], y=[y, y],
+                    mode="lines", showlegend=False, hoverinfo="skip",
+                    line=dict(color=_rgba(color, alpha), width=width)),
+                    row=row, col=1)
+
+    fig = make_subplots(rows=4, cols=1, vertical_spacing=0.075, subplot_titles=(
         f"Fraction of trials reaching each ROI — per animal "
         f"(reach {reach:g} u · {n_animals} animals; bars = median)",
-        "Time to reach target (split violin; area ∝ trials reached; box = median/IQR)",
-        "Heading error to left/right target centres (split violin; box = median/IQR)"))
+        "Residence time inside ROI — per animal mean seconds/trial (bars = median)",
+        "Time to reach target (split violin; area ∝ trials reached; lines = median/IQR)",
+        "Instantaneous heading error to target bearing (split violin; lines = median/IQR)"))
 
+    lx, rx, ly, ry, px, py = _paired_arrays(grp, "frac_left", "frac_right")
     fig.add_trace(go.Scatter(x=px.tolist(), y=py.tolist(), mode="lines",
         line=dict(color="rgba(120,120,120,0.35)", width=1),
         hoverinfo="skip", showlegend=False), row=1, col=1)
@@ -2037,12 +2135,51 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
         hovertemplate=("Right %{customdata[1]:.0f}/%{customdata[2]:.0f} trials"
                        "<br>fraction %{y:.2f}<br>%{customdata[0]}<extra></extra>")),
         row=1, col=1)
+    mlx, mly, mrx, mry = _median_segments(grp, "frac_left", "frac_right")
     fig.add_trace(go.Scatter(x=mlx, y=mly, mode="lines", showlegend=False,
         line=dict(color=lc, width=3), hoverinfo="skip"), row=1, col=1)
     fig.add_trace(go.Scatter(x=mrx, y=mry, mode="lines", showlegend=False,
         line=dict(color=rc, width=3), hoverinfo="skip"), row=1, col=1)
 
-    # --- panel 2: time-to-target split violin ---
+    # --- panel 2: residence-time paired swarm ---
+    res = roi_residence_table(df, rois_by_cfg, reach)
+    if len(res):
+        rgrp = res.groupby(["ConfigFile", "animal"], sort=False, observed=True).agg(
+            residence_left=("residence_left", "mean"),
+            residence_right=("residence_right", "mean"),
+            trials=("_seg_id", "size")).reset_index()
+        rgrp["label"] = rgrp["ConfigFile"].map(humanise_config)
+        rgrp = rgrp[rgrp["label"].isin(xpos)]
+        if len(rgrp):
+            rlx, rrx, rly, rry, rpx, rpy = _paired_arrays(
+                rgrp, "residence_left", "residence_right")
+            fig.add_trace(go.Scatter(x=rpx.tolist(), y=rpy.tolist(), mode="lines",
+                line=dict(color="rgba(120,120,120,0.28)", width=1),
+                hoverinfo="skip", showlegend=False), row=2, col=1)
+            rleft_cd = rgrp[["animal", "trials"]].to_numpy()
+            rright_cd = rgrp[["animal", "trials"]].to_numpy()
+            fig.add_trace(go.Scatter(x=rlx.tolist(), y=rly.tolist(), mode="markers",
+                name="Left residence", legendgroup="left", showlegend=False,
+                marker=dict(color=lc, size=6, opacity=0.72,
+                line=dict(width=0.5, color="#333")), customdata=rleft_cd,
+                hovertemplate=("Left %{y:.2f}s/trial"
+                               "<br>%{customdata[1]:.0f} trials<br>%{customdata[0]}"
+                               "<extra></extra>")), row=2, col=1)
+            fig.add_trace(go.Scatter(x=rrx.tolist(), y=rry.tolist(), mode="markers",
+                name="Right residence", legendgroup="right", showlegend=False,
+                marker=dict(color=rc, size=6, opacity=0.72,
+                line=dict(width=0.5, color="#333")), customdata=rright_cd,
+                hovertemplate=("Right %{y:.2f}s/trial"
+                               "<br>%{customdata[1]:.0f} trials<br>%{customdata[0]}"
+                               "<extra></extra>")), row=2, col=1)
+            rmlx, rmly, rmrx, rmry = _median_segments(
+                rgrp, "residence_left", "residence_right")
+            fig.add_trace(go.Scatter(x=rmlx, y=rmly, mode="lines", showlegend=False,
+                line=dict(color=lc, width=3), hoverinfo="skip"), row=2, col=1)
+            fig.add_trace(go.Scatter(x=rmrx, y=rmry, mode="lines", showlegend=False,
+                line=dict(color=rc, width=3), hoverinfo="skip"), row=2, col=1)
+
+    # --- panel 3: time-to-target split violin ---
     ttt = time_to_target_table(df, rois_by_cfg, reach)
     if len(ttt):
         ttt["label"] = ttt["ConfigFile"].map(humanise_config)
@@ -2053,12 +2190,15 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
             fig.add_trace(go.Violin(
                 x=s["label"].map(xpos), y=s["t"], side=sd, scalemode="count", scalegroup="ttt",
                 line_color=color, fillcolor=color, opacity=0.55, points=False,
-                meanline_visible=False, box_visible=True, showlegend=False, spanmode="hard",
-                hovertemplate=side + " %{y:.1f}s<extra></extra>"), row=2, col=1)
+                meanline_visible=False, box_visible=False, showlegend=False, spanmode="hard",
+                hovertemplate=side + " %{y:.1f}s<extra></extra>"), row=3, col=1)
+            _add_quantile_lines(ttt, "t", 3, color, side)
 
+    # --- panel 4: instantaneous heading error split violin ---
     ang = heading_target_angle_table(df, rois_by_cfg)
     if len(ang):
         ang["label"] = ang["ConfigFile"].map(humanise_config)
+        ang_quantiles = ang
         budget = 40_000
         if len(ang) > budget:
             ang = ang.iloc[np.linspace(0, len(ang) - 1, budget).astype(int)]
@@ -2070,27 +2210,26 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
                 x=s["label"].map(xpos), y=s["angle_deg"], side=sd,
                 scalemode="count", scalegroup="angle", line_color=color,
                 fillcolor=color, opacity=0.45, points=False,
-                meanline_visible=False, box_visible=True, showlegend=False,
+                meanline_visible=False, box_visible=False, showlegend=False,
                 span=[-180, 180],
-                hovertemplate=side + " %{y:.0f}° from target centre<extra></extra>"),
-                row=3, col=1)
+                hovertemplate=side + " %{y:.0f}° heading - target bearing<extra></extra>"),
+                row=4, col=1)
+            _add_quantile_lines(ang_quantiles, "angle_deg", 4, color, side)
 
-    fig.update_layout(template="plotly_white", height=980, violinmode="overlay",
+    fig.update_layout(template="plotly_white", height=1220, violinmode="overlay",
         legend=dict(orientation="h", y=1.05, yanchor="bottom", x=1, xanchor="right"),
         margin=dict(l=60, r=20, t=50, b=80), dragmode="pan")
     fig.update_yaxes(title_text="fraction reaching", range=[-0.03, 1.03], row=1, col=1)
-    fig.update_yaxes(title_text="time to reach (s)", rangemode="tozero", row=2, col=1)
+    fig.update_yaxes(title_text="residence (s/trial)", rangemode="tozero", row=2, col=1)
+    fig.update_yaxes(title_text="time to reach (s)", rangemode="tozero", row=3, col=1)
     fig.update_yaxes(title_text="heading error (deg)", range=[-180, 180],
                      zeroline=True, zerolinewidth=1.5, zerolinecolor="#555",
-                     row=3, col=1)
-    fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
-                     ticktext=labels, range=[-0.6, len(labels) - 0.4], row=1, col=1)
-    fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
-                     ticktext=labels, range=[-0.6, len(labels) - 0.4],
-                     title_text="config", row=2, col=1)
-    fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
-                     ticktext=labels, range=[-0.6, len(labels) - 0.4],
-                     title_text="config", row=3, col=1)
+                     row=4, col=1)
+    for row in range(1, 5):
+        fig.update_xaxes(tickmode="array", tickvals=list(range(len(labels))),
+                         ticktext=labels, range=[-0.6, len(labels) - 0.4],
+                         title_text="config" if row == 4 else None,
+                         row=row, col=1)
     fig.update_xaxes(matches="x")
     return fig
 
@@ -2637,17 +2776,15 @@ app.layout = html.Div([
                               value=["on"], style={"fontSize": "9px"}),
             ], style={"marginBottom": "3px"}),
             html.Div([
-                html.Div([
-                    html.Label("Trim edge samples", style={"fontSize": "10px"}),
-                    dcc.Input(id="trim-samples", type="number", value=100,
-                              debounce=True, style=_INPUT_STYLE),
-                ], style={"flex": "1"}),
-                html.Div([
-                    html.Label("Spike buffer (ms)", style={"fontSize": "10px"}),
-                    dcc.Input(id="jump-buffer", type="number", value=100, min=0,
-                              step=10, debounce=True, style=_INPUT_STYLE),
-                ], style={"flex": "1"}),
-            ], style={"display": "flex", "gap": "6px", "marginBottom": "3px"}),
+                html.Label("Extra trim around speed spikes (ms)",
+                           style={"fontSize": "10px"}),
+                dcc.Input(id="jump-buffer", type="number", value=100, min=0,
+                          step=10, debounce=True, style=_INPUT_STYLE),
+                html.Div("Velocity spikes are removed with this time buffer on "
+                         "both sides. Old links can still set edge-sample trim.",
+                         style={"fontSize": "9px", "color": "#888",
+                                "marginTop": "2px"}),
+            ], style={"marginBottom": "3px"}),
 
             html.Button("Re-Plot", id="btn-plot", n_clicks=0,
                         style={"width": "100%", "marginTop": "4px", "padding": "5px",
@@ -2695,9 +2832,16 @@ app.layout = html.Div([
                           style=_INPUT_STYLE),
                 html.Div("Blank = auto-decimate to a browser-safe budget.",
                          style={"fontSize": "9px", "color": "#888"}),
+                html.Label("Edge trim samples (legacy)", style={"fontSize": "10px",
+                                                                  "marginTop": "3px"}),
+                dcc.Input(id="trim-samples", type="number", value=0, min=0,
+                          debounce=True, style=_INPUT_STYLE),
+                html.Div("Normally leave at 0; this removes N samples from both "
+                         "ends of every trial after spike filtering.",
+                         style={"fontSize": "9px", "color": "#888"}),
                 html.Label("Raw trace cols", style={"fontSize": "10px", "marginTop": "3px"}),
                 dcc.Dropdown(id="raw-columns", multi=True,
-                             value=["GameObjectPosX", "GameObjectPosZ"],
+                             value=[],
                              style={"fontSize": "10px"}),
 
                 html.Hr(style={"margin": "6px 0"}),
@@ -3092,6 +3236,8 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim, rebase,
             "hbound": hbound, "hcmin": hcmin, "hcmax": hcmax, "ncols": ncols, "pts": pts}
     for k, v in nums.items():
         if v is not None and v != "":
+            if k == "trim" and float(v or 0) <= 0:
+                continue
             params[k] = v
     strs = {"groupby": gb, "pool": pm, "color": color, "hscale": hscale,
             "hmetric": hmetric, "hcrange": hcrange, "view": view}
@@ -3636,7 +3782,7 @@ def update_plots(n, view, pattern, vel_thresh, min_disp, trim, jump_buf,
                                reach if _mask_on else None)
     if view == "diag":
         raw_fig = build_raw_trace_figure(
-            df_view, raw_cols or ["GameObjectPosX", "GameObjectPosZ"],
+            df_view, raw_cols or [],
             max_points=max_points)
     bt = time.time() - t0
 
@@ -3853,7 +3999,7 @@ def update_roi_view(n_plot, reach, roi_show, roi_trim, roi_entered, view, patter
     n_before = int(df_sub["_seg_id"].nunique()) if len(df_sub) else 0
     summary = (f"ROI {_compact_count(len(df_view))}/{_compact_count(len(df_sub))} pts | "
                f"{_compact_count(n_traces)}/{_compact_count(n_before)} segs | reach {reach_v:g} u | "
-               f"heading error = left/right target centres")
+               f"heading error = instantaneous heading - target bearing")
     return build_roi_swarm_figure(df_view, rois, reach_v, table=table), summary
 
 
@@ -4112,7 +4258,7 @@ app.clientside_callback(
     "window.Plotly.restyle(hg,{colorbar:[v.colorbar]},[0]);"
     "if(v.roi_texts&&hg.layout&&hg.layout.annotations){"
     "var j=0;var anns=hg.layout.annotations.map(function(a){"
-    "var b=Object.assign({},a);if(b.name==='hm-roi'){b.text=v.roi_texts[j++]||'';}return b;});"
+    "var b=Object.assign({},a);if((b.name||'').indexOf('hm-roi')===0){b.text=v.roi_texts[j++]||'';}return b;});"
     "window.Plotly.relayout(hg,{annotations:anns});}"
     "}}catch(e){}}"
     "},90);return '';}",

@@ -37,16 +37,17 @@ python app.py --port 8051 --host 0.0.0.0
 - **Heatmap**: occupancy density — bin size in **data units**, lin/log with
   human-readable log labels (100 ms / 1 s / 10 s), percentile-bounded extent,
   metric = count / occupancy-seconds / % of time, explicit `cmin/cmax`
-  (absolute or percentile). Zoom stays linked with the trajectory.
+  (absolute or percentile), and faint ROI rings with left/right occupancy labels
+  in each subplot's top corners. Zoom stays linked with the trajectory.
 - **ROI targets** auto-loaded from the scene configs (Choice/BinaryChoice; polar
   `{radius,angle}` or cartesian `{x,y,z}`, Unity left-handed). Adjustable **reach
   radius** slider, reach circles + per-subplot left/right **reached counts**
   overlaid on the trajectories, and an optional **tail-trim** that drops each
   trial's path after it first leaves an ROI it entered.
 - **ROI counts view**: per-animal fraction reaching left/right with reached/trial
-  hover counts, split violins for time-to-target, and split violins for
-  heading-error to left/right target centres. Plotly's native box overlays show
-  median/IQR.
+  hover counts, per-animal ROI residence time, split violins for time-to-target,
+  and split violins for instantaneous heading error to left/right targets.
+  Median/IQR are drawn as simple line overlays, not violin boxes.
 - **Polar view**: each trial's path as r (distance from origin) vs angle
   (0° = forward, clockwise — same frame as the trajectories and ROIs), coloured
   by instantaneous velocity or local tortuosity, with a moving-only (walk-speed)
