@@ -1,9 +1,11 @@
 # Architecture & context — Trajectory Dashboard
 
-> One-stop context for a developer or coding agent. Read this instead of scanning
-> all ~4k lines. The app is a **single file** (`app.py`). A sibling
-> `Plotting/dashboard.py` exists but currently lags this repo; treat this
-> repo's `app.py` as source of truth unless explicitly asked to sync the copy.
+> One-stop context for a developer or coding agent. The dashboard shell and
+> Plotly figure builders live in `app.py`; reusable Dash-free loading, filtering,
+> and grouping live under `trajectory_dashboard/`. A sibling `Plotting/dashboard.py`
+> exists but currently lags this repo; treat this repo's `app.py` plus
+> `trajectory_dashboard/` as source of truth unless explicitly asked to sync the
+> copy.
 
 ---
 
@@ -15,6 +17,10 @@ and density-maps 2-D trajectories — fast, on millions of rows.
 
 Stack in this environment: **Dash 4.2, Plotly 6.8, pandas 2, numpy**. (Dash 4 /
 Plotly 6 matter — see the rendering gotchas in §7.)
+
+The importable library entry points are `trajectory_dashboard.load_dataset`,
+`FilterSpec`, `filter_frame`, and `group_frames`. They do not import Dash or
+Plotly.
 
 ---
 
@@ -46,9 +52,10 @@ Plotly 6 matter — see the rendering gotchas in §7.)
 
 | Lines (~) | Section | Key functions |
 |---|---|---|
-| 28-390 | **Config + data helpers + ROI geometry** | `humanise_config`, tolerant JSON loaders, ROI extraction, readable config LUT. |
-| 395-670 | **ROI tables/masks + CSV loading** | `roi_reached_table`, `time_to_target_table`, `heading_target_angle_table`, `_roi_masks`, `_roi_apply`, `load_csv_fast`. |
-| 763-947 | **Filtering / stats** | `velocity_all`, `smoothed_velocity`, `compute_segment_stats`, `apply_filters`, `filter_by_stat_range`, `_dilate_keep`. |
+| package | **Reusable pipeline** | `trajectory_dashboard.io.load_dataset`, `trajectory_dashboard.filters`, `trajectory_dashboard.grouping.FilterSpec`. |
+| 28-390 | **Config + ROI geometry** | `humanise_config`, ROI extraction, readable config LUT. |
+| 395-670 | **ROI tables/masks + CSV loader bridge** | `roi_reached_table`, `time_to_target_table`, `heading_target_angle_table`, `_roi_masks`, `_roi_apply`, `load_csv_fast`. |
+| 763-947 | **Filtering bridge / stats** | Compatibility wrappers; canonical implementations live in `trajectory_dashboard.filters`. |
 | 948-2040 | **Plotting** | `_prepare_merged_groups`, `build_trajectory_figure`, heatmap builders + variants, histograms, raw trace, ROI split violins, polar rays. |
 | 2041-2181 | **Dash app + data caches** | `app`, `_DATA_CACHE`, `_FILTER_CACHE`, `_ROI_MASK_CACHE`, `_POLAR_RAY_CACHE`, `resolve_dropped_folder`, `_load_data`. |
 | 2182-2649 | **Layout** | sidebar controls + five mounted panels (`traj`, `heat`, `roi`, `polar`, `diag`) hidden via `visibility`. |
@@ -57,6 +64,8 @@ Plotly 6 matter — see the rendering gotchas in §7.)
 | 4127-end | **`__main__`** | CLI (`--glob/--port/--host/--debug`), optional pre-load. |
 
 Assets (Dash auto-serves `/assets`):
+- `assets/dashboard.css` — dashboard chrome, tabs, buttons, drop target, and
+  workspace styling.
 - `assets/dropzone.js` — folder drag-and-drop → `set_props('drop-data', …)`.
 - `assets/heatsync.js` — re-attaches a relayout→`viewport-store` handler after the heatmap is `newPlot`-ed (Dash's own listener is lost on newPlot).
 - `assets/plot_wheel_guard.js` — prevents page/panel scroll while the pointer is
@@ -70,11 +79,13 @@ Assets (Dash auto-serves `/assets`):
 
 ```
 glob / dropped folder
-   └─ find_csv_files → load_csv_fast (per file) → concat → sort ONCE by time
+   └─ trajectory_dashboard.io.find_csv_files → load_csv_fast (per file)
+      → concat → sort ONCE by time
       └─ _load_data(pattern)                         cached in _DATA_CACHE
          └─ _filtered_df(...)                        cached in _FILTER_CACHE (last 4)
-            ├─ subset by config/vr/fly/scene/folder + histogram range-selections
-            └─ apply_filters: velocity-jump (time-buffered), min-displacement, trim
+            ├─ trajectory_dashboard.grouping.subset_frame + histogram range-selections
+            └─ trajectory_dashboard.filters.apply_filters
+               velocity-jump (time-buffered), min-displacement, trim
                └─ _roi_apply(...)                    cached masks in _ROI_MASK_CACHE
                   └─ build_* figures → dcc.Graph / figure stores
 ```
@@ -101,11 +112,12 @@ same cache key.
 - **Decimation budgets** (`_decimation_budget` / build): static WebGL
   `BUDGET_GL=300k`; animated `BUDGET_SVG=40k` (every frame is embedded in the
   figure JSON — Plotly cannot stream frames, so the budget is the payload lever);
-  raw plot `BUDGET_RAW=25k`. "Max plot points" (Advanced) overrides.
-- **Colour modes** (`color_by`): `individual`/`vr` (categorical, lines, legend);
-  `trial`/`local_time`/`velocity` (sequential; markers for per-point ones; a
-  hidden anchor trace supplies the Viridis colourbar). Velocity is
-  rolling-smoothed (10 frames) and spike-clipped.
+  raw plot `BUDGET_RAW=25k`. "Point budget" (Advanced) overrides.
+- **Colour modes** (`color_by`): `individual`/`vr`/`roi` (categorical, lines,
+  legend); `trial`/`local_time`/`velocity` (sequential; markers for per-point
+  ones; a hidden anchor trace supplies the Viridis colourbar). ROI outcome is
+  computed per segment from the first left/right ROI reached and falls back to
+  "No ROI". Velocity is rolling-smoothed (10 frames) and spike-clipped.
 - **Layout**: 2-col grid, `SUBPLOT_PX=480` per subplot → the figure is its
   natural full height and the panel scrolls (no squishing). Subplot vertical
   spacing is deliberately tight so Plotly drag rectangles are easy to hit. 1:1
@@ -120,10 +132,18 @@ same cache key.
   are available and paths are not rebased, the heatmap overlays faint target
   rings and puts left/right ROI occupancy labels in each subplot's top corners
   using the active metric; metric/scale swaps restyle those labels clientside
-  from the variant store.
+  from the variant store. Per-side ROI heatmap labels use a boolean union of
+  samples hit by any same-side ROI, not a sum over ROI centers, so percentages
+  cannot exceed 100% under pooled/overlapping target states.
 - **Diagnostics**: velocity/displacement histograms include the full filtered
   data, with the initial x viewbox set to the current 99th percentile. Autoscale
-  or zoom out reveals the tail; the modebar is visible in Diagnostics.
+  or zoom out reveals the tail; the modebar is visible in Diagnostics. The raw
+  trace graph remains mounted for callback wiring but its wrapper is hidden
+  until raw columns are selected.
+- **Trajectory ROI labels**: corner labels are exclusive first-reached outcome
+  counts (`L-first`, `R-first`) over the visible ROI-capable trials in that
+  subplot. Do not switch them back to independent reached-left/reached-right
+  counts; trials can visit both sides and the labels would sum past 100%.
 - **ROI tab**: one figure with four synced-x panels: per-animal fraction
   reaching left/right (hover includes reached/trials), per-animal residence time
   inside each ROI, time-to-target split violins, and instantaneous heading-error
@@ -146,12 +166,21 @@ same cache key.
 - `start_progress`/`tick_progress` poll the `_LOAD_PROGRESS` global (works
   because the dev server is threaded).
 - `load_data_cb` populates filter options, histograms, the smart default bin
-  size, then auto-triggers `update_plots`.
+  size, then auto-triggers `update_plots`. `_load_data` is keyed by the matched
+  file list plus mtime/size, so adding files under the same glob invalidates the
+  stale dataframe/filter/heatmap signatures.
 - `render_config_order_list`/`apply_config_order` expose all loaded configs as a
   draggable order list. The default order uses the sequenceConfig with the best
   coverage; missing configs remain alphabetic at the bottom.
+- `progressive_preload` starts after load / Update views and feeds
+  `preload-view` with one non-active view at a time on smaller datasets. On
+  loaded frames above `PRELOAD_ROW_LIMIT` (1M rows), hidden preloads are deferred
+  so background tab work does not compete with the focused view; those tabs build
+  lazily on first open.
 - `update_plots` — trajectory/raw/summary/hist rebuilds only when Trajectory or
-  Diagnostics is visible.
+  Diagnostics is visible **and** that view has no current signature for the
+  effective filter/plot state. Pure tab switches reuse the mounted figure and
+  only restore that view's cached summary.
 - `_filtered_df` normalizes jump-buffer units for cache keys (`100` ms and old
   `0.1` second URLs share a signature). `_roi_masks` caches reached table,
   entered segment ids, and trim masks for fast ROI toggles.
@@ -169,9 +198,17 @@ same cache key.
   loop. `apply_viewport_traj` re-applies stored ranges to the trajectory on view
   switch; heatmap applies only close, overlapping ranges so a stale URL viewbox
   cannot make the binned heatmap a tiny island inside a mostly blank plot.
-- `switch_view` toggles panel `visibility`. Clientside callbacks drive playback,
-  resize graphs shown for the first time, and `newPlot` the heatmap.
-- `export_html` rebuilds all figures server-side and emits one self-contained file.
+- `switch_view` toggles panel `visibility` from `dcc.Tabs` value changes.
+  Clientside callbacks drive playback, resize visible non-polar graphs shown for
+  the first time, and fingerprint-guard `newPlot` for heatmap/polar so unchanged
+  tab switches do not reinitialise figures.
+- `update_filter_summary` reports final retained points/trials/animals and a
+  serial per-criterion retention audit. It is triggered from `view-render-state`
+  after a view finishes rendering, not directly from `btn-plot`, so the audit
+  does not race the focused plot callback. Each stage's percentage is relative
+  to the previous stage, mirroring the actual filter pipeline.
+- `export_html` rebuilds figures server-side and emits one self-contained file.
+  It includes trajectories, heatmap, polar, diagnostics, and selected raw traces.
 
 ### Trigger contract
 
@@ -179,15 +216,15 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 
 | Control / event | What it may update | What it must not update |
 |---|---|---|
-| Load & Plot / dropped folder | Load/cache data, options, metadata, diagnostic histograms, auto thresholds, then bump `btn-plot` once | Heatmap/polar hidden graphs directly |
-| Re-Plot (`btn-plot`) | Trajectory, raw trace, summary, histograms; ROI only if ROI tab is visible; heatmap only if Heatmap tab is visible; polar only if Polar tab is visible | URL from pan/zoom; hidden heatmap `dcc.Graph.figure` |
+| Load / dropped folder | Load/cache data, options, metadata, diagnostic histograms, auto thresholds, bump `btn-plot`, then queue hidden-view preloads | Stale same-glob caches; URL from pan/zoom |
+| Update views (`btn-plot`) | Focused view first; one hidden non-active view at a time via `preload-view` | Blocking all tabs behind the focused render; hidden heatmap `dcc.Graph.figure` |
 | Heatmap bin/bound/cmin/cmax | Heatmap store + variants only when Heatmap tab is visible | Trajectory/raw/ROI/polar |
 | Heatmap metric/scale | Clientside `Plotly.restyle` from the current binning variants | Server rebuild or `newPlot` |
 | ROI entered/trim while on heatmap | Heatmap store + current-mask variants only when Heatmap tab is visible | Trajectory/raw/ROI/polar |
 | Trajectory/heatmap pan/zoom | Debounced asset-level `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
-| View switch | Panel visibility; visible tab's lazy plot only; visible-graph resize only | Rebuilding every tab; resizing hidden scaleanchor graphs |
+| View switch | Tab value + panel visibility; visible tab's lazy plot only if its state signature changed or has never been built; queue background preloads | Rebuilding every tab; resizing hidden scaleanchor graphs; polar resize on unchanged reveal |
 | ROI reach/show | Visible trajectory overlay patch; visible ROI tab rebuild | Hidden trajectory patches while another tab is active |
-| Polar controls / Re-Plot on Polar | Polar plot only | Trajectory/heatmap/raw |
+| Polar controls / Plot on Polar | Polar plot only | Trajectory/heatmap/raw |
 
 ---
 
@@ -236,8 +273,9 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
 
 4. **Panels hide with `visibility:hidden` + absolute positioning, not
    `display:none`.** `display:none` gives a graph 0 size at creation and it can't
-   recover; `dcc.Tabs` is worse (it *remounts* and resets the figure to the
-   layout default). So all five views stay mounted and only toggle visibility.
+   recover. The app uses `dcc.Tabs` only as a value control; tab content is not
+   mounted/unmounted by Dash. All five view panels stay mounted and only toggle
+   visibility.
 
 5. **The Polar view fought three separate rendering bugs — keep all three fixes.**
    - Use **SVG `go.Scatterpolar`, not `Scatterpolargl`.** WebGL polar crashes on
@@ -249,9 +287,10 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
    - **It needs a height-pinned clientside `newPlot`.** Born hidden, Dash's
      `Plotly.react` updates the polar's traces but *not* the figure height (the
      SVG stays at the placeholder size and the subplots collapse). A clientside
-     callback sets the container height to `figure.layout.height` and re-`newPlot`s
-     it; the polar `dcc.Graph` is `responsive=False`. It is NOT in the fit-to-
-     container resize map (that would flatten it).
+     callback sets the container height to `figure.layout.height` and
+     fingerprint-guards `newPlot`; unchanged tab switches leave it alone. The
+     polar `dcc.Graph` is `responsive=False`. It is NOT in the fit-to-container
+     resize map (that would flatten it).
 
 **Coordinate convention (ROIs + polar).** Unity is left-handed: objects at polar
 `(radius, angle°)` sit at `X = r·sin(angle)`, `Z = r·cos(angle)` (0° = forward/+Z
@@ -264,14 +303,14 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
 ## 8. Known issues / glitches / limitations
 
 - **Heatmap "flash" on rebuild — largely resolved.** The heatmap re-inits only on
-  a real *binning* change (bin size/bound/cmin/cmax, filter, viewport sync), with
-  a short opacity fade; tab switches are resize-only (§7.2). **Metric/scale swaps
+  a real *binning* change (bin size/bound/cmin/cmax or filter); opacity stays
+  stable during the guarded `newPlot`, and tab switches are resize-only (§7.2).
+  **Metric/scale swaps
   are instant, in-place, flash-free:** every metric×scale variant is precomputed
   at bin time (`build_heatmap_and_variants` → `heatmap-variants` store, ~0.7 MB)
   and the clientside `Plotly.restyle`s z/customdata/zmin/zmax/colorbar — no server
   round-trip, no newPlot. metric/scale are therefore NOT server inputs; the
-  fingerprint tracks binning only (no zmin/zmax). *Residual:* toggling lin↔log
-  still does one newPlot (metric swaps don't); harmless but not yet flash-free.
+  fingerprint tracks binning only (no zmin/zmax).
   *Cleanest future fix remains:* a `Plotly.react`-safe subplot state that drops
   the newPlot/heatsync machinery entirely.
 - **Heatmap→trajectory zoom sync depends on `assets/heatsync.js`.** newPlot drops
@@ -281,11 +320,12 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
 - **Playback frames use `Scattergl` and are re-drawn client-side.** On very large
   animated selections the embedded frames make the figure JSON heavy (~tens of
   MB). Animation auto-uses the tighter `BUDGET_SVG`; still, prefer "Playback off"
-  for the biggest datasets or lower "Max plot points".
+  for the biggest datasets or lower "Point budget".
 - **Drag-drop can only resolve folders under searched local roots.** Browsers
   don't expose absolute paths; `resolve_dropped_folder` searches the working dir,
-  nearby ancestors, and optional `TRAJ_DATA_ROOT`. Data elsewhere → type/paste a
-  path. Status line says when it can't locate a folder.
+  nearby ancestors, and optional `TRAJ_DATA_ROOT`. Data elsewhere -> type/paste a
+  path. Drop handling is scoped to the folder control and plot workspace, and
+  ignores internal drags so config-order reordering remains reliable.
 - **Two copies of the code** (`Plotting/dashboard.py` and `trajectory-dashboard/
   app.py`) can drift. Decide on one source of truth.
 - **`raw-columns` default** doesn't always stick in the control; `update_plots`

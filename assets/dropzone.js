@@ -12,6 +12,7 @@
 
   function init() {
     var zone = document.getElementById('drop-zone');
+    var plotTarget = document.getElementById('plot-drop-target');
     if (!zone) { setTimeout(init, 300); return; }
     if (zone.__bound) return;
     zone.__bound = true;
@@ -39,14 +40,14 @@
 
     var label = document.getElementById('drop-label');
     var sub = document.getElementById('drop-sub');
-    var defLabel = label ? label.textContent : 'Drop a data folder here';
+    var defLabel = label ? label.textContent : 'Drop or choose a data folder';
     var defSub = sub ? sub.textContent : '';
 
     var overlay = document.createElement('div');
     overlay.id = 'drop-overlay';
-    overlay.innerHTML = '<div><div style="font-size:42px;line-height:1">📁</div>' +
+    overlay.innerHTML = '<div>' +
       '<div style="font-size:22px;font-weight:700;margin-top:8px">Drop folder to load</div>' +
-      '<div style="font-size:13px;opacity:.8;margin-top:4px">the whole tab is a drop target</div></div>';
+      '<div style="font-size:13px;opacity:.8;margin-top:4px">drop on the folder control or plotting workspace</div></div>';
     overlay.style.cssText = [
       'position:fixed', 'inset:0', 'z-index:9999', 'display:none',
       'align-items:center', 'justify-content:center', 'text-align:center',
@@ -56,8 +57,21 @@
     document.body.appendChild(overlay);
     var dragDepth = 0;
 
-    // React instantly to a drag: the sidebar zone still highlights, while a
-    // fixed overlay makes the entire browser tab a receiver.
+    function isFileDrag(e) {
+      var types = e.dataTransfer && e.dataTransfer.types;
+      if (!types) return false;
+      return Array.prototype.indexOf.call(types, 'Files') >= 0;
+    }
+
+    function isDropSurface(target) {
+      return !!(target && (
+        zone.contains(target) ||
+        (plotTarget && plotTarget.contains(target))
+      ));
+    }
+
+    // React instantly to external file drags only. Internal drags, such as the
+    // config order list, must pass through untouched.
     function hi(on) {
       overlay.style.display = on ? 'flex' : 'none';
       zone.style.transition = 'all .12s ease';
@@ -66,6 +80,10 @@
       zone.style.minHeight = on ? '150px' : '92px';
       zone.style.transform = on ? 'scale(1.02)' : 'scale(1)';
       zone.style.boxShadow = on ? '0 4px 16px rgba(13,110,253,0.25)' : 'none';
+      if (plotTarget) {
+        plotTarget.style.outline = on ? '2px dashed #2563eb' : '';
+        plotTarget.style.outlineOffset = on ? '-6px' : '';
+      }
       if (label && !zone.__busy) label.textContent = on ? 'Drop to load' : defLabel;
     }
     function busy(msg) {
@@ -75,8 +93,8 @@
       zone.style.minHeight = '92px';
       zone.style.transform = 'scale(1)';
       zone.style.boxShadow = 'none';
-      if (label) label.textContent = '⏳ ' + (msg || 'Processing…');
-      if (sub) sub.textContent = 'locating the folder on disk…';
+      if (label) label.textContent = msg || 'Processing...';
+      if (sub) sub.textContent = 'Locating the folder on disk...';
     }
     zone.__setBusy = busy;
     // Clear the busy state once loading actually starts (progress bar shows).
@@ -91,26 +109,31 @@
       }).observe(track, { attributes: true, attributeFilter: ['style'] });
     }
     function dragOn(e) {
+      if (!isFileDrag(e) || !isDropSurface(e.target)) return;
       e.preventDefault(); e.stopPropagation();
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
       if (e.type === 'dragenter') dragDepth++;
       hi(true);
     }
     function dragOff(e) {
+      if (!isFileDrag(e)) return;
       e.preventDefault(); e.stopPropagation();
       if (e.type === 'dragleave') dragDepth = Math.max(0, dragDepth - 1);
       if (e.type === 'dragend' || dragDepth === 0) hi(false);
     }
-    ['dragenter', 'dragover'].forEach(function (ev) {
-      document.addEventListener(ev, dragOn, true);
-    });
-    ['dragleave', 'dragend'].forEach(function (ev) {
-      document.addEventListener(ev, dragOff, true);
+    [zone, plotTarget].filter(Boolean).forEach(function (target) {
+      ['dragenter', 'dragover'].forEach(function (ev) {
+        target.addEventListener(ev, dragOn, false);
+      });
+      ['dragleave', 'dragend'].forEach(function (ev) {
+        target.addEventListener(ev, dragOff, false);
+      });
     });
 
     function handleDrop(e) {
+      if (!isFileDrag(e) || !isDropSurface(e.target)) return;
       dragDepth = 0;
-      e.preventDefault(); e.stopPropagation(); hi(false); busy('Processing…');
+      e.preventDefault(); e.stopPropagation(); hi(false); busy('Processing...');
       var items = e.dataTransfer.items;
       var files = [], folderName = '', pending = 0, done = false;
 
@@ -159,7 +182,9 @@
       roots.forEach(function (r) { walk(r, ''); });
       setTimeout(function () { if (pending === 0) finish(); }, 80);
     }
-    document.addEventListener('drop', handleDrop, true);
+    [zone, plotTarget].filter(Boolean).forEach(function (target) {
+      target.addEventListener('drop', handleDrop, false);
+    });
   }
 
   if (document.readyState !== 'loading') init();

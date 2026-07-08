@@ -11,9 +11,10 @@ millions of rows.
 
 ## Quick Start With uv
 
-This repo is intentionally simple: it is a single Dash app (`app.py`) plus
-static browser assets. There is no package build step. Use `uv` to create a
-clean virtual environment and install exactly what `requirements.txt` declares.
+This repo has a thin Dash shell (`app.py`) plus a reusable, Dash-free
+`trajectory_dashboard` package for loading, filtering, and grouping trajectory
+data. There is no package build step for local use. Use `uv` to create a clean
+virtual environment and install exactly what `requirements.txt` declares.
 
 ### Install uv
 
@@ -84,6 +85,54 @@ uv self update
 
 Official uv docs: https://docs.astral.sh/uv/
 
+## Use The Pipeline Without Dash
+
+The preprocessing path is importable as a small library. It handles CSV
+discovery, tolerant JSON metadata loading, segment ID normalization, vectorized
+quality filters, histogram-range filters, and grouping. You can use it for a
+plain script or notebook without starting the dashboard.
+
+```python
+from trajectory_dashboard import FilterSpec, filter_frame, group_frames, load_dataset
+
+dataset = load_dataset("/path/to/Data/**/*_VR*.csv")
+df = dataset.frame          # row-level samples, sorted with contiguous _seg_id
+stats = dataset.stats       # one row per segment
+metadata = dataset.metadata # sequenceConfig, fly metadata, and scene configs
+
+spec = FilterSpec(
+    vel_threshold=2500,       # raw position units / second
+    min_displacement=2.0,
+    jump_buffer_ms=100,
+    configs=("Choice_Push.json",),
+)
+filtered = filter_frame(df, spec).filtered
+
+for name, group_df in group_frames(filtered, group_by="config").items():
+    print(name, len(group_df), group_df["_seg_id"].nunique())
+```
+
+A minimal Matplotlib plot:
+
+```python
+import matplotlib.pyplot as plt
+from trajectory_dashboard import FilterSpec, filter_frame, group_frames, load_dataset
+
+data = load_dataset("/path/to/Data/**/*_VR*.csv")
+filtered = filter_frame(data.frame, FilterSpec(jump_buffer_ms=100)).filtered
+
+fig, ax = plt.subplots()
+for seg_id, seg in next(iter(group_frames(filtered, "all").values())).groupby("_seg_id", sort=False):
+    ax.plot(seg["GameObjectPosX"], seg["GameObjectPosZ"], alpha=0.25, lw=0.8)
+ax.set_aspect("equal")
+ax.set_xlabel("X")
+ax.set_ylabel("Z")
+plt.show()
+```
+
+Important invariants stay the same outside the dashboard: `_seg_id` is the
+atomic trial/step segment key, and velocity is in raw position units per second.
+
 ## Features
 
 - **Load** by glob, folder path, or **drag-and-drop a folder** (finds every
@@ -91,15 +140,17 @@ Official uv docs: https://docs.astral.sh/uv/
   for readable subplot titles. Live "loading N/M files" progress.
 - **Pool / group** by config (treatment), scene, VR, fly, source folder, or
   all-pooled → a 2-col grid of square, axis-synced, scrollable subplots.
-- **Colour by** individual, VR, trial, local time, or **velocity** (units/s,
-  rolling-smoothed, reset-spikes removed).
+- **Colour by** individual, VR, ROI outcome, trial, local time, or **velocity**
+  (units/s, rolling-smoothed, reset-spikes removed).
 - **Filters**: max-velocity jump removal (time-buffered), min net displacement,
-  trim N edge samples/end. Velocity and displacement have auto defaults; the
-  active exclusion line reports the actual params in play. Drag-select ranges on
-  the velocity/displacement histograms.
+  trim N edge samples/end, ROI entered-only, and after-exit ROI trim. Velocity
+  and displacement have auto defaults; the top line reports final retained
+  points/trials/animals and the sidebar shows serial retained/discarded counts
+  per criterion. Drag-select ranges on the velocity/displacement histograms.
 - **Playback**: native client-side animation with a sticky play/pause/scrub bar;
-  each track grows from its first point over local time. "Start at origin" rebase
-  toggle.
+  each track grows from its first point over local time.
+- **Progressive view preparation**: the focused tab renders first; heatmap,
+  diagnostics, targets, and polar prepare one-by-one in the background.
 - **Heatmap**: occupancy density — bin size in **data units**, lin/log with
   human-readable log labels (100 ms / 1 s / 10 s), percentile-bounded extent,
   metric = count / occupancy-seconds / % of time, explicit `cmin/cmax`
@@ -107,8 +158,9 @@ Official uv docs: https://docs.astral.sh/uv/
   in each subplot's top corners. Zoom stays linked with the trajectory.
 - **ROI targets** auto-loaded from the scene configs (Choice/BinaryChoice; polar
   `{radius,angle}` or cartesian `{x,y,z}`, Unity left-handed). Adjustable **reach
-  radius** slider, reach circles + per-subplot left/right **reached counts**
-  overlaid on the trajectories, and an optional **tail-trim** that drops each
+  radius** slider, reach circles + per-subplot exclusive first-reached
+  **L-first/R-first counts** overlaid on the trajectories, and an optional
+  **tail-trim** that drops each
   trial's path after it first leaves an ROI it entered.
 - **ROI counts view**: per-animal fraction reaching left/right with reached/trial
   hover counts, per-animal ROI residence time, split violins for time-to-target,
@@ -141,27 +193,26 @@ shareable URL.
 | Control | Meaning | Rationale |
 |---|---|---|
 | Glob / folder path | A file glob, folder, or dropped folder. Dropped folders are expanded into nested CSV globs. | Keeps loading flexible: paste an exact experiment glob or just drop the top-level folder. |
-| Load & Plot | Loads CSVs, metadata, filter choices, auto thresholds, and the first visible plot. | Separates potentially expensive disk IO from lighter parameter changes. |
-| Drag-drop target | The whole page becomes receptive during a drag event. | Faster than finding the text box when exploring local folders. |
+| Load | Loads CSVs, metadata, filter choices, auto thresholds, and the first visible plot. | Separates potentially expensive disk IO from lighter parameter changes. |
+| Drag-drop target | Drop folders on the folder control or the plotting workspace. | Keeps data loading easy without intercepting the config-order drag list. |
 
 ### Grouping And Layout
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Group By | Subplot split: config/treatment, scene, VR, fly, source folder, or all pooled. | Lets you move between treatment-level comparison and individual-level debugging. |
+| Panels | Subplot split: config/treatment, scene, VR, fly, source folder, or all pooled. | Lets you move between treatment-level comparison and individual-level debugging. |
 | Pool Mode | Separate subplots or one pooled subplot. | Separate is better for comparison; pooled is better for quick global density/shape checks. |
 | Plot order | Drag the loaded config list. | Keeps figures aligned to experimental order instead of arbitrary filename order. |
-| Subplot cols | Number of columns in the grid. | Wide screens can use 2-4 columns; narrow screens are easier with 1. |
+| Panel columns | Number of columns in the grid. | Wide screens can use 2-4 columns; narrow screens are easier with 1. |
 | Show raw config filenames | Uses exact config filenames instead of readable labels. | Debugs metadata/name mapping when labels look surprising. |
 
 ### Trajectories
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Colour By | Individual, VR, trial, local time, or smoothed velocity. | Categorical colors identify animals/runs; sequential colors reveal progression or speed structure. |
+| Colour | Individual, VR, trial, local time, or smoothed velocity. | Categorical colors identify animals/runs; sequential colors reveal progression or speed structure. |
 | Playback animation | Builds animated frames and shows play/pause/scrub controls. | Good for presentations and temporal intuition; off is faster and crisper for analysis. |
-| Start each track at origin | Rebases each segment to `(0, 0)`. | Compares path shape independent of absolute arena position. ROI overlays are hidden when rebased because target coordinates no longer match. |
-| Max plot points | Optional decimation budget. | Larger values preserve detail but increase browser cost; blank uses the app's safe default. |
+| Point budget | Optional decimation budget. | Larger values preserve detail but increase browser cost; blank uses the app's safe default. |
 
 ### Filters
 
@@ -170,9 +221,9 @@ shareable URL.
 | Max velocity (units/s) | Removes samples whose instantaneous velocity exceeds this threshold. Auto uses the 99th percentile. | Cuts teleport/reset spikes without hand-tuning every dataset. Units are raw position units per second, not cm/s. |
 | Extra trim around speed spikes (ms) | Removes a time buffer on both sides of each velocity spike. | A single bad jump can contaminate neighboring samples; the buffer removes the small temporal halo around it. |
 | Min displacement | Removes whole segments whose start-to-end displacement is below this value. Auto uses 5% of median segment displacement. | Drops trials where the animal effectively did not move. |
-| Edge trim samples (Advanced) | Removes N samples from both ends of every segment after spike filtering. | Legacy blunt instrument for start/end artifacts; normally leave at `0` and prefer the time-based spike buffer. |
+| Trim segment edges (Advanced) | Removes N samples from both ends of every segment after spike filtering. | Blunt instrument for start/end artifacts; normally leave at `0` and prefer the time-based spike buffer. |
 | Histogram range selections | Drag-select velocity/displacement histogram ranges. | Quick exploratory subset filtering without typing exact cutoffs. |
-| Exclusion line | Reports the actual active velocity, displacement, trim, and moving-sample criteria. | Makes it obvious which filters are truly enabled and how many points/trials they remove. |
+| Retention summary | Reports final retained/discarded points, trials, and animals. The sidebar audit shows each criterion serially, relative to the previous step. | Makes active filters auditable without mixing independent and sequential denominators. |
 
 ### Heatmap
 
@@ -189,10 +240,11 @@ shareable URL.
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Show target ROIs + reached counts | Adds target rings and L/R reached counts to trajectories; heatmaps get faint rings and corner occupancy labels. | Keeps target context visible without baking it into the trajectory traces. |
+| Show target ROIs + reached counts | Adds target rings and exclusive first-reached L/R counts to trajectories; heatmaps get faint rings and corner occupancy labels. | Keeps target context visible without baking it into the trajectory traces while avoiding double-counted trials. |
 | Reach radius (units) | Distance from target center counted as entering/reaching. | Lets you tune strict vs forgiving target contact. |
 | Only trials that entered an ROI | Shows only segments that reached either left or right ROI. | Focuses plots on successful/target-engaged behavior. Trajectory denominators change because whole trials are filtered. |
 | Trim trial tail after ROI exit | Keeps approach and first contact, then drops samples after the first post-ROI exit. | Focuses heatmaps/trajectories on approach/interaction instead of post-choice wandering. Trial-level reached counts usually do not change because the trial still reached. |
+| Trajectory colour: ROI outcome | Colours each segment by first reached side: left ROI, right ROI, or no ROI. | Highlights target outcome while preserving the merged-trace renderer. |
 
 ### ROI Tab
 
@@ -215,9 +267,9 @@ shareable URL.
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Diagnostics tab | Velocity/displacement histograms and optional raw time-series columns. | Debugs filters, spikes, and unexpected raw sensor columns. |
-| Raw trace cols | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
-| Export HTML | Writes a self-contained dashboard snapshot. | Useful for sharing a fixed analysis state without a running Dash server. |
+| Diagnostics tab | Velocity/displacement histograms and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Debugs filters, spikes, and unexpected raw sensor columns without showing an empty plot. |
+| Raw trace columns | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
+| Export HTML | Writes a self-contained dashboard snapshot including trajectories, heatmap, polar, diagnostics, and selected raw traces. | Useful for sharing a fixed analysis state without a running Dash server. |
 
 ## Data assumptions
 
@@ -230,15 +282,19 @@ alone. Velocity is in **position units/second**, not cm/s (values are large).
 ## Layout
 
 ```
-app.py               # the whole application (single file, sectioned)
-assets/dropzone.js   # folder drag-and-drop
-assets/heatsync.js   # heatmap zoom→viewport sync after newPlot
-assets/plot_wheel_guard.js # Plotly wheel zoom without page scroll
-assets/config_order.js     # draggable config subplot order list
+app.py                        # Dash shell, layout, callbacks, Plotly figures
+trajectory_dashboard/io.py     # CSV discovery, config/metadata loading
+trajectory_dashboard/filters.py # velocity, segment stats, vectorized filters
+trajectory_dashboard/grouping.py # subset filters and group splitting
+assets/dropzone.js             # folder drag-and-drop
+assets/dashboard.css           # dashboard chrome and tab styling
+assets/heatsync.js             # heatmap zoom viewport sync after newPlot
+assets/plot_wheel_guard.js     # Plotly wheel zoom without page scroll
+assets/config_order.js         # draggable config subplot order list
 requirements.txt
-ARCHITECTURE.md      # deep context for humans and coding agents  ← read this
-AGENTS.md            # short agent entry point
-HANDOFF.md           # latest state, verification recipe, and safe next work
+ARCHITECTURE.md                # deep context for humans and coding agents
+AGENTS.md                      # short agent entry point
+HANDOFF.md                     # latest state, verification recipe, and safe next work
 ```
 
 ## Notes / limitations

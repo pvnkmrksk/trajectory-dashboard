@@ -1,0 +1,230 @@
+:root {
+  --td-bg: #f5f7fb;
+  --td-panel: #ffffff;
+  --td-panel-soft: #f8fafc;
+  --td-border: #d8dee9;
+  --td-border-strong: #b9c2d3;
+  --td-text: #162033;
+  --td-muted: #667085;
+  --td-blue: #2563eb;
+  --td-blue-soft: #e8efff;
+  --td-teal: #0f766e;
+  --td-amber: #b7791f;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--td-bg);
+  color: var(--td-text);
+}
+
+.td-app {
+  background: var(--td-bg);
+  color: var(--td-text);
+}
+
+.td-header {
+  background: linear-gradient(180deg, #ffffff, #f7f9fd) !important;
+  border-bottom: 1px solid var(--td-border) !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+}
+
+.td-header h3 {
+  font-weight: 650;
+}
+
+.td-sidebar {
+  background: var(--td-panel) !important;
+  border-right: 1px solid var(--td-border) !important;
+  box-shadow: 1px 0 0 rgba(15, 23, 42, 0.02);
+}
+
+.td-sidebar label {
+  color: #27364d;
+}
+
+.td-sidebar hr {
+  border: 0;
+  border-top: 1px solid #e7ebf2;
+}
+
+#drop-zone {
+  background: #f7faff !important;
+  border-color: var(--td-border-strong) !important;
+  border-radius: 6px !important;
+}
+
+#drop-zone:hover {
+  background: var(--td-blue-soft) !important;
+  border-color: var(--td-blue) !important;
+}
+
+#glob-input,
+.td-sidebar input[type="number"],
+.td-sidebar input[type="text"],
+.td-sidebar textarea {
+  border: 1px solid var(--td-border);
+  border-radius: 5px;
+  background: #ffffff;
+  color: var(--td-text);
+}
+
+#btn-load,
+#btn-plot,
+#btn-export,
+#btn-apply-lut,
+#btn-prefill-lut {
+  border-radius: 5px !important;
+  font-weight: 600;
+  box-shadow: none;
+}
+
+#btn-load {
+  background: var(--td-blue) !important;
+}
+
+#btn-plot {
+  border-color: var(--td-teal) !important;
+  color: var(--td-teal) !important;
+  background: #ffffff !important;
+}
+
+#btn-plot:hover,
+#btn-export:hover,
+#btn-apply-lut:hover,
+#btn-prefill-lut:hover {
+  background: #f2f6ff !important;
+}
+
+#data-summary {
+  background: #eef4ff !important;
+  border: 1px solid #cfddff;
+  color: #1e3a8a;
+  border-radius: 5px !important;
+}
+
+#exclusion-info,
+#plot-status,
+#load-status {
+  color: var(--td-muted) !important;
+}
+
+.filter-detail {
+  margin: 5px 0 7px;
+  padding: 6px;
+  border: 1px solid var(--td-border);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #344054;
+  font-size: 9px;
+  line-height: 1.25;
+}
+
+.filter-detail-note {
+  color: var(--td-muted);
+  margin-bottom: 5px;
+}
+
+.filter-stage {
+  padding: 5px 0;
+  border-top: 1px solid #edf1f7;
+}
+
+.filter-stage:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.filter-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.filter-stage-status {
+  border-radius: 999px;
+  padding: 1px 5px;
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: .02em;
+}
+
+.filter-stage-status.active {
+  background: #e8f5ee;
+  color: #17663a;
+}
+
+.filter-stage-status.inactive {
+  background: #f2f4f7;
+  color: #667085;
+}
+
+.filter-stage-line {
+  color: #475467;
+}
+
+.filter-stage-note {
+  margin-top: 2px;
+  color: var(--td-muted);
+}
+
+.view-tabs-wrap {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--td-border);
+  margin-bottom: 6px;
+}
+
+.view-tabs {
+  height: 38px;
+}
+
+.view-tab {
+  border: 0 !important;
+  border-bottom: 2px solid transparent !important;
+  background: transparent !important;
+  color: var(--td-muted) !important;
+  padding: 9px 14px !important;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.view-tab-selected {
+  border: 0 !important;
+  border-bottom: 2px solid var(--td-blue) !important;
+  background: #ffffff !important;
+  color: var(--td-blue) !important;
+}
+
+.td-main {
+  background: var(--td-bg);
+}
+
+.plot-drop-target {
+  background: var(--td-panel);
+  border: 1px solid var(--td-border);
+  border-radius: 6px;
+}
+
+#config-order-list li {
+  border-color: var(--td-border) !important;
+  border-radius: 5px !important;
+  background: #ffffff !important;
+}
+
+#config-order-list li:hover {
+  border-color: var(--td-blue) !important;
+  background: #f7faff !important;
+}
+
+.dash-graph {
+  background: #ffffff;
+}
+
+.Select-control,
+.Select-menu-outer {
+  border-color: var(--td-border) !important;
+  border-radius: 5px !important;
+}

@@ -39,19 +39,24 @@
     }, DEBOUNCE_MS);
   }
 
-  window.__attachViewportSync = function (gd, source) {
-    if (!gd || gd.__vpSyncSource === source) return;
+  window.__attachViewportSync = function (gd, source, force) {
+    if (!gd) return;
+    if (!force && gd.__vpSyncSource === source && gd.__vpSyncHandler) return;
+    if (gd.__vpSyncHandler && gd.removeListener) {
+      try { gd.removeListener('plotly_relayout', gd.__vpSyncHandler); } catch (e) {}
+    }
     gd.__vpSyncSource = source;
-    gd.on('plotly_relayout', function (ed) {
+    gd.__vpSyncHandler = function (ed) {
       queueViewport(source, ed);
-    });
+    };
+    gd.on('plotly_relayout', gd.__vpSyncHandler);
   };
 
   // The heatmap is re-initialised via Plotly.newPlot, which detaches event
   // listeners. Re-attach the same debounced viewport listener after each newPlot.
-  window.__attachHeatSync = function (hg) {
-    if (!hg || hg.__heatSync) return;
+  window.__attachHeatSync = function (hg, force) {
+    if (!hg || (!force && hg.__heatSync)) return;
     hg.__heatSync = true;
-    window.__attachViewportSync(hg, 'heat');
+    window.__attachViewportSync(hg, 'heat', !!force);
   };
 })();

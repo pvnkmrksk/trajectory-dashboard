@@ -1,4 +1,4 @@
-dash>=2.16
-plotly>=5.20
+dash>=4.2,<5
+plotly>=6.8,<7
 pandas>=2.0
 numpy>=1.24
