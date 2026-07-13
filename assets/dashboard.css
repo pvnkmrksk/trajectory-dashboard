@@ -44,6 +44,11 @@ body {
   color: #27364d;
 }
 
+.td-sidebar > label {
+  display: block;
+  margin-top: 2px;
+}
+
 .td-sidebar hr {
   border: 0;
   border-top: 1px solid #e7ebf2;
@@ -95,6 +100,79 @@ body {
 #btn-apply-lut:hover,
 #btn-prefill-lut:hover {
   background: #f2f6ff !important;
+}
+
+.segmented-control {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  gap: 0;
+  padding: 2px;
+  border: 1px solid var(--td-border);
+  border-radius: 6px;
+  background: #eef2f7;
+}
+
+.segmented-control label {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  color: var(--td-muted);
+  cursor: pointer;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.segmented-control input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  accent-color: var(--td-blue);
+}
+
+.segmented-control label:has(input:checked) {
+  background: #ffffff;
+  color: var(--td-text);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
+.compact-control-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.compact-control-row > label {
+  flex-shrink: 0;
+}
+
+#vel-range-hist,
+#disp-range-hist,
+#trial-range-hist,
+#polar-r-hist,
+#polar-point-frac-hist,
+#polar-animal-frac-hist,
+#heatmap-color-hist {
+  border: 1px solid #edf1f7;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+#vel-range,
+#disp-range,
+#trial-range,
+#polar-r-range,
+#polar-min-point-frac,
+#polar-min-animal-frac,
+#heatmap-color-range {
+  margin: 0 2px 4px;
 }
 
 #data-summary {
@@ -217,6 +295,10 @@ body {
 #config-order-list li:hover {
   border-color: var(--td-blue) !important;
   background: #f7faff !important;
+}
+
+.td-footer-credit a:hover {
+  text-decoration: underline !important;
 }
 
 .dash-graph {

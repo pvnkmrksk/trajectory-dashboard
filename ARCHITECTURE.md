@@ -31,7 +31,11 @@ Plotly.
   optional rotation/sensor columns.
 - Sibling JSON is auto-detected per folder: `*_ControlScene_sequenceConfig.json`
   maps `CurrentStep → ConfigFile` (the treatment); `*FlyMetaData.json` maps
-  `VR → FlyID/Sex`.
+  `VR → FlyID/Sex`. VR labels are normalized from filename/CSV text
+  (`VR2 Cube` → `VR2`). If fly metadata is absent, an existing CSV FlyID-like
+  column is preserved; if neither exists, `FlyID` falls back to a stable
+  `session:VR` label so grouping by fly/individual does not collapse into a
+  single `unknown` bucket.
 - **A _segment_ is the atomic unit:** `_seg_id = SourceFile + CurrentTrial +
   CurrentStep`, built **after** numeric coercion from the **integer** trial/step.
   Everything groups/filters by this. Two gotchas, both real bugs: (a) never key on
@@ -42,6 +46,10 @@ Plotly.
   interleaved after the time-sort and inflated every per-trial count ~5×. Coerce
   first, format as int. (Animal identity — `FlyID@VR` — is a *separate* grouping
   that intentionally merges files.)
+- `TrialIndex` is a derived 1-based per-`SourceFile` ordinal over contiguous
+  `_seg_id` segments after the load-time sort. It is internal/helper metadata;
+  the dashboard's trial-range control, trial colour mode, and
+  `FilterSpec.trial_range` use the dataset's raw `CurrentTrial` values.
 - **Velocity is in raw position-units per second, NOT cm/s.** Values are large
   (median ~thousands). Histograms cap at the 99th percentile; the velocity
   colour mode drops reset-spikes above the 99.5th pct before smoothing.
@@ -83,7 +91,7 @@ glob / dropped folder
       → concat → sort ONCE by time
       └─ _load_data(pattern)                         cached in _DATA_CACHE
          └─ _filtered_df(...)                        cached in _FILTER_CACHE (last 4)
-            ├─ trajectory_dashboard.grouping.subset_frame + histogram range-selections
+            ├─ trajectory_dashboard.grouping.subset_frame + trial/histogram range selections
             └─ trajectory_dashboard.filters.apply_filters
                velocity-jump (time-buffered), min-displacement, trim
                └─ _roi_apply(...)                    cached masks in _ROI_MASK_CACHE

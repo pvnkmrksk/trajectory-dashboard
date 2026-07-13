@@ -23,6 +23,8 @@ from .grouping import (
 )
 from .io import (
     TrajectoryDataset,
+    assign_trial_index,
+    concatenate_restarted_trials,
     find_csv_files,
     load_csv_fast,
     load_dataset,
@@ -33,6 +35,8 @@ __all__ = [
     "FilterResult",
     "FilterSpec",
     "TrajectoryDataset",
+    "assign_trial_index",
+    "concatenate_restarted_trials",
     "apply_filters",
     "compute_segment_stats",
     "compute_tortuosity",

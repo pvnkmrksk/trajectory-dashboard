@@ -104,6 +104,7 @@ spec = FilterSpec(
     vel_threshold=2500,       # raw position units / second
     min_displacement=2.0,
     jump_buffer_ms=100,
+    trial_range=(0, 40),      # inclusive CurrentTrial window
     configs=("Choice_Push.json",),
 )
 filtered = filter_frame(df, spec).filtered
@@ -132,6 +133,9 @@ plt.show()
 
 Important invariants stay the same outside the dashboard: `_seg_id` is the
 atomic trial/step segment key, and velocity is in raw position units per second.
+
+For a quick preprocessing check on the homing enemy data, run
+`python scripts/smoke_homing_enemy.py --trial-min 0 --trial-max 1`.
 
 ## Features
 
@@ -221,6 +225,7 @@ shareable URL.
 | Max velocity (units/s) | Removes samples whose instantaneous velocity exceeds this threshold. Auto uses the 99th percentile. | Cuts teleport/reset spikes without hand-tuning every dataset. Units are raw position units per second, not cm/s. |
 | Extra trim around speed spikes (ms) | Removes a time buffer on both sides of each velocity spike. | A single bad jump can contaminate neighboring samples; the buffer removes the small temporal halo around it. |
 | Min displacement | Removes whole segments whose start-to-end displacement is below this value. Auto uses 5% of median segment displacement. | Drops trials where the animal effectively did not move. |
+| Trial range | Inclusive `CurrentTrial` min/max fields in the Subset section. | Splits early vs late trials without changing segment identity or writing a separate preprocessing script. |
 | Trim segment edges (Advanced) | Removes N samples from both ends of every segment after spike filtering. | Blunt instrument for start/end artifacts; normally leave at `0` and prefer the time-based spike buffer. |
 | Histogram range selections | Drag-select velocity/displacement histogram ranges. | Quick exploratory subset filtering without typing exact cutoffs. |
 | Retention summary | Reports final retained/discarded points, trials, and animals. The sidebar audit shows each criterion serially, relative to the previous step. | Makes active filters auditable without mixing independent and sequential denominators. |

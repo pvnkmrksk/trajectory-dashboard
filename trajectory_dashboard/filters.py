@@ -111,7 +111,7 @@ def compute_tortuosity(df: pd.DataFrame, window: int = 15) -> np.ndarray:
 
 
 def compute_segment_stats(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute vectorized per-segment summary statistics."""
+    """Compute per-segment summary statistics from contiguous `_seg_id` blocks."""
 
     cols = [
         "seg_id", "n_points", "displacement", "peak_velocity",
@@ -120,30 +120,32 @@ def compute_segment_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
     speed = velocity_all(df)
-    work = pd.DataFrame({
-        "_seg_id": df["_seg_id"].to_numpy(),
-        "x": df["GameObjectPosX"].to_numpy(),
-        "z": df["GameObjectPosZ"].to_numpy(),
-        "speed": speed,
-    })
-    grouped = work.groupby("_seg_id", sort=False)
-    agg = grouped.agg(
-        n_points=("x", "size"),
-        x0=("x", "first"),
-        z0=("z", "first"),
-        x1=("x", "last"),
-        z1=("z", "last"),
-        peak_velocity=("speed", "max"),
-        median_velocity=("speed", "median"),
+
+    seg = df["_seg_id"].to_numpy()
+    starts = np.concatenate(([0], np.flatnonzero(seg[1:] != seg[:-1]) + 1))
+    ends = np.concatenate((starts[1:], [len(df)]))
+    lens = ends - starts
+    keep = lens >= 2
+
+    x = df["GameObjectPosX"].to_numpy()
+    z = df["GameObjectPosZ"].to_numpy()
+    peak_in = np.where(np.isfinite(speed), speed, -np.inf)
+    peak = np.maximum.reduceat(peak_in, starts)
+    peak[~np.isfinite(peak)] = 0.0
+    median = (
+        pd.Series(speed)
+        .groupby(seg, sort=False)
+        .median()
+        .fillna(0.0)
+        .to_numpy()
     )
-    agg["displacement"] = np.hypot(agg["x1"] - agg["x0"], agg["z1"] - agg["z0"])
-    first = df.groupby("_seg_id", sort=False).first()
+
     out = pd.DataFrame({
-        "seg_id": agg.index,
-        "n_points": agg["n_points"].to_numpy(),
-        "displacement": agg["displacement"].to_numpy(),
-        "peak_velocity": agg["peak_velocity"].fillna(0).to_numpy(),
-        "median_velocity": agg["median_velocity"].fillna(0).to_numpy(),
+        "seg_id": seg[starts],
+        "n_points": lens,
+        "displacement": np.hypot(x[ends - 1] - x[starts], z[ends - 1] - z[starts]),
+        "peak_velocity": peak,
+        "median_velocity": median,
     })
     meta_cols = {
         "config": "ConfigFile",
@@ -153,8 +155,8 @@ def compute_segment_stats(df: pd.DataFrame) -> pd.DataFrame:
         "source_folder": "SourceFolder",
     }
     for out_col, src_col in meta_cols.items():
-        out[out_col] = first[src_col].to_numpy() if src_col in first.columns else ""
-    return out[out["n_points"] >= 2].reset_index(drop=True)
+        out[out_col] = df[src_col].to_numpy()[starts] if src_col in df.columns else ""
+    return out.loc[keep].reset_index(drop=True)
 
 
 def _dilate_keep(seg: np.ndarray, time_s: np.ndarray, is_jump: np.ndarray, buf: float) -> np.ndarray:
@@ -191,6 +193,7 @@ def apply_filters(
     if df is None or len(df) == 0:
         return df
 
+    changed = False
     if vel_threshold is not None and vel_threshold > 0:
         speed = velocity_all(df)
         jumps = np.nan_to_num(speed, nan=0.0) > float(vel_threshold)
@@ -198,6 +201,7 @@ def apply_filters(
             seg = df["_seg_id"].to_numpy()
             time_s = df["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64") / 1e9
             df = df[_dilate_keep(seg, time_s, jumps, float(jump_buffer))]
+            changed = True
 
     if min_disp is not None and min_disp > 0 and len(df):
         grouped = df.groupby("_seg_id", sort=False)
@@ -207,6 +211,7 @@ def apply_filters(
         z1 = grouped["GameObjectPosZ"].transform("last")
         displacement = np.hypot(x1 - x0, z1 - z0)
         df = df[displacement >= float(min_disp)]
+        changed = True
 
     if trim_samples is not None and trim_samples > 0 and len(df):
         grouped = df.groupby("_seg_id", sort=False)
@@ -214,8 +219,9 @@ def apply_filters(
         size = grouped["_seg_id"].transform("size")
         trim = int(trim_samples)
         df = df[(pos >= trim) & (pos < size - trim)]
+        changed = True
 
-    return df.reset_index(drop=True)
+    return df.reset_index(drop=True) if changed else df
 
 
 def filter_by_stat_range(df: pd.DataFrame, stats: pd.DataFrame, stat_col: str, lo, hi) -> pd.DataFrame:
