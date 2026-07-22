@@ -15,11 +15,24 @@
 html,
 body {
   margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
   background: var(--td-bg);
   color: var(--td-text);
 }
 
+/* Plotly installs off-screen measurement nodes on body. Keep Dash's shell
+   pinned to the viewport so focus/automation scrolls cannot clip the header. */
+#react-entry-point {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
 .td-app {
+  height: 100%;
+  overflow: hidden;
   background: var(--td-bg);
   color: var(--td-text);
 }
@@ -35,6 +48,7 @@ body {
 }
 
 .td-sidebar {
+  box-sizing: border-box;
   background: var(--td-panel) !important;
   border-right: 1px solid var(--td-border) !important;
   box-shadow: 1px 0 0 rgba(15, 23, 42, 0.02);
@@ -188,6 +202,108 @@ body {
   color: var(--td-muted) !important;
 }
 
+.status-dock {
+  position: fixed;
+  left: 8px;
+  bottom: 8px;
+  z-index: 40;
+  box-sizing: border-box;
+  width: 239px;
+  padding: 9px 10px;
+  border: 1px solid #cfd8e7;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(8px);
+}
+
+.status-dock-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: #24324a;
+  font-size: 10px;
+}
+
+.status-label {
+  letter-spacing: 0.01em;
+}
+
+.status-phase {
+  margin-left: auto;
+  color: #087443;
+  font-weight: 700;
+}
+
+.status-phase::after {
+  content: "Ready";
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: #16a36a;
+  box-shadow: 0 0 0 3px rgba(22, 163, 106, 0.12);
+}
+
+body._dash-loading-callback .status-phase::after {
+  content: "Working…";
+}
+
+body._dash-loading-callback .status-phase {
+  color: #a45f00;
+}
+
+body._dash-loading-callback .status-dot {
+  background: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.16);
+  animation: status-pulse 1s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  50% { opacity: 0.45; transform: scale(0.78); }
+}
+
+.status-message {
+  overflow: hidden;
+  color: #172033;
+  font-size: 10px;
+  font-weight: 620;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  margin-top: 2px;
+  color: #667085;
+  font-size: 8.5px;
+  line-height: 1.25;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.status-details {
+  margin-top: 5px;
+  color: #667085;
+  font-size: 8.5px;
+}
+
+.status-details summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.status-raw-line {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
 .filter-detail {
   margin: 5px 0 7px;
   padding: 6px;
@@ -253,6 +369,11 @@ body {
   flex-shrink: 0;
   border-bottom: 1px solid var(--td-border);
   margin-bottom: 6px;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: rgba(245, 247, 251, 0.96);
+  backdrop-filter: blur(8px);
 }
 
 .view-tabs {
@@ -277,13 +398,43 @@ body {
 }
 
 .td-main {
+  box-sizing: border-box;
   background: var(--td-bg);
 }
 
 .plot-drop-target {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+
+.plot-section {
   background: var(--td-panel);
   border: 1px solid var(--td-border);
-  border-radius: 6px;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.plot-section-heading {
+  min-height: 36px;
+  padding: 8px 12px 6px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #edf1f7;
+}
+
+.plot-section-heading h4 {
+  margin: 0;
+  font-size: 13px;
+  color: #24324a;
+}
+
+.plot-section-kicker {
+  color: var(--td-muted);
+  font-size: 10px;
+  text-align: right;
 }
 
 #config-order-list li {

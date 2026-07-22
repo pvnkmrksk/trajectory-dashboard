@@ -7,7 +7,7 @@ millions of rows.
 
 > **New here / an AI agent?** Read **[ARCHITECTURE.md](ARCHITECTURE.md)** — it has
 > the data model, file map, callback graph, the non-obvious rendering gotchas,
-> known issues, and how to verify changes. Don't scan all ~4k lines.
+> known issues, and how to verify changes. Don't scan all ~6k lines.
 
 ## Quick Start With uv
 
@@ -68,6 +68,9 @@ uv run python app.py --host 0.0.0.0 --port 8050
 
 # Debug mode while developing callbacks
 uv run python app.py --debug
+
+# Include cache hits and other detailed diagnostics in the terminal
+uv run python app.py --log-level DEBUG
 ```
 
 Maintenance commands:
@@ -153,8 +156,11 @@ For a quick preprocessing check on the homing enemy data, run
   per criterion. Drag-select ranges on the velocity/displacement histograms.
 - **Playback**: native client-side animation with a sticky play/pause/scrub bar;
   each track grows from its first point over local time.
-- **Progressive view preparation**: the focused tab renders first; heatmap,
-  diagnostics, targets, and polar prepare one-by-one in the background.
+- **Single-page plotting workspace**: trajectories, heatmap, diagnostics,
+  targets and polar stay mounted together. The sticky section bar scrolls to a
+  plot without hiding/reloading graphs, so zoom, hover and legend state survive.
+  Speed is the default and only thins browser drawing primitives; analytical
+  counts and statistics remain exact.
 - **Heatmap**: occupancy density — bin size in **data units**, lin/log with
   human-readable log labels (100 ms / 1 s / 10 s), percentile-bounded extent,
   metric = count / occupancy-seconds / % of time, explicit `cmin/cmax`
@@ -170,13 +176,19 @@ For a quick preprocessing check on the homing enemy data, run
   hover counts, per-animal ROI residence time, split violins for time-to-target,
   and split violins for instantaneous heading error to left/right targets.
   Median/IQR are drawn as simple line overlays, not violin boxes.
-- **Polar view**: each trial's path as r (distance from origin) vs angle
-  (0° = forward, clockwise — same frame as the trajectories and ROIs), coloured
-  by instantaneous velocity or local tortuosity, with a moving-only (walk-speed)
-  toggle; ROI targets shown as rings.
-- **Diagnostics tab**: velocity + displacement histograms and raw time-series.
+- **Polar view**: one circular resultant per trial from Unity body orientation
+  (`GameObjectRotY`) by default, with movement heading as an alternative. 0° is
+  forward/+Z and positive angles turn right/+X. The bold population ray exactly
+  pools all valid samples and is independent of display thinning.
+- **Diagnostics section**: explicit-bin velocity/displacement histograms and
+  optional raw time-series.
+- **Live activity dock**: a fixed bottom-left status card shows loading,
+  debounced updates, render completion and export completion. Detailed Python
+  errors and tracebacks are written to the server terminal with timestamps,
+  thread names and operation context.
 - **Shareable URL**: every control *and the current zoom box* is in the URL.
-- **Export**: one self-contained `.html` with all panels and real data embedded.
+- **Export**: one offline, self-contained `.html` with Plotly, every panel and
+  the filtered data embedded.
 
 ## CLI Arguments
 
@@ -189,6 +201,7 @@ shareable URL.
 | `--port` | `--port 8051` | Changes the Dash port. | Useful when another dashboard is already on `8050`. |
 | `--host` | `--host 0.0.0.0` | Changes the bind host. | Use `127.0.0.1` for local-only, `0.0.0.0` to view from another machine on the network. |
 | `--debug` | `--debug` | Enables Dash/Flask debug behavior. | Helpful while editing callbacks; avoid for regular data review. |
+| `--log-level` | `--log-level DEBUG` | Selects `DEBUG`, `INFO`, `WARNING`, or `ERROR` terminal output. | `INFO` records load/render/export timing; `DEBUG` also exposes cache reuse and request-level detail. |
 
 ## Controls And Parameters
 
@@ -197,7 +210,7 @@ shareable URL.
 | Control | Meaning | Rationale |
 |---|---|---|
 | Glob / folder path | A file glob, folder, or dropped folder. Dropped folders are expanded into nested CSV globs. | Keeps loading flexible: paste an exact experiment glob or just drop the top-level folder. |
-| Load | Loads CSVs, metadata, filter choices, auto thresholds, and the first visible plot. | Separates potentially expensive disk IO from lighter parameter changes. |
+| Load | Loads CSVs, metadata, filter choices and auto thresholds, resets range controls when the data source changes, then renders all sections once. | Prevents new data from racing stale ranges from the previous source. |
 | Drag-drop target | Drop folders on the folder control or the plotting workspace. | Keeps data loading easy without intercepting the config-order drag list. |
 
 ### Grouping And Layout
@@ -215,6 +228,7 @@ shareable URL.
 | Control | Meaning | Rationale |
 |---|---|---|
 | Colour | Individual, VR, trial, local time, or smoothed velocity. | Categorical colors identify animals/runs; sequential colors reveal progression or speed structure. |
+| Render mode | Speed (default) or Accuracy. | Speed reduces only the number of browser drawing primitives; both modes use full filtered data for bins, counts and statistics. |
 | Playback animation | Builds animated frames and shows play/pause/scrub controls. | Good for presentations and temporal intuition; off is faster and crisper for analysis. |
 | Point budget | Optional decimation budget. | Larger values preserve detail but increase browser cost; blank uses the app's safe default. |
 
@@ -264,7 +278,10 @@ shareable URL.
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Colour by | Mean velocity or tortuosity per trial. | Velocity highlights fast directed runs; tortuosity highlights winding vs straight paths. |
+| Angle source | Body orientation (`GameObjectRotY`, degrees) or movement heading from consecutive X/Z samples. | Separates where the animal faced from where it moved; body orientation is the default analysis variable. |
+| Rayleigh R range | Filters trial resultants by circular concentration from 0 (dispersed) to 1 (aligned). | Excludes poorly directed trials without changing the meaning of angle. |
+| Valid-point / good-trial fractions | Trial and animal quality gates. | Makes missing/filtered heading coverage explicit. |
+| Colour by | Individual/VR/ROI or a sequential trial metric. | Preserves the same identity/sequence encoding used by trajectories. |
 | Moving samples only | Uses only samples above the walk-speed threshold. | Prevents stationary jitter from dominating heading vectors. |
 | Walk speed threshold (units/s) | Minimum smoothed speed for the moving-only polar mode. | Tune this to the dataset's speed scale. |
 
@@ -272,9 +289,10 @@ shareable URL.
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Diagnostics tab | Velocity/displacement histograms and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Debugs filters, spikes, and unexpected raw sensor columns without showing an empty plot. |
+| Diagnostics section | Velocity/displacement histograms and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Debugs filters, spikes, and unexpected raw sensor columns without showing an empty plot. |
 | Raw trace columns | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
-| Export HTML | Writes a self-contained dashboard snapshot including trajectories, heatmap, polar, diagnostics, and selected raw traces. | Useful for sharing a fixed analysis state without a running Dash server. |
+| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, target diagnostics, polar, velocity/displacement diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
+| Activity dock | Remains fixed at the bottom-left and reports the current load, render, debounce, or export state plus the last completed render. | Makes slow work and failures visible without losing the current plot section. |
 
 ## Data assumptions
 
@@ -292,7 +310,7 @@ trajectory_dashboard/io.py     # CSV discovery, config/metadata loading
 trajectory_dashboard/filters.py # velocity, segment stats, vectorized filters
 trajectory_dashboard/grouping.py # subset filters and group splitting
 assets/dropzone.js             # folder drag-and-drop
-assets/dashboard.css           # dashboard chrome and tab styling
+assets/dashboard.css           # dashboard chrome and sticky section styling
 assets/heatsync.js             # heatmap zoom viewport sync after newPlot
 assets/plot_wheel_guard.js     # Plotly wheel zoom without page scroll
 assets/config_order.js         # draggable config subplot order list
