@@ -49,7 +49,9 @@ Plotly.
 - `TrialIndex` is a derived 1-based per-`SourceFile` ordinal over contiguous
   `_seg_id` segments after the load-time sort. It is internal/helper metadata;
   the dashboard's trial-range control, trial colour mode, and
-  `FilterSpec.trial_range` use the dataset's raw `CurrentTrial` values.
+  `FilterSpec.trial_range` and `FilterSpec.step_range` use the dataset's raw
+  numeric `CurrentTrial`/`CurrentStep` values and keep complete `_seg_id`
+  segments.
 - **Velocity is in raw position-units per second, NOT cm/s.** Values are large
   (median ~thousands). Histograms cap at the 99th percentile; the velocity
   colour mode drops reset-spikes above the 99.5th pct before smoothing.
@@ -199,8 +201,10 @@ same cache key.
 - `update_plots` takes one filtered snapshot and returns trajectory, heatmap
   store/variants, target diagnostics, polar, raw traces, diagnostics, summary
   and render state atomically. Retired split-view/lazy callbacks are not
-  registered. Heatmap-colour and polar-quality mini-histograms wait for the
-  completed render state, so they reuse its caches instead of competing with it.
+  registered. `update_polar_only` owns moving/R/quality changes and all three
+  polar mini-histograms; it reuses the filtered-frame and Rayleigh caches rather
+  than triggering the master renderer. Heatmap-colour controls wait for the
+  completed render state so their aggregation does not compete with it.
 - `_filtered_df` normalizes jump-buffer units for cache keys (`100` ms and old
   `0.1` second URLs share a signature). `_roi_masks` caches reached table,
   entered segment ids, and trim masks for fast ROI toggles.
@@ -208,8 +212,9 @@ same cache key.
   `heatmap-plot.figure`, so Dash's `Plotly.react` path never applies the heatmap
   subplot figure. Metric/scale variants still update clientside without
   re-binning.
-- debounced asset-level viewport sync — `assets/heatsync.js` attaches directly to
-  Plotly `plotly_relayout` and writes `viewport-store` only after an idle delay.
+- asset-level viewport sync — `assets/heatsync.js` attaches directly to Plotly
+  `plotly_relayout`, immediately relayouts the peer spatial graph, and writes
+  `viewport-store` only after an idle delay.
   The plots' `relayoutData` props are NOT Dash callback Inputs. This keeps live
   pan/wheel gestures out of Dash's callback scheduler and out of the URL-update
   loop. The master renderer applies a validated stored range to both spatial
@@ -218,7 +223,8 @@ same cache key.
   plot.
 - `view-mode` is navigation state only. A clientside callback scrolls the main
   container to the requested section while the sticky section bar stays visible;
-  no graph style, figure or server callback depends on a section switch.
+  `assets/section_nav.js` also handles clicks on the already-active tab. No graph
+  style, figure or server callback depends on a section switch.
 - `update_filter_summary` reports final retained points/trials/animals and a
   serial per-criterion retention audit. It is triggered from `view-render-state`
   after a view finishes rendering, not directly from `btn-plot`, so the audit
@@ -228,9 +234,10 @@ same cache key.
   Plotly is embedded once (no CDN dependency). It includes trajectories,
   heatmap, target diagnostics, polar, velocity/displacement diagnostics, and
   selected raw traces.
-- The fixed `status-dock` mirrors load/render/export state and uses Dash's body
-  loading class for immediate Working/Ready feedback. Python logging records
-  load, cache, render and export timings; Dash's `on_error` hook writes uncaught
+- The header `status-dock` mirrors load/filter/render/export state and uses
+  Dash's body loading class for immediate Working/Ready feedback. Its hover text
+  exposes the latest stage timings. Python logging records load, cache, polar,
+  render and export timings; Dash's `on_error` hook writes uncaught
   callback exceptions with full tracebacks to the server terminal.
 
 ### Trigger contract
@@ -244,10 +251,10 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Heatmap bin/bound/cmin/cmax | Debounced all-section update; heatmap store + variants are built exactly | Concurrent heatmap sidebar aggregation |
 | Heatmap metric/scale | Clientside `Plotly.restyle` from the current binning variants | Server rebuild or `newPlot` |
 | ROI entered/trim | Debounced atomic update of all affected sections | A second ROI/trajectory refresh callback |
-| Trajectory/heatmap pan/zoom | Debounced asset-level `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
-| Section navigation | Clientside scroll only | Any server render, graph hide/show or Plotly reinitialisation |
+| Trajectory/heatmap pan/zoom | Immediate clientside peer relayout plus debounced `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
+| Section navigation | Clientside scroll only, including replay of the active tab | Any server render, graph hide/show or Plotly reinitialisation |
 | ROI reach/show | Debounced atomic update | Competing overlay/ROI callbacks |
-| Polar controls | Debounced atomic update; exact stats precede display thinning | Concurrent Rayleigh recomputation |
+| Polar moving/R/quality controls | Cached polar figure + three quality histograms only; exact stats precede display thinning | Master trajectory/heatmap/ROI/raw rebuild |
 
 ---
 

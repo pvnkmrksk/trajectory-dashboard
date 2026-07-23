@@ -108,6 +108,7 @@ spec = FilterSpec(
     min_displacement=2.0,
     jump_buffer_ms=100,
     trial_range=(0, 40),      # inclusive CurrentTrial window
+    step_range=(1, 3),        # inclusive CurrentStep window
     configs=("Choice_Push.json",),
 )
 filtered = filter_frame(df, spec).filtered
@@ -150,7 +151,8 @@ For a quick preprocessing check on the homing enemy data, run
 - **Colour by** individual, VR, ROI outcome, trial, local time, or **velocity**
   (units/s, rolling-smoothed, reset-spikes removed).
 - **Filters**: max-velocity jump removal (time-buffered), min net displacement,
-  trim N edge samples/end, ROI entered-only, and after-exit ROI trim. Velocity
+  inclusive trial and step ranges, trim N edge samples/end, ROI entered-only,
+  and after-exit ROI trim. Velocity
   and displacement have auto defaults; the top line reports final retained
   points/trials/animals and the sidebar shows serial retained/discarded counts
   per criterion. Drag-select ranges on the velocity/displacement histograms.
@@ -165,7 +167,9 @@ For a quick preprocessing check on the homing enemy data, run
   human-readable log labels (100 ms / 1 s / 10 s), percentile-bounded extent,
   metric = count / occupancy-seconds / % of time, explicit `cmin/cmax`
   (absolute or percentile), and faint ROI rings with left/right occupancy labels
-  in each subplot's top corners. Zoom stays linked with the trajectory.
+  in each subplot's top corners. Heatmap and trajectory start from the same
+  central-98% square extent, and pan/zoom propagate immediately in both
+  directions without a server render.
 - **ROI targets** auto-loaded from the scene configs (Choice/BinaryChoice; polar
   `{radius,angle}` or cartesian `{x,y,z}`, Unity left-handed). Adjustable **reach
   radius** slider, reach circles + per-subplot exclusive first-reached
@@ -179,11 +183,14 @@ For a quick preprocessing check on the homing enemy data, run
 - **Polar view**: one circular resultant per trial from Unity body orientation
   (`GameObjectRotY`) by default, with movement heading as an alternative. 0° is
   forward/+Z and positive angles turn right/+X. The bold population ray exactly
-  pools all valid samples and is independent of display thinning.
+  pools all valid samples and is independent of display thinning. Moving-only
+  and polar-quality changes use a cached polar-only update path; their R,
+  valid-point and per-animal good-trial histograms stay mounted and auditable.
 - **Diagnostics section**: explicit-bin velocity/displacement histograms and
   optional raw time-series.
-- **Live activity dock**: a fixed bottom-left status card shows loading,
-  debounced updates, render completion and export completion. Detailed Python
+- **Live activity status**: a compact header status shows loading, the active
+  filter/render operation, retained-point summary and export completion. Hover
+  it for per-stage timings. Detailed Python
   errors and tracebacks are written to the server terminal with timestamps,
   thread names and operation context.
 - **Shareable URL**: every control *and the current zoom box* is in the URL.
@@ -240,6 +247,7 @@ shareable URL.
 | Extra trim around speed spikes (ms) | Removes a time buffer on both sides of each velocity spike. | A single bad jump can contaminate neighboring samples; the buffer removes the small temporal halo around it. |
 | Min displacement | Removes whole segments whose start-to-end displacement is below this value. Auto uses 5% of median segment displacement. | Drops trials where the animal effectively did not move. |
 | Trial range | Inclusive `CurrentTrial` min/max fields in the Subset section. | Splits early vs late trials without changing segment identity or writing a separate preprocessing script. |
+| Step range | Inclusive `CurrentStep` min/max fields in the Subset section. | Selects repeated scene steps while preserving complete `SourceFile+Trial+Step` segments. |
 | Trim segment edges (Advanced) | Removes N samples from both ends of every segment after spike filtering. | Blunt instrument for start/end artifacts; normally leave at `0` and prefer the time-based spike buffer. |
 | Histogram range selections | Drag-select velocity/displacement histogram ranges. | Quick exploratory subset filtering without typing exact cutoffs. |
 | Retention summary | Reports final retained/discarded points, trials, and animals. The sidebar audit shows each criterion serially, relative to the previous step. | Makes active filters auditable without mixing independent and sequential denominators. |
@@ -253,7 +261,7 @@ shareable URL.
 | Scale | Linear or log color scaling. | Linear emphasizes dense regions; log reveals low-occupancy structure. |
 | Metric | Occupancy seconds, percent of time, or sample count. | Seconds are intuitive within a subplot, percent compares across unequal trial counts, count is the rawest diagnostic. |
 | cmin / cmax | Color limits. Blank auto-scales. | Fix limits across views when comparing treatments or exporting. |
-| cmin/cmax as value or percentile | Interpret color limits literally or as data percentiles. | Percentiles are convenient when the absolute range changes by dataset. |
+| Color range as value or percentile | Interpret color limits literally or as data percentiles. Percentile is the default and its slider/histogram axis is 0–100. | Percentiles are convenient when the absolute range changes by dataset while keeping the underlying histogram silhouette recognizable. |
 
 ### ROI / Targets
 
@@ -292,7 +300,7 @@ shareable URL.
 | Diagnostics section | Velocity/displacement histograms and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Debugs filters, spikes, and unexpected raw sensor columns without showing an empty plot. |
 | Raw trace columns | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
 | Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, target diagnostics, polar, velocity/displacement diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
-| Activity dock | Remains fixed at the bottom-left and reports the current load, render, debounce, or export state plus the last completed render. | Makes slow work and failures visible without losing the current plot section. |
+| Header activity status | Reports the current load, filter/render, debounce, or export state plus retained points; hover exposes per-stage timings. | Makes slow work and failures visible, while the terminal retains full errors and tracebacks. |
 
 ## Data assumptions
 
@@ -312,6 +320,7 @@ trajectory_dashboard/grouping.py # subset filters and group splitting
 assets/dropzone.js             # folder drag-and-drop
 assets/dashboard.css           # dashboard chrome and sticky section styling
 assets/heatsync.js             # heatmap zoom viewport sync after newPlot
+assets/section_nav.js          # section scroll, including active-tab replay
 assets/plot_wheel_guard.js     # Plotly wheel zoom without page scroll
 assets/config_order.js         # draggable config subplot order list
 requirements.txt

@@ -38,6 +38,8 @@ body {
 }
 
 .td-header {
+  box-sizing: border-box;
+  min-height: 46px;
   background: linear-gradient(180deg, #ffffff, #f7f9fd) !important;
   border-bottom: 1px solid var(--td-border) !important;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
@@ -169,6 +171,7 @@ body {
 #vel-range-hist,
 #disp-range-hist,
 #trial-range-hist,
+#step-range-hist,
 #polar-r-hist,
 #polar-point-frac-hist,
 #polar-animal-frac-hist,
@@ -182,6 +185,7 @@ body {
 #vel-range,
 #disp-range,
 #trial-range,
+#step-range,
 #polar-r-range,
 #polar-min-point-frac,
 #polar-min-animal-frac,
@@ -203,35 +207,38 @@ body {
 }
 
 .status-dock {
-  position: fixed;
-  left: 8px;
-  bottom: 8px;
-  z-index: 40;
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  column-gap: 8px;
+  flex: 1 1 480px;
+  min-width: 180px;
+  max-width: 760px;
   box-sizing: border-box;
-  width: 239px;
-  padding: 9px 10px;
+  padding: 3px 8px;
   border: 1px solid #cfd8e7;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
-  backdrop-filter: blur(8px);
+  border-radius: 7px;
+  background: rgba(248, 250, 252, 0.92);
+  cursor: help;
 }
 
 .status-dock-heading {
+  grid-row: 1 / 3;
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 4px;
+  padding-right: 8px;
+  border-right: 1px solid #d8dee9;
   color: #24324a;
   font-size: 10px;
 }
 
-.status-label {
+.status-phase-label {
   letter-spacing: 0.01em;
 }
 
 .status-phase {
-  margin-left: auto;
   color: #087443;
   font-weight: 700;
 }
@@ -268,6 +275,7 @@ body._dash-loading-callback .status-dot {
 }
 
 .status-message {
+  min-width: 0;
   overflow: hidden;
   color: #172033;
   font-size: 10px;
@@ -278,30 +286,17 @@ body._dash-loading-callback .status-dot {
 }
 
 .status-detail {
-  display: -webkit-box;
+  min-width: 0;
   overflow: hidden;
-  margin-top: 2px;
   color: #667085;
   font-size: 8.5px;
-  line-height: 1.25;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.status-details {
-  margin-top: 5px;
-  color: #667085;
-  font-size: 8.5px;
-}
-
-.status-details summary {
-  cursor: pointer;
-  user-select: none;
-}
-
-.status-raw-line {
-  margin-top: 2px;
-  overflow-wrap: anywhere;
+.status-raw-hidden {
+  display: none;
 }
 
 .filter-detail {

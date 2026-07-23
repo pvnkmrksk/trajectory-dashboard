@@ -1570,7 +1570,7 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                             ncols=2, color_by="individual", animate=True,
                             max_points=None, rois=None, reach_radius=3.0,
                             show_rois=False, roi_counts=None,
-                            roi_outcomes=None):
+                            roi_outcomes=None, view_range=None):
     if df is None or len(df) == 0:
         fig = go.Figure()
         fig.add_annotation(text="No trajectories match the active filters.", showarrow=False,
@@ -1653,7 +1653,7 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
             frames.append(dict(data=frame_traces, name=str(fi)))
         fig.frames = frames
 
-    _apply_axis_sync(fig, nrows, ncols, df, uirev="traj_view")
+    _apply_axis_sync(fig, nrows, ncols, df, uirev="traj_view", rng=view_range)
 
     for i, ann in enumerate(fig.layout.annotations):
         if i < len(group_names):
@@ -2363,6 +2363,47 @@ def build_mini_histogram(values, selected=None, *, bins=MINI_HIST_BINS,
     return fig
 
 
+def build_percentile_mini_histogram(values, selected=None, *, bins=MINI_HIST_BINS,
+                                    color="#0f766e") -> go.Figure:
+    """Preserve the raw histogram silhouette on a 0–100 percentile axis.
+
+    Bin counts are computed in value space, then their x coordinates are
+    linearly mapped to 0–100. This keeps the familiar histogram shape while the
+    range control and labels correctly communicate percentile inputs.
+    """
+    vals = _finite_values(values)
+    rng = _numeric_range(selected) or (0.0, 100.0)
+    fig = go.Figure()
+    if vals.size:
+        raw_lo, raw_hi = _range_bounds(vals, floor_zero=True,
+                                       upper_pct=MINI_HIST_UPPER_PCT)
+        shown = vals[(vals >= raw_lo) & (vals <= raw_hi)]
+        edges = _histogram_edges(shown, raw_lo, raw_hi, max_bins=bins)
+        counts, edges = np.histogram(shown, bins=edges)
+        span = max(float(raw_hi - raw_lo), 1e-12)
+        pedges = 100.0 * (edges - raw_lo) / span
+        centres = 0.5 * (pedges[:-1] + pedges[1:])
+        fig.add_trace(go.Bar(
+            x=centres.tolist(), y=counts.tolist(),
+            width=(np.diff(pedges) * 0.96).tolist(),
+            customdata=np.column_stack([edges[:-1], edges[1:]]).tolist(),
+            marker_color=color, opacity=0.72, showlegend=False,
+            hovertemplate=("value %{customdata[0]:.3g}–%{customdata[1]:.3g}"
+                           "<br>%{y:,} bins/items<extra></extra>")))
+        fig.add_vrect(x0=rng[0], x1=rng[1],
+                      fillcolor="rgba(37,99,235,0.14)",
+                      line_width=0, layer="below")
+    fig.update_layout(
+        height=58, template="plotly_white", margin=dict(l=4, r=4, t=2, b=14),
+        bargap=0.04, dragmode=False, showlegend=False,
+        xaxis=dict(range=[0, 100], fixedrange=True, showgrid=False,
+                   tickmode="array", tickvals=[0, 50, 100],
+                   ticktext=["0", "50", "100"], tickfont=dict(size=8)),
+        yaxis=dict(fixedrange=True, visible=False),
+    )
+    return fig
+
+
 def _range_control_payload(values, current, *, color="#2563eb", floor_zero=True,
                            upper_pct=MINI_HIST_UPPER_PCT):
     lo, hi = _range_bounds(values, floor_zero=floor_zero, upper_pct=upper_pct)
@@ -2879,6 +2920,45 @@ def _polar_animal_good_fractions(ray: pd.DataFrame, r_range=None,
     return frac.to_numpy(dtype=float)
 
 
+def build_polar_quality_histograms(ray: pd.DataFrame | None, r_range=None,
+                                   min_point_frac=0.0,
+                                   min_animal_trial_frac=0.0):
+    """Build all three polar quality controls from the same cached ray table.
+
+    These deliberately show the *pre-gate* distributions.  The shaded slider
+    selection then explains which trials/animals survive each gate instead of
+    making the histogram disappear as soon as a restrictive gate is selected.
+    """
+    pfrac = _frac_value(min_point_frac)
+    afrac = _frac_value(min_animal_trial_frac)
+    r_hist = build_polar_r_histogram(ray, r_range)
+    point_values = (ray["valid_frac"].to_numpy(dtype=float)
+                    if ray is not None and len(ray) else np.array([], dtype=float))
+    animal_values = _polar_animal_good_fractions(ray, r_range, pfrac)
+    point_hist = build_mini_histogram(
+        point_values, [pfrac, 1.0], bins=24, color="#7c3aed", x_range=(0, 1))
+    animal_hist = build_mini_histogram(
+        animal_values, [afrac, 1.0], bins=24, color="#0f766e", x_range=(0, 1))
+    if point_hist.data:
+        point_hist.data[0].hovertemplate = (
+            "valid-point fraction %{customdata[0]:.2f}–%{customdata[1]:.2f}"
+            "<br>%{y:,} trials<extra></extra>")
+    if animal_hist.data:
+        animal_hist.data[0].hovertemplate = (
+            "good-trial fraction %{customdata[0]:.2f}–%{customdata[1]:.2f}"
+            "<br>%{y:,} animals<extra></extra>")
+    for fig, label in (
+        (r_hist, "No valid Rayleigh R values"),
+        (point_hist, "No trial fractions available"),
+        (animal_hist, "No animal fractions available"),
+    ):
+        if not fig.data:
+            fig.add_annotation(text=label, x=0.5, y=0.5, xref="paper",
+                               yref="paper", showarrow=False,
+                               font=dict(size=9, color="#64748b"))
+    return r_hist, point_hist, animal_hist
+
+
 def _polar_custom_base(sub: pd.DataFrame, roi_outcomes=None) -> np.ndarray:
     outcomes = (sub["_seg_id"].astype(str).map({str(k): str(v) for k, v in (roi_outcomes or {}).items()})
                 .fillna("").to_numpy())
@@ -3385,7 +3465,23 @@ app.layout = html.Div([
     # Header
     html.Div([
         html.H3("Trajectory Dashboard",
-                style={"margin": "0", "flex": "1", "fontSize": "17px"}),
+                style={"margin": "0", "fontSize": "17px", "whiteSpace": "nowrap"}),
+        # Compact live status belongs beside the title, where it remains visible
+        # regardless of sidebar/main scroll position. Hover exposes stage timing.
+        html.Div([
+            html.Div([
+                html.Span(className="status-dot"),
+                html.Strong("Status", className="status-phase-label"),
+                html.Span(className="status-phase"),
+            ], className="status-dock-heading"),
+            html.Div("Choose a data source to begin.", id="status-message",
+                     className="status-message"),
+            html.Div("Server diagnostics appear in the terminal.",
+                     id="status-detail", className="status-detail"),
+            html.Div(id="load-status", className="status-raw-hidden"),
+            html.Div(id="plot-status", className="status-raw-hidden"),
+        ], id="status-dock", className="status-dock header-status",
+           title="No completed operation yet."),
         html.Button("Export HTML", id="btn-export", n_clicks=0,
                     title="Download a standalone HTML report with the current views.",
                     style={"fontSize": "11px", "padding": "4px 10px"}),
@@ -3541,7 +3637,7 @@ app.layout = html.Div([
             dcc.RadioItems(id="heatmap-crange", options=[
                 {"label": "Value", "value": "value"},
                 {"label": "Percentile", "value": "percentile"},
-            ], value="value", inline=True, className="segmented-control",
+            ], value="percentile", inline=True, className="segmented-control",
                style={"fontSize": "10px"}),
             html.Div("Color limits follow the selected metric; percentile mode converts the selected metric span to percentiles.",
                      style={"fontSize": "9px", "color": "#888"}),
@@ -3686,6 +3782,24 @@ app.layout = html.Div([
             html.Div("Uses the dataset's CurrentTrial values.",
                      style={"fontSize": "9px", "color": "#888", "marginTop": "-1px",
                             "marginBottom": "3px"}),
+            html.Label("Step range",
+                       title="Subset complete segments by CurrentStep. Full span keeps every step.",
+                       style={"fontSize": "10px", "marginTop": "2px"}),
+            dcc.Graph(id="step-range-hist", figure=build_mini_histogram(None),
+                      config={"displayModeBar": False, "staticPlot": True},
+                      style={"height": "58px", "margin": "0 0 -6px"}),
+            dcc.RangeSlider(id="step-range", min=0, max=1, step=1,
+                            value=[0, 1], marks={0: "0", 1: "1"},
+                            tooltip={"placement": "bottom", "always_visible": False}),
+            html.Div([
+                dcc.Input(id="step-min", type="number", value=None,
+                          step=1, debounce=True),
+                dcc.Input(id="step-max", type="number", value=None,
+                          step=1, debounce=True),
+            ], style={"display": "none"}),
+            html.Div("Uses CurrentStep and preserves whole T…_S… segments.",
+                     style={"fontSize": "9px", "color": "#888", "marginTop": "-1px",
+                            "marginBottom": "3px"}),
             html.Label("Configs", style={"fontSize": "10px"}),
             dcc.Dropdown(id="filter-configs", multi=True, placeholder="All",
                          style={"fontSize": "10px"}),
@@ -3806,27 +3920,8 @@ app.layout = html.Div([
                style={"fontSize": "10px", "marginTop": "10px", "paddingTop": "7px",
                       "borderTop": "1px solid #e7ebf2", "color": "#667085"}),
 
-            # Persistent activity dock. It remains visible while the long
-            # sidebar scrolls and mirrors the latest load/render/export state.
-            html.Div([
-                html.Div([
-                    html.Span(className="status-dot"),
-                    html.Strong("Dashboard", className="status-label"),
-                    html.Span(className="status-phase"),
-                ], className="status-dock-heading"),
-                html.Div("Choose a data source to begin.", id="status-message",
-                         className="status-message"),
-                html.Div("Server diagnostics appear in the terminal.",
-                         id="status-detail", className="status-detail"),
-                html.Details([
-                    html.Summary("Activity details"),
-                    html.Div(id="load-status", className="status-raw-line"),
-                    html.Div(id="plot-status", className="status-raw-line"),
-                ], className="status-details"),
-            ], id="status-dock", className="status-dock"),
-
         ], className="td-sidebar",
-           style={"width": "255px", "padding": "8px 8px 126px", "overflowY": "auto",
+           style={"width": "255px", "padding": "8px", "overflowY": "auto",
                    "overflowX": "hidden",
                    "borderRight": "1px solid #ddd", "background": "#fafafa",
                    "flexShrink": "0", "height": "calc(100vh - 46px)"}),
@@ -3981,6 +4076,7 @@ app.layout = html.Div([
     dcc.Store(id="auto-thresholds"),
     dcc.Store(id="drop-data"),
     dcc.Store(id="view-render-state", data={}),
+    dcc.Store(id="polar-render-state", data={}),
     dcc.Store(id="url-restored", data=False),
     dcc.Store(id="auto-replot-state"),
     dcc.Checklist(id="rebase-origin", options=[{"label": "", "value": "on"}],
@@ -3997,7 +4093,7 @@ app.layout = html.Div([
 # reads Dash's global loading class so the phase dot changes immediately for
 # every callback, including failures that do not manage to update a message.
 app.clientside_callback(
-    "function(load,plot,summary,render,generation){"
+    "function(load,plot,summary,render,polar,generation){"
     "var loaded=generation&&Number(generation.loaded||0);"
     "var completed=render&&Number(render.completed||0);"
     "var pending=loaded&&(!completed||loaded>completed);"
@@ -4010,22 +4106,41 @@ app.clientside_callback(
     "try{bits.push('Last render '+new Date(done*1000).toLocaleTimeString());}catch(e){}}"
     "if(generation&&generation.pattern&&!load)bits.push(generation.pattern);"
     "bits.push('Errors and tracebacks: server terminal');"
-    "return [message,bits.join(' • ')];}",
+    "var op=render||{};if(polar&&Number(polar.completed||0)>Number(op.completed||0))op=polar;"
+    "var tip=[];if(op.operation)tip.push('Last operation: '+op.operation);"
+    "var tm=op.timings||{};Object.keys(tm).forEach(function(k){"
+    "var v=Number(tm[k]);if(isFinite(v))tip.push(k+': '+v.toFixed(3)+' s');});"
+    "if(!tip.length)tip.push('Timing appears after the first completed render.');"
+    "tip.push('Full errors and tracebacks are in the server terminal.');"
+    "return [message,bits.join(' • '),tip.join('\\n')];}",
     Output("status-message", "children"),
     Output("status-detail", "children"),
+    Output("status-dock", "title"),
     Input("load-status", "children"),
     Input("plot-status", "children"),
     Input("data-summary", "children"),
     Input("view-render-state", "data"),
+    Input("polar-render-state", "data"),
     Input("data-generation", "data"),
 )
 
 app.clientside_callback(
-    "function(n,pattern){if(!n||!pattern)return window.dash_clientside.no_update;"
+    "function(n,pattern,armed){if(!n||!pattern)return window.dash_clientside.no_update;"
+    "var labels={'trial-range':'trial subset','trial-min':'trial subset',"
+    "'trial-max':'trial subset','step-range':'step subset','step-min':'step subset',"
+    "'step-max':'step subset','vel-range':'velocity subset',"
+    "'disp-range':'displacement subset','filter-configs':'config subset',"
+    "'filter-vrs':'VR subset','filter-flyids':'animal subset',"
+    "'filter-scenes':'scene subset','filter-folders':'folder subset'};"
+    "var fresh=armed&&((Date.now()/1000-Number(armed.ts||0))<4)&&"
+    "Number(n)===Number(armed.clicks||0)+1;"
+    "if(fresh){var key=String(armed.trigger||'filters');"
+    "return 'Applying '+(labels[key]||key.replace(/-/g,' '))+' and rebuilding sections…';}"
     "return 'Rendering all sections… request '+n;}",
     Output("plot-status", "children", allow_duplicate=True),
     Input("btn-plot", "n_clicks"),
     State("store-glob", "data"),
+    State("auto-replot-state", "data"),
     prevent_initial_call=True,
 )
 
@@ -4042,14 +4157,12 @@ app.clientside_callback(
 # The section tabs are navigation, not conditional rendering. Every graph stays
 # mounted; changing the tab only moves the existing main scroller to that card.
 app.clientside_callback(
-    "function(view){var scroller=document.getElementById('main-scroll');"
+    "function(view){if(window.__scrollTrajectorySection){"
+    "window.__scrollTrajectorySection(view,'smooth');return '';}"
+    "var scroller=document.getElementById('main-scroll');"
     "var target=document.getElementById('view-'+view);"
-    "if(!scroller||!target)return '';"
-    "window.requestAnimationFrame(function(){"
-    "var tabs=scroller.querySelector('.view-tabs-wrap');"
-    "var offset=(tabs&&tabs.offsetHeight||0)+4;"
-    "scroller.scrollTo({top:Math.max(0,target.offsetTop-offset),behavior:'smooth'});"
-    "});return '';}",
+    "if(scroller&&target)scroller.scrollTo({top:target.offsetTop,behavior:'smooth'});"
+    "return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
     Input("view-mode", "value"),
     prevent_initial_call=True,
@@ -4065,6 +4178,7 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
             "jb": "jump-buffer", "hbin": "heatmap-binsize", "hbound": "heatmap-bound",
             "hcmin": "heatmap-cmin", "hcmax": "heatmap-cmax", "ncols": "subplot-ncols",
             "pts": "plot-points", "tmin": "trial-min", "tmax": "trial-max",
+            "smin": "step-min", "smax": "step-max",
             "rmin": "polar-r-range", "rmax": "polar-r-range",
             "vrmin": "vel-range", "vrmax": "vel-range",
             "drmin": "disp-range", "drmax": "disp-range",
@@ -4101,6 +4215,8 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("filter-folders", "value", allow_duplicate=True),
     Output("trial-min", "value", allow_duplicate=True),
     Output("trial-max", "value", allow_duplicate=True),
+    Output("step-min", "value", allow_duplicate=True),
+    Output("step-max", "value", allow_duplicate=True),
     Output("raw-columns", "value", allow_duplicate=True),
     Output("subplot-ncols", "value", allow_duplicate=True),
     Output("plot-points", "value", allow_duplicate=True),
@@ -4109,6 +4225,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("disp-range", "value", allow_duplicate=True),
     Output("heatmap-color-range", "value", allow_duplicate=True),
     Output("trial-range", "value", allow_duplicate=True),
+    Output("step-range", "value", allow_duplicate=True),
     Output("polar-min-point-frac", "value", allow_duplicate=True),
     Output("polar-min-animal-frac", "value", allow_duplicate=True),
     Output("polar-angle-source", "value", allow_duplicate=True),
@@ -4121,7 +4238,9 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     prevent_initial_call="initial_duplicate",
 )
 def restore_from_url(search, already):
-    n_out = 38
+    # All outputs except the final url-restored flag. The guarded early-return
+    # appends that flag below, so this count must remain one below total arity.
+    n_out = 41
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -4186,11 +4305,19 @@ def restore_from_url(search, already):
             return no_update
         return range_pair("tmin", "tmax")
 
+    def step_slider_range():
+        if "smin" not in p or "smax" not in p:
+            return no_update
+        return range_pair("smin", "smax")
+
     def heat_color_slider_range():
         rng = range_pair("hcmin", "hcmax", 0, 100)
         if rng is no_update:
             return no_update
-        return rng if 0 <= rng[0] <= 100 and 0 <= rng[1] <= 100 else no_update
+        mode = p.get("hcrange", ["percentile"])[0]
+        if mode == "percentile":
+            return rng if 0 <= rng[0] <= 100 and 0 <= rng[1] <= 100 else no_update
+        return rng
 
     anim = (["on"] if p["anim"][0] == "1" else []) if "anim" in p else no_update
     rebase = []
@@ -4214,12 +4341,14 @@ def restore_from_url(search, already):
         num("hbin"), s("hscale"), num("hbound"), s("hmetric"),
         num("hcmin"), num("hcmax"), s("hcrange"),
         lst("fcfg"), lst("fvr"), lst("ffly"), lst("fscn"), lst("ffld"),
-        num("tmin"), num("tmax"), lst("raw"), num("ncols"), num("pts"),
+        num("tmin"), num("tmax"), num("smin"), num("smax"),
+        lst("raw"), num("ncols"), num("pts"),
         r_range(),
         range_pair("vrmin", "vrmax"),
         range_pair("drmin", "drmax"),
         heat_color_slider_range(),
         trial_slider_range(),
+        step_slider_range(),
         num("pmin"), num("amin"), angle_source, mode, view, vp, True,
     )
 
@@ -4323,6 +4452,8 @@ def tick_progress(n, barstyle, trackstyle):
     Input("filter-folders", "value"),
     Input("trial-min", "value"),
     Input("trial-max", "value"),
+    Input("step-min", "value"),
+    Input("step-max", "value"),
     Input("raw-columns", "value"),
     Input("subplot-ncols", "value"),
     Input("plot-points", "value"),
@@ -4340,7 +4471,7 @@ def tick_progress(n, barstyle, trackstyle):
 )
 def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                hbin, hscale, hbound, hmetric, hcmin, hcmax, hcrange,
-               fcfg, fvr, ffly, fscn, ffld, tmin, tmax, raw, ncols, pts,
+               fcfg, fvr, ffly, fscn, ffld, tmin, tmax, smin, smax, raw, ncols, pts,
                rrange, vrange, drange, pmin, amin, angle_source, mode, view, vp, restored):
     if not restored:
         return no_update
@@ -4349,7 +4480,8 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
         params["glob"] = g
     nums = {"vel": vel, "disp": disp, "trim": trim, "jb": jb, "hbin": hbin,
             "hbound": hbound, "hcmin": hcmin, "hcmax": hcmax, "ncols": ncols,
-            "pts": pts, "tmin": tmin, "tmax": tmax, "pmin": pmin, "amin": amin}
+            "pts": pts, "tmin": tmin, "tmax": tmax,
+            "smin": smin, "smax": smax, "pmin": pmin, "amin": amin}
     for k, v in nums.items():
         if v is not None and v != "":
             if k == "trim" and float(v or 0) <= 0:
@@ -4409,19 +4541,16 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     Input("trial-range", "value"),
     Input("trial-min", "value"),
     Input("trial-max", "value"),
+    Input("step-range", "value"),
+    Input("step-min", "value"),
+    Input("step-max", "value"),
     Input("raw-columns", "value"),
     Input("subplot-ncols", "value"),
     Input("plot-points", "value"),
-    Input("polar-r-range", "value"),
-    Input("polar-min-point-frac", "value"),
-    Input("polar-min-animal-frac", "value"),
     Input("roi-show", "value"),
     Input("roi-reach", "value"),
     Input("roi-entered", "value"),
     Input("roi-trim", "value"),
-    Input("polar-moving", "value"),
-    Input("polar-walk", "value"),
-    Input("polar-angle-source", "value"),
     State("data-generation", "data"),
     State("store-glob", "data"),
     State("btn-plot", "n_clicks"),
@@ -4435,11 +4564,20 @@ def arm_auto_replot(*values):
             and time.time() - float(generation.get("loaded") or 0) < 2.0):
         return no_update, True, 0, no_update
     trigger = ctx.triggered_id or "control"
+    label = {
+        "trial-range": "trial subset", "trial-min": "trial subset",
+        "trial-max": "trial subset", "step-range": "step subset",
+        "step-min": "step subset", "step-max": "step subset",
+        "vel-range": "velocity subset", "disp-range": "displacement subset",
+        "filter-configs": "config subset", "filter-vrs": "VR subset",
+        "filter-flyids": "animal subset", "filter-scenes": "scene subset",
+        "filter-folders": "folder subset",
+    }.get(str(trigger), str(trigger).replace("-", " "))
     return (
         {"clicks": int(clicks or 0), "trigger": str(trigger), "ts": time.time()},
         False,
         0,
-        f"Auto-update armed ({PLOT_DEBOUNCE_MS / 1000:g}s idle).",
+        f"Queued {label} update ({PLOT_DEBOUNCE_MS / 1000:g}s idle).",
     )
 
 
@@ -4483,6 +4621,7 @@ def fire_auto_replot(n, armed, clicks, pattern):
     Output("btn-plot", "n_clicks"),
     Output("auto-thresholds", "data"),
     Output("view-render-state", "data", allow_duplicate=True),
+    Output("viewport-store", "data", allow_duplicate=True),
     Input("btn-load", "n_clicks"),
     State("glob-input", "value"),
     State("btn-plot", "n_clicks"),
@@ -4494,7 +4633,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     empty = go.Figure().update_layout(height=190, template="plotly_white")
     nope = ("Choose a folder or enter a CSV glob.", None, None, [], [], [], [], [], [], "",
             empty, empty,
-            no_update, no_update, None, {})
+            no_update, no_update, None, {}, no_update)
     if not pattern:
         LOGGER.warning("ui.load_rejected reason=missing_source")
         return nope
@@ -4507,7 +4646,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     if df is None or len(df) == 0:
         LOGGER.warning("ui.load_empty source=%r", pattern)
         return (f"No trajectory CSVs matched the current data source.", None, None, [], [], [], [], [], [], "",
-                empty, empty, no_update, no_update, None, {})
+                empty, empty, no_update, no_update, None, {}, {"reset": True})
 
     n_files = df["SourceFile"].nunique()
     n_segs = df["_seg_id"].nunique()
@@ -4575,6 +4714,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
         "\n".join(meta_parts) or "No experiment metadata found.",
         vel_fig, disp_fig, binsize_out,
         no_update, auto, no_update,
+        {"reset": True} if reset_controls else no_update,
     )
 
 
@@ -4597,6 +4737,12 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     Output("trial-range", "marks"),
     Output("trial-range", "value"),
     Output("trial-range-hist", "figure"),
+    Output("step-range", "min"),
+    Output("step-range", "max"),
+    Output("step-range", "step"),
+    Output("step-range", "marks"),
+    Output("step-range", "value"),
+    Output("step-range-hist", "figure"),
     Output("btn-plot", "n_clicks", allow_duplicate=True),
     Input("data-generation", "data"),
     State("store-glob", "data"),
@@ -4605,18 +4751,22 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     State("trial-range", "value"),
     State("trial-min", "value"),
     State("trial-max", "value"),
+    State("step-range", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
     State("btn-plot", "n_clicks"),
     prevent_initial_call=True,
 )
 def update_range_controls(generation, pattern, vel_current, disp_current, trial_current,
-                          trial_min, trial_max, plot_clicks):
+                          trial_min, trial_max, step_current, step_min, step_max,
+                          plot_clicks):
     empty = build_mini_histogram(None)
     defaults = (0, 1, 0.01, {0: "0", 1: "1"}, [0, 1], empty)
     if not pattern:
-        return defaults + defaults + defaults + (no_update,)
+        return defaults + defaults + defaults + defaults + (no_update,)
     df, stats, _ = _load_data(pattern)
     if df is None or len(df) == 0 or stats is None:
-        return defaults + defaults + defaults + (no_update,)
+        return defaults + defaults + defaults + defaults + (no_update,)
 
     reset_controls = bool((generation or {}).get("reset_controls"))
     vel_payload = _range_control_payload(
@@ -4649,32 +4799,49 @@ def update_range_controls(generation, pattern, vel_current, disp_current, trial_
         build_mini_histogram(trial_values, trial_value, color="#b7791f",
                              x_range=(lo, hi)),
     )
+    step_values = pd.to_numeric(df["CurrentStep"], errors="coerce").to_numpy(dtype=float)
+    slo, shi = _range_bounds(step_values, floor_zero=False, upper_pct=None)
+    restored_step = _value_range(step_min, step_max)
+    step_source = None if reset_controls else step_current
+    if restored_step and _looks_like_initial_range(_numeric_range(step_current), slo, shi):
+        step_source = [slo if restored_step[0] is None else restored_step[0],
+                       shi if restored_step[1] is None else restored_step[1]]
+    step_value = _range_control_value(step_source, slo, shi)
+    step_payload = (
+        float(slo), float(shi), 1, _slider_marks(slo, shi), step_value,
+        build_mini_histogram(step_values, step_value, color="#0f766e",
+                             x_range=(slo, shi)),
+    )
     # This click is the load barrier: all slider outputs in this response are
     # applied before the master renderer reads them as State.  Triggering the
     # renderer directly from data-generation allowed it to race stale ranges
     # from the previous dataset.
-    return vel_payload + disp_payload + trial_payload + ((plot_clicks or 0) + 1,)
+    return (vel_payload + disp_payload + trial_payload + step_payload
+            + ((plot_clicks or 0) + 1,))
 
 
 @app.callback(
     Output("vel-range-hist", "figure", allow_duplicate=True),
     Output("disp-range-hist", "figure", allow_duplicate=True),
     Output("trial-range-hist", "figure", allow_duplicate=True),
+    Output("step-range-hist", "figure", allow_duplicate=True),
     Input("vel-range", "value"),
     Input("disp-range", "value"),
     Input("trial-range", "value"),
+    Input("step-range", "value"),
     State("store-glob", "data"),
     prevent_initial_call=True,
 )
-def update_range_hist_selection(vel_range, disp_range, trial_range, pattern):
+def update_range_hist_selection(vel_range, disp_range, trial_range, step_range, pattern):
     if not pattern:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     df, stats, _ = _load_data(pattern)
     if df is None or stats is None:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     vel_values = stats["peak_velocity"].to_numpy() if "peak_velocity" in stats else []
     disp_values = stats["displacement"].to_numpy() if "displacement" in stats else []
     trial_values = pd.to_numeric(df["CurrentTrial"], errors="coerce").to_numpy(dtype=float)
+    step_values = pd.to_numeric(df["CurrentStep"], errors="coerce").to_numpy(dtype=float)
     return (
         build_mini_histogram(vel_values, vel_range, color="#1f77b4",
                              x_range=_range_bounds(vel_values, floor_zero=True)),
@@ -4682,6 +4849,9 @@ def update_range_hist_selection(vel_range, disp_range, trial_range, pattern):
                              x_range=_range_bounds(disp_values, floor_zero=True)),
         build_mini_histogram(trial_values, trial_range, color="#b7791f",
                              x_range=_range_bounds(trial_values, floor_zero=False,
+                                                   upper_pct=None)),
+        build_mini_histogram(step_values, step_range, color="#0f766e",
+                             x_range=_range_bounds(step_values, floor_zero=False,
                                                    upper_pct=None)),
     )
 
@@ -4703,19 +4873,19 @@ def _input_number(value):
     prevent_initial_call=True,
 )
 def sync_trial_range_to_inputs(value, full_min, full_max):
-    rng = _numeric_range(value)
-    if rng is None:
-        return no_update, no_update
-    try:
-        full_min = float(full_min)
-        full_max = float(full_max)
-    except Exception:
-        full_min, full_max = rng
-    span = max(abs(full_max - full_min), 1.0)
-    eps = span * 1e-9
-    lo = None if rng[0] <= full_min + eps else _input_number(rng[0])
-    hi = None if rng[1] >= full_max - eps else _input_number(rng[1])
-    return lo, hi
+    return _range_slider_to_open_bounds(value, full_min, full_max)
+
+
+@app.callback(
+    Output("step-min", "value", allow_duplicate=True),
+    Output("step-max", "value", allow_duplicate=True),
+    Input("step-range", "value"),
+    State("step-range", "min"),
+    State("step-range", "max"),
+    prevent_initial_call=True,
+)
+def sync_step_range_to_inputs(value, full_min, full_max):
+    return _range_slider_to_open_bounds(value, full_min, full_max)
 
 
 @app.callback(
@@ -4729,12 +4899,13 @@ def sync_trial_range_to_inputs(value, full_min, full_max):
     # Run after the atomic figure build.  The previous callback raced that
     # build over the same multi-million-row frame and could double wall time.
     Input("view-render-state", "data"),
+    Input("heatmap-metric", "value"),
+    Input("heatmap-crange", "value"),
     State("store-glob", "data"),
-    State("heatmap-metric", "value"),
     State("heatmap-binsize", "value"),
     State("heatmap-bound", "value"),
-    State("heatmap-crange", "value"),
     State("heatmap-color-range", "value"),
+    State("heatmap-color-values", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
     State("trim-samples", "value"),
@@ -4746,14 +4917,17 @@ def sync_trial_range_to_inputs(value, full_min, full_max):
     State("filter-folders", "value"),
     State("trial-min", "value"),
     State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
     State("vel-range", "value"),
     State("disp-range", "value"),
     prevent_initial_call=True,
 )
-def update_heatmap_color_controls(_render_state, pattern, metric, binsize, bound, mode,
-                                  current, vel_thresh, min_disp, trim, jump_buf,
+def update_heatmap_color_controls(_render_state, metric, mode, pattern, binsize, bound,
+                                  current, previous, vel_thresh, min_disp, trim, jump_buf,
                                   cfg, vrs, fids, scenes, folders,
-                                  trial_min, trial_max, vel_range, disp_range):
+                                  trial_min, trial_max, step_min, step_max,
+                                  vel_range, disp_range):
     empty = build_mini_histogram(None, color="#0f766e")
     default = ({}, 0, 1, 0.01, {0: "0", 1: "1"}, [0, 1], empty)
     if not pattern:
@@ -4761,16 +4935,12 @@ def update_heatmap_color_controls(_render_state, pattern, metric, binsize, bound
     df_f, df_sub, _ = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-        vel_range, disp_range)
+        step_min, step_max, vel_range, disp_range)
     if df_f is None or len(df_f) == 0:
         return default
     values = _heatmap_metric_values(df_f, binsize, bound if bound else 100,
                                     metric or "time")
     lo, hi = _range_bounds(values, floor_zero=True, upper_pct=MINI_HIST_UPPER_PCT)
-    selected = _range_control_value(current, lo, hi)
-    selected_out = (no_update
-                    if _numeric_range(current) == _numeric_range(selected)
-                    else selected)
     store = {
         "values": _sample_for_store(values),
         "lo": float(lo),
@@ -4778,6 +4948,27 @@ def update_heatmap_color_controls(_render_state, pattern, metric, binsize, bound
         "metric": metric or "time",
         "mode": mode or "value",
     }
+    if mode == "percentile":
+        prior_mode = (previous or {}).get("mode")
+        current_rng = _numeric_range(current)
+        if prior_mode == "percentile" and current_rng:
+            selected = [max(0.0, current_rng[0]), min(100.0, current_rng[1])]
+        elif prior_mode == "value" and current_rng:
+            selected = [_percentile_rank(values, current_rng[0]),
+                        _percentile_rank(values, current_rng[1])]
+        else:
+            selected = [0.0, 100.0]
+        selected_out = (no_update if _numeric_range(current) == _numeric_range(selected)
+                        else selected)
+        return (
+            store, 0.0, 100.0, 1.0, {0: "0", 50: "50", 100: "100"},
+            selected_out,
+            build_percentile_mini_histogram(values, selected, color="#0f766e"),
+        )
+    selected = _range_control_value(current, lo, hi)
+    selected_out = (no_update
+                    if _numeric_range(current) == _numeric_range(selected)
+                    else selected)
     return (
         store,
         float(lo),
@@ -4806,6 +4997,15 @@ def sync_heatmap_color_range(value, mode, data, current_cmin, current_cmax):
         return no_update, no_update, no_update
     lo, hi = rng
     values = _finite_values((data or {}).get("values", []))
+    if mode == "percentile":
+        lo, hi = max(0.0, lo), min(100.0, hi)
+        is_full = lo <= 1e-9 and hi >= 100.0 - 1e-9
+        cmin = None if is_full or lo <= 1e-9 else _input_number(lo)
+        cmax = None if is_full or hi >= 100.0 - 1e-9 else _input_number(hi)
+        fig = build_percentile_mini_histogram(
+            values, [lo, hi], color="#0f766e")
+        return (no_update if cmin == current_cmin else cmin,
+                no_update if cmax == current_cmax else cmax, fig)
     full_lo = float((data or {}).get("lo", lo))
     full_hi = float((data or {}).get("hi", hi))
     span = max(abs(full_hi - full_lo), 1.0)
@@ -4813,11 +5013,6 @@ def sync_heatmap_color_range(value, mode, data, current_cmin, current_cmax):
     is_full = lo <= full_lo + eps and hi >= full_hi - eps
     fig = build_mini_histogram(values, [lo, hi], color="#0f766e",
                                x_range=(full_lo, full_hi))
-    if mode == "percentile":
-        cmin = None if is_full or lo <= full_lo + eps else _input_number(_percentile_rank(values, lo))
-        cmax = None if is_full or hi >= full_hi - eps else _input_number(_percentile_rank(values, hi))
-        return (no_update if cmin == current_cmin else cmin,
-                no_update if cmax == current_cmax else cmax, fig)
     cmin = None if is_full else _input_number(lo)
     cmax = None if is_full else _input_number(hi)
     return (no_update if cmin == current_cmin else cmin,
@@ -4905,7 +5100,7 @@ def _selected_range(sel):
     return _numeric_range(sel)
 
 
-def _trial_range(trial_min, trial_max):
+def _value_range(value_min, value_max):
     def val(x):
         if x in (None, ""):
             return None
@@ -4914,12 +5109,32 @@ def _trial_range(trial_min, trial_max):
         except Exception:
             return None
 
-    lo, hi = val(trial_min), val(trial_max)
+    lo, hi = val(value_min), val(value_max)
     if lo is None and hi is None:
         return None
     if lo is not None and hi is not None and lo > hi:
         lo, hi = hi, lo
     return (lo, hi)
+
+
+def _trial_range(trial_min, trial_max):
+    return _value_range(trial_min, trial_max)
+
+
+def _range_slider_to_open_bounds(value, full_min, full_max):
+    rng = _numeric_range(value)
+    if rng is None:
+        return no_update, no_update
+    try:
+        full_min = float(full_min)
+        full_max = float(full_max)
+    except Exception:
+        full_min, full_max = rng
+    span = max(abs(full_max - full_min), 1.0)
+    eps = span * 1e-9
+    lo = None if rng[0] <= full_min + eps else _input_number(rng[0])
+    hi = None if rng[1] >= full_max - eps else _input_number(rng[1])
+    return lo, hi
 
 
 def _animal_count(df) -> int:
@@ -4997,6 +5212,7 @@ def _filter_stage_row(label: str, before, after, active=True,
 def _filter_detail_children(df_all, vel_thresh, min_disp, trim, jump_buf,
                             cfg, vrs, fids, scenes, folders,
                             vel_sel, disp_sel, trial_min=None, trial_max=None,
+                            step_min=None, step_max=None,
                             pattern=None,
                             roi_reach=None, roi_entered=None, roi_trim=None):
     if df_all is None or len(df_all) == 0:
@@ -5034,6 +5250,24 @@ def _filter_detail_children(df_all, vel_thresh, min_disp, trim, jump_buf,
     rows.append(_filter_stage_row(
         "Trial range", before, cur, active=bool(trng),
         note=trial_note,
+        counts_cache=counts_cache))
+
+    srng = _value_range(step_min, step_max)
+    before = cur
+    if srng:
+        cur = td_grouping.subset_frame(cur, step_range=srng)
+    if srng:
+        lo, hi = srng
+        if lo is None:
+            step_note = f"Keeps CurrentStep <= {hi:g}."
+        elif hi is None:
+            step_note = f"Keeps CurrentStep >= {lo:g}."
+        else:
+            step_note = f"Keeps CurrentStep {lo:g} to {hi:g}, inclusive."
+    else:
+        step_note = None
+    rows.append(_filter_stage_row(
+        "Step range", before, cur, active=bool(srng), note=step_note,
         counts_cache=counts_cache))
 
     disp_raw_rng = _selected_range(disp_sel)
@@ -5141,27 +5375,27 @@ def _filter_detail_children(df_all, vel_thresh, min_disp, trim, jump_buf,
     State("filter-folders", "value"),
     State("trial-min", "value"),
     State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
     State("vel-range", "value"),
     State("disp-range", "value"),
-    State("polar-moving", "value"),
-    State("polar-walk", "value"),
     prevent_initial_call=True,
 )
 def update_filter_summary(render_state, pattern, roi_entered, roi_trim, roi_reach,
                           vel_thresh, min_disp, trim, jump_buf,
                           cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-                          vel_sel, disp_sel, polar_moving, polar_walk):
+                          step_min, step_max, vel_sel, disp_sel):
     if not pattern or not render_state:
         return no_update, no_update
     df_all, _, _ = _load_data(pattern)
     df_f, df_sub, _ = _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
                                    cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-                                   vel_sel, disp_sel)
+                                   step_min, step_max, vel_sel, disp_sel)
     if df_all is None or df_f is None or len(df_f) == 0:
         return "", _filter_detail_children(df_all, vel_thresh, min_disp, trim,
                                            jump_buf, cfg, vrs, fids, scenes,
                                            folders, vel_sel, disp_sel,
-                                           trial_min, trial_max,
+                                           trial_min, trial_max, step_min, step_max,
                                            pattern, roi_reach, roi_entered,
                                            roi_trim)
     reach = float(roi_reach) if roi_reach else 3.0
@@ -5171,6 +5405,7 @@ def update_filter_summary(render_state, pattern, roi_entered, roi_trim, roi_reac
         _filter_detail_children(df_all, vel_thresh, min_disp, trim, jump_buf,
                                 cfg, vrs, fids, scenes, folders,
                                 vel_sel, disp_sel, trial_min, trial_max,
+                                step_min, step_max,
                                 pattern, roi_reach, roi_entered, roi_trim),
     )
 
@@ -5180,7 +5415,7 @@ _FILTER_CACHE_ORDER: list = []
 _FILTER_CACHE_MAX = 4
 def _filter_signature(pattern, vel_thresh, min_disp, trim, jump_buf,
                       cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-                      vel_selection, disp_selection):
+                      step_min, step_max, vel_selection, disp_selection):
     def rng(sel):
         return _selected_range(sel)
     def lst(v):
@@ -5190,12 +5425,14 @@ def _filter_signature(pattern, vel_thresh, min_disp, trim, jump_buf,
             vel_thresh, min_disp, trim, round(_jump_buffer_seconds(jump_buf), 6),
             lst(cfg), lst(vrs), lst(fids), lst(scenes), lst(folders),
             _trial_range(trial_min, trial_max),
+            _value_range(step_min, step_max),
             rng(vel_selection), rng(disp_selection))
 
 
 def _filtered_df_locked(pattern, vel_thresh, min_disp, trim, jump_buf,
                         cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-                        vel_selection, disp_selection, need_stats=False):
+                        step_min, step_max, vel_selection, disp_selection,
+                        need_stats=False):
     """
     Shared filtering pipeline (cached). Returns (df_f, df_sub, stats_sub|None).
 
@@ -5209,7 +5446,7 @@ def _filtered_df_locked(pattern, vel_thresh, min_disp, trim, jump_buf,
         return None, None, None
     sig = _filter_signature(pattern, vel_thresh, min_disp, trim, jump_buf,
                             cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-                            vel_selection, disp_selection)
+                            step_min, step_max, vel_selection, disp_selection)
     if sig in _FILTER_CACHE:
         result = _FILTER_CACHE[sig]
         if need_stats and result[2] is None and result[1] is not None:
@@ -5231,6 +5468,7 @@ def _filtered_df_locked(pattern, vel_thresh, min_disp, trim, jump_buf,
         scenes=tuple(scenes) if scenes else None,
         folders=tuple(folders) if folders else None,
         trial_range=_trial_range(trial_min, trial_max),
+        step_range=_value_range(step_min, step_max),
         velocity_range=vel_rng,
         displacement_range=disp_rng,
     )
@@ -5251,13 +5489,15 @@ def _filtered_df_locked(pattern, vel_thresh, min_disp, trim, jump_buf,
 
 def _filtered_df(pattern, vel_thresh, min_disp, trim, jump_buf,
                  cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-                 vel_selection, disp_selection, need_stats=False):
+                 step_min, step_max, vel_selection, disp_selection,
+                 need_stats=False):
     """Single-flight wrapper around the shared vectorised filter pipeline."""
     with _FILTER_LOCK:
         return _filtered_df_locked(
             pattern, vel_thresh, min_disp, trim, jump_buf,
             cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-            vel_selection, disp_selection, need_stats=need_stats)
+            step_min, step_max, vel_selection, disp_selection,
+            need_stats=need_stats)
 
 
 def _apply_viewport(fig, viewport, df, max_span_mult=3.0):
@@ -5365,6 +5605,8 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     State("filter-folders", "value"),
     State("trial-min", "value"),
     State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
     State("raw-columns", "value"),
     State("subplot-ncols", "value"),
     State("plot-points", "value"),
@@ -5387,7 +5629,8 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
 def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
                  group_by, pool_mode, color_by, animate, rebase, hm_binsize, hm_scale,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
-                 scenes, folders, trial_min, trial_max, raw_cols, ncols, max_points,
+                 scenes, folders, trial_min, trial_max, step_min, step_max,
+                 raw_cols, ncols, max_points,
                  render_mode, vel_selection, disp_selection, viewport, roi_show, roi_reach,
                  roi_trim, roi_entered, polar_moving, polar_walk, polar_angle_source,
                  polar_r_range,
@@ -5400,6 +5643,8 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
                 no_update, no_update, "", {}, "Waiting for data.")
 
     started = time.perf_counter()
+    stage_started = started
+    timings = {}
     mode = _render_mode(render_mode)
     LOGGER.info(
         "render.start epoch=%s mode=%s group=%s pool=%s source=%r",
@@ -5416,7 +5661,8 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     df_f, df_sub, _stats_sub = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-        vel_selection, disp_selection)
+        step_min, step_max, vel_selection, disp_selection)
+    timings["filter/cache"] = time.perf_counter() - stage_started
 
     if df_sub is None:
         msg = "No CSV rows matched the current data source."
@@ -5439,6 +5685,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     # visible segments, while the ROI tab uses the unmasked table. df_view is
     # what trajectory/heatmap/raw draw: optionally restricted to whole trials
     # that entered an ROI, then tail-trimmed.
+    stage_started = time.perf_counter()
     rois = rois_by_config(metas)
     reach = float(roi_reach) if roi_reach else 3.0
     want_rois = _on(roi_show) and bool(rois)
@@ -5453,8 +5700,14 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         roi_fig = _msg_figure("Enable target ROIs to view target diagnostics.")
     else:
         roi_fig = _msg_figure("No target ROIs were found for the current configs.")
+    timings["ROI masks/diagnostics"] = time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     df_plot = rebase_to_origin(df_view) if do_rebase else df_view
+    bound_pct = float(hm_bound) if hm_bound not in (None, "") else 98.0
+    shared_fit = ((_robust_range(df_plot, bound_pct)
+                   if bound_pct < 100 else _shared_range(df_plot))
+                  if len(df_plot) else None)
     traj_budget = _budget(BUDGET_SVG if do_animate else BUDGET_GL,
                           BUDGET_SVG_SPEED if do_animate else BUDGET_GL_SPEED,
                           mode, max_points)
@@ -5465,24 +5718,28 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         color_by=color_by or "individual", animate=do_animate,
         max_points=traj_max_points, rois=rois, reach_radius=reach,
         show_rois=want_rois and not do_rebase, roi_counts=roi_counts,
-        roi_outcomes=roi_outcomes)
+        roi_outcomes=roi_outcomes, view_range=shared_fit)
     _apply_viewport(traj_fig, viewport, df_plot_draw)
+    timings["trajectory"] = time.perf_counter() - stage_started
 
     # Heatmap binning and analytical panels always use the complete filtered
     # frame. Speed mode only limits browser primitives; it never changes counts,
     # circular statistics, residence time, or diagnostic distributions.
+    stage_started = time.perf_counter()
     heat_fig, heat_variants = build_heatmap_mask_variants(
         df_f, pattern, reach, group_by, pool_mode, ncols_val,
-        bin_size=hm_binsize, bound_pct=hm_bound if hm_bound else 100,
+        bin_size=hm_binsize, bound_pct=bound_pct,
         cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
         do_rebase=do_rebase, entered_only=_on(roi_entered),
         trim_tail=_on(roi_trim), max_points=None,
         metric=hm_metric or "time", log_scale=(hm_scale == "log"))
     _apply_viewport_to_current_range(heat_fig, viewport, max_span_mult=1.5)
+    timings["heatmap"] = time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     polar_budget = _budget(BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points)
     polar_fig, polar_quality = build_polar_figure(
-        df_plot, group_by, pool_mode, ncols=ncols_val,
+        df_view, group_by, pool_mode, ncols=ncols_val,
         color_by=color_by or "individual", moving_only=_on(polar_moving),
         walk_thresh=polar_walk, max_points=polar_budget, rois=rois,
         reach_radius=reach, show_rois=want_rois and not do_rebase,
@@ -5490,7 +5747,9 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         min_point_frac=polar_min_point_frac,
         min_animal_trial_frac=polar_min_animal_frac,
         return_summary=True, angle_source=polar_angle_source)
+    timings["polar"] = time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     raw_style = {"display": "block"} if raw_cols else raw_hidden
     raw_fig = (build_raw_trace_figure(
         df_view, raw_cols or [],
@@ -5498,6 +5757,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         if raw_cols else empty)
     vel_fig = build_velocity_histogram(df_view, vel_thresh)
     disp_fig = build_displacement_histogram(compute_segment_stats(df_view), min_disp)
+    timings["diagnostic plots"] = time.perf_counter() - stage_started
 
     drawn = sum(len(t.x) for t in traj_fig.data
                 if getattr(t, "x", None) is not None)
@@ -5505,6 +5765,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
     n_segs_before = df_sub["_seg_id"].nunique()
     bt = time.perf_counter() - started
+    timings["total"] = bt
     summary = (f"{_compact_count(len(df_view))}/{_compact_count(len(df_sub))} pts | "
                f"{_compact_count(n_traces)}/{_compact_count(n_segs_before)} segs | "
                f"trajectory ~{drawn:,}/{traj_budget:,} drawn pts | "
@@ -5523,10 +5784,168 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     render_state = {
         "epoch": int(n or 0), "data": _DATA_TOKEN_BY_PATTERN.get(_pattern_key(pattern)),
         "mode": mode, "completed": time.time(),
+        "timings": {k: round(float(v), 4) for k, v in timings.items()},
+        "operation": "all sections",
     }
     return (traj_fig, heat_fig.to_plotly_json(), heat_variants, roi_fig, polar_fig,
             raw_fig, raw_style, summary, vel_fig, disp_fig, exclusion,
             render_state, f"Ready — all sections updated in {bt:.2f}s.")
+
+
+# Polar quality controls are intentionally isolated from the atomic dashboard
+# render above.  Moving-only, Rayleigh, and valid-fraction changes reuse the
+# cached filtered frame and cached per-segment circular statistics, so they do
+# not rebuild trajectories, heatmap bins, ROI diagnostics, or raw traces.
+app.clientside_callback(
+    "function(a,b,c,d,e,f,pattern){if(!pattern)return window.dash_clientside.no_update;"
+    "return 'Updating polar filters…';}",
+    Output("plot-status", "children", allow_duplicate=True),
+    Input("polar-moving", "value"),
+    Input("polar-walk", "value"),
+    Input("polar-angle-source", "value"),
+    Input("polar-r-range", "value"),
+    Input("polar-min-point-frac", "value"),
+    Input("polar-min-animal-frac", "value"),
+    State("store-glob", "data"),
+    prevent_initial_call=True,
+)
+
+
+@app.callback(
+    Output("polar-plot", "figure", allow_duplicate=True),
+    Output("polar-r-hist", "figure"),
+    Output("polar-point-frac-hist", "figure"),
+    Output("polar-animal-frac-hist", "figure"),
+    Output("polar-render-state", "data"),
+    Output("plot-status", "children", allow_duplicate=True),
+    Output("data-summary", "children", allow_duplicate=True),
+    Input("view-render-state", "data"),
+    Input("polar-moving", "value"),
+    Input("polar-walk", "value"),
+    Input("polar-angle-source", "value"),
+    Input("polar-r-range", "value"),
+    Input("polar-min-point-frac", "value"),
+    Input("polar-min-animal-frac", "value"),
+    State("store-glob", "data"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("trial-min", "value"),
+    State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
+    State("vel-range", "value"),
+    State("disp-range", "value"),
+    State("group-by", "value"),
+    State("pool-mode", "value"),
+    State("color-by", "value"),
+    State("subplot-ncols", "value"),
+    State("plot-points", "value"),
+    State("render-mode", "value"),
+    State("rebase-origin", "value"),
+    State("roi-show", "value"),
+    State("roi-reach", "value"),
+    State("roi-entered", "value"),
+    State("roi-trim", "value"),
+    State("data-summary", "children"),
+    prevent_initial_call=True,
+)
+def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source,
+                      polar_r_range, polar_min_point_frac,
+                      polar_min_animal_frac, pattern, vel_thresh, min_disp, trim,
+                      jump_buf, cfg, vrs, fids, scenes, folders, trial_min,
+                      trial_max, step_min, step_max, vel_selection,
+                      disp_selection, group_by, pool_mode, color_by, ncols,
+                      max_points, render_mode, rebase, roi_show, roi_reach,
+                      roi_entered, roi_trim, current_summary):
+    empty_hists = build_polar_quality_histograms(None, polar_r_range,
+                                                  polar_min_point_frac,
+                                                  polar_min_animal_frac)
+    if not pattern or not render_state:
+        return no_update, *empty_hists, no_update, no_update, no_update
+
+    trigger = ctx.triggered_id
+    refresh_figure = trigger != "view-render-state"
+    started = time.perf_counter()
+    stage_started = started
+    timings = {}
+    LOGGER.info(
+        "polar.start trigger=%s moving=%s walk=%s angle=%s source=%r",
+        trigger, _on(polar_moving), polar_walk, polar_angle_source, pattern,
+    )
+    df_f, _, _ = _filtered_df(
+        pattern, vel_thresh, min_disp, trim, jump_buf,
+        cfg, vrs, fids, scenes, folders, trial_min, trial_max,
+        step_min, step_max, vel_selection, disp_selection)
+    timings["filter/cache"] = time.perf_counter() - stage_started
+    if df_f is None or len(df_f) == 0:
+        msg = _msg_figure("No trajectories match the active filters.")
+        return (msg if refresh_figure else no_update), *empty_hists, no_update, (
+            "Polar update skipped — no rows match the active filters."
+            if refresh_figure else no_update), no_update
+
+    stage_started = time.perf_counter()
+    _, _, metas = _load_data(pattern)
+    rois = rois_by_config(metas)
+    reach = float(roi_reach) if roi_reach else 3.0
+    df_view, _ = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
+    ray_metric = color_by if color_by in ("velocity", "tortuosity") else "none"
+    ray = rayleigh_by_segment(
+        df_view, _on(polar_moving), polar_walk, ray_metric,
+        angle_source=polar_angle_source)
+    timings["ray aggregation"] = time.perf_counter() - stage_started
+
+    stage_started = time.perf_counter()
+    hists = build_polar_quality_histograms(
+        ray, polar_r_range, polar_min_point_frac, polar_min_animal_frac)
+    polar_fig = no_update
+    quality = _filter_polar_ray_table(
+        ray, polar_r_range, polar_min_point_frac, polar_min_animal_frac)[1]
+    if refresh_figure:
+        ncols_val = int(ncols) if ncols and ncols >= 1 else 2
+        mode = _render_mode(render_mode)
+        want_rois = _on(roi_show) and bool(rois)
+        roi_outcomes = (roi_outcome_by_segment(df_view, rois, reach)
+                        if (color_by == "roi" or want_rois) and rois else None)
+        polar_fig, quality = build_polar_figure(
+            df_view, group_by, pool_mode, ncols=ncols_val,
+            color_by=color_by or "individual",
+            moving_only=_on(polar_moving), walk_thresh=polar_walk,
+            max_points=_budget(BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points),
+            rois=rois, reach_radius=reach,
+            show_rois=want_rois and not _on(rebase), roi_outcomes=roi_outcomes,
+            r_range=polar_r_range, min_point_frac=polar_min_point_frac,
+            min_animal_trial_frac=polar_min_animal_frac,
+            return_summary=True, angle_source=polar_angle_source)
+    timings["figure/histograms"] = time.perf_counter() - stage_started
+    elapsed = time.perf_counter() - started
+    timings["total"] = elapsed
+
+    if not refresh_figure:
+        LOGGER.info("polar.histograms trials=%d seconds=%.3f",
+                    int(quality.get("after_animal", 0)), elapsed)
+        return no_update, *hists, no_update, no_update, no_update
+
+    state = {
+        "completed": time.time(), "operation": "polar filters",
+        "timings": {k: round(float(v), 4) for k, v in timings.items()},
+        "trigger": str(trigger),
+    }
+    kept = int(quality.get("after_animal", 0))
+    LOGGER.info("polar.done trigger=%s trials=%d seconds=%.3f",
+                trigger, kept, elapsed)
+    summary_out = (re.sub(r"polar [\d,]+ trials", f"polar {kept:,} trials",
+                          current_summary)
+                   if isinstance(current_summary, str) else no_update)
+    return (polar_fig, *hists, state,
+            f"Ready — polar filters kept {kept:,} trials in {elapsed:.2f}s.",
+            summary_out)
 
 
 # Attach a debounced Plotly relayout listener directly to the visible
@@ -5567,20 +5986,12 @@ app.clientside_callback(
     "+'|'+(L.height||0)+'|'+JSON.stringify(L.xaxis&&L.xaxis.range)"
     "+'|'+JSON.stringify(L.yaxis&&L.yaxis.range);}catch(e){}"
     "if(hg&&window.Plotly&&hfig&&hfig.data&&hfig.data.length){"
-    "var prev=null;try{var ly=hg.layout||{};"
-    "var xr=ly.xaxis&&ly.xaxis.range, yr=ly.yaxis&&ly.yaxis.range;"
-    "if(xr&&yr){prev={x:[xr[0],xr[1]],y:[yr[0],yr[1]]};}}catch(e){}"
     "var changed=hg.__hmfp!==fp;"
     "var needPaint=changed||!hg.__hmPainted;"
     "if(needPaint){"
     "window.__hmSuppress=true;"
     "try{hc.style.transition='none';hc.style.opacity='1';}catch(e){}"
     "try{window.Plotly.newPlot(hg,hfig.data,hfig.layout,{scrollZoom:true,displayModeBar:true,displaylogo:false});"
-    "if(prev){var u={};"
-    "function finiteRange(r){return r&&r.length===2&&isFinite(r[0])&&isFinite(r[1])&&r[0]!==r[1];}"
-    "if(finiteRange(prev.x))u['xaxis.range']=prev.x;"
-    "if(finiteRange(prev.y))u['yaxis.range']=prev.y;"
-    "if(Object.keys(u).length){try{window.Plotly.relayout(hg,u);}catch(e){}}}"
     "hg.__hmfp=fp;hg.__hmPainted=true;"
     "if(window.__attachHeatSync){window.__attachHeatSync(hg,true);}}catch(e){}"
     "try{hc.style.opacity='1';}catch(e){}"
@@ -5717,6 +6128,8 @@ h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
     State("filter-folders", "value"),
     State("trial-min", "value"),
     State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
     State("raw-columns", "value"),
     State("subplot-ncols", "value"),
     State("plot-points", "value"),
@@ -5742,7 +6155,8 @@ h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
 def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool_mode,
                 color_by, animate, hm_binsize, hm_scale, hm_bound, hm_metric,
                 hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids, scenes, folders,
-                trial_min, trial_max, raw_cols, ncols, max_points, render_mode,
+                trial_min, trial_max, step_min, step_max,
+                raw_cols, ncols, max_points, render_mode,
                 rebase, roi_show, roi_reach, roi_entered, roi_trim,
                 polar_r_range, polar_min_point_frac, polar_min_animal_frac,
                 polar_moving, polar_walk, polar_angle_source,
@@ -5758,7 +6172,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
     df_f, df_sub, _stats_sub = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
         cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-        vel_selection, disp_selection, need_stats=True)
+        step_min, step_max, vel_selection, disp_selection, need_stats=True)
     if df_f is None or len(df_f) == 0:
         LOGGER.warning("export.rejected reason=no_filtered_rows source=%r", pattern)
         return no_update, "Export skipped — no rows match the active filters."
@@ -5781,7 +6195,11 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                           mode, max_points)
     df_traj = _decimate_frame(df_plot, traj_budget) if mode == "speed" else df_plot
     df_heat = df_plot
-    df_polar = df_plot
+    df_polar = df_view
+    bound_pct = float(hm_bound) if hm_bound not in (None, "") else 98.0
+    shared_fit = ((_robust_range(df_plot, bound_pct)
+                   if bound_pct < 100 else _shared_range(df_plot))
+                  if len(df_plot) else None)
     traj = build_trajectory_figure(df_traj, group_by, pool_mode, ncols=ncols_val,
                                    color_by=color_by or "individual",
                                    animate=do_animate,
@@ -5789,10 +6207,11 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                                    rois=rois, reach_radius=reach,
                                    show_rois=want_rois and not do_rebase,
                                    roi_counts=roi_counts,
-                                   roi_outcomes=roi_outcomes)
+                                   roi_outcomes=roi_outcomes,
+                                   view_range=shared_fit)
     heat = build_heatmap_figure(df_heat, group_by, pool_mode, ncols=ncols_val,
                                 bin_size=hm_binsize, log_scale=(hm_scale == "log"),
-                                bound_pct=hm_bound if hm_bound else 100,
+                                bound_pct=bound_pct,
                                 metric=hm_metric or "time",
                                 cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
                                 rois=rois if want_rois and not do_rebase else None,

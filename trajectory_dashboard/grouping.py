@@ -27,10 +27,10 @@ def _has_values(values) -> bool:
         return bool(values)
 
 
-def _normalise_trial_range(trial_range):
-    if not trial_range:
+def _normalise_range(value_range):
+    if not value_range:
         return None
-    lo, hi = trial_range
+    lo, hi = value_range
     if lo is None and hi is None:
         return None
     if lo is not None and hi is not None and float(lo) > float(hi):
@@ -61,6 +61,7 @@ class FilterSpec:
     scenes: tuple[str, ...] | None = None
     folders: tuple[str, ...] | None = None
     trial_range: tuple[float | None, float | None] | None = None
+    step_range: tuple[float | None, float | None] | None = None
     velocity_range: tuple[float, float] | None = None
     displacement_range: tuple[float, float] | None = None
 
@@ -98,17 +99,21 @@ def subset_frame(
     scenes=None,
     folders=None,
     trial_range: tuple[float | None, float | None] | None = None,
+    step_range: tuple[float | None, float | None] | None = None,
 ) -> pd.DataFrame:
-    """Return rows matching optional metadata and trial-number subsets.
+    """Return rows matching optional metadata, trial, and step subsets.
 
     `trial_range` is inclusive and uses the dataset's numeric `CurrentTrial`
-    column.
+    column. `step_range` is inclusive and uses numeric `CurrentStep`; because
+    step is constant within `_seg_id`, this keeps or drops complete segments.
     """
 
     if df is None or len(df) == 0:
         return df
-    trng = _normalise_trial_range(trial_range)
-    if not any(_has_values(v) for v in (configs, vrs, fly_ids, scenes, folders)) and not trng:
+    trng = _normalise_range(trial_range)
+    srng = _normalise_range(step_range)
+    if (not any(_has_values(v) for v in (configs, vrs, fly_ids, scenes, folders))
+            and not trng and not srng):
         return df
     mask = pd.Series(True, index=df.index)
     if _has_values(configs):
@@ -128,6 +133,13 @@ def subset_frame(
             mask &= trial >= float(lo)
         if hi is not None:
             mask &= trial <= float(hi)
+    if srng:
+        lo, hi = srng
+        step = pd.to_numeric(df["CurrentStep"], errors="coerce")
+        if lo is not None:
+            mask &= step >= float(lo)
+        if hi is not None:
+            mask &= step <= float(hi)
     return df[mask].copy()
 
 
@@ -150,6 +162,7 @@ def filter_frame(
         scenes=spec.scenes,
         folders=spec.folders,
         trial_range=spec.trial_range,
+        step_range=spec.step_range,
     )
     if len(subset) == 0:
         return FilterResult(subset, subset, None)
