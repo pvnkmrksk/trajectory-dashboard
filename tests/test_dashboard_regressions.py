@@ -1,6 +1,8 @@
 import math
+import inspect
 from types import SimpleNamespace
 import unittest
+from urllib.parse import parse_qs
 
 import numpy as np
 import pandas as pd
@@ -252,13 +254,42 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("heatmap-crange").value, "percentile")
         self.assertIsNotNone(_component("step-range"))
         restored = app.restore_from_url("?smin=2&smax=4&hcrange=percentile", False)
-        self.assertEqual(len(restored), 42)
+        self.assertEqual(len(restored), 43)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[34], [2.0, 4.0])
-        self.assertEqual(len(app.restore_from_url("", True)), 42)
+        self.assertEqual(len(app.restore_from_url("", True)), 43)
         value_restore = app.restore_from_url(
             "?hcmin=150&hcmax=200&hcrange=value", False)
         self.assertEqual(value_restore[32], [150.0, 200.0])
+
+    def test_reach_radius_is_unbounded_in_exact_input_and_url(self):
+        exact = _component("roi-reach")
+        slider = _component("roi-reach-slider")
+        self.assertIsNone(getattr(exact, "max", None))
+        self.assertEqual(slider.max, 100)
+
+        restored = app.restore_from_url("?reach=250.5", False)
+        self.assertEqual(restored[-2], 250.5)
+        self.assertIs(app.restore_from_url("?reach=-1", False)[-2], app.no_update)
+
+        args = {name: None for name in inspect.signature(app.update_url).parameters}
+        args.update(restored=True, reach=250.5, rrange=[0, 1], anim=[])
+        params = parse_qs(app.update_url(**args).lstrip("?"))
+        self.assertEqual(params["reach"], ["250.5"])
+
+        original_ctx = app.ctx
+        try:
+            app.ctx = SimpleNamespace(triggered_id="roi-reach")
+            exact_out, slider_out = app.sync_roi_reach_controls(250.5, 3)
+            self.assertIs(exact_out, app.no_update)
+            self.assertEqual(slider_out, 100)
+
+            app.ctx = SimpleNamespace(triggered_id="roi-reach-slider")
+            exact_out, slider_out = app.sync_roi_reach_controls(250.5, 80)
+            self.assertEqual(exact_out, 80)
+            self.assertIs(slider_out, app.no_update)
+        finally:
+            app.ctx = original_ctx
 
     def test_export_is_offline_capable_and_contains_every_section(self):
         fig = app.go.Figure(app.go.Scatter(x=[0, 1], y=[0, 1]))

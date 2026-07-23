@@ -200,6 +200,10 @@ same cache key.
   threshold suggestions does not issue another plot click when both automatic
   cuts are off, so a load produces one master render rather than two identical
   epoch-1 renders.
+- ROI reach radius is stored as the unbounded positive `reach=` URL parameter.
+  `roi-reach` is the authoritative exact number input; `roi-reach-slider` is a
+  0.5–100 convenience view whose handle clamps visually without changing an
+  exact value above 100.
 - `render_config_order_list`/`apply_config_order` expose all loaded configs as a
   draggable order list. The default order uses the sequenceConfig with the best
   coverage; missing configs remain alphabetic at the bottom.

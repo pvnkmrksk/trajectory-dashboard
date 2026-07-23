@@ -271,7 +271,7 @@ shareable URL.
 | Control | Meaning | Rationale |
 |---|---|---|
 | Show target ROIs + reached counts | Adds target rings and exclusive first-reached L/R counts to trajectories; heatmaps get faint rings and corner occupancy labels. | Keeps target context visible without baking it into the trajectory traces while avoiding double-counted trials. |
-| Reach radius (units) | Distance from target center counted as entering/reaching. | Lets you tune strict vs forgiving target contact. |
+| Reach radius (units) | Distance from target center counted as entering/reaching. The slider spans 0.5–100; the adjacent exact input and `reach=` URL parameter accept any positive value. | Lets you tune strict vs forgiving target contact without silently clipping large arenas. |
 | Only trials that entered an ROI | Shows only segments that reached either left or right ROI. | Focuses plots on successful/target-engaged behavior. Trajectory denominators change because whole trials are filtered. |
 | Trim trial tail after ROI exit | Keeps approach and first contact, then drops samples after the first post-ROI exit. | Focuses heatmaps/trajectories on approach/interaction instead of post-choice wandering. Trial-level reached counts usually do not change because the trial still reached. |
 | Trajectory colour: ROI outcome | Colours each segment by first reached side: left ROI, right ROI, or no ROI. | Highlights target outcome while preserving the merged-trace renderer. |

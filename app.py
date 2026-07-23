@@ -3747,10 +3747,18 @@ app.layout = html.Div([
                           options=[{"label": " Show target ROIs + reached counts",
                                     "value": "on"}],
                           value=["on"], style={"fontSize": "11px"}),
-            html.Label("Reach radius (units)", title="Distance from target centre counted as ROI entry.",
-                       style={"fontSize": "10px", "marginTop": "4px"}),
-            dcc.Slider(id="roi-reach", min=0.5, max=30, step=0.5, value=3,
-                       marks={1: "1", 10: "10", 20: "20", 30: "30"},
+            html.Div([
+                html.Label("Reach radius (units)",
+                           title="Distance from target centre counted as ROI entry.",
+                           style={"fontSize": "10px"}),
+                dcc.Input(id="roi-reach", type="number", value=3, min=0.001,
+                          step="any", debounce=False,
+                          style={**_INPUT_STYLE, "width": "78px"}),
+            ], className="compact-control-row",
+               title="Exact radius. Values above the slider maximum are allowed.",
+               style={"marginTop": "4px", "alignItems": "center"}),
+            dcc.Slider(id="roi-reach-slider", min=0.5, max=100, step=0.5, value=3,
+                       marks={1: "1", 25: "25", 50: "50", 75: "75", 100: "100"},
                        tooltip={"placement": "bottom", "always_visible": True}),
             dcc.Checklist(id="roi-entered",
                           options=[{"label": " Only trials that entered an ROI",
@@ -3760,7 +3768,7 @@ app.layout = html.Div([
                           options=[{"label": " Trim trial tail after ROI exit",
                                     "value": "on"}],
                           value=[], style={"fontSize": "11px", "marginTop": "1px"}),
-            html.Div("Targets come from scene configs. Reach radius controls left/right entry counts.",
+            html.Div("The slider covers 0.5–100; the exact box and URL accept any positive radius.",
                      style={"fontSize": "9px", "color": "#888", "marginTop": "2px"}),
 
             html.Hr(style={"margin": "6px 0"}),
@@ -4299,6 +4307,7 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
             "hcmin": "heatmap-cmin", "hcmax": "heatmap-cmax", "ncols": "subplot-ncols",
             "pts": "plot-points", "tmin": "trial-min", "tmax": "trial-max",
             "smin": "step-min", "smax": "step-max",
+            "reach": "roi-reach",
             "rmin": "polar-r-range", "rmax": "polar-r-range",
             "vrmin": "vel-range", "vrmax": "vel-range",
             "drmin": "disp-range", "drmax": "disp-range",
@@ -4352,6 +4361,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("render-mode", "value", allow_duplicate=True),
     Output("view-mode", "value", allow_duplicate=True),
     Output("viewport-store", "data", allow_duplicate=True),
+    Output("roi-reach", "value", allow_duplicate=True),
     Output("url-restored", "data"),
     Input("url", "search"),
     State("url-restored", "data"),
@@ -4360,7 +4370,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 41
+    n_out = 42
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -4376,6 +4386,13 @@ def restore_from_url(search, already):
             v = float(p[k][0]); return int(v) if v.is_integer() else v
         except Exception:
             return no_update
+
+    def positive_num(k):
+        value = num(k)
+        if value is no_update:
+            return no_update
+        numeric = float(value)
+        return value if np.isfinite(numeric) and numeric > 0 else no_update
 
     def jump_ms():
         if "jb" not in p:
@@ -4469,7 +4486,8 @@ def restore_from_url(search, already):
         heat_color_slider_range(),
         trial_slider_range(),
         step_slider_range(),
-        num("pmin"), num("amin"), angle_source, mode, view, vp, True,
+        num("pmin"), num("amin"), angle_source, mode, view, vp,
+        positive_num("reach"), True,
     )
 
 
@@ -4585,6 +4603,7 @@ def tick_progress(n, barstyle, trackstyle):
     Input("polar-angle-source", "value"),
     Input("render-mode", "value"),
     Input("view-mode", "value"),
+    Input("roi-reach", "value"),
     State("viewport-store", "data"),
     State("url-restored", "data"),
     prevent_initial_call=True,
@@ -4592,7 +4611,8 @@ def tick_progress(n, barstyle, trackstyle):
 def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                hbin, hscale, hbound, hmetric, hcmin, hcmax, hcrange,
                fcfg, fvr, ffly, fscn, ffld, tmin, tmax, smin, smax, raw, ncols, pts,
-               rrange, vrange, drange, pmin, amin, angle_source, mode, view, vp, restored):
+               rrange, vrange, drange, pmin, amin, angle_source, mode, view,
+               reach, vp, restored):
     if not restored:
         return no_update
     params = {}
@@ -4601,7 +4621,8 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     nums = {"vel": vel, "disp": disp, "trim": trim, "jb": jb, "hbin": hbin,
             "hbound": hbound, "hcmin": hcmin, "hcmax": hcmax, "ncols": ncols,
             "pts": pts, "tmin": tmin, "tmax": tmax,
-            "smin": smin, "smax": smax, "pmin": pmin, "amin": amin}
+            "smin": smin, "smax": smax, "pmin": pmin, "amin": amin,
+            "reach": reach}
     for k, v in nums.items():
         if v is not None and v != "":
             if k == "trim" and float(v or 0) <= 0:
@@ -5006,6 +5027,33 @@ def sync_trial_range_to_inputs(value, full_min, full_max):
 )
 def sync_step_range_to_inputs(value, full_min, full_max):
     return _range_slider_to_open_bounds(value, full_min, full_max)
+
+
+@app.callback(
+    Output("roi-reach", "value", allow_duplicate=True),
+    Output("roi-reach-slider", "value"),
+    Input("roi-reach", "value"),
+    Input("roi-reach-slider", "value"),
+    prevent_initial_call=True,
+)
+def sync_roi_reach_controls(exact_value, slider_value):
+    """Keep the quick slider and unbounded exact value in sync.
+
+    The number input is authoritative for URL/restored values. Values outside
+    the slider's visual 0.5–100 span move its handle to the nearest endpoint
+    without changing or clipping the exact radius.
+    """
+    if ctx.triggered_id == "roi-reach-slider":
+        return slider_value, no_update
+    if ctx.triggered_id == "roi-reach":
+        try:
+            exact = float(exact_value)
+        except (TypeError, ValueError):
+            return no_update, no_update
+        if not np.isfinite(exact) or exact <= 0:
+            return no_update, no_update
+        return no_update, min(100.0, max(0.5, exact))
+    return no_update, no_update
 
 
 @app.callback(
