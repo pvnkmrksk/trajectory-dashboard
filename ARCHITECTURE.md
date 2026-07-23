@@ -75,6 +75,8 @@ Assets (Dash auto-serves `/assets`):
   workspace styling.
 - `assets/dropzone.js` — folder drag-and-drop → `set_props('drop-data', …)`.
 - `assets/heatsync.js` — re-attaches a relayout→`viewport-store` handler after the heatmap is `newPlot`-ed (Dash's own listener is lost on newPlot).
+- `assets/heatmap_colors.js` — applies metric/scale variants and color-limit
+  restyles directly to the mounted heatmap from the binned cell distribution.
 - `assets/plot_wheel_guard.js` — prevents page/panel scroll while the pointer is
   over Plotly's central wheel-zoom plane; margins still scroll normally.
 - `assets/config_order.js` — drag-to-reorder the full loaded config subplot order
@@ -149,9 +151,12 @@ same cache key.
   from the variant store. Per-side ROI heatmap labels use a boolean union of
   samples hit by any same-side ROI, not a sum over ROI centers, so percentages
   cannot exceed 100% under pooled/overlapping target states.
-- **Diagnostics**: velocity/displacement histograms include the full filtered
-  data. Sidebar mini-histograms and diagnostic histograms are server-aggregated
-  into explicit bounded bar bins; no multi-million-value arrays are sent to the
+- **Diagnostics**: velocity/displacement histograms are native load-time
+  distributions and deliberately do not follow interactive filters. The
+  starting-heading null diagnostic takes the first sorted sample of every
+  `_seg_id` and renders 36 fixed 10-degree `Barpolar` sectors per treatment.
+  Sidebar mini-histograms and diagnostic histograms are server-aggregated into
+  explicit bounded bar bins; no multi-million-value arrays are sent to the
   browser for Plotly auto-binning. The raw
   trace graph remains mounted for callback wiring but its wrapper is hidden
   until raw columns are selected.
@@ -199,12 +204,14 @@ same cache key.
   draggable order list. The default order uses the sequenceConfig with the best
   coverage; missing configs remain alphabetic at the bottom.
 - `update_plots` takes one filtered snapshot and returns trajectory, heatmap
-  store/variants, target diagnostics, polar, raw traces, diagnostics, summary
+  store/variants, target diagnostics, polar, raw traces, summary
   and render state atomically. Retired split-view/lazy callbacks are not
   registered. `update_polar_only` owns moving/R/quality changes and all three
   polar mini-histograms; it reuses the filtered-frame and Rayleigh caches rather
-  than triggering the master renderer. Heatmap-colour controls wait for the
-  completed render state so their aggregation does not compete with it.
+  than triggering the master renderer. Heatmap-colour distributions are derived
+  from the already-computed bin matrices and sent as a small sorted sample;
+  value/percentile changes update only `zmin`, `zmax`, and colorbar ticks in
+  `assets/heatmap_colors.js`, without a dataframe pass or server render.
 - `_filtered_df` normalizes jump-buffer units for cache keys (`100` ms and old
   `0.1` second URLs share a signature). `_roi_masks` caches reached table,
   entered segment ids, and trim masks for fast ROI toggles.
@@ -232,8 +239,8 @@ same cache key.
   to the previous stage, mirroring the actual filter pipeline.
 - `export_html` rebuilds figures server-side and emits one self-contained file.
   Plotly is embedded once (no CDN dependency). It includes trajectories,
-  heatmap, target diagnostics, polar, velocity/displacement diagnostics, and
-  selected raw traces.
+  heatmap, polar, target diagnostics, native velocity/displacement and
+  starting-heading diagnostics, and selected raw traces.
 - The header `status-dock` mirrors load/filter/render/export state and uses
   Dash's body loading class for immediate Working/Ready feedback. Its hover text
   exposes the latest stage timings. Python logging records load, cache, polar,
@@ -248,8 +255,8 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 |---|---|---|
 | Load / dropped folder | Load/cache data, options and metadata; reset range controls on a changed source; render once after that barrier | Stale prior-dataset ranges; URL from pan/zoom |
 | Update all plots (`btn-plot`) | Build every mounted section from one filtered state | Competing per-section builders; direct heatmap `dcc.Graph.figure` |
-| Heatmap bin/bound/cmin/cmax | Debounced all-section update; heatmap store + variants are built exactly | Concurrent heatmap sidebar aggregation |
-| Heatmap metric/scale | Clientside `Plotly.restyle` from the current binning variants | Server rebuild or `newPlot` |
+| Heatmap bin/bound or data filter | Debounced all-section update; heatmap store + variants are built exactly | Concurrent heatmap sidebar aggregation |
+| Heatmap metric/scale/color range mode/value | Clientside `Plotly.restyle` from current binning variants and stored cell distribution | Dataframe filtering/binning, server rebuild or `newPlot` |
 | ROI entered/trim | Debounced atomic update of all affected sections | A second ROI/trajectory refresh callback |
 | Trajectory/heatmap pan/zoom | Immediate clientside peer relayout plus debounced `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
 | Section navigation | Clientside scroll only, including replay of the active tab | Any server render, graph hide/show or Plotly reinitialisation |
@@ -313,14 +320,14 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
 ## 8. Known issues / glitches / limitations
 
 - **Heatmap "flash" on rebuild — largely resolved.** The heatmap re-inits only on
-  a real *binning* change (bin size/bound/cmin/cmax or filter); opacity stays
+  a real *binning* change (bin size/bound or filter); opacity stays
   stable during the guarded `newPlot`, and section navigation does no plot work.
   **Metric/scale swaps
   are instant, in-place, flash-free:** every metric×scale variant is precomputed
   at bin time (`build_heatmap_and_variants` → `heatmap-variants` store, ~0.7 MB)
   and the clientside `Plotly.restyle`s z/customdata/zmin/zmax/colorbar — no server
-  round-trip, no newPlot. metric/scale are therefore NOT server inputs; the
-  fingerprint tracks binning only (no zmin/zmax).
+  round-trip, no newPlot. Metric, scale and color limits are therefore NOT
+  master-renderer inputs; the fingerprint tracks binning only (no zmin/zmax).
   *Cleanest future fix remains:* a `Plotly.react`-safe subplot state that drops
   the newPlot/heatsync machinery entirely.
 - **Heatmap→trajectory zoom sync depends on `assets/heatsync.js`.** newPlot drops

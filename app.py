@@ -1929,6 +1929,21 @@ def _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
                                              reach_v))
 
 
+def _heatmap_metric_mats(bins, metric):
+    """Materialise one heatmap metric from the already-computed count bins."""
+    metric = metric if metric in METRIC_UNITS else "count"
+    mats = []
+    for H in bins["counts"]:
+        M = H.copy()
+        if metric == "time":
+            M = M * bins["dt"]
+        elif metric == "percent":
+            total = M.sum()
+            M = (100.0 * M / total) if total > 0 else M
+        mats.append(M)
+    return mats
+
+
 def _heatmap_variant(bins, metric, log_scale, cmin=None, cmax=None,
                      crange_mode="value"):
     """Cheap: turn the raw-count bins into one metric/scale variant's per-trace
@@ -1937,15 +1952,7 @@ def _heatmap_variant(bins, metric, log_scale, cmin=None, cmax=None,
     metric = metric if metric in METRIC_UNITS else "count"
     unit = METRIC_UNITS[metric]
     dt = bins["dt"]
-    mats = []
-    for H in bins["counts"]:
-        M = H.copy()
-        if metric == "time":
-            M = M * dt
-        elif metric == "percent":
-            tot = M.sum()
-            M = (100.0 * M / tot) if tot > 0 else M
-        mats.append(M)
+    mats = _heatmap_metric_mats(bins, metric)
     gmax = max((float(m.max()) if m.size else 0.0) for m in mats) if mats else 0.0
     nonzero = np.concatenate([m[m > 0].ravel() for m in mats]) if mats else np.array([])
     auto_lo = (float(nonzero.min()) if nonzero.size else 1.0) if log_scale else 0.0
@@ -2040,6 +2047,32 @@ HEATMAP_METRICS = ("time", "percent", "count")
 HEATMAP_SCALES = ("lin", "log")
 
 
+def _heatmap_color_distributions(bins) -> dict:
+    """Small browser-safe colour distributions derived from binned matrices.
+
+    Colour-limit changes only need the few thousand occupied heatmap cells, not
+    another pass over a multi-million-row dataframe.  The sorted sample is used
+    for interactive percentile lookup; exact current figures still come from
+    the complete bin matrices in ``_heatmap_variant``.
+    """
+    out = {}
+    for metric in HEATMAP_METRICS:
+        mats = _heatmap_metric_mats(bins, metric)
+        nonzero = (np.concatenate([m[m > 0].ravel() for m in mats])
+                   if mats else np.array([], dtype=float))
+        nonzero = nonzero[np.isfinite(nonzero)]
+        lo, hi = _range_bounds(nonzero, floor_zero=True,
+                               upper_pct=MINI_HIST_UPPER_PCT)
+        out[metric] = {
+            "values": _sample_for_store(nonzero),
+            "lo": float(lo),
+            "hi": float(hi),
+            "max": float(nonzero.max()) if nonzero.size else 1.0,
+            "min_positive": float(nonzero.min()) if nonzero.size else 1.0,
+        }
+    return out
+
+
 def _all_variants_from_bins(bins, cmin, cmax, crange_mode):
     return {f"{m}_{s}": _heatmap_variant(bins, log_scale=(s == "log"), metric=m,
                                          cmin=cmin, cmax=cmax, crange_mode=crange_mode)
@@ -2073,13 +2106,13 @@ def build_heatmap_mask_variants(df_f, pattern, reach, group_by, pool_mode, ncols
     and scale still swap clientside from this state's variants.
     """
     if df_f is None or len(df_f) == 0:
-        return _msg_figure("No trajectories match the active filters."), {}
+        return _msg_figure("No trajectories match the active filters."), {}, {}
     reach_v = float(reach) if reach else 3.0
     df_view, _ = _roi_apply(df_f, pattern, reach_v, entered_only, trim_tail)
     base = rebase_to_origin(df_view) if (do_rebase and len(df_view)) else df_view
     base = _decimate_frame(base, max_points)
     if len(base) == 0:
-        return _msg_figure("No trajectories remain after target filtering."), {}
+        return _msg_figure("No trajectories remain after target filtering."), {}, {}
     xedges, yedges, rng = _heatmap_edges(base, bin_size, bound_pct)
     xc = (0.5 * (xedges[:-1] + xedges[1:])).tolist()
     yc = (0.5 * (yedges[:-1] + yedges[1:])).tolist()
@@ -2103,7 +2136,7 @@ def build_heatmap_mask_variants(df_f, pattern, reach, group_by, pool_mode, ncols
     metric = metric if metric in HEATMAP_METRICS else "time"
     scale = "log" if log_scale else "lin"
     base_fig = _assemble_heatmap(bins, store[f"e{e}_t{t}_{metric}_{scale}"], ncols, base)
-    return base_fig, store
+    return base_fig, store, _heatmap_color_distributions(bins)
 
 
 def build_velocity_histogram(df, vel_threshold=None, velocity_values=None):
@@ -2328,7 +2361,8 @@ def _range_bounds(values, default=(0.0, 1.0), floor_zero=True,
 
 
 def build_mini_histogram(values, selected=None, *, bins=MINI_HIST_BINS,
-                         color="#2563eb", x_range=None) -> go.Figure:
+                         color="#2563eb", x_range=None,
+                         uniform_bins=False) -> go.Figure:
     vals = _finite_values(values)
     rng = _numeric_range(selected)
     fig = go.Figure()
@@ -2337,7 +2371,9 @@ def build_mini_histogram(values, selected=None, *, bins=MINI_HIST_BINS,
     if vals.size and lo is not None and hi is not None:
         plot_vals = vals[(vals >= float(lo)) & (vals <= float(hi))]
     if plot_vals.size:
-        edges = _histogram_edges(plot_vals, lo, hi, max_bins=bins)
+        edges = (np.linspace(float(lo), float(hi), int(bins) + 1)
+                 if uniform_bins else
+                 _histogram_edges(plot_vals, lo, hi, max_bins=bins))
         counts, edges = np.histogram(plot_vals, bins=edges)
         centres = 0.5 * (edges[:-1] + edges[1:])
         fig.add_trace(go.Bar(
@@ -2499,13 +2535,73 @@ def build_raw_trace_figure(df, columns, max_points=None):
     return fig
 
 
+def build_initial_heading_distribution(df, ncols=2, bins=36) -> go.Figure:
+    """Raw first-sample body-heading distribution for every treatment.
+
+    This is intentionally a load-time diagnostic: it uses the first sorted row
+    of each globally unique ``_seg_id`` in the native dataset and never follows
+    the interactive analysis filters.  The fixed 36 bins are 10-degree sectors.
+    """
+    if df is None or len(df) == 0:
+        return _msg_figure("No raw segments are available for starting headings.", 360)
+    if "GameObjectRotY" not in df:
+        return _msg_figure("GameObjectRotY is unavailable; starting headings cannot be shown.",
+                           360)
+    first = df.drop_duplicates("_seg_id", keep="first")
+    angles = pd.to_numeric(first["GameObjectRotY"], errors="coerce")
+    first = first.assign(_initial_heading=np.mod(angles, 360.0))
+    first = first[np.isfinite(first["_initial_heading"].to_numpy(dtype=float))]
+    if len(first) == 0:
+        return _msg_figure("No valid first-sample body headings were found.", 360)
+
+    names = _ordered_values(first["ConfigFile"].dropna().unique())
+    ncols = max(1, int(ncols or 2))
+    nrows = max(1, (len(names) + ncols - 1) // ncols)
+    specs = [[{"type": "polar"} for _ in range(ncols)] for _ in range(nrows)]
+    edges = np.linspace(0.0, 360.0, int(bins) + 1)
+    centres = (0.5 * (edges[:-1] + edges[1:])).tolist()
+    widths = np.diff(edges).tolist()
+    titles = []
+    counts_by_name = {}
+    for name in names:
+        vals = first.loc[first["ConfigFile"] == name, "_initial_heading"].to_numpy()
+        counts, _ = np.histogram(vals, bins=edges)
+        counts_by_name[name] = counts
+        titles.append(
+            f"{_wrap_subplot_title(humanise_config(name))}<br>{len(vals):,} segment starts")
+    fig = make_subplots(
+        rows=nrows, cols=ncols, specs=specs, subplot_titles=titles,
+        horizontal_spacing=0.08, vertical_spacing=min(0.14, 0.7 / nrows))
+    for idx, name in enumerate(names):
+        row, col = idx // ncols + 1, idx % ncols + 1
+        fig.add_trace(go.Barpolar(
+            r=counts_by_name[name].tolist(), theta=centres, width=widths,
+            marker_color=COLORS[idx % len(COLORS)], marker_line_width=0.3,
+            opacity=0.78, showlegend=False,
+            hovertemplate="start heading %{theta:.0f}°<br>%{r:,} segments<extra></extra>"),
+            row=row, col=col)
+    fig.update_polars(
+        angularaxis=dict(rotation=90, direction="clockwise", thetaunit="degrees",
+                         tickmode="array", tickvals=list(range(0, 360, 45))),
+        radialaxis=dict(angle=90, tickangle=90, rangemode="tozero"),
+        bgcolor="white")
+    for ann in fig.layout.annotations:
+        ann.update(font=dict(size=10), yshift=8)
+    fig.update_layout(
+        height=80 + nrows * 380, template="plotly_white",
+        margin=dict(l=45, r=45, t=72, b=35), showlegend=False,
+        uirevision="raw_initial_heading")
+    return fig
+
+
 def build_polar_r_histogram(ray: pd.DataFrame | None, r_range=None) -> go.Figure:
     lo, hi = _polar_r_range(r_range)
     values = np.array([], dtype=float)
     if ray is not None and len(ray):
         values = _finite_values(ray["R"].to_numpy(dtype=float))
     fig = build_mini_histogram(
-        values, [lo, hi], bins=24, color="#2563eb", x_range=(0, 1))
+        values, [lo, hi], bins=36, color="#2563eb", x_range=(0, 1),
+        uniform_bins=True)
     if fig.data:
         fig.data[0].hovertemplate = ("R %{customdata[0]:.2f}–%{customdata[1]:.2f}"
                                      "<br>%{y:,} trials<extra></extra>")
@@ -2936,9 +3032,11 @@ def build_polar_quality_histograms(ray: pd.DataFrame | None, r_range=None,
                     if ray is not None and len(ray) else np.array([], dtype=float))
     animal_values = _polar_animal_good_fractions(ray, r_range, pfrac)
     point_hist = build_mini_histogram(
-        point_values, [pfrac, 1.0], bins=24, color="#7c3aed", x_range=(0, 1))
+        point_values, [pfrac, 1.0], bins=36, color="#7c3aed", x_range=(0, 1),
+        uniform_bins=True)
     animal_hist = build_mini_histogram(
-        animal_values, [afrac, 1.0], bins=24, color="#0f766e", x_range=(0, 1))
+        animal_values, [afrac, 1.0], bins=36, color="#0f766e", x_range=(0, 1),
+        uniform_bins=True)
     if point_hist.data:
         point_hist.data[0].hovertemplate = (
             "valid-point fraction %{customdata[0]:.2f}–%{customdata[1]:.2f}"
@@ -3073,6 +3171,15 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
     if df is None or len(df) == 0:
         return _msg_figure("No trajectories match the active filters.")
     color_by = color_by or "individual"
+    groups = _group_frames(df, group_by, pool_mode, ncols)
+    names = list(groups.keys())
+    n = len(names)
+    nrows = max(1, (n + ncols - 1) // ncols)
+    total_by_group = {name: int(group["_seg_id"].nunique())
+                      for name, group in groups.items()}
+    # seg -> subplot-group map (vectorised via concat of per-group index labels)
+    seg_group = pd.concat([pd.Series(gname, index=g["_seg_id"].unique())
+                           for gname, g in groups.items()]) if names else pd.Series(dtype=object)
     angle_source = str(angle_source or "orientation").lower()
     if angle_source != "orientation" or "GameObjectRotY" not in df:
         angle_source = "movement"
@@ -3081,25 +3188,12 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
         df, moving_only, walk_thresh, ray_metric,
         angle_source=angle_source)
     ray = ray.dropna(subset=["R", "theta_deg"])
-    if len(ray) == 0:
-        fig = _msg_figure("No headings meet the current moving-sample threshold.")
-        return (fig, {"start_trials": 0, "after_trial": 0, "after_animal": 0,
-                      "start_animals": 0, "after_animals": 0}) if return_summary else fig
     ray, quality = _filter_polar_ray_table(ray, r_range, min_point_frac,
                                            min_animal_trial_frac)
-    if len(ray) == 0:
-        fig = _msg_figure("No trials pass the polar Rayleigh/quality filters.")
-        return (fig, quality) if return_summary else fig
-
-    groups = _group_frames(df, group_by, pool_mode, ncols)
-    names = list(groups.keys())
-    n = len(names)
-    nrows = max(1, (n + ncols - 1) // ncols)
-    # seg -> subplot-group map (vectorised via concat of per-group index labels)
-    seg_group = pd.concat([pd.Series(gname, index=g["_seg_id"].unique())
-                           for gname, g in groups.items()]) if names else pd.Series(dtype=object)
     ray = ray.assign(group=ray["_seg_id"].map(seg_group))
     population_ray = ray
+    kept_by_group = (population_ray.groupby("group", sort=False, observed=True)["_seg_id"]
+                     .nunique().to_dict() if len(population_ray) else {})
     ray = _thin_ray_table(ray, max_points=max_points)
     seq_vals, seq_cmin, seq_cmax, seq_title = _polar_seq_values(ray, color_by)
     if seq_vals is not None:
@@ -3108,9 +3202,13 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
 
     specs = [[{"type": "polar"} for _ in range(ncols)] for _ in range(nrows)]
     vspace = min(0.12, 0.7 / max(nrows, 1))
+    titles = [
+        (f"{_wrap_subplot_title(humanise_config(name))}<br>"
+         f"{int(kept_by_group.get(name, 0)):,}/{total_by_group.get(name, 0):,} trials shown")
+        for name in names
+    ]
     fig = make_subplots(rows=nrows, cols=ncols, specs=specs,
-                        subplot_titles=[_wrap_subplot_title(humanise_config(t))
-                                        for t in names],
+                        subplot_titles=titles,
                         horizontal_spacing=0.06, vertical_spacing=vspace)
 
     legend_seen = set()
@@ -3944,11 +4042,11 @@ app.layout = html.Div([
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Heatmap", value="heat",
                         className="view-tab", selected_className="view-tab-selected"),
-                dcc.Tab(label="Diagnostics", value="diag",
+                dcc.Tab(label="Polar", value="polar",
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Targets", value="roi",
                         className="view-tab", selected_className="view-tab-selected"),
-                dcc.Tab(label="Polar", value="polar",
+                dcc.Tab(label="Diagnostics", value="diag",
                         className="view-tab", selected_className="view-tab-selected"),
             ], style={"flexShrink": "0"}),
 
@@ -4004,29 +4102,20 @@ app.layout = html.Div([
                                        "pointerEvents": "none"})],
                     id="view-heat", className="plot-section", style={**_PANEL_STYLE}),
 
-                # --- Diagnostics ---
-                html.Div([
-                    html.Div([html.H4("Diagnostics"),
-                              html.Span("Filter distributions and raw signals", className="plot-section-kicker")],
-                             className="plot-section-heading"),
-                    html.Div([
-                        dcc.Graph(id="vel-histogram", figure=_EMPTY,
+                # --- Polar ---
+                html.Div(
+                    [html.Div([html.H4("Polar direction"),
+                               html.Span("Per-trial vectors and pooled population mean", className="plot-section-kicker")],
+                              className="plot-section-heading"),
+                     dcc.Loading(
+                        dcc.Graph(id="polar-plot", figure=_EMPTY, responsive=False,
                                   config=GRAPH_CONFIG,
-                                  style={"flex": "1", "minWidth": "0"}),
-                        dcc.Graph(id="disp-histogram", figure=_EMPTY,
-                                  config=GRAPH_CONFIG,
-                                  style={"flex": "1", "minWidth": "0"}),
-                    ], style={"display": "flex", "gap": "6px"}),
-                    html.Div(
-                        dcc.Loading(
-                            dcc.Graph(id="raw-trace-plot", figure=_EMPTY,
-                                      config=GRAPH_CONFIG),
-                            type="circle", delay_show=250, delay_hide=250,
-                            overlay_style={"visibility": "visible", "opacity": 0.55,
-                                           "transition": "opacity .2s",
-                                           "pointerEvents": "none"}),
-                        id="raw-trace-wrap", style={"display": "none"}),
-                ], id="view-diag", className="plot-section", style={**_PANEL_STYLE}),
+                                  style={"width": "100%"}),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s",
+                                       "pointerEvents": "none"})],
+                    id="view-polar", className="plot-section", style={**_PANEL_STYLE}),
 
                 # --- ROI counts (violins) ---
                 html.Div(
@@ -4043,20 +4132,43 @@ app.layout = html.Div([
                                        "pointerEvents": "none"})],
                     id="view-roi", className="plot-section", style={**_PANEL_STYLE}),
 
-                # --- Polar ---
-                html.Div(
-                    [html.Div([html.H4("Polar direction"),
-                               html.Span("Per-trial vectors and pooled population mean", className="plot-section-kicker")],
-                              className="plot-section-heading"),
-                     dcc.Loading(
-                        dcc.Graph(id="polar-plot", figure=_EMPTY, responsive=False,
+                # --- Raw, load-time diagnostics (intentionally last) ---
+                html.Div([
+                    html.Div([html.H4("Diagnostics"),
+                              html.Span("Native distributions; independent of active filters",
+                                        className="plot-section-kicker")],
+                             className="plot-section-heading"),
+                    html.Div([
+                        dcc.Graph(id="vel-histogram", figure=_EMPTY,
                                   config=GRAPH_CONFIG,
-                                  style={"width": "100%"}),
-                        type="circle", delay_show=250, delay_hide=250,
-                        overlay_style={"visibility": "visible", "opacity": 0.55,
-                                       "transition": "opacity .2s",
-                                       "pointerEvents": "none"})],
-                    id="view-polar", className="plot-section", style={**_PANEL_STYLE}),
+                                  style={"flex": "1", "minWidth": "0"}),
+                        dcc.Graph(id="disp-histogram", figure=_EMPTY,
+                                  config=GRAPH_CONFIG,
+                                  style={"flex": "1", "minWidth": "0"}),
+                    ], style={"display": "flex", "gap": "6px"}),
+                    html.Div([
+                        dcc.Checklist(
+                            id="diag-start-heading-toggle",
+                            options=[{"label": " Show raw starting-heading null distribution",
+                                      "value": "on"}],
+                            value=["on"], inline=True,
+                            style={"fontSize": "12px", "color": "#475569",
+                                   "padding": "4px 8px"}),
+                        html.Div(
+                            dcc.Graph(id="initial-heading-plot", figure=_EMPTY,
+                                      config=GRAPH_CONFIG, style={"width": "100%"}),
+                            id="diag-start-heading-wrap", style={"display": "block"}),
+                    ]),
+                    html.Div(
+                        dcc.Loading(
+                            dcc.Graph(id="raw-trace-plot", figure=_EMPTY,
+                                      config=GRAPH_CONFIG),
+                            type="circle", delay_show=250, delay_hide=250,
+                            overlay_style={"visibility": "visible", "opacity": 0.55,
+                                           "transition": "opacity .2s",
+                                           "pointerEvents": "none"}),
+                        id="raw-trace-wrap", style={"display": "none"}),
+                ], id="view-diag", className="plot-section", style={**_PANEL_STYLE}),
             ], id="plot-drop-target", className="plot-drop-target",
                style={"position": "relative", "minWidth": "0"}),
         ], id="main-scroll", className="td-main",
@@ -4071,6 +4183,7 @@ app.layout = html.Div([
     dcc.Store(id="viewport-store"),
     dcc.Store(id="heatmap-figure-store"),
     dcc.Store(id="heatmap-variants"),
+    dcc.Store(id="heatmap-color-distributions"),
     dcc.Store(id="heatmap-color-values"),
     dcc.Store(id="config-order-store"),
     dcc.Store(id="auto-thresholds"),
@@ -4087,6 +4200,13 @@ app.layout = html.Div([
                  max_intervals=-1, disabled=True),
 ], className="td-app",
    style={"fontFamily": "system-ui, -apple-system, sans-serif", "margin": "0"})
+
+
+app.clientside_callback(
+    "function(v){return {display:(v&&v.indexOf('on')>=0)?'block':'none'};}",
+    Output("diag-start-heading-wrap", "style"),
+    Input("diag-start-heading-toggle", "value"),
+)
 
 
 # Keep a compact, always-visible account of the latest activity. The CSS also
@@ -4528,9 +4648,6 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     Input("animate-toggle", "value"),
     Input("heatmap-binsize", "value"),
     Input("heatmap-bound", "value"),
-    Input("heatmap-cmin", "value"),
-    Input("heatmap-cmax", "value"),
-    Input("heatmap-crange", "value"),
     Input("filter-configs", "value"),
     Input("filter-vrs", "value"),
     Input("filter-flyids", "value"),
@@ -4617,6 +4734,7 @@ def fire_auto_replot(n, armed, clicks, pattern):
     Output("metadata-display", "children"),
     Output("vel-histogram", "figure"),
     Output("disp-histogram", "figure"),
+    Output("initial-heading-plot", "figure"),
     Output("heatmap-binsize", "value", allow_duplicate=True),
     Output("btn-plot", "n_clicks"),
     Output("auto-thresholds", "data"),
@@ -4631,8 +4749,9 @@ def fire_auto_replot(n, armed, clicks, pattern):
 )
 def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     empty = go.Figure().update_layout(height=190, template="plotly_white")
+    empty_heading = _msg_figure("Load data to inspect raw starting headings.", 360)
     nope = ("Choose a folder or enter a CSV glob.", None, None, [], [], [], [], [], [], "",
-            empty, empty,
+            empty, empty, empty_heading,
             no_update, no_update, None, {}, no_update)
     if not pattern:
         LOGGER.warning("ui.load_rejected reason=missing_source")
@@ -4646,7 +4765,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     if df is None or len(df) == 0:
         LOGGER.warning("ui.load_empty source=%r", pattern)
         return (f"No trajectory CSVs matched the current data source.", None, None, [], [], [], [], [], [], "",
-                empty, empty, no_update, no_update, None, {}, {"reset": True})
+                empty, empty, empty_heading, no_update, no_update, None, {}, {"reset": True})
 
     n_files = df["SourceFile"].nunique()
     n_segs = df["_seg_id"].nunique()
@@ -4694,6 +4813,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     vv = vv[np.isfinite(vv)]
     vel_fig = build_velocity_histogram(df, velocity_values=vv)
     disp_fig = build_displacement_histogram(stats)
+    heading_fig = build_initial_heading_distribution(df)
 
     # Auto filter defaults: 99th-pct velocity, and 5% of the median net
     # displacement (a scale-free "barely moved" cut). Stored for the auto boxes.
@@ -4712,7 +4832,7 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
         opts("ConfigFile"), opts("VR"), opts("FlyID"), opts("SceneName"),
         opts("SourceFolder"), col_opts,
         "\n".join(meta_parts) or "No experiment metadata found.",
-        vel_fig, disp_fig, binsize_out,
+        vel_fig, disp_fig, heading_fig, binsize_out,
         no_update, auto, no_update,
         {"reset": True} if reset_controls else no_update,
     )
@@ -4896,64 +5016,40 @@ def sync_step_range_to_inputs(value, full_min, full_max):
     Output("heatmap-color-range", "marks"),
     Output("heatmap-color-range", "value"),
     Output("heatmap-color-hist", "figure"),
-    # Run after the atomic figure build.  The previous callback raced that
-    # build over the same multi-million-row frame and could double wall time.
-    Input("view-render-state", "data"),
+    # These distributions are derived from the already-computed heatmap bins.
+    # Colour-control changes therefore never revisit the source dataframe.
+    Input("heatmap-color-distributions", "data"),
     Input("heatmap-metric", "value"),
     Input("heatmap-crange", "value"),
-    State("store-glob", "data"),
-    State("heatmap-binsize", "value"),
-    State("heatmap-bound", "value"),
     State("heatmap-color-range", "value"),
     State("heatmap-color-values", "data"),
-    State("vel-threshold", "value"),
-    State("min-disp", "value"),
-    State("trim-samples", "value"),
-    State("jump-buffer", "value"),
-    State("filter-configs", "value"),
-    State("filter-vrs", "value"),
-    State("filter-flyids", "value"),
-    State("filter-scenes", "value"),
-    State("filter-folders", "value"),
-    State("trial-min", "value"),
-    State("trial-max", "value"),
-    State("step-min", "value"),
-    State("step-max", "value"),
-    State("vel-range", "value"),
-    State("disp-range", "value"),
     prevent_initial_call=True,
 )
-def update_heatmap_color_controls(_render_state, metric, mode, pattern, binsize, bound,
-                                  current, previous, vel_thresh, min_disp, trim, jump_buf,
-                                  cfg, vrs, fids, scenes, folders,
-                                  trial_min, trial_max, step_min, step_max,
-                                  vel_range, disp_range):
+def update_heatmap_color_controls(distributions, metric, mode, current, previous):
     empty = build_mini_histogram(None, color="#0f766e")
-    default = ({}, 0, 1, 0.01, {0: "0", 1: "1"}, [0, 1], empty)
-    if not pattern:
+    mode = mode or "percentile"
+    default_range = [0, 100] if mode == "percentile" else [0, 1]
+    default = ({}, default_range[0], default_range[1],
+               1 if mode == "percentile" else 0.01,
+               ({0: "0", 50: "50", 100: "100"} if mode == "percentile"
+                else {0: "0", 1: "1"}), default_range, empty)
+    dist = (distributions or {}).get(metric or "time")
+    if not dist:
         return default
-    df_f, df_sub, _ = _filtered_df(
-        pattern, vel_thresh, min_disp, trim, jump_buf,
-        cfg, vrs, fids, scenes, folders, trial_min, trial_max,
-        step_min, step_max, vel_range, disp_range)
-    if df_f is None or len(df_f) == 0:
-        return default
-    values = _heatmap_metric_values(df_f, binsize, bound if bound else 100,
-                                    metric or "time")
-    lo, hi = _range_bounds(values, floor_zero=True, upper_pct=MINI_HIST_UPPER_PCT)
-    store = {
-        "values": _sample_for_store(values),
-        "lo": float(lo),
-        "hi": float(hi),
-        "metric": metric or "time",
-        "mode": mode or "value",
-    }
+    values = _finite_values(dist.get("values", []))
+    lo = float(dist.get("lo", 0.0))
+    hi = float(dist.get("hi", 1.0))
+    if not hi > lo:
+        hi = lo + 1.0
+    store = {**dist, "metric": metric or "time", "mode": mode}
+    previous = previous or {}
+    prior_mode = previous.get("mode")
+    same_metric = previous.get("metric") == (metric or "time")
+    current_rng = _numeric_range(current)
     if mode == "percentile":
-        prior_mode = (previous or {}).get("mode")
-        current_rng = _numeric_range(current)
-        if prior_mode == "percentile" and current_rng:
+        if same_metric and prior_mode == "percentile" and current_rng:
             selected = [max(0.0, current_rng[0]), min(100.0, current_rng[1])]
-        elif prior_mode == "value" and current_rng:
+        elif same_metric and prior_mode == "value" and current_rng:
             selected = [_percentile_rank(values, current_rng[0]),
                         _percentile_rank(values, current_rng[1])]
         else:
@@ -4965,7 +5061,13 @@ def update_heatmap_color_controls(_render_state, metric, mode, pattern, binsize,
             selected_out,
             build_percentile_mini_histogram(values, selected, color="#0f766e"),
         )
-    selected = _range_control_value(current, lo, hi)
+    if same_metric and prior_mode == "percentile" and current_rng and values.size:
+        selected = [float(np.percentile(values, max(0.0, current_rng[0]))),
+                    float(np.percentile(values, min(100.0, current_rng[1])))]
+    elif same_metric and prior_mode == "value":
+        selected = _range_control_value(current, lo, hi)
+    else:
+        selected = [lo, hi]
     selected_out = (no_update
                     if _numeric_range(current) == _numeric_range(selected)
                     else selected)
@@ -5010,11 +5112,10 @@ def sync_heatmap_color_range(value, mode, data, current_cmin, current_cmax):
     full_hi = float((data or {}).get("hi", hi))
     span = max(abs(full_hi - full_lo), 1.0)
     eps = span * 1e-9
-    is_full = lo <= full_lo + eps and hi >= full_hi - eps
     fig = build_mini_histogram(values, [lo, hi], color="#0f766e",
                                x_range=(full_lo, full_hi))
-    cmin = None if is_full else _input_number(lo)
-    cmax = None if is_full else _input_number(hi)
+    cmin = None if lo <= full_lo + eps else _input_number(lo)
+    cmax = None if hi >= full_hi - eps else _input_number(hi)
     return (no_update if cmin == current_cmin else cmin,
             no_update if cmax == current_cmax else cmax, fig)
 
@@ -5569,13 +5670,12 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     Output("trajectory-plot", "figure"),
     Output("heatmap-figure-store", "data", allow_duplicate=True),
     Output("heatmap-variants", "data", allow_duplicate=True),
+    Output("heatmap-color-distributions", "data", allow_duplicate=True),
     Output("roi-plot", "figure", allow_duplicate=True),
     Output("polar-plot", "figure", allow_duplicate=True),
     Output("raw-trace-plot", "figure"),
     Output("raw-trace-wrap", "style"),
     Output("data-summary", "children"),
-    Output("vel-histogram", "figure", allow_duplicate=True),
-    Output("disp-histogram", "figure", allow_duplicate=True),
     Output("exclusion-info", "children"),
     Output("view-render-state", "data", allow_duplicate=True),
     Output("plot-status", "children", allow_duplicate=True),
@@ -5638,9 +5738,9 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     raw_hidden = {"display": "none"}
     if not pattern:
-        return (empty, empty, {}, empty, empty, empty, raw_hidden,
+        return (empty, empty, {}, {}, empty, empty, empty, raw_hidden,
                 "Choose a data folder or CSV glob to begin.",
-                no_update, no_update, "", {}, "Waiting for data.")
+                "", {}, "Waiting for data.")
 
     started = time.perf_counter()
     stage_started = started
@@ -5667,13 +5767,13 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     if df_sub is None:
         msg = "No CSV rows matched the current data source."
         LOGGER.warning("render.empty epoch=%s reason=no_rows source=%r", n, pattern)
-        return (empty, empty, {}, empty, empty, empty, raw_hidden, msg,
-                no_update, no_update, "", {"epoch": int(n or 0)}, msg)
+        return (empty, empty, {}, {}, empty, empty, empty, raw_hidden, msg,
+                "", {"epoch": int(n or 0)}, msg)
     if len(df_sub) == 0:
         msg = "No trajectories match the active filters."
         LOGGER.warning("render.empty epoch=%s reason=filters source=%r", n, pattern)
-        return (empty, empty, {}, empty, empty, empty, raw_hidden, msg,
-                no_update, no_update, "", {"epoch": int(n or 0)}, msg)
+        return (empty, empty, {}, {}, empty, empty, empty, raw_hidden, msg,
+                "", {"epoch": int(n or 0)}, msg)
 
     df, _, metas = _load_data(pattern)
     ncols_val = int(ncols) if ncols and ncols >= 1 else 2
@@ -5726,7 +5826,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     # frame. Speed mode only limits browser primitives; it never changes counts,
     # circular statistics, residence time, or diagnostic distributions.
     stage_started = time.perf_counter()
-    heat_fig, heat_variants = build_heatmap_mask_variants(
+    heat_fig, heat_variants, heat_color_distributions = build_heatmap_mask_variants(
         df_f, pattern, reach, group_by, pool_mode, ncols_val,
         bin_size=hm_binsize, bound_pct=bound_pct,
         cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
@@ -5755,9 +5855,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         df_view, raw_cols or [],
         max_points=_budget(BUDGET_RAW, BUDGET_RAW_SPEED, mode, max_points))
         if raw_cols else empty)
-    vel_fig = build_velocity_histogram(df_view, vel_thresh)
-    disp_fig = build_displacement_histogram(compute_segment_stats(df_view), min_disp)
-    timings["diagnostic plots"] = time.perf_counter() - stage_started
+    timings["raw traces"] = time.perf_counter() - stage_started
 
     drawn = sum(len(t.x) for t in traj_fig.data
                 if getattr(t, "x", None) is not None)
@@ -5787,8 +5885,9 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         "timings": {k: round(float(v), 4) for k, v in timings.items()},
         "operation": "all sections",
     }
-    return (traj_fig, heat_fig.to_plotly_json(), heat_variants, roi_fig, polar_fig,
-            raw_fig, raw_style, summary, vel_fig, disp_fig, exclusion,
+    return (traj_fig, heat_fig.to_plotly_json(), heat_variants,
+            heat_color_distributions, roi_fig, polar_fig,
+            raw_fig, raw_style, summary, exclusion,
             render_state, f"Ready — all sections updated in {bt:.2f}s.")
 
 
@@ -5970,7 +6069,7 @@ app.clientside_callback(
 # Fingerprint the structural content so metric/scale restyles never trigger a
 # second newPlot. Section navigation is intentionally absent from this callback.
 app.clientside_callback(
-    "function(hfig, metric, scale, entered, trim, variants){setTimeout(function(){"
+    "function(hfig,metric,scale,entered,trim,colorRange,rangeMode,colorData,variants){setTimeout(function(){"
     "var hc=document.getElementById('heatmap-plot');"
     "var hg=hc&&hc.querySelector('.js-plotly-plot');"
     "var fp='';try{var L=(hfig&&hfig.layout)||{};"
@@ -6004,15 +6103,8 @@ app.clientside_callback(
     "var t=(trim&&trim.indexOf('on')>=0)?1:0;"
     "var key='e'+e+'_t'+t+'_'+(metric||'time')+'_'+(scale||'lin');"
     "var v=variants&&variants[key];"
-    "if(v&&hg&&hg.data&&hg.data.length){"
-    "var vi=v.z.map(function(_,i){return i;});"
-    "window.Plotly.restyle(hg,{z:v.z,customdata:v.customdata},vi);"
-    "window.Plotly.restyle(hg,{zmin:v.zmin,zmax:v.zmax,hovertemplate:v.hovertemplate});"
-    "window.Plotly.restyle(hg,{colorbar:[v.colorbar]},[0]);"
-    "if(v.roi_texts&&hg.layout&&hg.layout.annotations){"
-    "var j=0;var anns=hg.layout.annotations.map(function(a){"
-    "var b=Object.assign({},a);if((b.name||'').indexOf('hm-roi')===0){b.text=v.roi_texts[j++]||'';}return b;});"
-    "window.Plotly.relayout(hg,{annotations:anns});}"
+    "if(v&&window.__restyleHeatmap){"
+    "window.__restyleHeatmap(hg,v,metric,scale,colorRange,rangeMode,colorData);"
     "}}catch(e){}}"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
@@ -6021,6 +6113,9 @@ app.clientside_callback(
     Input("heatmap-scale", "value"),
     Input("roi-entered", "value"),
     Input("roi-trim", "value"),
+    Input("heatmap-color-range", "value"),
+    Input("heatmap-crange", "value"),
+    Input("heatmap-color-values", "data"),
     State("heatmap-variants", "data"),
     prevent_initial_call=True,
 )
@@ -6065,7 +6160,7 @@ def apply_lut(n, lut_text, plot_clicks):
         return f"Error: {e}", no_update
 
 
-def _compose_export_html(traj, heat, roi, polar, vel, disp, raw,
+def _compose_export_html(traj, heat, roi, polar, vel, disp, initial_heading, raw,
                          *, include_raw, summary, share_state):
     """Build one offline-capable report with a single embedded plotly.js."""
     cfgd = dict(scrollZoom=True, displaylogo=False)
@@ -6075,6 +6170,8 @@ def _compose_export_html(traj, heat, roi, polar, vel, disp, raw,
     polar_h = polar.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     vel_h = vel.to_html(full_html=False, include_plotlyjs=False)
     disp_h = disp.to_html(full_html=False, include_plotlyjs=False)
+    initial_heading_h = initial_heading.to_html(
+        full_html=False, include_plotlyjs=False, config=cfgd)
     raw_h = (raw.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
              if include_raw else "<p>No raw trace columns selected.</p>")
     return f"""<!DOCTYPE html>
@@ -6092,8 +6189,9 @@ h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
 <div class="share">State: <code>{share_state or ''}</code></div>
 <h3>Trajectories</h3>{traj_h}
 <h3>Heatmap</h3>{heat_h}
-<h3>Target diagnostics</h3>{roi_h}
 <h3>Polar</h3>{polar_h}
+<h3>Target diagnostics</h3>{roi_h}
+<h3>Diagnostics: raw starting-heading null distribution</h3>{initial_heading_h}
 <h3>Velocity / Displacement</h3><div class="row"><div>{vel_h}</div><div>{disp_h}</div></div>
 <h3>Raw traces</h3>{raw_h}
 <div class="credit"><a href="{REPO_URL}">❤️ by pvnkmrksk</a></div>
@@ -6181,7 +6279,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
     do_animate = bool(animate) and "on" in (animate or [])
     do_rebase = bool(rebase) and "on" in (rebase or [])
     mode = _render_mode(render_mode)
-    _, _, metas = _load_data(pattern)
+    df_native, native_stats, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     reach = float(roi_reach) if roi_reach else 3.0
     df_view, table = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
@@ -6229,9 +6327,15 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
     roi_fig = (build_roi_swarm_figure(df_view, rois, reach, table=table)
                if want_rois and table is not None
                else _msg_figure("No target diagnostics are available for this selection."))
-    df_diag = df_view
-    vel_fig = build_velocity_histogram(df_diag, vel_thresh)
-    disp_fig = build_displacement_histogram(compute_segment_stats(df_diag), min_disp)
+    token = _DATA_TOKEN_BY_PATTERN.get(_pattern_key(pattern))
+    native_velocity = _VELOCITY_CACHE.get(token)
+    if native_velocity is None:
+        native_velocity = velocity_all(df_native)
+        if token is not None:
+            _VELOCITY_CACHE[token] = native_velocity
+    vel_fig = build_velocity_histogram(df_native, velocity_values=native_velocity)
+    disp_fig = build_displacement_histogram(native_stats)
+    initial_heading_fig = build_initial_heading_distribution(df_native)
     raw = build_raw_trace_figure(
         df_view, raw_cols or [],
         max_points=_budget(BUDGET_RAW, BUDGET_RAW_SPEED, mode, max_points))
@@ -6244,7 +6348,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 f.update_yaxes(range=viewport["yaxis"])
 
     content = _compose_export_html(
-        traj, heat, roi_fig, polar, vel_fig, disp_fig, raw,
+        traj, heat, roi_fig, polar, vel_fig, disp_fig, initial_heading_fig, raw,
         include_raw=bool(raw_cols), summary=summary,
         share_state=url_search,
     )

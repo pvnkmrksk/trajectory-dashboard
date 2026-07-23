@@ -158,8 +158,8 @@ For a quick preprocessing check on the homing enemy data, run
   per criterion. Drag-select ranges on the velocity/displacement histograms.
 - **Playback**: native client-side animation with a sticky play/pause/scrub bar;
   each track grows from its first point over local time.
-- **Single-page plotting workspace**: trajectories, heatmap, diagnostics,
-  targets and polar stay mounted together. The sticky section bar scrolls to a
+- **Single-page plotting workspace**: trajectories, heatmap, polar, targets and
+  diagnostics stay mounted together. The sticky section bar scrolls to a
   plot without hiding/reloading graphs, so zoom, hover and legend state survive.
   Speed is the default and only thins browser drawing primitives; analytical
   counts and statistics remain exact.
@@ -185,9 +185,12 @@ For a quick preprocessing check on the homing enemy data, run
   forward/+Z and positive angles turn right/+X. The bold population ray exactly
   pools all valid samples and is independent of display thinning. Moving-only
   and polar-quality changes use a cached polar-only update path; their R,
-  valid-point and per-animal good-trial histograms stay mounted and auditable.
-- **Diagnostics section**: explicit-bin velocity/displacement histograms and
-  optional raw time-series.
+  valid-point and per-animal good-trial histograms use 36 fixed bins and stay
+  mounted and auditable. Each subplot title reports retained/available trials.
+- **Diagnostics section**: load-time native velocity/displacement histograms,
+  an optional 36-bin polar null distribution of the first body heading in every
+  segment, and optional raw time-series. Native distributions do not change
+  when analysis filters change.
 - **Live activity status**: a compact header status shows loading, the active
   filter/render operation, retained-point summary and export completion. Hover
   it for per-stage timings. Detailed Python
@@ -261,7 +264,7 @@ shareable URL.
 | Scale | Linear or log color scaling. | Linear emphasizes dense regions; log reveals low-occupancy structure. |
 | Metric | Occupancy seconds, percent of time, or sample count. | Seconds are intuitive within a subplot, percent compares across unequal trial counts, count is the rawest diagnostic. |
 | cmin / cmax | Color limits. Blank auto-scales. | Fix limits across views when comparing treatments or exporting. |
-| Color range as value or percentile | Interpret color limits literally or as data percentiles. Percentile is the default and its slider/histogram axis is 0–100. | Percentiles are convenient when the absolute range changes by dataset while keeping the underlying histogram silhouette recognizable. |
+| Color range as value or percentile | Interpret color limits literally or as data percentiles. Percentile is the default and its slider/histogram axis is 0–100. Range changes restyle only `zmin`/`zmax` and the colorbar in the browser. | Percentiles are convenient when the absolute range changes by dataset; changing them does not refilter rows or rebuild unrelated plots. |
 
 ### ROI / Targets
 
@@ -297,9 +300,9 @@ shareable URL.
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Diagnostics section | Velocity/displacement histograms and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Debugs filters, spikes, and unexpected raw sensor columns without showing an empty plot. |
+| Diagnostics section | Native velocity/displacement histograms, a toggleable 36-bin starting-heading null distribution per treatment, and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Preserves the original dataset baseline while filters change and exposes unexpected directional bias at segment starts. |
 | Raw trace columns | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
-| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, target diagnostics, polar, velocity/displacement diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
+| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, polar, target diagnostics, native velocity/displacement and starting-heading diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
 | Header activity status | Reports the current load, filter/render, debounce, or export state plus retained points; hover exposes per-stage timings. | Makes slow work and failures visible, while the terminal retains full errors and tracebacks. |
 
 ## Data assumptions
@@ -320,6 +323,7 @@ trajectory_dashboard/grouping.py # subset filters and group splitting
 assets/dropzone.js             # folder drag-and-drop
 assets/dashboard.css           # dashboard chrome and sticky section styling
 assets/heatsync.js             # heatmap zoom viewport sync after newPlot
+assets/heatmap_colors.js       # browser-local metric/scale/color-limit restyles
 assets/section_nav.js          # section scroll, including active-tab replay
 assets/plot_wheel_guard.js     # Plotly wheel zoom without page scroll
 assets/config_order.js         # draggable config subplot order list

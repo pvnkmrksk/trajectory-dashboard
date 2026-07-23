@@ -121,7 +121,25 @@ class DashboardRegressionTests(unittest.TestCase):
         figures = app.build_polar_quality_histograms(ray, [0.2, 1], 0.25, 0.5)
         self.assertEqual(len(figures), 3)
         self.assertTrue(all(len(fig.data) == 1 for fig in figures))
-        self.assertTrue(all(len(fig.data[0].x) > 0 for fig in figures))
+        self.assertTrue(all(len(fig.data[0].x) == 36 for fig in figures))
+        self.assertTrue(all(np.allclose(fig.data[0].width, 0.96 / 36)
+                            for fig in figures))
+
+    def test_polar_titles_report_retained_over_visible_trials(self):
+        fig = app.build_polar_figure(
+            _polar_frame(), group_by="all", pool_mode="pooled",
+            color_by="none", r_range=[0.0, 0.5], angle_source="orientation")
+        titles = [annotation.text for annotation in fig.layout.annotations]
+        self.assertTrue(any("0/2 trials shown" in title for title in titles))
+
+    def test_raw_initial_heading_uses_one_first_sample_per_segment(self):
+        fig = app.build_initial_heading_distribution(_polar_frame(), bins=36)
+        bars = [trace for trace in fig.data if trace.type == "barpolar"]
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(len(bars[0].r), 36)
+        self.assertEqual(sum(bars[0].r), 2)
+        self.assertTrue(any("2 segment starts" in annotation.text
+                            for annotation in fig.layout.annotations))
 
     def test_step_range_keeps_complete_segment_ids(self):
         frame = pd.concat([
@@ -154,6 +172,40 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertIn("data-generation", state_ids)
         self.assertIn("step-min", state_ids)
         self.assertIn("step-max", state_ids)
+
+    def test_heatmap_colour_controls_never_arm_the_full_renderer(self):
+        auto = next(
+            meta for output, meta in app.app.callback_map.items()
+            if output.startswith("..auto-replot-state.data...")
+        )
+        auto_inputs = {item["id"] for item in auto["inputs"]}
+        for control in ("heatmap-color-range", "heatmap-cmin",
+                        "heatmap-cmax", "heatmap-crange"):
+            self.assertNotIn(control, auto_inputs)
+
+        colour = next(
+            meta for output, meta in app.app.callback_map.items()
+            if output.startswith("..heatmap-color-values.data...")
+        )
+        colour_inputs = {item["id"] for item in colour["inputs"]}
+        colour_state = {item["id"] for item in colour["state"]}
+        self.assertIn("heatmap-color-distributions", colour_inputs)
+        self.assertNotIn("store-glob", colour_state)
+        self.assertNotIn("vel-threshold", colour_state)
+
+    def test_native_diagnostics_are_not_outputs_of_the_master_renderer(self):
+        master_key = next(
+            output for output in app.app.callback_map
+            if output.startswith("..trajectory-plot.figure...")
+        )
+        self.assertNotIn("vel-histogram.figure", master_key)
+        self.assertNotIn("disp-histogram.figure", master_key)
+
+    def test_sections_follow_analysis_then_diagnostics_order(self):
+        ids = [getattr(node, "id", None) for node in _components(app.app.layout)]
+        positions = [ids.index(component_id) for component_id in (
+            "view-traj", "view-heat", "view-polar", "view-roi", "view-diag")]
+        self.assertEqual(positions, sorted(positions))
 
     def test_polar_controls_use_the_polar_only_callback(self):
         master = next(
@@ -211,12 +263,13 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_export_is_offline_capable_and_contains_every_section(self):
         fig = app.go.Figure(app.go.Scatter(x=[0, 1], y=[0, 1]))
         document = app._compose_export_html(
-            fig, fig, fig, fig, fig, fig, fig,
+            fig, fig, fig, fig, fig, fig, fig, fig,
             include_raw=False, summary="test summary", share_state="?mode=speed",
         )
         self.assertNotIn('src="https://cdn.plot.ly', document)
         self.assertIn("plotly.js", document)
         for heading in ("Trajectories", "Heatmap", "Target diagnostics", "Polar",
+                        "Diagnostics: raw starting-heading null distribution",
                         "Velocity / Displacement", "Raw traces"):
             self.assertIn(f"<h3>{heading}</h3>", document)
 
