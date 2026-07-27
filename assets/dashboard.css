@@ -210,7 +210,7 @@ body {
   position: relative;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  grid-template-rows: auto auto;
+  grid-template-rows: auto auto 3px;
   column-gap: 8px;
   flex: 1 1 480px;
   min-width: 180px;
@@ -224,7 +224,7 @@ body {
 }
 
 .status-dock-heading {
-  grid-row: 1 / 3;
+  grid-row: 1 / 4;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -243,10 +243,6 @@ body {
   font-weight: 700;
 }
 
-.status-phase::after {
-  content: "Ready";
-}
-
 .status-dot {
   width: 8px;
   height: 8px;
@@ -257,7 +253,7 @@ body {
 }
 
 body._dash-loading-callback .status-phase::after {
-  content: "Working…";
+  content: "";
 }
 
 body._dash-loading-callback .status-phase {
@@ -293,6 +289,33 @@ body._dash-loading-callback .status-dot {
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.status-progress-track {
+  grid-column: 2;
+  position: relative;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e5eaf2;
+}
+
+.status-progress-bar {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2563eb, #0f9f72);
+  transition: width .18s ease;
+}
+
+.status-progress-text {
+  position: absolute;
+  right: 8px;
+  bottom: 7px;
+  color: #667085;
+  font-size: 8px;
+  line-height: 1;
+  pointer-events: none;
 }
 
 .status-raw-hidden {
@@ -358,6 +381,66 @@ body._dash-loading-callback .status-dot {
 .filter-stage-note {
   margin-top: 2px;
   color: var(--td-muted);
+}
+
+.data-summary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-shrink: 0;
+  min-width: 0;
+  margin: 0 0 3px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: #e9ecef;
+  color: #344054;
+  font-size: 11px;
+}
+
+.visible-layer-count {
+  flex: 0 0 auto;
+  color: #526173;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.compare-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    "trajectory polar"
+    "heatmap heatmap"
+    "targets targets"
+    "metrics metrics"
+    "diagnostics diagnostics";
+  align-items: start;
+  gap: 10px;
+}
+
+.compare-workspace #view-traj { grid-area: trajectory; }
+.compare-workspace #view-polar { grid-area: polar; }
+.compare-workspace #view-heat { grid-area: heatmap; }
+.compare-workspace #view-roi { grid-area: targets; }
+.compare-workspace #view-metrics { grid-area: metrics; }
+.compare-workspace #view-diag { grid-area: diagnostics; }
+
+.compare-workspace .plot-section {
+  min-width: 0;
+  margin-bottom: 0 !important;
+}
+
+@media (max-width: 1180px) {
+  .compare-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "trajectory"
+      "polar"
+      "heatmap"
+      "targets"
+      "metrics"
+      "diagnostics";
+  }
 }
 
 .view-tabs-wrap {

@@ -167,8 +167,10 @@ def filter_frame(
     if len(subset) == 0:
         return FilterResult(subset, subset, None)
 
-    subset_is_original = subset is df
-    subset_stats = stats if (subset_is_original and stats is not None) else None
+    subset_stats = None
+    if stats is not None and len(stats):
+        visible_ids = pd.Index(subset["_seg_id"].astype(str).unique())
+        subset_stats = stats[stats["seg_id"].astype(str).isin(visible_ids)].copy()
     has_range = bool(spec.displacement_range or spec.velocity_range)
     if spec.displacement_range:
         subset_stats = subset_stats if subset_stats is not None else compute_segment_stats(subset)
@@ -179,7 +181,13 @@ def filter_frame(
         lo, hi = spec.velocity_range
         subset = filter_by_stat_range(subset, subset_stats, "peak_velocity", lo, hi)
     if has_range:
-        subset_stats = compute_segment_stats(subset) if len(subset) else subset_stats
+        if subset_stats is not None and len(subset):
+            kept_ids = pd.Index(subset["_seg_id"].astype(str).unique())
+            subset_stats = subset_stats[
+                subset_stats["seg_id"].astype(str).isin(kept_ids)
+            ].copy()
+        elif len(subset):
+            subset_stats = compute_segment_stats(subset)
     elif compute_stats and subset_stats is None:
         subset_stats = compute_segment_stats(subset)
     elif not compute_stats:

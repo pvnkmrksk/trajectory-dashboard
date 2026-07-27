@@ -52,9 +52,11 @@ Plotly.
   `FilterSpec.trial_range` and `FilterSpec.step_range` use the dataset's raw
   numeric `CurrentTrial`/`CurrentStep` values and keep complete `_seg_id`
   segments.
-- **Velocity is in raw position-units per second, NOT cm/s.** Values are large
-  (median ~thousands). Histograms cap at the 99th percentile; the velocity
-  colour mode drops reset-spikes above the 99.5th pct before smoothing.
+- **Velocity is in raw position-units per second, NOT cm/s.** The trajectory
+  colour, native velocity histogram, and per-segment peak/median statistics all
+  use the same 10-frame within-segment smoothed series after reset-spikes above
+  the 99.5th percentile are removed. The peak-range UI is displayed through the
+  99th percentile, with optional unbounded exact inputs.
 
 ---
 
@@ -66,7 +68,7 @@ Plotly.
 | 28-390 | **Config + ROI geometry** | `humanise_config`, ROI extraction, readable config LUT. |
 | 395-670 | **ROI tables/masks + CSV loader bridge** | `roi_reached_table`, `time_to_target_table`, `heading_target_angle_table`, `_roi_masks`, `_roi_apply`, `load_csv_fast`. |
 | 763-947 | **Filtering bridge / stats** | Compatibility wrappers; canonical implementations live in `trajectory_dashboard.filters`. |
-| 948-3140 | **Plotting** | `_prepare_merged_groups`, `build_trajectory_figure`, heatmap builders + variants, explicit-bin histograms, raw trace, ROI panels, circular/polar statistics. |
+| 948-3410 | **Plotting** | `_prepare_merged_groups`, `build_trajectory_figure`, heatmap builders + variants, explicit-bin histograms, raw trace, ROI panels, circular/polar statistics, and grouped trial metrics. |
 | 3141-3980 | **Dash app, caches + layout** | `app`, data/filter/ROI/polar caches, sidebar controls, and five continuously mounted scroll sections. |
 | 3981-end | **Callbacks + clientside interaction** | URL/load state, the atomic all-section renderer, viewport sync, LUT, export, playback and guards. |
 
@@ -81,6 +83,9 @@ Assets (Dash auto-serves `/assets`):
   over Plotly's central wheel-zoom plane; margins still scroll normally.
 - `assets/config_order.js` — drag-to-reorder the full loaded config subplot order
   via `config-order-store` (independent of active filters).
+- `assets/shared_legend.js` — shares categorical layer visibility between the
+  trajectory and polar figures and reports counts for the currently visible
+  layers.
 
 ---
 
@@ -89,7 +94,8 @@ Assets (Dash auto-serves `/assets`):
 ```
 glob / dropped folder
    └─ trajectory_dashboard.io.find_csv_files → load_csv_fast (per file)
-      → concat → sort ONCE by time
+      → smoothed velocity + exact segment stats → endpoint-safe retain/downcast
+      → concat retained frames → sort ONCE by time
       └─ _load_data(pattern)                         cached in _DATA_CACHE
          └─ _filtered_df(...)                        cached in _FILTER_CACHE (last 4)
             ├─ trajectory_dashboard.grouping.subset_frame + trial/histogram range selections
@@ -102,6 +108,14 @@ glob / dropped folder
 **Everything downstream assumes the load-time time-sort** and uses
 `groupby(..., sort=False)`. Do not re-sort per segment (that was the original
 perf killer).
+
+The dashboard retains at most `TRAJ_LOAD_ROW_BUDGET` normalized rows across the
+matched files (default 2,000,000; `0` opts into retaining all rows). Quotas are
+proportional to source-file byte size and preserve every segment's endpoints.
+Only one complete source file is resident during preprocessing. Exact
+per-segment point counts, displacement, and smoothed velocity summaries are
+finalized before sampling; spatial bins, ROI sample masks, and circular panels
+operate on the retained frame.
 
 `apply_filters` is fully vectorised: the velocity-jump buffer is a
 `np.searchsorted` "dilation" (`_dilate_keep`), displacement/trim are groupby
@@ -126,9 +140,9 @@ same cache key.
   `BUDGET_GL=300k`; animated `BUDGET_SVG=40k` (every frame is embedded in the
   figure JSON — Plotly cannot stream frames, so the budget is the payload lever);
   raw plot `BUDGET_RAW=25k`. "Point budget" (Advanced) overrides.
-  Speed is the default and reduces browser primitives only. Heatmap bins, ROI
-  outcomes, filter histograms and circular statistics always use the complete
-  filtered frame in both modes.
+  Speed is the default and applies a second browser drawing budget. Both modes
+  share the same retained analytical frame; file-level segment statistics were
+  finalized before load-time sampling.
 - **Colour modes** (`color_by`): `individual`/`vr`/`roi` (categorical, lines,
   legend); `trial`/`local_time`/`velocity` (sequential; markers for per-point
   ones; a hidden anchor trace supplies the Viridis colourbar). ROI outcome is
@@ -138,7 +152,8 @@ same cache key.
   natural full height and the panel scrolls (no squishing). Subplot vertical
   spacing is deliberately tight so Plotly drag rectangles are easy to hit. 1:1
   aspect on trajectories via `scaleanchor` (see §7 for why the heatmap can't use
-  it).
+  it). The optional comparison workspace places trajectory and polar sections
+  side-by-side, with heatmap and diagnostics full-width below.
 - **Heatmap**: `build_heatmap_figure` bins X/Z with `np.histogram2d`.
   `bin_size` is in **data units** (blank → `default_bin_size` ≈ 1/20 of the
   95th-pct extent); `bound_pct` clips the extent to a central percentile;
@@ -160,6 +175,13 @@ same cache key.
   browser for Plotly auto-binning. The raw
   trace graph remains mounted for callback wiring but its wrapper is hidden
   until raw columns are selected.
+- **Trial metrics**: `build_trial_metrics_figure` selects the exact pre-retention
+  segment summaries for currently visible `_seg_id` values and groups them by
+  the same panel axis. It shows path length, net displacement, median smoothed
+  speed, and the median 15-sample local path/chord ratio. Up to 60 trials per
+  group render as jittered points; larger groups render as count-scaled violins.
+  The starting-heading diagnostic uses 36 fixed sectors with edges
+  `[-5°, 5°], [5°, 15°], …`, so cardinal 0° is a bin centre.
 - **Trajectory ROI labels**: corner labels are exclusive first-reached outcome
   counts (`L-first`, `R-first`) over the visible ROI-capable trials in that
   subplot. Do not switch them back to independent reached-left/reached-right
@@ -189,8 +211,10 @@ same cache key.
   `location.search`. The once-guard breaks the echo loop.
 - `on_folder_drop` ← `drop-data` (set by dropzone.js) → `resolve_dropped_folder`
   → glob + auto-load.
-- `start_progress`/`tick_progress` poll the `_LOAD_PROGRESS` global (works
-  because the dev server is threaded).
+- `start_progress`/`tick_progress` poll the unified `_OP_PROGRESS` snapshot
+  (works because the dev server is threaded). Load, render, polar-only, and
+  export operations publish checklist stages, progress fractions, and timings
+  into the one header status bar.
 - `load_data_cb` populates filter options, histograms and the smart default bin
   size. `update_range_controls` then applies/reset ranges and increments the
   plot epoch as a load barrier; `update_plots` cannot race the previous
@@ -204,11 +228,14 @@ same cache key.
   `roi-reach` is the authoritative exact number input; `roi-reach-slider` is a
   0.5–100 convenience view whose handle clamps visually without changing an
   exact value above 100.
+- Peak velocity's robust slider can be overridden by unbounded exact min/max
+  inputs; those values persist as `vrmin=`/`vrmax=`. Workspace mode persists as
+  `layout=sections|compare`.
 - `render_config_order_list`/`apply_config_order` expose all loaded configs as a
   draggable order list. The default order uses the sequenceConfig with the best
   coverage; missing configs remain alphabetic at the bottom.
 - `update_plots` takes one filtered snapshot and returns trajectory, heatmap
-  store/variants, target diagnostics, polar, raw traces, summary
+  store/variants, target diagnostics, polar, trial metrics, raw traces, summary
   and render state atomically. Retired split-view/lazy callbacks are not
   registered. `update_polar_only` owns moving/R/quality changes and all three
   polar mini-histograms; it reuses the filtered-frame and Rayleigh caches rather
@@ -243,7 +270,7 @@ same cache key.
   to the previous stage, mirroring the actual filter pipeline.
 - `export_html` rebuilds figures server-side and emits one self-contained file.
   Plotly is embedded once (no CDN dependency). It includes trajectories,
-  heatmap, polar, target diagnostics, native velocity/displacement and
+  heatmap, polar, target diagnostics, trial metrics, native velocity/displacement and
   starting-heading diagnostics, and selected raw traces.
 - The header `status-dock` mirrors load/filter/render/export state and uses
   Dash's body loading class for immediate Working/Ready feedback. Its hover text
@@ -351,8 +378,9 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
   app.py`) can drift. Decide on one source of truth.
 - **`raw-columns` default** doesn't always stick in the control; `update_plots`
   defaults it to `[GameObjectPosX, GameObjectPosZ]` so the raw plot isn't empty.
-- Filter cache holds up to 4 filtered frames (`_FILTER_CACHE_MAX`) — a few
-  hundred MB for multi-million-row frames. Lower it if memory-constrained.
+- Filter cache holds up to 4 views of the retained frame
+  (`_FILTER_CACHE_MAX`). Lower it or `TRAJ_LOAD_ROW_BUDGET` on
+  memory-constrained systems.
 
 ---
 
@@ -386,8 +414,9 @@ browser checks that caught the recent Plotly drag/pan regression.
 ## 10. Scope for improvement (nice-to-haves, roughly ordered)
 
 1. Remove the heatmap `newPlot` workaround (see §8) for flash-free updates.
-2. Background/long callback for loading with true streamed progress (currently a
-   threaded-global poll; would also decouple heavy loads from the request).
+2. Background/long callback for loading (the current per-file loader is
+   memory-bounded and reports live threaded-global progress, but still occupies
+   a request worker).
 3. Server-side figure/HTML caching for exports and repeat views.
 4. Persist the config LUT to disk so renames survive restarts.
 5. Downsample-on-zoom (send more points only for the visible window) instead of a

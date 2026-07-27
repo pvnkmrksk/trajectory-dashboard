@@ -1,5 +1,10 @@
 import math
 import inspect
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
 from types import SimpleNamespace
 import unittest
 from urllib.parse import parse_qs
@@ -140,8 +145,54 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(len(bars), 1)
         self.assertEqual(len(bars[0].r), 36)
         self.assertEqual(sum(bars[0].r), 2)
+        self.assertEqual(float(bars[0].theta[0]), 0.0)
+        self.assertEqual(float(bars[0].theta[1]), 10.0)
         self.assertTrue(any("2 segment starts" in annotation.text
                             for annotation in fig.layout.annotations))
+
+    def test_trial_metrics_switch_between_swarms_and_violins(self):
+        def stats(count):
+            return pd.DataFrame({
+                "seg_id": [f"s{i}" for i in range(count)],
+                "n_points": np.full(count, 100),
+                "distance_walked": np.linspace(5, 10, count),
+                "displacement": np.linspace(2, 4, count),
+                "median_local_tortuosity": np.linspace(1, 1.5, count),
+                "median_velocity": np.linspace(0.5, 2, count),
+                "config": ["cfg.json"] * count,
+                "vr": ["VR1"] * count,
+                "fly_id": ["1"] * count,
+                "scene": ["scene"] * count,
+                "source_folder": ["folder"] * count,
+            })
+
+        swarm = app.build_trial_metrics_figure(stats(8))
+        violin = app.build_trial_metrics_figure(stats(80))
+        self.assertEqual({trace.type for trace in swarm.data}, {"box"})
+        self.assertEqual({trace.type for trace in violin.data}, {"violin"})
+        self.assertEqual(len(swarm.data), 4)
+        self.assertIn("15-sample path/chord", swarm.layout.yaxis3.title.text)
+
+    def test_local_tortuosity_uses_matching_path_and_chord_intervals(self):
+        straight = pd.DataFrame({
+            "_seg_id": ["straight_T1_S0"] * 15,
+            "GameObjectPosX": np.arange(15, dtype=float),
+            "GameObjectPosZ": np.zeros(15),
+        })
+        turn = straight.copy()
+        turn["_seg_id"] = "turn_T1_S0"
+        turn["GameObjectPosX"] = np.r_[np.arange(8), np.full(7, 7)]
+        turn["GameObjectPosZ"] = np.r_[np.zeros(8), np.arange(1, 8)]
+
+        self.assertAlmostEqual(
+            float(app.compute_tortuosity(straight, window=15)[-1]),
+            1.0,
+            places=10,
+        )
+        self.assertGreater(
+            float(app.compute_tortuosity(turn, window=15)[-1]),
+            1.3,
+        )
 
     def test_step_range_keeps_complete_segment_ids(self):
         frame = pd.concat([
@@ -206,7 +257,8 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_sections_follow_analysis_then_diagnostics_order(self):
         ids = [getattr(node, "id", None) for node in _components(app.app.layout)]
         positions = [ids.index(component_id) for component_id in (
-            "view-traj", "view-heat", "view-polar", "view-roi", "view-diag")]
+            "view-traj", "view-heat", "view-polar", "view-roi",
+            "view-metrics", "view-diag")]
         self.assertEqual(positions, sorted(positions))
 
     def test_polar_controls_use_the_polar_only_callback(self):
@@ -246,21 +298,154 @@ class DashboardRegressionTests(unittest.TestCase):
         ids = {getattr(node, "id", None) for node in _components(app.app.layout)}
         self.assertIn("status-dock", ids)
         self.assertIn("status-message", ids)
+        self.assertIn("status-progress-bar", ids)
+        self.assertIn("operation-progress", ids)
         self.assertIn("main-scroll", ids)
         self.assertNotIn("preload-view", ids)
         self.assertNotIn("preload-interval", ids)
 
+    def test_inline_clientside_callbacks_are_valid_javascript(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is not available")
+        document = app.app.server.test_client().get("/").get_data(as_text=True)
+        scripts = [
+            body for body in re.findall(
+                r"<script[^>]*>(.*?)</script>", document, re.DOTALL
+            )
+            if "_dashprivate_clientside_funcs" in body
+        ]
+        self.assertTrue(scripts)
+        failures = []
+        for index, script in enumerate(scripts):
+            result = subprocess.run(
+                [node, "--check"], input=script, text=True,
+                capture_output=True, check=False,
+            )
+            if result.returncode:
+                failures.append(f"script {index}: {result.stderr}")
+        self.assertFalse(failures, "\n".join(failures))
+
     def test_new_controls_and_url_restore_are_synchronised(self):
         self.assertEqual(_component("heatmap-crange").value, "percentile")
+        self.assertEqual(_component("heatmap-color-range").value, [0, 99])
         self.assertIsNotNone(_component("step-range"))
         restored = app.restore_from_url("?smin=2&smax=4&hcrange=percentile", False)
-        self.assertEqual(len(restored), 43)
+        self.assertEqual(len(restored), 46)
         self.assertEqual(restored[24:26], (2, 4))
-        self.assertEqual(restored[34], [2.0, 4.0])
-        self.assertEqual(len(app.restore_from_url("", True)), 43)
+        self.assertEqual(restored[36], [2.0, 4.0])
+        self.assertEqual(len(app.restore_from_url("", True)), 46)
         value_restore = app.restore_from_url(
             "?hcmin=150&hcmax=200&hcrange=value", False)
-        self.assertEqual(value_restore[32], [150.0, 200.0])
+        self.assertEqual(value_restore[34], [150.0, 200.0])
+
+        exact_velocity = app.restore_from_url(
+            "?vrmin=2.5&vrmax=250&layout=compare", False)
+        self.assertEqual(exact_velocity[31:33], (2.5, 250))
+        self.assertEqual(exact_velocity[42], "compare")
+
+    def test_exact_velocity_bounds_are_unbounded_and_explicit(self):
+        self.assertIsNone(getattr(_component("vel-range-min"), "min", None))
+        self.assertIsNone(getattr(_component("vel-range-max"), "max", None))
+        value = app.effective_velocity_range([0, 6], None, 250)
+        self.assertEqual(value["range"], [0.0, 250.0])
+        self.assertTrue(value["explicit"])
+        self.assertEqual(app._active_stat_range(
+            value,
+            pd.DataFrame({"peak_velocity": [1.0, 6.0, 300.0]}),
+            "peak_velocity",
+        ), (0.0, 250.0))
+
+    def test_segment_peak_velocity_matches_smoothed_colour_series(self):
+        n = 60
+        frame = pd.DataFrame({
+            "_seg_id": ["source_T1_S0"] * n,
+            "Current Time": pd.date_range("2026-01-01", periods=n, freq="100ms"),
+            "GameObjectPosX": np.r_[np.arange(30) * 0.1,
+                                    np.arange(30, 60) * 0.1 + 10],
+            "GameObjectPosZ": np.zeros(n),
+            "ConfigFile": "cfg.json",
+            "VR": "VR1",
+            "FlyID": "1",
+            "SceneName": "scene",
+            "SourceFolder": "folder",
+        })
+        raw_peak = float(np.nanmax(app.velocity_all(frame)))
+        smooth = app.smoothed_velocity(frame)
+        stats = app.compute_segment_stats(frame, smooth)
+        self.assertAlmostEqual(
+            float(stats.iloc[0]["peak_velocity"]),
+            float(np.nanmax(smooth)),
+            places=10,
+        )
+        self.assertLess(float(stats.iloc[0]["peak_velocity"]), raw_peak)
+
+    def test_streaming_loader_retains_a_bounded_frame_but_exact_point_counts(self):
+        old_budget = app.LOAD_ROW_BUDGET
+        try:
+            with tempfile.TemporaryDirectory(dir="/tmp") as folder:
+                for file_index in range(2):
+                    n = 100
+                    pd.DataFrame({
+                        "Current Time": pd.date_range(
+                            "2026-01-01", periods=n, freq="100ms"),
+                        "CurrentTrial": file_index,
+                        "CurrentStep": 0,
+                        "GameObjectPosX": np.linspace(0, 10, n),
+                        "GameObjectPosZ": np.zeros(n),
+                        "ConfigFile": "Choice_empty.json",
+                        "SceneName": "scene",
+                        "FlyID": "1",
+                        "GameObjectRotY": np.zeros(n),
+                    }).to_csv(
+                        Path(folder) / f"source_VR{file_index + 1}.csv",
+                        index=False,
+                    )
+                app.LOAD_ROW_BUDGET = 40
+                app._DATA_CACHE.clear()
+                app._STATS_CACHE.clear()
+                app._META_CACHE.clear()
+                app._DATA_TOKEN_BY_PATTERN.clear()
+                app._DATA_CACHE_ORDER.clear()
+                frame, stats, _ = app._load_data(str(Path(folder) / "*.csv"))
+                self.assertEqual(frame.attrs["_raw_rows"], 200)
+                self.assertLess(len(frame), 200)
+                self.assertLessEqual(len(frame), 44)
+                self.assertEqual(int(stats["n_points"].sum()), 200)
+                self.assertIn("distance_walked", stats)
+                self.assertIn("median_local_tortuosity", stats)
+                self.assertIn("_smoothed_velocity", frame)
+                progress = app._progress_snapshot()
+                self.assertFalse(progress["active"])
+                self.assertEqual(
+                    [stage["label"] for stage in progress["stages"]],
+                    ["Detect files", "Load + preprocess",
+                     "Combine retained rows", "Index + cache"],
+                )
+        finally:
+            app.LOAD_ROW_BUDGET = old_budget
+            app._DATA_CACHE.clear()
+            app._STATS_CACHE.clear()
+            app._META_CACHE.clear()
+            app._DATA_TOKEN_BY_PATTERN.clear()
+            app._DATA_CACHE_ORDER.clear()
+
+    def test_missing_target_config_uses_modal_loaded_geometry(self):
+        def config(x):
+            return {"objects": [{"type": "tree01",
+                                 "position": {"x": x, "z": 10},
+                                 "scale": {"x": 1}}]}
+
+        metas = [
+            {"sequence_order": ["empty.json"],
+             "configs": {"a.json": config(-3), "empty.json": {"objects": []}}},
+            {"sequence_order": [], "configs": {"a2.json": config(-3)}},
+            {"sequence_order": [], "configs": {"b.json": config(7)}},
+        ]
+        rois = app.rois_by_config(metas)
+        self.assertIn("empty.json", rois)
+        self.assertEqual(rois["empty.json"][0]["x"], -3)
+        self.assertTrue(rois["empty.json"][0]["inferred"])
 
     def test_reach_radius_is_unbounded_in_exact_input_and_url(self):
         exact = _component("roi-reach")
@@ -294,12 +479,13 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_export_is_offline_capable_and_contains_every_section(self):
         fig = app.go.Figure(app.go.Scatter(x=[0, 1], y=[0, 1]))
         document = app._compose_export_html(
-            fig, fig, fig, fig, fig, fig, fig, fig,
+            fig, fig, fig, fig, fig, fig, fig, fig, fig,
             include_raw=False, summary="test summary", share_state="?mode=speed",
         )
         self.assertNotIn('src="https://cdn.plot.ly', document)
         self.assertIn("plotly.js", document)
         for heading in ("Trajectories", "Heatmap", "Target diagnostics", "Polar",
+                        "Trial metrics",
                         "Diagnostics: raw starting-heading null distribution",
                         "Velocity / Displacement", "Raw traces"):
             self.assertIn(f"<h3>{heading}</h3>", document)

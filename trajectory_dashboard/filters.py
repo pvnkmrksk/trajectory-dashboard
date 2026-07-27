@@ -60,6 +60,10 @@ def smoothed_velocity(
 ) -> np.ndarray:
     """Speed smoothed within each segment after dropping reset spikes."""
 
+    if "_smoothed_velocity" in df.columns:
+        return pd.to_numeric(
+            df["_smoothed_velocity"], errors="coerce"
+        ).to_numpy(dtype=float)
     speed = velocity_all(df)
     finite = speed[np.isfinite(speed)]
     if finite.size:
@@ -92,10 +96,13 @@ def compute_tortuosity(df: pd.DataFrame, window: int = 15) -> np.ndarray:
     starts = np.empty(len(df), bool); starts[0] = True
     starts[1:] = seg[1:] != seg[:-1]
     step[starts] = 0.0
+    # A ``window``-sample chord spans ``window - 1`` step lengths. Use the same
+    # interval count for the path so a straight trajectory is exactly 1.
+    step_window = max(1, int(window) - 1)
     step_series = pd.Series(step, index=df.index)
     path = (
         step_series.groupby(seg, sort=False)
-        .rolling(window, min_periods=2)
+        .rolling(step_window, min_periods=step_window)
         .sum()
         .reset_index(level=0, drop=True)
         .reindex(df.index)
@@ -110,16 +117,30 @@ def compute_tortuosity(df: pd.DataFrame, window: int = 15) -> np.ndarray:
     return np.clip(out, 1.0, None)
 
 
-def compute_segment_stats(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-segment summary statistics from contiguous `_seg_id` blocks."""
+def compute_segment_stats(
+    df: pd.DataFrame,
+    speed: np.ndarray | None = None,
+    tortuosity: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Compute per-segment summary statistics from contiguous `_seg_id` blocks.
+
+    Peak and median velocity use the same within-segment smoothed velocity as
+    trajectory colouring.  Callers loading a file can pass that already
+    computed array so statistics are finalized before any display decimation.
+    """
 
     cols = [
-        "seg_id", "n_points", "displacement", "peak_velocity",
-        "median_velocity", "config", "vr", "fly_id", "scene", "source_folder",
+        "seg_id", "n_points", "distance_walked", "displacement",
+        "peak_velocity", "median_velocity", "median_local_tortuosity",
+        "config", "vr", "fly_id", "scene", "source_folder",
     ]
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
-    speed = velocity_all(df)
+    speed = smoothed_velocity(df) if speed is None else np.asarray(speed, dtype=float)
+    tortuosity = (
+        compute_tortuosity(df, window=15)
+        if tortuosity is None else np.asarray(tortuosity, dtype=float)
+    )
 
     seg = df["_seg_id"].to_numpy()
     starts = np.concatenate(([0], np.flatnonzero(seg[1:] != seg[:-1]) + 1))
@@ -129,6 +150,11 @@ def compute_segment_stats(df: pd.DataFrame) -> pd.DataFrame:
 
     x = df["GameObjectPosX"].to_numpy()
     z = df["GameObjectPosZ"].to_numpy()
+    dx = np.empty(len(df)); dx[0] = 0.0; dx[1:] = np.diff(x)
+    dz = np.empty(len(df)); dz[0] = 0.0; dz[1:] = np.diff(z)
+    path_step = np.hypot(dx, dz)
+    path_step[starts] = 0.0
+    distance_walked = np.add.reduceat(path_step, starts)
     peak_in = np.where(np.isfinite(speed), speed, -np.inf)
     peak = np.maximum.reduceat(peak_in, starts)
     peak[~np.isfinite(peak)] = 0.0
@@ -139,13 +165,22 @@ def compute_segment_stats(df: pd.DataFrame) -> pd.DataFrame:
         .fillna(0.0)
         .to_numpy()
     )
+    median_tortuosity = (
+        pd.Series(tortuosity)
+        .groupby(seg, sort=False)
+        .median()
+        .fillna(1.0)
+        .to_numpy()
+    )
 
     out = pd.DataFrame({
         "seg_id": seg[starts],
         "n_points": lens,
+        "distance_walked": distance_walked,
         "displacement": np.hypot(x[ends - 1] - x[starts], z[ends - 1] - z[starts]),
         "peak_velocity": peak,
         "median_velocity": median,
+        "median_local_tortuosity": median_tortuosity,
     })
     meta_cols = {
         "config": "ConfigFile",
