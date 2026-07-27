@@ -786,13 +786,24 @@ def _frame_cache_token(df):
     if df is None:
         return ("none",)
     token = getattr(df, "attrs", {}).get("_frame_token")
-    if token is not None:
-        return token
     n = int(len(df))
     if n == 0:
-        return ("empty", tuple(df.columns))
+        return ("empty", token, tuple(df.columns))
     idx = df.index
     seg = df["_seg_id"] if "_seg_id" in df else None
+    if token is not None:
+        # pandas propagates ``attrs`` through row subsets. Include the concrete
+        # row identity so a slice cannot reuse ROI masks cached for its parent
+        # frame (or for a different same-sized subset).
+        index_hash = int(
+            pd.util.hash_array(idx.to_numpy()).sum(dtype=np.uint64)
+        )
+        return (
+            "token", token, n, index_hash,
+            str(idx[0]), str(idx[-1]),
+            str(seg.iloc[0]) if seg is not None else "",
+            str(seg.iloc[-1]) if seg is not None else "",
+        )
     return (
         "frame", n, str(idx[0]), str(idx[-1]),
         str(seg.iloc[0]) if seg is not None else "",
@@ -3462,13 +3473,13 @@ def _metric_stat_groups(stats: pd.DataFrame, group_by="config",
 
 def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                                pool_mode="separate",
-                               swarm_max=60) -> go.Figure:
+                               swarm_max=200) -> go.Figure:
     """Compare robust per-trial movement summaries across the active panel axis.
 
     Small groups use a jittered point swarm; larger groups use count-scaled
-    violins with a compact box/mean line. Tortuosity is a median of local
-    15-sample path/chord ratios, avoiding the unstable whole-trial
-    distance/displacement shortcut.
+    violins. Both encodings carry the same full-width IQR band and median line.
+    Tortuosity is a median of local 15-sample path/chord ratios, avoiding the
+    unstable whole-trial distance/displacement shortcut.
     """
 
     if stats is None or len(stats) == 0:
@@ -3483,19 +3494,24 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
         subplot_titles=[spec[1] for spec in _TRIAL_METRIC_SPECS],
         horizontal_spacing=0.09, vertical_spacing=0.17,
     )
+    half_width = 0.36
     for metric_index, (column, _title, axis_title) in enumerate(_TRIAL_METRIC_SPECS):
         row, col = metric_index // 2 + 1, metric_index % 2 + 1
+        ticktext = []
         for group_index, (raw_name, group) in enumerate(groups):
+            name = humanise_config(str(raw_name)) if group_by == "config" else str(raw_name)
             if column not in group:
+                ticktext.append(f"{name}<br>n=0")
                 continue
             values = pd.to_numeric(group[column], errors="coerce")
             keep = np.isfinite(values.to_numpy(dtype=float))
             if not keep.any():
+                ticktext.append(f"{name}<br>n=0")
                 continue
             sub = group.loc[keep]
             y = values.loc[keep].to_numpy(dtype=float)
-            name = humanise_config(str(raw_name)) if group_by == "config" else str(raw_name)
             x_name = f"{name}<br>n={len(y):,}"
+            ticktext.append(x_name)
             custom = np.column_stack([
                 sub["seg_id"].astype(str).to_numpy(),
                 pd.to_numeric(sub["n_points"], errors="coerce")
@@ -3508,26 +3524,70 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                 "<br>source points: %{customdata[1]:,}<extra></extra>"
             )
             if len(y) <= int(swarm_max):
-                fig.add_trace(go.Box(
-                    x=[x_name] * len(y), y=y.tolist(), name=name,
+                # Explicit, deterministic jitter avoids opaque box-trace point
+                # positioning and remains stable across rerenders.
+                rng = np.random.default_rng(
+                    1741 + metric_index * 1009 + group_index * 97
+                )
+                jitter_x = group_index + rng.uniform(
+                    -half_width, half_width, len(y)
+                )
+                fig.add_trace(go.Scatter(
+                    x=jitter_x.tolist(), y=y.tolist(), name=name,
                     legendgroup=f"metric:{raw_name}", showlegend=False,
-                    boxpoints="all", jitter=0.48, pointpos=0,
-                    fillcolor="rgba(0,0,0,0)", line=dict(color=color, width=0),
+                    mode="markers",
                     marker=dict(color=color, size=5, opacity=0.68),
                     customdata=custom, hovertemplate=hover,
-                    whiskerwidth=0,
                 ), row=row, col=col)
             else:
                 fig.add_trace(go.Violin(
-                    x=[x_name] * len(y), y=y.tolist(), name=name,
-                    legendgroup=f"metric:{raw_name}", scalegroup=str(raw_name),
+                    x=[group_index] * len(y), y=y.tolist(), name=name,
+                    legendgroup=f"metric:{raw_name}",
+                    scalegroup=f"trial-metric:{column}",
                     showlegend=False, scalemode="count", spanmode="hard",
-                    box_visible=True, meanline_visible=True, points=False,
+                    box_visible=False, meanline_visible=False, points=False,
+                    width=half_width * 2,
                     line_color=color, fillcolor=color, opacity=0.55,
                     customdata=custom, hovertemplate=hover,
                 ), row=row, col=col)
+
+            # The same summary encoding sits above either primary mark. Its
+            # width exactly matches the jitter/violin span.
+            q1, median, q3 = np.percentile(y, [25, 50, 75])
+            fig.add_shape(
+                type="rect",
+                x0=group_index - half_width,
+                x1=group_index + half_width,
+                y0=float(q1),
+                y1=float(q3),
+                fillcolor=_rgba(color, 0.14),
+                line=dict(color=_rgba(color, 0.72), width=1.4),
+                layer="above",
+                row=row,
+                col=col,
+            )
+            fig.add_shape(
+                type="line",
+                x0=group_index - half_width,
+                x1=group_index + half_width,
+                y0=float(median),
+                y1=float(median),
+                line=dict(color=_rgba(color, 1.0), width=3),
+                layer="above",
+                row=row,
+                col=col,
+            )
         fig.update_yaxes(title_text=axis_title, rangemode="tozero", row=row, col=col)
-        fig.update_xaxes(tickangle=-22, tickfont=dict(size=9), row=row, col=col)
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=list(range(len(groups))),
+            ticktext=ticktext,
+            range=[-0.55, max(len(groups) - 0.45, 0.55)],
+            tickangle=-22,
+            tickfont=dict(size=9),
+            row=row,
+            col=col,
+        )
 
     fig.update_layout(
         height=820,
@@ -3542,7 +3602,8 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
         x=0.5, y=-0.13, xref="paper", yref="paper", showarrow=False,
         text=(
             f"Each observation is one visible trial. Groups with ≤{int(swarm_max)} "
-            "trials show points; larger groups show count-scaled violins."
+            "trials show jittered points; larger groups show count-scaled violins. "
+            "Shaded bands are IQR; bold lines are medians."
         ),
         font=dict(size=10, color="#667085"),
     )

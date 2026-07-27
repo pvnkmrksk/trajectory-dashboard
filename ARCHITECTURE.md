@@ -178,8 +178,10 @@ same cache key.
 - **Trial metrics**: `build_trial_metrics_figure` selects the exact pre-retention
   segment summaries for currently visible `_seg_id` values and groups them by
   the same panel axis. It shows path length, net displacement, median smoothed
-  speed, and the median 15-sample local path/chord ratio. Up to 60 trials per
-  group render as jittered points; larger groups render as count-scaled violins.
+  speed, and the median 15-sample local path/chord ratio. Up to 200 trials per
+  group render as deterministic jittered points; larger groups render as
+  count-scaled violins. Both encodings share a full-width IQR band and median
+  line overlay.
   The starting-heading diagnostic uses 36 fixed sectors with edges
   `[-5°, 5°], [5°, 15°], …`, so cardinal 0° is a bin centre.
 - **Trajectory ROI labels**: corner labels are exclusive first-reached outcome

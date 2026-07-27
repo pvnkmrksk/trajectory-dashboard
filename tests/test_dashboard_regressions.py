@@ -167,10 +167,24 @@ class DashboardRegressionTests(unittest.TestCase):
             })
 
         swarm = app.build_trial_metrics_figure(stats(8))
-        violin = app.build_trial_metrics_figure(stats(80))
-        self.assertEqual({trace.type for trace in swarm.data}, {"box"})
+        boundary = app.build_trial_metrics_figure(stats(200))
+        violin = app.build_trial_metrics_figure(stats(201))
+        self.assertEqual({trace.type for trace in swarm.data}, {"scatter"})
+        self.assertEqual({trace.type for trace in boundary.data}, {"scatter"})
         self.assertEqual({trace.type for trace in violin.data}, {"violin"})
         self.assertEqual(len(swarm.data), 4)
+        self.assertEqual(len(swarm.layout.shapes), 8)
+        self.assertEqual(len(violin.layout.shapes), 8)
+        self.assertGreater(np.ptp(np.asarray(swarm.data[0].x, dtype=float)), 0)
+        self.assertTrue(all(
+            abs(float(x)) <= 0.36 for x in swarm.data[0].x
+        ))
+        iqr, median = swarm.layout.shapes[:2]
+        self.assertEqual(iqr.type, "rect")
+        self.assertEqual(median.type, "line")
+        self.assertAlmostEqual(float(iqr.x1) - float(iqr.x0), 0.72)
+        self.assertAlmostEqual(float(median.x1) - float(median.x0), 0.72)
+        self.assertAlmostEqual(float(median.y0), 7.5)
         self.assertIn("15-sample path/chord", swarm.layout.yaxis3.title.text)
 
     def test_local_tortuosity_uses_matching_path_and_chord_intervals(self):
@@ -213,6 +227,22 @@ class DashboardRegressionTests(unittest.TestCase):
             color_by="none", view_range=view)
         self.assertEqual(tuple(fig.layout.xaxis.range), view[0])
         self.assertEqual(tuple(fig.layout.yaxis.range), view[1])
+
+    def test_inherited_frame_tokens_do_not_alias_different_row_subsets(self):
+        frame = _polar_frame().reset_index(drop=True)
+        frame.attrs["_frame_token"] = ("data", "same-source")
+        subset_a = frame.iloc[[0, 1, 3]].copy()
+        subset_b = frame.iloc[[0, 2, 3]].copy()
+        self.assertEqual(subset_a.attrs["_frame_token"], frame.attrs["_frame_token"])
+        self.assertEqual(subset_b.attrs["_frame_token"], frame.attrs["_frame_token"])
+        self.assertNotEqual(
+            app._frame_cache_token(frame),
+            app._frame_cache_token(subset_a),
+        )
+        self.assertNotEqual(
+            app._frame_cache_token(subset_a),
+            app._frame_cache_token(subset_b),
+        )
 
     def test_dataset_generation_waits_for_range_controls(self):
         master = next(

@@ -187,8 +187,9 @@ For a quick preprocessing check on the homing enemy data, run
   Median/IQR are drawn as simple line overlays, not violin boxes.
 - **Trial metrics view**: distance walked, net displacement, median smoothed
   velocity, and median local 15-sample path/chord tortuosity across the current
-  panel grouping. Groups with up to 60 visible trials use jittered swarms;
-  larger groups use count-scaled violins.
+  panel grouping. Groups with up to 200 visible trials use deterministic
+  jittered swarms; larger groups use count-scaled violins. Both show a
+  full-width shaded IQR with a bold median overlay.
 - **Polar view**: one circular resultant per trial from Unity body orientation
   (`GameObjectRotY`) by default, with movement heading as an alternative. 0° is
   forward/+Z and positive angles turn right/+X. The bold population ray exactly
