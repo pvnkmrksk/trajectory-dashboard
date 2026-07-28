@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import base64
 import copy
 import glob
 import json
@@ -18,8 +19,10 @@ import math
 import os
 import platform
 import re
+import struct
 import threading
 import time
+import zlib
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
@@ -1210,6 +1213,24 @@ def _subplot_spacing(nrows):
     return min(0.035, 0.10 / max(int(nrows) - 1, 1))
 
 
+def _horizontal_legend_layout(labels, ncols, base_top=78):
+    """Reserve enough top margin and height for a wrapping horizontal legend."""
+    labels = [str(label) for label in labels if label not in (None, "")]
+    if not labels:
+        return 50, 0
+    available_px = max(360, int(ncols or 1) * 455 - 95)
+    item_widths = [min(260, 38 + 6 * len(label)) for label in labels]
+    rows = 1
+    used = 0
+    for width in item_widths:
+        if used and used + width > available_px:
+            rows += 1
+            used = 0
+        used += width
+    extra = max(0, rows - 1) * 24
+    return int(base_top + extra), int(extra)
+
+
 def _group_frames(df, group_by, pool_mode, ncols):
     return td_grouping.group_frames(
         df, group_by, pool_mode, config_order=_CONFIG_ORDER,
@@ -1759,13 +1780,21 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                                                roi_outcomes if overlay else None))
 
     show_legend = color_by in ("individual", "vr", "roi")
+    legend_labels = [
+        trace.name for trace in fig.data
+        if bool(getattr(trace, "showlegend", False))
+    ]
+    legend_top, legend_extra = (
+        _horizontal_legend_layout(legend_labels, ncols)
+        if show_legend else (50, 0)
+    )
     fig.update_layout(
-        height=60 + nrows * _subplot_px(nrows, ncols),
+        height=60 + nrows * _subplot_px(nrows, ncols) + legend_extra,
         showlegend=show_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="left", x=0,
                     font_size=10, itemclick="toggle", itemdoubleclick="toggleothers"),
-        margin=dict(l=50, r=35, t=78 if show_legend else 50, b=40),
+        margin=dict(l=50, r=35, t=legend_top, b=40),
         template="plotly_white", dragmode="pan",
     )
     return fig
@@ -2126,6 +2155,543 @@ def build_heatmap_figure(df, group_by="config", pool_mode="separate", ncols=2,
     var = _heatmap_variant(bins, log_scale=log_scale, metric=metric, cmin=cmin,
                            cmax=cmax, crange_mode=crange_mode)
     return _assemble_heatmap(bins, var, ncols, df)
+
+
+# ---------------------------------------------------------------------------
+# Local direction / abundance field
+# ---------------------------------------------------------------------------
+
+FLOW_ARROW_DENSITY_BREAKS = np.array(
+    [0.0, 0.12, 0.28, 0.48, 0.72, 1.000001])
+FLOW_ARROW_OPACITY = (0.10, 0.24, 0.44, 0.70, 0.94)
+FLOW_ARROW_WIDTH = (1.0, 1.35, 1.8, 2.3, 3.0)
+
+
+def _direction_unit_vectors(df, angle_source="orientation", moving_only=False,
+                            walk_thresh=None):
+    """Unit heading components aligned to ``df`` plus the source actually used.
+
+    The coordinate convention matches the polar view: ``ux=sin(theta)`` points
+    along +X, ``uz=cos(theta)`` points along +Z, and positive angles turn right.
+    Movement headings are calculated only within contiguous ``_seg_id`` blocks.
+    """
+    n = 0 if df is None else len(df)
+    source = str(angle_source or "orientation").lower()
+    if source not in ("orientation", "movement"):
+        source = "orientation"
+    if source == "orientation" and (df is None or "GameObjectRotY" not in df):
+        source = "movement"
+    if n == 0:
+        return np.array([], dtype=float), np.array([], dtype=float), source
+
+    if source == "orientation":
+        angles = pd.to_numeric(
+            df["GameObjectRotY"], errors="coerce").to_numpy(dtype=float)
+        angles = np.radians(angles)
+        ux = np.sin(angles)
+        uz = np.cos(angles)
+        invalid = ~np.isfinite(angles)
+        ux[invalid] = np.nan
+        uz[invalid] = np.nan
+    else:
+        x = df["GameObjectPosX"].to_numpy(dtype=float)
+        z = df["GameObjectPosZ"].to_numpy(dtype=float)
+        seg = df["_seg_id"].to_numpy()
+        dx = np.empty(n, dtype=float)
+        dz = np.empty(n, dtype=float)
+        dx[0] = dz[0] = np.nan
+        dx[1:] = np.diff(x)
+        dz[1:] = np.diff(z)
+        starts = np.empty(n, dtype=bool)
+        starts[0] = True
+        starts[1:] = seg[1:] != seg[:-1]
+        dx[starts] = np.nan
+        dz[starts] = np.nan
+        magnitude = np.hypot(dx, dz)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ux = dx / magnitude
+            uz = dz / magnitude
+        invalid = ~np.isfinite(ux) | ~np.isfinite(uz)
+        ux[invalid] = np.nan
+        uz[invalid] = np.nan
+
+    if moving_only:
+        threshold = float(walk_thresh or 0.0)
+        speed = smoothed_velocity(df, 10)
+        slow = ~np.isfinite(speed) | (speed < threshold)
+        ux[slow] = np.nan
+        uz[slow] = np.nan
+    return ux, uz, source
+
+
+def _direction_field_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
+                          angle_source, moving_only, walk_thresh,
+                          metric="time", log_scale=False, cmin=None, cmax=None,
+                          crange_mode="value"):
+    """Vectorised local circular means on the shared heatmap grid."""
+    groups = _group_frames(df, group_by, pool_mode, ncols)
+    group_items = list(groups.items())
+    xedges, yedges, rng = _heatmap_edges(df, bin_size, bound_pct)
+    nx, nz = len(xedges) - 1, len(yedges) - 1
+    ux, uz, actual_source = _direction_unit_vectors(
+        df, angle_source, moving_only, walk_thresh)
+    ux_by_index = pd.Series(ux, index=df.index)
+    uz_by_index = pd.Series(uz, index=df.index)
+    results = []
+
+    for gname, gdf in group_items:
+        gx = gdf["GameObjectPosX"].to_numpy(dtype=float)
+        gz = gdf["GameObjectPosZ"].to_numpy(dtype=float)
+        gux = ux_by_index.loc[gdf.index].to_numpy(dtype=float)
+        guz = uz_by_index.loc[gdf.index].to_numpy(dtype=float)
+        ix = np.searchsorted(xedges, gx, side="right") - 1
+        iz = np.searchsorted(yedges, gz, side="right") - 1
+        good = (
+            np.isfinite(gx) & np.isfinite(gz)
+            & np.isfinite(gux) & np.isfinite(guz)
+            & (ix >= 0) & (ix < nx) & (iz >= 0) & (iz < nz)
+        )
+        flat = (iz[good] * nx + ix[good]).astype(np.int64, copy=False)
+        count = np.bincount(flat, minlength=nx * nz).astype(np.int64)
+        sum_x = np.bincount(
+            flat, weights=gux[good], minlength=nx * nz)
+        sum_z = np.bincount(
+            flat, weights=guz[good], minlength=nx * nz)
+        denom = np.maximum(count, 1)
+        mean_x = sum_x / denom
+        mean_z = sum_z / denom
+        strength = np.hypot(mean_x, mean_z)
+        theta = np.degrees(np.arctan2(mean_x, mean_z))
+        strength[count == 0] = np.nan
+        theta[count == 0] = np.nan
+        results.append({
+            "name": gname,
+            "frame": gdf,
+            "count": count,
+            "R": strength,
+            "theta": theta,
+        })
+
+    metric = metric if metric in METRIC_UNITS else "time"
+    dt = _median_dt(df)
+    metric_arrays = []
+    for result in results:
+        values = result["count"].astype(float)
+        if metric == "time":
+            values = values * dt
+        elif metric == "percent":
+            total = values.sum()
+            values = (100.0 * values / total) if total > 0 else values
+        result["metric"] = values
+        metric_arrays.append(values)
+
+    nonzero_parts = [values[values > 0] for values in metric_arrays
+                     if np.any(values > 0)]
+    nonzero = (
+        np.concatenate(nonzero_parts)
+        if nonzero_parts else np.array([], dtype=float)
+    )
+    auto_lo = (
+        float(nonzero.min()) if log_scale and nonzero.size else 0.0)
+    auto_hi = (
+        max(float(values.max()) for values in metric_arrays)
+        if metric_arrays else 1.0)
+    if auto_hi <= 0:
+        auto_hi = 1.0
+
+    def _resolve(value, default):
+        if value is None or value == "":
+            return default
+        value = float(value)
+        if crange_mode == "percentile" and nonzero.size:
+            percentile = max(0.0, min(100.0, value))
+            return float(np.percentile(nonzero, percentile))
+        return value
+
+    metric_min = _resolve(cmin, auto_lo)
+    metric_max = _resolve(cmax, auto_hi)
+    if metric == "time":
+        metric_min = max(metric_min, 0.1)
+    if log_scale:
+        metric_min = max(metric_min, 1e-9)
+    if metric_max <= metric_min:
+        metric_max = metric_min * 10 if log_scale else metric_min + 1.0
+
+    if log_scale:
+        scale_min = float(np.log10(metric_min))
+        scale_max = float(np.log10(metric_max))
+    else:
+        scale_min = float(metric_min)
+        scale_max = float(metric_max)
+    scale_span = scale_max - scale_min
+    for result in results:
+        values = result["metric"]
+        display = np.full(values.shape, scale_min, dtype=float)
+        occupied = values > 0
+        if log_scale:
+            display[occupied] = np.log10(
+                np.maximum(values[occupied], metric_min))
+        else:
+            display[occupied] = values[occupied]
+        result["abundance"] = np.where(
+            occupied,
+            np.clip((display - scale_min) / scale_span, 0.0, 1.0),
+            0.0,
+        )
+
+    return {
+        "groups": results,
+        "xedges": xedges,
+        "yedges": yedges,
+        "xc": 0.5 * (xedges[:-1] + xedges[1:]),
+        "yc": 0.5 * (yedges[:-1] + yedges[1:]),
+        "rng": rng,
+        "nrows": max(1, (len(results) + ncols - 1) // ncols),
+        "source": actual_source,
+        "dt": dt,
+        "metric": metric,
+        "metric_unit": METRIC_UNITS[metric],
+        "metric_scale": "log" if log_scale else "linear",
+        "metric_min": float(metric_min),
+        "metric_max": float(metric_max),
+    }
+
+
+def _hsv_rgb_arrays(hue, saturation, value):
+    """Vectorised HSV → RGB conversion for equally-shaped arrays."""
+    hue = np.mod(np.asarray(hue, dtype=float), 1.0)
+    saturation = np.clip(np.asarray(saturation, dtype=float), 0.0, 1.0)
+    value = np.clip(np.asarray(value, dtype=float), 0.0, 1.0)
+    sector_float = hue * 6.0
+    sector = np.floor(sector_float).astype(np.int8) % 6
+    frac = sector_float - np.floor(sector_float)
+    p = value * (1.0 - saturation)
+    q = value * (1.0 - frac * saturation)
+    t = value * (1.0 - (1.0 - frac) * saturation)
+    red = np.choose(sector, [value, q, p, p, t, value])
+    green = np.choose(sector, [t, value, value, q, p, p])
+    blue = np.choose(sector, [p, p, t, value, value, q])
+    return np.column_stack([red, green, blue])
+
+
+def _direction_field_rgba(result, nz, nx):
+    """RGBA pixels: soft circular hue=direction, saturation=R, alpha=abundance."""
+    rgba = np.zeros((nz, nx, 4), dtype=np.uint8)
+    occupied = result["count"] > 0
+    if not np.any(occupied):
+        return rgba
+    theta = result["theta"][occupied]
+    strength = np.clip(result["R"][occupied], 0.0, 1.0)
+    abundance = np.clip(result["abundance"][occupied], 0.0, 1.0)
+    hue = np.mod(theta, 360.0) / 360.0
+    # Low-R bins are neutral grey rather than displaying a meaningless hue.
+    # High-R bins approach a soft, high-chroma cyclic direction colour without
+    # the eye-searing value/saturation of a raw HSV wheel.
+    saturation = 0.60 * strength
+    value = 0.84 + 0.09 * strength
+    rgb = np.rint(
+        255.0 * _hsv_rgb_arrays(hue, saturation, value)).astype(np.uint8)
+    alpha = np.rint(255.0 * abundance).astype(np.uint8)
+    pixels = rgba.reshape(-1, 4)
+    pixels[occupied, :3] = rgb
+    pixels[occupied, 3] = alpha
+    return rgba
+
+
+def _rgba_png_data_uri(rgba):
+    """Encode a small RGBA array as a PNG data URI without extra dependencies."""
+    rgba = np.ascontiguousarray(np.asarray(rgba, dtype=np.uint8))
+    if rgba.ndim != 3 or rgba.shape[2] != 4:
+        raise ValueError("RGBA image must have shape (height, width, 4)")
+    height, width = rgba.shape[:2]
+    # PNG scanlines are top-to-bottom; direction grids are stored low-Z first.
+    top_down = np.flipud(rgba).reshape(height, width * 4)
+    scanlines = np.concatenate(
+        [np.zeros((height, 1), dtype=np.uint8), top_down], axis=1).tobytes()
+
+    def chunk(kind, payload):
+        crc = zlib.crc32(kind + payload) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(payload)) + kind + payload
+            + struct.pack(">I", crc)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(scanlines, level=6))
+        + chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _flow_arrow_arrays(x, z, strength, theta_deg, cell_size,
+                       max_radius=0.49):
+    """NaN-joined direction strokes built in one vectorised allocation."""
+    if len(x) == 0:
+        return [], []
+    theta = np.radians(theta_deg)
+    vx, vz = np.sin(theta), np.cos(theta)
+    radius = max(0.01, min(0.49, float(max_radius or 0.49)))
+    length = radius * float(cell_size) * strength
+    tip_x = x + length * vx
+    tip_z = z + length * vz
+
+    out_x = np.full(len(x) * 3, np.nan, dtype=float)
+    out_z = np.full(len(x) * 3, np.nan, dtype=float)
+    out_x[0::3], out_z[0::3] = x, z
+    out_x[1::3], out_z[1::3] = tip_x, tip_z
+    return out_x.tolist(), out_z.tolist()
+
+
+def _layout_axis_key(axis_ref):
+    """Plotly trace axis ref (``x2``) → layout key (``xaxis2``)."""
+    return f"{axis_ref[0]}axis{axis_ref[1:]}"
+
+
+def _add_direction_marginals(fig, bins, ncols):
+    """Add compact top/right abundance marginals aligned to every flow panel."""
+    results = bins["groups"]
+    total_main_axes = bins["nrows"] * ncols
+    main_fraction = 0.82
+    gap_fraction = 0.025
+    line_color = "rgba(15,118,110,0.92)"
+    fill_color = "rgba(15,118,110,0.18)"
+    unit = bins["metric_unit"]
+    nx, nz = len(bins["xc"]), len(bins["yc"])
+
+    for index, result in enumerate(results):
+        main_x_ref, main_y_ref = _subplot_axis(index + 1)
+        main_x_key = _layout_axis_key(main_x_ref)
+        main_y_key = _layout_axis_key(main_y_ref)
+        xdomain = list(getattr(fig.layout, main_x_key).domain)
+        ydomain = list(getattr(fig.layout, main_y_key).domain)
+        xspan = xdomain[1] - xdomain[0]
+        yspan = ydomain[1] - ydomain[0]
+        x_main_end = xdomain[0] + main_fraction * xspan
+        y_main_end = ydomain[0] + main_fraction * yspan
+        x_margin_start = xdomain[0] + (main_fraction + gap_fraction) * xspan
+        y_margin_start = ydomain[0] + (main_fraction + gap_fraction) * yspan
+
+        getattr(fig.layout, main_x_key).domain = [xdomain[0], x_main_end]
+        getattr(fig.layout, main_y_key).domain = [ydomain[0], y_main_end]
+
+        top_number = total_main_axes + index * 2 + 1
+        side_number = top_number + 1
+        top_x_ref, top_y_ref = f"x{top_number}", f"y{top_number}"
+        side_x_ref, side_y_ref = f"x{side_number}", f"y{side_number}"
+        metric_grid = np.asarray(result["metric"], dtype=float).reshape(nz, nx)
+        x_marginal = np.nansum(metric_grid, axis=0)
+        z_marginal = np.nansum(metric_grid, axis=1)
+
+        fig.update_layout(**{
+            _layout_axis_key(top_x_ref): dict(
+                domain=[xdomain[0], x_main_end], anchor=top_y_ref,
+                matches=main_x_ref, showticklabels=False, showgrid=False,
+                zeroline=False, ticks="",
+            ),
+            _layout_axis_key(top_y_ref): dict(
+                domain=[y_margin_start, ydomain[1]], anchor=top_x_ref,
+                rangemode="tozero", showticklabels=False, showgrid=False,
+                zeroline=False, fixedrange=True, ticks="",
+            ),
+            _layout_axis_key(side_x_ref): dict(
+                domain=[x_margin_start, xdomain[1]], anchor=side_y_ref,
+                rangemode="tozero", showticklabels=False, showgrid=False,
+                zeroline=False, fixedrange=True, ticks="",
+            ),
+            _layout_axis_key(side_y_ref): dict(
+                domain=[ydomain[0], y_main_end], anchor=side_x_ref,
+                matches=main_y_ref, showticklabels=False, showgrid=False,
+                zeroline=False, ticks="",
+            ),
+        })
+        fig.add_trace(go.Scatter(
+            x=bins["xc"].tolist(), y=x_marginal.tolist(),
+            xaxis=top_x_ref, yaxis=top_y_ref,
+            mode="lines", fill="tozeroy", showlegend=False,
+            line=dict(color=line_color, width=1.5), fillcolor=fill_color,
+            name="X abundance",
+            hovertemplate=(
+                "X=%{x:.2f}<br>X marginal=%{y:.3g} "
+                f"{unit}<extra></extra>"
+            ),
+        ))
+        fig.add_trace(go.Scatter(
+            x=z_marginal.tolist(), y=bins["yc"].tolist(),
+            xaxis=side_x_ref, yaxis=side_y_ref,
+            mode="lines", fill="tozerox", showlegend=False,
+            line=dict(color=line_color, width=1.5), fillcolor=fill_color,
+            name="Z abundance",
+            hovertemplate=(
+                "Z=%{y:.2f}<br>Z marginal=%{x:.3g} "
+                f"{unit}<extra></extra>"
+            ),
+        ))
+
+
+def build_direction_field_figure(
+        df, group_by="config", pool_mode="separate", ncols=2,
+        bin_size=20.0, bound_pct=98.0, angle_source="orientation",
+        moving_only=False, walk_thresh=None, rois=None, reach_radius=3.0,
+        show_rois=False, metric="time", log_scale=False, cmin=None, cmax=None,
+        crange_mode="value", max_radius=0.49):
+    """Local circular direction field with an abundance-weighted colour raster.
+
+    Every occupied spatial bin is a polar summary of its valid sample headings:
+    arrow angle / hue are the circular mean, arrow length / saturation are the
+    resultant strength R (0..1), and arrow visibility / raster alpha follow the
+    active heatmap abundance metric, scale, and colour range.
+    """
+    if df is None or len(df) == 0:
+        return _msg_figure("No trajectories match the active filters.")
+    ncols = max(1, int(ncols or 2))
+    bins = _direction_field_bins(
+        df, group_by, pool_mode, ncols, bin_size, bound_pct,
+        angle_source, moving_only, walk_thresh,
+        metric=metric, log_scale=log_scale, cmin=cmin, cmax=cmax,
+        crange_mode=crange_mode)
+    results = bins["groups"]
+    if not results:
+        return _msg_figure("No panel groups are available for the direction field.")
+
+    fig = make_subplots(
+        rows=bins["nrows"], cols=ncols,
+        subplot_titles=[humanise_config(result["name"]) for result in results],
+        horizontal_spacing=0.05,
+        vertical_spacing=_subplot_spacing(bins["nrows"]),
+    )
+    xedges, yedges = bins["xedges"], bins["yedges"]
+    xc, yc = bins["xc"], bins["yc"]
+    nx, nz = len(xc), len(yc)
+    cell_size = min(
+        float(np.median(np.diff(xedges))),
+        float(np.median(np.diff(yedges))),
+    )
+    images = []
+    occupied_total = 0
+
+    for index, result in enumerate(results):
+        row, col = index // ncols + 1, index % ncols + 1
+        sx, sy = _subplot_axis(index + 1)
+        rgba = _direction_field_rgba(result, nz, nx)
+        images.append(dict(
+            source=_rgba_png_data_uri(rgba),
+            xref=sx, yref=sy,
+            x=float(xedges[0]), y=float(yedges[-1]),
+            sizex=float(xedges[-1] - xedges[0]),
+            sizey=float(yedges[-1] - yedges[0]),
+            xanchor="left", yanchor="top",
+            sizing="stretch", opacity=1.0, layer="below",
+        ))
+
+        occupied = result["count"] > 0
+        occupied_total += int(np.count_nonzero(occupied))
+        flat = np.flatnonzero(occupied)
+        iy, ix = np.divmod(flat, nx)
+        cell_x, cell_z = xc[ix], yc[iy]
+        cell_count = result["count"][occupied]
+        cell_r = result["R"][occupied]
+        cell_theta = result["theta"][occupied]
+        cell_abundance = result["abundance"][occupied]
+        cell_metric = result["metric"][occupied]
+        custom = np.column_stack([
+            cell_count.astype(float),
+            cell_count.astype(float) * bins["dt"],
+            cell_metric,
+            cell_theta,
+            cell_r,
+            100.0 * cell_abundance,
+        ]).tolist()
+        fig.add_trace(go.Scattergl(
+            x=cell_x.tolist(), y=cell_z.tolist(),
+            mode="markers", showlegend=False,
+            marker=dict(size=15, color="rgba(0,0,0,0.001)"),
+            customdata=custom,
+            hovertemplate=(
+                "x=%{x:.2f} z=%{y:.2f}<br>"
+                "%{customdata[0]:,.0f} valid heading samples"
+                "<br>≈ %{customdata[1]:.2f} s occupancy"
+                f"<br>{bins['metric_unit']}=%{{customdata[2]:.3g}}"
+                "<br>mean direction=%{customdata[3]:.1f}°"
+                "<br>resultant R=%{customdata[4]:.3f}"
+                "<br>visible abundance=%{customdata[5]:.0f}%"
+                "<extra></extra>"
+            ),
+        ), row=row, col=col)
+
+        arrow_ok = (
+            np.isfinite(cell_r) & np.isfinite(cell_theta)
+            & (cell_r >= 0.04) & (cell_abundance >= 0.02)
+        )
+        tier = np.digitize(
+            cell_abundance, FLOW_ARROW_DENSITY_BREAKS[1:-1], right=False)
+        for tier_index, (opacity, width) in enumerate(
+                zip(FLOW_ARROW_OPACITY, FLOW_ARROW_WIDTH)):
+            take = arrow_ok & (tier == tier_index)
+            if not np.any(take):
+                continue
+            arrow_x, arrow_z = _flow_arrow_arrays(
+                cell_x[take], cell_z[take], cell_r[take],
+                cell_theta[take], cell_size, max_radius=max_radius)
+            fig.add_trace(go.Scattergl(
+                x=arrow_x, y=arrow_z, mode="lines",
+                line=dict(color="#18212f", width=width),
+                opacity=opacity, hoverinfo="skip", showlegend=False,
+            ), row=row, col=col)
+
+    fig.update_layout(images=images)
+
+    _apply_axis_sync(
+        fig, bins["nrows"], ncols, df, uirev="traj_view", rng=bins["rng"])
+    _add_direction_marginals(fig, bins, ncols)
+    if show_rois and rois:
+        fig.update_layout(
+            shapes=_roi_overlay_shapes(
+                [(result["name"], result["frame"]) for result in results],
+                rois, float(reach_radius or 3.0)),
+        )
+    source_label = (
+        "body orientation" if bins["source"] == "orientation"
+        else "movement heading"
+    )
+    moving_label = (
+        f" · moving ≥ {float(walk_thresh or 0):g} units/s"
+        if moving_only else ""
+    )
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.5, y=-0.035,
+        xanchor="center", yanchor="top", showarrow=False,
+        text=(
+            f"{source_label}{moving_label} · hue/angle = mean direction · "
+            f"length/saturation = R · opacity/width = "
+            f"{bins['metric_unit']} ({bins['metric_scale']}) · "
+            "top/right = X/Z abundance"
+        ),
+        font=dict(size=10, color="#5b6472"),
+    )
+    for i, annotation in enumerate(fig.layout.annotations):
+        if i < len(results):
+            annotation.update(
+                hovertext=results[i]["name"], font=dict(size=12))
+    fig.update_layout(
+        height=92 + bins["nrows"] * int(round(
+            1.20 * _subplot_px(bins["nrows"], ncols))),
+        margin=dict(l=50, r=45, t=50, b=65),
+        template="plotly_white", dragmode="pan", showlegend=False,
+        meta={
+            "flow_cells": occupied_total,
+            "heading_source": bins["source"],
+            "max_radius": max(0.01, min(0.49, float(max_radius or 0.49))),
+            "abundance_metric": bins["metric"],
+            "abundance_scale": bins["metric_scale"],
+            "abundance_range": [bins["metric_min"], bins["metric_max"]],
+            "spatial_axis_count": bins["nrows"] * ncols,
+            "marginals": "active heatmap metric",
+        },
+    )
+    return fig
 
 
 # metric/scale combinations precomputed so the client can swap between them
@@ -3418,9 +3984,19 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                       bgcolor="white")
     for ann in fig.layout.annotations:
         ann.update(font=dict(size=10), yshift=10)
-    fig.update_layout(height=90 + nrows * 450, template="plotly_white",
-                      margin=dict(l=42, r=112, t=74, b=44),
-                      showlegend=color_by in ("individual", "vr", "roi", "none"),
+    show_legend = color_by in ("individual", "vr", "roi", "none")
+    legend_labels = [
+        trace.name for trace in fig.data
+        if bool(getattr(trace, "showlegend", False))
+    ]
+    legend_top, legend_extra = (
+        _horizontal_legend_layout(legend_labels, ncols, base_top=74)
+        if show_legend else (54, 0)
+    )
+    fig.update_layout(height=90 + nrows * 450 + legend_extra,
+                      template="plotly_white",
+                      margin=dict(l=42, r=112, t=legend_top, b=44),
+                      showlegend=show_legend,
                       legend=dict(
                           orientation="h", yanchor="bottom", y=1.02,
                           xanchor="left", x=0, font_size=10,
@@ -4211,10 +4787,12 @@ app.layout = html.Div([
 
             html.Hr(style={"margin": "6px 0"}),
 
-            html.Label("Heatmap", style={"fontWeight": "bold", "fontSize": "12px"}),
+            html.Label("Spatial fields",
+                       title="Shared grid and extent for the occupancy heatmap and local direction field.",
+                       style={"fontWeight": "bold", "fontSize": "12px"}),
             html.Div([
                 html.Div([
-                    html.Label("Bin size (units)", style={"fontSize": "10px"}),
+                    html.Label("Grid size (units)", style={"fontSize": "10px"}),
                     dcc.Input(id="heatmap-binsize", type="number", value=None, min=0,
                               step="any", debounce=True, placeholder="auto",
                               style=_INPUT_STYLE),
@@ -4240,6 +4818,20 @@ app.layout = html.Div([
                 {"label": "Time %", "value": "percent"},
                 {"label": "Samples", "value": "count"},
             ], value="time", clearable=False, style={"fontSize": "10px"}),
+            html.Label(
+                "Max direction radius (cell widths)",
+                title=(
+                    "Maximum length of a fully directed local vector. "
+                    "Values below 0.49 leave more space between adjacent cells."
+                ),
+                style={"fontSize": "10px", "marginTop": "5px"},
+            ),
+            dcc.Slider(
+                id="flow-max-radius", min=0.05, max=0.49, step=0.01,
+                value=0.49, updatemode="mouseup",
+                marks={0.05: "0.05", 0.25: "0.25", 0.49: "0.49"},
+                tooltip={"placement": "bottom", "always_visible": False},
+            ),
             html.Div([
                 html.Label("Color range",
                            title="Heatmap colour min/max using the active metric distribution.",
@@ -4309,7 +4901,8 @@ app.layout = html.Div([
 
             html.Hr(style={"margin": "6px 0"}),
 
-            html.Label("Polar", style={"fontWeight": "bold", "fontSize": "12px"}),
+            html.Label("Direction analysis",
+                       style={"fontWeight": "bold", "fontSize": "12px"}),
             html.Label("Angle source",
                        title="Body orientation uses Unity GameObjectRotY. Movement heading uses consecutive X/Z samples.",
                        style={"fontSize": "10px", "marginTop": "2px"}),
@@ -4359,7 +4952,7 @@ app.layout = html.Div([
                           style={**_INPUT_STYLE, "width": "62px"}),
             ], className="compact-control-row",
                style={"marginTop": "3px", "alignItems": "center"}),
-            html.Div("0° is forward (+Z), positive angles turn right (+X). The bold ray pools all valid samples exactly.",
+            html.Div("These source/moving controls drive both the local flow field and polar view. 0° is forward (+Z), positive angles turn right (+X).",
                      style={"fontSize": "9px", "color": "#888", "marginTop": "2px"}),
 
             html.Hr(style={"margin": "6px 0"}),
@@ -4602,6 +5195,8 @@ app.layout = html.Div([
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Heatmap", value="heat",
                         className="view-tab", selected_className="view-tab-selected"),
+                dcc.Tab(label="Flow field", value="flow",
+                        className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Polar", value="polar",
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Targets", value="roi",
@@ -4663,6 +5258,71 @@ app.layout = html.Div([
                                        "transition": "opacity .2s",
                                        "pointerEvents": "none"})],
                     id="view-heat", className="plot-section", style={**_PANEL_STYLE}),
+
+                # --- Local direction field ---
+                html.Div(
+                    [html.Div([html.H4("Local direction field"),
+                               html.Span(
+                                   "Circular mean, directionality and abundance per spatial bin",
+                                   className="plot-section-kicker")],
+                              className="plot-section-heading"),
+                     html.Div([
+                         html.Div([
+                             html.Span("Mean direction",
+                                       className="flow-legend-title"),
+                             html.Div([
+                                 html.Span("F", className=(
+                                     "flow-wheel-label flow-wheel-forward")),
+                                 html.Span("R", className=(
+                                     "flow-wheel-label flow-wheel-right")),
+                                 html.Span("B", className=(
+                                     "flow-wheel-label flow-wheel-back")),
+                                 html.Span("L", className=(
+                                     "flow-wheel-label flow-wheel-left")),
+                                 html.Span(className="flow-direction-wheel"),
+                             ], className="flow-wheel-frame",
+                                role="img",
+                                **{"aria-label": (
+                                    "Circular direction colour legend: forward "
+                                    "at top, right clockwise, back at bottom, "
+                                    "and left counter-clockwise.")}),
+                         ], className="flow-legend-group"),
+                         html.Div([
+                             html.Span("Abundance",
+                                       className="flow-legend-title"),
+                             html.Div([
+                                 html.Span([
+                                     html.I(className=(
+                                         "flow-arrow-sample flow-arrow-low")),
+                                     html.Small("low"),
+                                 ], className="flow-abundance-step"),
+                                 html.Span([
+                                     html.I(className=(
+                                         "flow-arrow-sample flow-arrow-mid")),
+                                     html.Small("medium"),
+                                 ], className="flow-abundance-step"),
+                                 html.Span([
+                                     html.I(className=(
+                                         "flow-arrow-sample flow-arrow-high")),
+                                     html.Small("high"),
+                                 ], className="flow-abundance-step"),
+                             ], className="flow-abundance-scale",
+                                role="img",
+                                **{"aria-label": (
+                                    "Abundance legend: direction strokes become more "
+                                    "opaque and thicker from low to high.")}),
+                         ], className="flow-legend-group"),
+                     ], id="flow-field-legend",
+                        className="flow-field-legend"),
+                     dcc.Loading(
+                        dcc.Graph(id="flow-plot", figure=_EMPTY,
+                                  config=GRAPH_CONFIG,
+                                  style={"width": "100%"}),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s",
+                                       "pointerEvents": "none"})],
+                    id="view-flow", className="plot-section", style={**_PANEL_STYLE}),
 
                 # --- Polar ---
                 html.Div(
@@ -4761,6 +5421,7 @@ app.layout = html.Div([
     dcc.Store(id="data-generation"),
     dcc.Store(id="viewport-store"),
     dcc.Store(id="heatmap-figure-store"),
+    dcc.Store(id="flow-figure-store"),
     dcc.Store(id="heatmap-variants"),
     dcc.Store(id="heatmap-color-distributions"),
     dcc.Store(id="heatmap-color-values"),
@@ -4876,6 +5537,7 @@ app.clientside_callback(
     Input("polar-r-range", "value"),
     Input("polar-min-point-frac", "value"),
     Input("polar-min-animal-frac", "value"),
+    Input("flow-max-radius", "value"),
     prevent_initial_call=True,
 )
 
@@ -4916,7 +5578,7 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
             "hcmin": "heatmap-cmin", "hcmax": "heatmap-cmax", "ncols": "subplot-ncols",
             "pts": "plot-points", "tmin": "trial-min", "tmax": "trial-max",
             "smin": "step-min", "smax": "step-max",
-            "reach": "roi-reach",
+            "reach": "roi-reach", "frad": "flow-max-radius",
             "rmin": "polar-r-range", "rmax": "polar-r-range",
             "vrmin": "vel-range", "vrmax": "vel-range",
             "drmin": "disp-range", "drmax": "disp-range",
@@ -4974,6 +5636,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("view-mode", "value", allow_duplicate=True),
     Output("view-layout", "value", allow_duplicate=True),
     Output("viewport-store", "data", allow_duplicate=True),
+    Output("flow-max-radius", "value", allow_duplicate=True),
     Output("roi-reach", "value", allow_duplicate=True),
     Output("url-restored", "data"),
     Input("url", "search"),
@@ -4983,7 +5646,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 45
+    n_out = 46
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -5074,7 +5737,7 @@ def restore_from_url(search, already):
     view = (
         p["view"][0]
         if p.get("view", [""])[0]
-        in ("traj", "heat", "roi", "polar", "metrics", "diag")
+        in ("traj", "heat", "flow", "roi", "polar", "metrics", "diag")
         else no_update
     )
     mode = p["mode"][0] if p.get("mode", [""])[0] in ("accuracy", "speed") else no_update
@@ -5111,7 +5774,7 @@ def restore_from_url(search, already):
         trial_slider_range(),
         step_slider_range(),
         num("pmin"), num("amin"), angle_source, mode, view, view_layout, vp,
-        positive_num("reach"), True,
+        positive_num("frad"), positive_num("reach"), True,
     )
 
 
@@ -5161,15 +5824,29 @@ def on_folder_drop(data, clicks):
     Input("polar-r-range", "value"),
     Input("polar-min-point-frac", "value"),
     Input("polar-min-animal-frac", "value"),
+    Input("heatmap-metric", "value"),
+    Input("heatmap-scale", "value"),
+    Input("heatmap-cmin", "value"),
+    Input("heatmap-cmax", "value"),
+    Input("heatmap-crange", "value"),
+    Input("flow-max-radius", "value"),
     State("store-glob", "data"),
     State("view-render-state", "data"),
     prevent_initial_call=True,
 )
 def start_progress(_load_n, _plot_n, _export_n, _moving, _walk, _angle,
-                   _r_range, _point_frac, _animal_frac, pattern, render_state):
+                   _r_range, _point_frac, _animal_frac, _hm_metric, _hm_scale,
+                   _hm_cmin, _hm_cmax, _hm_crange, _flow_radius,
+                   pattern, render_state):
     trigger = ctx.triggered_id
-    is_polar = str(trigger).startswith("polar-")
-    if is_polar and (not pattern or not render_state):
+    is_direction = (
+        str(trigger).startswith("polar-")
+        or trigger in {
+            "heatmap-metric", "heatmap-scale", "heatmap-cmin",
+            "heatmap-cmax", "heatmap-crange", "flow-max-radius",
+        }
+    )
+    if is_direction and (not pattern or not render_state):
         return True
     labels = {
         "btn-load": ("request", "Queuing dataset discovery…"),
@@ -5177,7 +5854,7 @@ def start_progress(_load_n, _plot_n, _export_n, _moving, _walk, _angle,
         "btn-export": ("request", "Queuing offline HTML export…"),
     }
     kind, message = labels.get(
-        trigger, ("request", "Queuing polar filter update…")
+        trigger, ("request", "Queuing direction-field update…")
     )
     _progress_arm(kind, message)
     return False
@@ -5261,6 +5938,7 @@ def tick_progress(n):
     Input("view-mode", "value"),
     Input("view-layout", "value"),
     Input("roi-reach", "value"),
+    Input("flow-max-radius", "value"),
     State("viewport-store", "data"),
     State("url-restored", "data"),
     prevent_initial_call=True,
@@ -5269,7 +5947,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                hbin, hscale, hbound, hmetric, hcmin, hcmax, hcrange,
                fcfg, fvr, ffly, fscn, ffld, tmin, tmax, smin, smax, raw, ncols, pts,
                rrange, vrange, drange, pmin, amin, angle_source, mode, view,
-               view_layout, reach, vp, restored):
+               view_layout, reach, flow_max_radius, vp, restored):
     if not restored:
         return no_update
     params = {}
@@ -5279,7 +5957,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             "hbound": hbound, "hcmin": hcmin, "hcmax": hcmax, "ncols": ncols,
             "pts": pts, "tmin": tmin, "tmax": tmax,
             "smin": smin, "smax": smax, "pmin": pmin, "amin": amin,
-            "reach": reach}
+            "reach": reach, "frad": flow_max_radius}
     for k, v in nums.items():
         if v is not None and v != "":
             if k == "trim" and float(v or 0) <= 0:
@@ -6404,10 +7082,27 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
 
     xr = _layout_range("xaxis")
     yr = _layout_range("yaxis")
+    meta = getattr(fig.layout, "meta", None)
+    spatial_axis_count = (
+        int(meta.get("spatial_axis_count", 0))
+        if isinstance(meta, dict) else 0
+    )
+
+    def _set_spatial_ranges(axis_prefix, value):
+        if not spatial_axis_count:
+            if axis_prefix == "x":
+                fig.update_xaxes(range=value)
+            else:
+                fig.update_yaxes(range=value)
+            return
+        for index in range(1, spatial_axis_count + 1):
+            key = f"{axis_prefix}axis{'' if index == 1 else index}"
+            fig.update_layout(**{key: dict(range=value)})
+
     if _ok(viewport.get("xaxis"), xr):
-        fig.update_xaxes(range=viewport["xaxis"])
+        _set_spatial_ranges("x", viewport["xaxis"])
     if _ok(viewport.get("yaxis"), yr):
-        fig.update_yaxes(range=viewport["yaxis"])
+        _set_spatial_ranges("y", viewport["yaxis"])
 
 
 @app.callback(
@@ -6415,6 +7110,7 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     Output("heatmap-figure-store", "data", allow_duplicate=True),
     Output("heatmap-variants", "data", allow_duplicate=True),
     Output("heatmap-color-distributions", "data", allow_duplicate=True),
+    Output("flow-figure-store", "data", allow_duplicate=True),
     Output("roi-plot", "figure", allow_duplicate=True),
     Output("polar-plot", "figure", allow_duplicate=True),
     Output("trial-metrics-plot", "figure"),
@@ -6469,6 +7165,7 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     State("polar-r-range", "value"),
     State("polar-min-point-frac", "value"),
     State("polar-min-animal-frac", "value"),
+    State("flow-max-radius", "value"),
     prevent_initial_call=True,
 )
 def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -6479,18 +7176,19 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
                  render_mode, vel_selection, disp_selection, viewport, roi_show, roi_reach,
                  roi_trim, roi_entered, polar_moving, polar_walk, polar_angle_source,
                  polar_r_range,
-                 polar_min_point_frac, polar_min_animal_frac):
+                 polar_min_point_frac, polar_min_animal_frac,
+                 flow_max_radius):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     raw_hidden = {"display": "none"}
     if not pattern:
-        return (empty, empty, {}, {}, empty, empty, empty, empty, raw_hidden,
+        return (empty, empty, {}, {}, empty, empty, empty, empty, empty, raw_hidden,
                 "Choose a data folder or CSV glob to begin.",
                 "", {}, "Waiting for data.")
 
     op_id = _progress_begin(
         "render",
-        ["Filter/cache", "ROI masks", "Trajectories", "Heatmap", "Polar",
-         "Trial metrics", "Raw traces"],
+        ["Filter/cache", "ROI masks", "Trajectories", "Heatmap", "Flow field",
+         "Polar", "Trial metrics", "Raw traces"],
         "Applying filters from the retained in-memory dataset…",
     )
     started = time.perf_counter()
@@ -6525,13 +7223,15 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         msg = "No CSV rows matched the current data source."
         _progress_finish(op_id, msg, failed=True)
         LOGGER.warning("render.empty epoch=%s reason=no_rows source=%r", n, pattern)
-        return (empty, empty, {}, {}, empty, empty, empty, empty, raw_hidden, msg,
+        return (empty, empty, {}, {}, empty, empty, empty, empty, empty,
+                raw_hidden, msg,
                 "", {"epoch": int(n or 0)}, msg)
     if len(df_sub) == 0:
         msg = "No trajectories match the active filters."
         _progress_finish(op_id, msg, failed=True)
         LOGGER.warning("render.empty epoch=%s reason=filters source=%r", n, pattern)
-        return (empty, empty, {}, {}, empty, empty, empty, empty, raw_hidden, msg,
+        return (empty, empty, {}, {}, empty, empty, empty, empty, empty,
+                raw_hidden, msg,
                 "", {"epoch": int(n or 0)}, msg)
 
     df, native_stats, metas = _load_data(pattern)
@@ -6604,6 +7304,23 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     timings["heatmap"] = time.perf_counter() - stage_started
     _progress_stage(
         op_id, 4, done=0, total=1,
+        message="Aggregating local circular vectors on the shared spatial grid…",
+    )
+
+    stage_started = time.perf_counter()
+    flow_fig = build_direction_field_figure(
+        df_plot, group_by, pool_mode, ncols=ncols_val,
+        bin_size=hm_binsize, bound_pct=bound_pct,
+        metric=hm_metric or "time", log_scale=(hm_scale == "log"),
+        cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
+        angle_source=polar_angle_source, moving_only=_on(polar_moving),
+        walk_thresh=polar_walk, rois=rois, reach_radius=reach,
+        show_rois=want_rois and not do_rebase,
+        max_radius=flow_max_radius)
+    _apply_viewport_to_current_range(flow_fig, viewport, max_span_mult=1.5)
+    timings["flow field"] = time.perf_counter() - stage_started
+    _progress_stage(
+        op_id, 5, done=0, total=1,
         message="Aggregating per-trial circular statistics…",
     )
 
@@ -6620,7 +7337,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         return_summary=True, angle_source=polar_angle_source)
     timings["polar"] = time.perf_counter() - stage_started
     _progress_stage(
-        op_id, 5, done=0, total=1,
+        op_id, 6, done=0, total=1,
         message="Building per-trial movement distributions…",
     )
 
@@ -6630,7 +7347,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         metric_stats, group_by=group_by, pool_mode=pool_mode)
     timings["trial metrics"] = time.perf_counter() - stage_started
     _progress_stage(
-        op_id, 6, done=0, total=1,
+        op_id, 7, done=0, total=1,
         message="Finalizing optional raw traces and dashboard state…",
     )
 
@@ -6672,18 +7389,21 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     }
     _progress_finish(op_id, f"Ready — all sections updated in {bt:.2f}s.")
     return (traj_fig, heat_fig.to_plotly_json(), heat_variants,
-            heat_color_distributions, roi_fig, polar_fig,
+            heat_color_distributions, flow_fig.to_plotly_json(), roi_fig, polar_fig,
             metrics_fig, raw_fig, raw_style, summary, exclusion,
             render_state, f"Ready — all sections updated in {bt:.2f}s.")
 
 
-# Polar quality controls are intentionally isolated from the atomic dashboard
-# render above.  Moving-only, Rayleigh, and valid-fraction changes reuse the
-# cached filtered frame and cached per-segment circular statistics, so they do
-# not rebuild trajectories, heatmap bins, ROI diagnostics, or raw traces.
+# Direction controls are intentionally isolated from the atomic dashboard
+# render above. Moving/source changes update the flow field and polar figure;
+# Rayleigh quality changes update only polar; heatmap metric/scale/range changes
+# update only the flow field. All paths reuse the filtered frame and do not
+# rebuild trajectories, occupancy bins, ROI diagnostics, trial metrics, or raw
+# traces.
 app.clientside_callback(
-    "function(a,b,c,d,e,f,pattern){if(!pattern)return window.dash_clientside.no_update;"
-    "return 'Updating polar filters…';}",
+    "function(a,b,c,d,e,f,g,h,i,j,k,l,pattern){"
+    "if(!pattern)return window.dash_clientside.no_update;"
+    "return 'Updating direction views…';}",
     Output("plot-status", "children", allow_duplicate=True),
     Input("polar-moving", "value"),
     Input("polar-walk", "value"),
@@ -6691,6 +7411,12 @@ app.clientside_callback(
     Input("polar-r-range", "value"),
     Input("polar-min-point-frac", "value"),
     Input("polar-min-animal-frac", "value"),
+    Input("heatmap-metric", "value"),
+    Input("heatmap-scale", "value"),
+    Input("heatmap-cmin", "value"),
+    Input("heatmap-cmax", "value"),
+    Input("heatmap-crange", "value"),
+    Input("flow-max-radius", "value"),
     State("store-glob", "data"),
     prevent_initial_call=True,
 )
@@ -6698,6 +7424,7 @@ app.clientside_callback(
 
 @app.callback(
     Output("polar-plot", "figure", allow_duplicate=True),
+    Output("flow-figure-store", "data", allow_duplicate=True),
     Output("polar-r-hist", "figure"),
     Output("polar-point-frac-hist", "figure"),
     Output("polar-animal-frac-hist", "figure"),
@@ -6711,6 +7438,12 @@ app.clientside_callback(
     Input("polar-r-range", "value"),
     Input("polar-min-point-frac", "value"),
     Input("polar-min-animal-frac", "value"),
+    Input("heatmap-metric", "value"),
+    Input("heatmap-scale", "value"),
+    Input("heatmap-cmin", "value"),
+    Input("heatmap-cmax", "value"),
+    Input("heatmap-crange", "value"),
+    Input("flow-max-radius", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
@@ -6734,6 +7467,9 @@ app.clientside_callback(
     State("plot-points", "value"),
     State("render-mode", "value"),
     State("rebase-origin", "value"),
+    State("heatmap-binsize", "value"),
+    State("heatmap-bound", "value"),
+    State("viewport-store", "data"),
     State("roi-show", "value"),
     State("roi-reach", "value"),
     State("roi-entered", "value"),
@@ -6743,33 +7479,48 @@ app.clientside_callback(
 )
 def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source,
                       polar_r_range, polar_min_point_frac,
-                      polar_min_animal_frac, pattern, vel_thresh, min_disp, trim,
-                      jump_buf, cfg, vrs, fids, scenes, folders, trial_min,
-                      trial_max, step_min, step_max, vel_selection,
+                      polar_min_animal_frac, hm_metric, hm_scale, hm_cmin,
+                      hm_cmax, hm_crange, flow_max_radius,
+                      pattern, vel_thresh, min_disp,
+                      trim, jump_buf, cfg, vrs, fids, scenes, folders,
+                      trial_min, trial_max, step_min, step_max, vel_selection,
                       disp_selection, group_by, pool_mode, color_by, ncols,
-                      max_points, render_mode, rebase, roi_show, roi_reach,
+                      max_points, render_mode, rebase, hm_binsize, hm_bound,
+                      viewport, roi_show, roi_reach,
                       roi_entered, roi_trim, current_summary):
     empty_hists = build_polar_quality_histograms(None, polar_r_range,
                                                   polar_min_point_frac,
                                                   polar_min_animal_frac)
     if not pattern or not render_state:
-        return no_update, *empty_hists, no_update, no_update, no_update
+        return no_update, no_update, *empty_hists, no_update, no_update, no_update
 
     trigger = ctx.triggered_id
-    refresh_figure = trigger != "view-render-state"
+    polar_triggers = {
+        "polar-moving", "polar-walk", "polar-angle-source",
+        "polar-r-range", "polar-min-point-frac", "polar-min-animal-frac",
+    }
+    flow_triggers = {
+        "polar-moving", "polar-walk", "polar-angle-source",
+        "heatmap-metric", "heatmap-scale", "heatmap-cmin",
+        "heatmap-cmax", "heatmap-crange", "flow-max-radius",
+    }
+    refresh_polar = trigger in polar_triggers
+    refresh_flow = trigger in flow_triggers
+    refresh_direction = refresh_polar or refresh_flow
+    refresh_hists = trigger == "view-render-state" or refresh_polar
     op_id = (
         _progress_begin(
-            "polar",
-            ["Filter/cache", "Ray aggregation", "Polar figure"],
-            "Updating polar filters from cached trajectory rows…",
+            "direction",
+            ["Filter/cache", "Direction aggregation", "Direction figures"],
+            "Updating direction views from cached trajectory rows…",
         )
-        if refresh_figure else None
+        if refresh_direction else None
     )
     started = time.perf_counter()
     stage_started = started
     timings = {}
     LOGGER.info(
-        "polar.start trigger=%s moving=%s walk=%s angle=%s source=%r",
+        "direction.start trigger=%s moving=%s walk=%s angle=%s source=%r",
         trigger, _on(polar_moving), polar_walk, polar_angle_source, pattern,
     )
     df_f, _, _ = _filtered_df(
@@ -6787,22 +7538,32 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
         if op_id is not None:
             _progress_finish(
                 op_id,
-                "Polar update skipped — no rows match the active filters.",
+                "Direction update skipped — no rows match the active filters.",
                 failed=True,
             )
-        return (msg if refresh_figure else no_update), *empty_hists, no_update, (
-            "Polar update skipped — no rows match the active filters."
-            if refresh_figure else no_update), no_update
+        histogram_out = empty_hists if refresh_hists else (no_update,) * 3
+        return (
+            msg if refresh_polar else no_update,
+            msg.to_plotly_json() if refresh_flow else no_update,
+            *histogram_out,
+            no_update,
+            ("Direction update skipped — no rows match the active filters."
+             if refresh_direction else no_update),
+            no_update,
+        )
 
     stage_started = time.perf_counter()
     _, _, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     reach = float(roi_reach) if roi_reach else 3.0
     df_view, _ = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
-    ray_metric = color_by if color_by in ("velocity", "tortuosity") else "none"
-    ray = rayleigh_by_segment(
-        df_view, _on(polar_moving), polar_walk, ray_metric,
-        angle_source=polar_angle_source)
+    ray = None
+    if refresh_hists:
+        ray_metric = (
+            color_by if color_by in ("velocity", "tortuosity") else "none")
+        ray = rayleigh_by_segment(
+            df_view, _on(polar_moving), polar_walk, ray_metric,
+            angle_source=polar_angle_source)
     timings["ray aggregation"] = time.perf_counter() - stage_started
     if op_id is not None:
         _progress_stage(
@@ -6811,55 +7572,89 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
         )
 
     stage_started = time.perf_counter()
-    hists = build_polar_quality_histograms(
-        ray, polar_r_range, polar_min_point_frac, polar_min_animal_frac)
+    hists = (
+        build_polar_quality_histograms(
+            ray, polar_r_range, polar_min_point_frac, polar_min_animal_frac)
+        if refresh_hists else (no_update,) * 3
+    )
     polar_fig = no_update
-    quality = _filter_polar_ray_table(
-        ray, polar_r_range, polar_min_point_frac, polar_min_animal_frac)[1]
-    if refresh_figure:
+    flow_fig = no_update
+    quality = (
+        _filter_polar_ray_table(
+            ray, polar_r_range, polar_min_point_frac,
+            polar_min_animal_frac)[1]
+        if refresh_hists else {}
+    )
+    if refresh_direction:
         ncols_val = int(ncols) if ncols and ncols >= 1 else 2
         mode = _render_mode(render_mode)
         want_rois = _on(roi_show) and bool(rois)
-        roi_outcomes = (roi_outcome_by_segment(df_view, rois, reach)
-                        if (color_by == "roi" or want_rois) and rois else None)
-        polar_fig, quality = build_polar_figure(
-            df_view, group_by, pool_mode, ncols=ncols_val,
-            color_by=color_by or "individual",
-            moving_only=_on(polar_moving), walk_thresh=polar_walk,
-            max_points=_budget(BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points),
-            rois=rois, reach_radius=reach,
-            show_rois=want_rois and not _on(rebase), roi_outcomes=roi_outcomes,
-            r_range=polar_r_range, min_point_frac=polar_min_point_frac,
-            min_animal_trial_frac=polar_min_animal_frac,
-            return_summary=True, angle_source=polar_angle_source)
+        if refresh_polar:
+            roi_outcomes = (
+                roi_outcome_by_segment(df_view, rois, reach)
+                if (color_by == "roi" or want_rois) and rois else None)
+            polar_fig, quality = build_polar_figure(
+                df_view, group_by, pool_mode, ncols=ncols_val,
+                color_by=color_by or "individual",
+                moving_only=_on(polar_moving), walk_thresh=polar_walk,
+                max_points=_budget(
+                    BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points),
+                rois=rois, reach_radius=reach,
+                show_rois=want_rois and not _on(rebase),
+                roi_outcomes=roi_outcomes,
+                r_range=polar_r_range, min_point_frac=polar_min_point_frac,
+                min_animal_trial_frac=polar_min_animal_frac,
+                return_summary=True, angle_source=polar_angle_source)
+        if refresh_flow:
+            df_flow = rebase_to_origin(df_view) if _on(rebase) else df_view
+            bound_pct = (
+                float(hm_bound) if hm_bound not in (None, "") else 98.0)
+            flow_fig = build_direction_field_figure(
+                df_flow, group_by, pool_mode, ncols=ncols_val,
+                bin_size=hm_binsize, bound_pct=bound_pct,
+                metric=hm_metric or "time", log_scale=(hm_scale == "log"),
+                cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
+                angle_source=polar_angle_source,
+                moving_only=_on(polar_moving), walk_thresh=polar_walk,
+                rois=rois, reach_radius=reach,
+                show_rois=want_rois and not _on(rebase),
+                max_radius=flow_max_radius)
+            _apply_viewport_to_current_range(
+                flow_fig, viewport, max_span_mult=1.5)
     timings["figure/histograms"] = time.perf_counter() - stage_started
     elapsed = time.perf_counter() - started
     timings["total"] = elapsed
 
-    if not refresh_figure:
+    if not refresh_direction:
         LOGGER.info("polar.histograms trials=%d seconds=%.3f",
                     int(quality.get("after_animal", 0)), elapsed)
-        return no_update, *hists, no_update, no_update, no_update
+        return no_update, no_update, *hists, no_update, no_update, no_update
 
     state = {
-        "completed": time.time(), "operation": "polar filters",
+        "completed": time.time(), "operation": "direction controls",
         "timings": {k: round(float(v), 4) for k, v in timings.items()},
         "trigger": str(trigger),
     }
     kept = int(quality.get("after_animal", 0))
-    LOGGER.info("polar.done trigger=%s trials=%d seconds=%.3f",
+    LOGGER.info("direction.done trigger=%s trials=%d seconds=%.3f",
                 trigger, kept, elapsed)
+    ready_message = (
+        f"Ready — direction views kept {kept:,} polar trials in {elapsed:.2f}s."
+        if refresh_polar
+        else f"Ready — flow field updated in {elapsed:.2f}s."
+    )
     if op_id is not None:
-        _progress_finish(
-            op_id,
-            f"Ready — polar filters kept {kept:,} trials in {elapsed:.2f}s.",
-        )
-    summary_out = (re.sub(r"polar [\d,]+ trials", f"polar {kept:,} trials",
-                          current_summary)
-                   if isinstance(current_summary, str) else no_update)
-    return (polar_fig, *hists, state,
-            f"Ready — polar filters kept {kept:,} trials in {elapsed:.2f}s.",
-            summary_out)
+        _progress_finish(op_id, ready_message)
+    summary_out = (
+        re.sub(r"polar [\d,]+ trials", f"polar {kept:,} trials",
+               current_summary)
+        if refresh_polar and isinstance(current_summary, str)
+        else no_update
+    )
+    flow_data = (
+        flow_fig.to_plotly_json() if flow_fig is not no_update else no_update)
+    return (polar_fig, flow_data, *hists, state,
+            ready_message, summary_out)
 
 
 # Attach a debounced Plotly relayout listener directly to the visible
@@ -6874,7 +7669,6 @@ app.clientside_callback(
     Input("trajectory-plot", "figure"),
     prevent_initial_call=True,
 )
-
 
 # The heatmap uses a 1:1 aspect lock (scaleanchor). Dash's Plotly.react update
 # path crashes on that with "axis scaling" when the figure is applied to a graph
@@ -6935,6 +7729,21 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
+app.clientside_callback(
+    "function(ffig){setTimeout(function(){"
+    "var fc=document.getElementById('flow-plot');"
+    "var fg=fc&&fc.querySelector('.js-plotly-plot');"
+    "if(fg&&window.Plotly&&ffig&&ffig.data&&ffig.data.length){"
+    "try{window.Plotly.newPlot(fg,ffig.data,ffig.layout,"
+    "{scrollZoom:true,displayModeBar:true,displaylogo:false});"
+    "if(window.__attachViewportSync){window.__attachViewportSync(fg,'flow',true);}"
+    "}catch(e){}}"
+    "},90);return '';}",
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("flow-figure-store", "data"),
+    prevent_initial_call=True,
+)
+
 
 # Pre-fill LUT editor with current configs → their auto-humanised names
 @app.callback(
@@ -6975,13 +7784,14 @@ def apply_lut(n, lut_text, plot_clicks):
         return f"Error: {e}", no_update
 
 
-def _compose_export_html(traj, heat, roi, polar, metrics, vel, disp,
+def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
                          initial_heading, raw,
                          *, include_raw, summary, share_state):
     """Build one offline-capable report with a single embedded plotly.js."""
     cfgd = dict(scrollZoom=True, displaylogo=False)
     traj_h = traj.to_html(full_html=False, include_plotlyjs=True, config=cfgd)
     heat_h = heat.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
+    flow_h = flow.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     roi_h = roi.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     polar_h = polar.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     metrics_h = metrics.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
@@ -6998,6 +7808,23 @@ h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
 .info{{background:#e9ecef;padding:8px;border-radius:4px;font-size:13px;margin:6px 0}}
 .row{{display:flex;gap:10px}}.row>div{{flex:1;min-width:0}}
 .share{{font-size:11px;color:#888;word-break:break-all}}
+.flowlegend{{display:flex;align-items:center;justify-content:flex-end;gap:24px;
+padding:5px 14px;border:1px solid #edf1f7;border-radius:6px;background:#fbfcfe}}
+.flowlegend>span{{font-size:9px;font-weight:650;color:#475467;text-transform:uppercase}}
+.flowwheel{{position:relative;width:64px;height:64px;font-size:8px;font-weight:700;color:#667085}}
+.flowwheel i{{position:absolute;inset:8px;border-radius:50%;
+background:radial-gradient(circle,#fff 0 40%,transparent 42%),
+conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f)}}
+.flowwheel b{{position:absolute;z-index:1;font-weight:700}}
+.flowwheel .f{{top:0;left:50%;transform:translateX(-50%)}}
+.flowwheel .r{{right:0;top:50%;transform:translateY(-50%)}}
+.flowwheel .b{{bottom:0;left:50%;transform:translateX(-50%)}}
+.flowwheel .l{{left:0;top:50%;transform:translateY(-50%)}}
+.flowabundance{{display:flex;align-items:flex-end;gap:12px;font-size:8px;color:#667085}}
+.flowabundance em{{display:grid;justify-items:center;gap:5px;font-style:normal}}
+.flowabundance i{{display:block;position:relative;width:34px;background:#18212f}}
+.flowabundance .lo{{height:1px;opacity:.16}}.flowabundance .mid{{height:2px;opacity:.52}}
+.flowabundance .hi{{height:3px;opacity:.94}}
 .credit{{font-size:12px;margin-top:22px;color:#667085}}
 .credit a{{color:#2563eb;text-decoration:none;font-weight:650}}</style>
 </head><body>
@@ -7006,6 +7833,13 @@ h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
 <div class="share">State: <code>{share_state or ''}</code></div>
 <h3>Trajectories</h3>{traj_h}
 <h3>Heatmap</h3>{heat_h}
+<h3>Local direction field</h3>
+<div class="flowlegend"><span>Mean direction</span>
+<div class="flowwheel" aria-label="Circular direction colour legend">
+<b class="f">F</b><b class="r">R</b><b class="b">B</b><b class="l">L</b><i></i></div>
+<span>Abundance</span><div class="flowabundance">
+<em><i class="lo"></i>low</em><em><i class="mid"></i>medium</em>
+<em><i class="hi"></i>high</em></div></div>{flow_h}
 <h3>Polar</h3>{polar_h}
 <h3>Target diagnostics</h3>{roi_h}
 <h3>Trial metrics</h3>{metrics_h}
@@ -7063,6 +7897,7 @@ h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
     State("polar-angle-source", "value"),
     State("vel-range-effective", "data"),
     State("disp-range", "value"),
+    State("flow-max-radius", "value"),
     State("viewport-store", "data"),
     State("data-summary", "children"),
     State("url", "search"),
@@ -7076,7 +7911,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 rebase, roi_show, roi_reach, roi_entered, roi_trim,
                 polar_r_range, polar_min_point_frac, polar_min_animal_frac,
                 polar_moving, polar_walk, polar_angle_source,
-                vel_selection, disp_selection,
+                vel_selection, disp_selection, flow_max_radius,
                 viewport, summary, url_search):
     if not pattern:
         LOGGER.warning("export.rejected reason=missing_source")
@@ -7146,6 +7981,15 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                                 cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
                                 rois=rois if want_rois and not do_rebase else None,
                                 reach_radius=reach)
+    flow = build_direction_field_figure(
+        df_plot, group_by, pool_mode, ncols=ncols_val,
+        bin_size=hm_binsize, bound_pct=bound_pct,
+        metric=hm_metric or "time", log_scale=(hm_scale == "log"),
+        cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
+        angle_source=polar_angle_source, moving_only=_on(polar_moving),
+        walk_thresh=polar_walk, rois=rois, reach_radius=reach,
+        show_rois=want_rois and not do_rebase,
+        max_radius=flow_max_radius)
     polar = build_polar_figure(
         df_polar, group_by, pool_mode, ncols=ncols_val,
         color_by=color_by or "individual",
@@ -7183,13 +8027,14 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 f.update_xaxes(range=viewport["xaxis"])
             if viewport.get("yaxis"):
                 f.update_yaxes(range=viewport["yaxis"])
+        _apply_viewport_to_current_range(flow, viewport, max_span_mult=1.5)
 
     _progress_stage(
         op_id, 2, done=0, total=1,
         message="Embedding Plotly and all figures into one offline HTML file…",
     )
     content = _compose_export_html(
-        traj, heat, roi_fig, polar, metrics_fig, vel_fig, disp_fig,
+        traj, heat, flow, roi_fig, polar, metrics_fig, vel_fig, disp_fig,
         initial_heading_fig, raw,
         include_raw=bool(raw_cols), summary=summary,
         share_state=url_search,

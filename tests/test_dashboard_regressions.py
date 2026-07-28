@@ -102,6 +102,78 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(means[0].r[-1]), expected[0], places=10)
         self.assertAlmostEqual(float(means[0].theta[-1]), expected[1], places=10)
 
+    def test_local_direction_field_encodes_cell_strength_and_abundance(self):
+        frame = _polar_frame().iloc[:2].copy()
+        frame["GameObjectPosX"] = 0.0
+        frame["GameObjectPosZ"] = 0.0
+        frame["GameObjectRotY"] = [0.0, 180.0]
+        bins = app._direction_field_bins(
+            frame, "all", "pooled", 1, 10.0, 100.0,
+            "orientation", False, None)
+        occupied = bins["groups"][0]["count"] > 0
+        self.assertEqual(int(bins["groups"][0]["count"][occupied][0]), 2)
+        self.assertAlmostEqual(
+            float(bins["groups"][0]["R"][occupied][0]), 0.0, places=10)
+        scaled = app._direction_field_bins(
+            frame, "all", "pooled", 1, 10.0, 100.0,
+            "orientation", False, None, metric="count",
+            log_scale=False, cmin=0, cmax=10)
+        scaled_occupied = scaled["groups"][0]["count"] > 0
+        self.assertAlmostEqual(
+            float(scaled["groups"][0]["abundance"][scaled_occupied][0]),
+            0.2,
+        )
+
+        fig = app.build_direction_field_figure(
+            frame, group_by="all", pool_mode="pooled", ncols=1,
+            bin_size=10.0, bound_pct=100.0, angle_source="orientation",
+            metric="count", cmin=0, cmax=10)
+        self.assertEqual(len(fig.layout.images), 1)
+        self.assertTrue(
+            str(fig.layout.images[0].source).startswith("data:image/png;base64,"))
+        self.assertEqual(fig.layout.meta["flow_cells"], 1)
+        self.assertEqual(fig.layout.meta["heading_source"], "orientation")
+        self.assertEqual(fig.layout.meta["max_radius"], 0.49)
+        self.assertEqual(fig.layout.meta["abundance_metric"], "count")
+        self.assertEqual(fig.layout.meta["abundance_scale"], "linear")
+        self.assertEqual(list(fig.layout.meta["abundance_range"]), [0.0, 10.0])
+        self.assertEqual(fig.layout.meta["marginals"], "active heatmap metric")
+        marginal_names = {
+            trace.name for trace in fig.data
+            if trace.name in ("X abundance", "Z abundance")
+        }
+        self.assertEqual(marginal_names, {"X abundance", "Z abundance"})
+        self.assertLess(fig.layout.xaxis.domain[1], 1.0)
+        self.assertLess(fig.layout.yaxis.domain[1], 1.0)
+        self.assertFalse(any(
+            bool(getattr(getattr(trace, "marker", None), "showscale", False))
+            for trace in fig.data
+        ))
+
+    def test_local_direction_strokes_respect_adjustable_cell_radius(self):
+        stroke_x, stroke_z = app._flow_arrow_arrays(
+            np.array([0.0]), np.array([0.0]), np.array([1.0]),
+            np.array([0.0]), 10.0, max_radius=0.3)
+        self.assertEqual(len(stroke_x), 3)
+        self.assertEqual(len(stroke_z), 3)
+        self.assertAlmostEqual(stroke_x[1], 0.0)
+        self.assertAlmostEqual(stroke_z[1], 3.0)
+        self.assertTrue(np.isnan(stroke_x[2]))
+        self.assertTrue(np.isnan(stroke_z[2]))
+
+    def test_local_direction_field_movement_heading_uses_segment_safe_diffs(self):
+        frame = _polar_frame().copy()
+        bins = app._direction_field_bins(
+            frame, "all", "pooled", 1, 100.0, 100.0,
+            "movement", False, None)
+        result = bins["groups"][0]
+        occupied = result["count"] > 0
+        # One sample per segment has no within-segment movement heading.
+        self.assertEqual(int(result["count"][occupied].sum()),
+                         len(frame) - frame["_seg_id"].nunique())
+        self.assertTrue(np.allclose(result["R"][occupied], 1.0))
+        self.assertTrue(np.allclose(result["theta"][occupied], 90.0))
+
     def test_inline_histogram_uses_explicit_bar_bins(self):
         fig = app.build_mini_histogram(np.arange(10), [2, 7], x_range=(0, 9))
         self.assertEqual(len(fig.data), 1)
@@ -284,10 +356,29 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertNotIn("vel-histogram.figure", master_key)
         self.assertNotIn("disp-histogram.figure", master_key)
 
+    def test_large_callback_signatures_match_registered_inputs_and_states(self):
+        checks = (
+            ("trajectory-plot.figure", app.update_plots),
+            ("polar-r-hist.figure", app.update_polar_only),
+            ("download-html.data", app.export_html),
+        )
+        for output_fragment, callback in checks:
+            meta = next(
+                value for output, value in app.app.callback_map.items()
+                if output_fragment in output
+            )
+            registered = len(meta["inputs"]) + len(meta["state"])
+            self.assertEqual(
+                len(inspect.signature(callback).parameters),
+                registered,
+                output_fragment,
+            )
+
     def test_sections_follow_analysis_then_diagnostics_order(self):
         ids = [getattr(node, "id", None) for node in _components(app.app.layout)]
+        self.assertIn("flow-field-legend", ids)
         positions = [ids.index(component_id) for component_id in (
-            "view-traj", "view-heat", "view-polar", "view-roi",
+            "view-traj", "view-heat", "view-flow", "view-polar", "view-roi",
             "view-metrics", "view-diag")]
         self.assertEqual(positions, sorted(positions))
 
@@ -309,7 +400,13 @@ class DashboardRegressionTests(unittest.TestCase):
         fast_inputs = {item["id"] for item in fast["inputs"]}
         self.assertIn("view-render-state", fast_inputs)
         self.assertIn("polar-moving", fast_inputs)
+        self.assertIn("flow-max-radius", fast_inputs)
         self.assertIn("polar-min-animal-frac", fast_inputs)
+        self.assertIn("heatmap-metric", fast_inputs)
+        self.assertIn("heatmap-scale", fast_inputs)
+        self.assertIn("heatmap-cmin", fast_inputs)
+        self.assertIn("heatmap-cmax", fast_inputs)
+        self.assertIn("heatmap-crange", fast_inputs)
 
     def test_auto_threshold_refresh_does_not_duplicate_initial_render(self):
         original_ctx = app.ctx
@@ -359,12 +456,15 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_new_controls_and_url_restore_are_synchronised(self):
         self.assertEqual(_component("heatmap-crange").value, "percentile")
         self.assertEqual(_component("heatmap-color-range").value, [0, 99])
+        self.assertEqual(_component("flow-max-radius").value, 0.49)
         self.assertIsNotNone(_component("step-range"))
-        restored = app.restore_from_url("?smin=2&smax=4&hcrange=percentile", False)
-        self.assertEqual(len(restored), 46)
+        restored = app.restore_from_url(
+            "?smin=2&smax=4&hcrange=percentile&frad=0.31", False)
+        self.assertEqual(len(restored), 47)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
-        self.assertEqual(len(app.restore_from_url("", True)), 46)
+        self.assertEqual(restored[44], 0.31)
+        self.assertEqual(len(app.restore_from_url("", True)), 47)
         value_restore = app.restore_from_url(
             "?hcmin=150&hcmax=200&hcrange=value", False)
         self.assertEqual(value_restore[34], [150.0, 200.0])
@@ -373,6 +473,14 @@ class DashboardRegressionTests(unittest.TestCase):
             "?vrmin=2.5&vrmax=250&layout=compare", False)
         self.assertEqual(exact_velocity[31:33], (2.5, 250))
         self.assertEqual(exact_velocity[42], "compare")
+
+    def test_long_horizontal_legends_reserve_plot_height(self):
+        short_top, short_extra = app._horizontal_legend_layout(["VR1"], 2)
+        long_top, long_extra = app._horizontal_legend_layout(
+            [f"VR{i} fly with a long label" for i in range(24)], 2)
+        self.assertEqual(short_extra, 0)
+        self.assertGreater(long_extra, short_extra)
+        self.assertGreater(long_top, short_top)
 
     def test_exact_velocity_bounds_are_unbounded_and_explicit(self):
         self.assertIsNone(getattr(_component("vel-range-min"), "min", None))
@@ -409,6 +517,52 @@ class DashboardRegressionTests(unittest.TestCase):
             places=10,
         )
         self.assertLess(float(stats.iloc[0]["peak_velocity"]), raw_peak)
+
+    def test_scene_grouping_uses_raw_fallback_and_never_splits_a_segment(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as folder:
+            path = Path(folder) / "scene_fallback_VR1.csv"
+            pd.DataFrame({
+                "Current Time": pd.date_range(
+                    "2026-01-01", periods=9, freq="100ms"),
+                "CurrentTrial": [1] * 9,
+                "CurrentStep": [0] * 3 + [1] * 3 + [2] * 3,
+                "GameObjectPosX": np.arange(9, dtype=float),
+                "GameObjectPosZ": np.zeros(9),
+                "ConfigFile": "cfg.json",
+                # Sequence scene is the authoritative raw scene when present.
+                "CurrentSequenceScene": (
+                    [" seq_scene "] * 3 + [None] * 3 + ["wrong_seq"] * 3
+                ),
+                # Generic Scene is the fallback; one stale transition frame
+                # must not split CurrentStep=1 across two scene panels.
+                "Scene": (
+                    ["wrong_scene"] * 3
+                    + ["stale_scene", "scene_b", "scene_b"]
+                    + ["wrong_scene"] * 3
+                ),
+                # A populated SceneName remains higher priority than raw
+                # fallback columns, while blanks fall through.
+                "SceneName": [None] * 6 + [" metadata_scene "] * 3,
+            }).to_csv(path, index=False)
+
+            frame = app.load_csv_fast(str(path))
+            self.assertIsNotNone(frame)
+            by_step = {
+                int(step): set(sub["SceneName"].astype(str))
+                for step, sub in frame.groupby(
+                    "CurrentStep", sort=False, observed=True)
+            }
+            self.assertEqual(by_step[0], {"seq_scene"})
+            self.assertEqual(by_step[1], {"scene_b"})
+            self.assertEqual(by_step[2], {"metadata_scene"})
+            self.assertTrue(
+                frame.groupby("_seg_id", sort=False, observed=True)[
+                    "SceneName"].nunique().eq(1).all()
+            )
+            groups = app._group_frames(
+                frame, "scene", "separate", ncols=2)
+            self.assertEqual(
+                set(groups), {"seq_scene", "scene_b", "metadata_scene"})
 
     def test_streaming_loader_retains_a_bounded_frame_but_exact_point_counts(self):
         old_budget = app.LOAD_ROW_BUDGET
@@ -509,12 +663,13 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_export_is_offline_capable_and_contains_every_section(self):
         fig = app.go.Figure(app.go.Scatter(x=[0, 1], y=[0, 1]))
         document = app._compose_export_html(
-            fig, fig, fig, fig, fig, fig, fig, fig, fig,
+            fig, fig, fig, fig, fig, fig, fig, fig, fig, fig,
             include_raw=False, summary="test summary", share_state="?mode=speed",
         )
         self.assertNotIn('src="https://cdn.plot.ly', document)
         self.assertIn("plotly.js", document)
-        for heading in ("Trajectories", "Heatmap", "Target diagnostics", "Polar",
+        for heading in ("Trajectories", "Heatmap", "Local direction field",
+                        "Target diagnostics", "Polar",
                         "Trial metrics",
                         "Diagnostics: raw starting-heading null distribution",
                         "Velocity / Displacement", "Raw traces"):

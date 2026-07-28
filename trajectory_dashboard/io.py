@@ -26,6 +26,14 @@ REQUIRED_COLUMNS = [
 
 _VR_RE = re.compile(r"\bVR\s*0*([0-9]+)\b", re.IGNORECASE)
 SORT_COLUMNS = ["SourceFolder", "SourceFile", "CurrentTrial", "CurrentStep", "Current Time"]
+SCENE_COLUMN_PRIORITY = (
+    "SceneName",
+    "CurrentSequenceScene",
+    "Scene",
+    "CurrentScene",
+    "SequenceScene",
+)
+_MISSING_SCENE_LABELS = frozenset({"", "nan", "none", "null", "unknown", "n/a", "na"})
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,53 @@ def _clean_id_value(value) -> str | None:
     if not text or text.lower() in {"nan", "none", "null", "unknown"}:
         return None
     return text
+
+
+def _scene_name_from_frame(df: pd.DataFrame) -> pd.Series:
+    """Resolve the best row-level scene label from common CSV column names.
+
+    ``SceneName`` remains authoritative when supplied. Unity sequence exports
+    otherwise use ``CurrentSequenceScene`` for the treatment scene; the generic
+    ``Scene`` field can lag briefly during a transition, so it is a fallback.
+    Blank/placeholder values fall through to the next available raw column.
+    """
+
+    resolved = pd.Series(pd.NA, index=df.index, dtype="string")
+    for column in SCENE_COLUMN_PRIORITY:
+        if column not in df.columns:
+            continue
+        candidate = df[column].astype("string").str.strip()
+        missing = candidate.isna() | candidate.str.lower().isin(
+            _MISSING_SCENE_LABELS)
+        resolved = resolved.fillna(candidate.mask(missing))
+    return resolved.fillna("unknown")
+
+
+def _stabilise_scene_per_segment(df: pd.DataFrame) -> None:
+    """Assign each segment its modal scene without per-segment Python loops.
+
+    A segment is one CurrentStep, so it must not be split across scene panels.
+    This also removes occasional one-frame stale ``Scene`` values at Unity scene
+    transitions when no ``CurrentSequenceScene`` column is available.
+    """
+
+    if len(df) == 0 or "_seg_id" not in df or "SceneName" not in df:
+        return
+    counts = df.groupby(
+        ["_seg_id", "SceneName"], sort=False, observed=True).size()
+    if counts.empty:
+        return
+    winners = counts.groupby(level=0, sort=False).idxmax()
+    winner_index = pd.MultiIndex.from_tuples(winners.to_numpy())
+    winner_by_segment = pd.Series(
+        winner_index.get_level_values(1).to_numpy(),
+        index=winners.index,
+    )
+    df["SceneName"] = (
+        df["_seg_id"].map(winner_by_segment)
+        .fillna(df["SceneName"])
+        .astype("string")
+    )
 
 
 def _fly_id_from_frame(df: pd.DataFrame) -> pd.Series | None:
@@ -361,8 +416,7 @@ def load_csv_fast(filepath: str) -> pd.DataFrame | None:
         else:
             df["ConfigFile"] = "unknown"
 
-    if "SceneName" not in df.columns:
-        df["SceneName"] = df.get("Scene", "unknown")
+    df["SceneName"] = _scene_name_from_frame(df)
 
     vr_number = _normalise_vr(csv_base) or _vr_from_frame(df)
     df["VR"] = vr_number or "unknown"
@@ -390,6 +444,7 @@ def load_csv_fast(filepath: str) -> pd.DataFrame | None:
     df["SourceFile"] = csv_base
 
     _rebuild_segment_ids(df)
+    _stabilise_scene_per_segment(df)
     sort_frame_for_segments(df)
 
     base_keep = {

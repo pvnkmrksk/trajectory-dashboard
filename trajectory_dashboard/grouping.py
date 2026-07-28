@@ -230,4 +230,7 @@ def group_frames(
     if column == "ConfigFile":
         values = ordered_values(pd.unique(df[column]), config_order=config_order, labeler=labeler)
         return {str(value): df[df[column] == value] for value in values}
-    return {str(key): frame for key, frame in df.groupby(column, sort=False)}
+    return {
+        str(key): frame
+        for key, frame in df.groupby(column, sort=False, observed=True)
+    }

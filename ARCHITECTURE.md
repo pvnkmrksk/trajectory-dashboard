@@ -36,6 +36,12 @@ Plotly.
   column is preserved; if neither exists, `FlyID` falls back to a stable
   `session:VR` label so grouping by fly/individual does not collapse into a
   single `unknown` bucket.
+- Scene grouping resolves row labels in priority order:
+  `SceneName → CurrentSequenceScene → Scene → CurrentScene → SequenceScene`.
+  Blank/placeholder labels fall through. The chosen labels are then reduced to
+  one modal `SceneName` per `_seg_id`, because one CurrentStep must never be
+  split across scene panels by a stale Unity transition frame. This raw-column
+  path is the normal fallback when sibling JSON metadata is absent.
 - **A _segment_ is the atomic unit:** `_seg_id = SourceFile + CurrentTrial +
   CurrentStep`, built **after** numeric coercion from the **integer** trial/step.
   Everything groups/filters by this. Two gotchas, both real bugs: (a) never key on
@@ -69,7 +75,7 @@ Plotly.
 | 395-670 | **ROI tables/masks + CSV loader bridge** | `roi_reached_table`, `time_to_target_table`, `heading_target_angle_table`, `_roi_masks`, `_roi_apply`, `load_csv_fast`. |
 | 763-947 | **Filtering bridge / stats** | Compatibility wrappers; canonical implementations live in `trajectory_dashboard.filters`. |
 | 948-3410 | **Plotting** | `_prepare_merged_groups`, `build_trajectory_figure`, heatmap builders + variants, explicit-bin histograms, raw trace, ROI panels, circular/polar statistics, and grouped trial metrics. |
-| 3141-3980 | **Dash app, caches + layout** | `app`, data/filter/ROI/polar caches, sidebar controls, and five continuously mounted scroll sections. |
+| 3141-3980 | **Dash app, caches + layout** | `app`, data/filter/ROI/polar caches, sidebar controls, and seven continuously mounted scroll sections. |
 | 3981-end | **Callbacks + clientside interaction** | URL/load state, the atomic all-section renderer, viewport sync, LUT, export, playback and guards. |
 
 Assets (Dash auto-serves `/assets`):
@@ -132,8 +138,8 @@ same cache key.
 - **Trace count, not point count, drives Plotly render cost.** Segments sharing
   a colour collapse into ONE NaN-separated trace per (subplot, colour) via
   `_prepare_merged_groups` (vectorised). ~100 traces instead of ~4000.
-- **The plot workspace is one mounted document.** Trajectory, heatmap,
-  diagnostics, target and polar figures stay in normal layout flow. The top
+- **The plot workspace is one mounted document.** Trajectory, heatmap, local
+  direction field, diagnostics, target and polar figures stay in normal layout flow. The top
   navigation only scrolls `.td-main`; it never hides graphs or asks the server
   to rebuild a tab. This preserves pan/zoom, hover, legends and WebGL contexts.
 - **Decimation budgets** (`_decimation_budget` / build): static WebGL
@@ -166,6 +172,23 @@ same cache key.
   from the variant store. Per-side ROI heatmap labels use a boolean union of
   samples hit by any same-side ROI, not a sum over ROI centers, so percentages
   cannot exceed 100% under pooled/overlapping target states.
+- **Local direction field**: `build_direction_field_figure` uses the heatmap's
+  shared spatial grid and computes one circular mean from valid heading samples
+  per occupied cell. Hue/stroke angle encode mean direction, colour
+  saturation/stroke length encode resultant `R`, and raster alpha/stroke
+  visibility encode abundance using the heatmap's active metric, linear/log
+  scale, and value/percentile range semantics. The colour field is a tiny
+  in-memory RGBA PNG attached as a Plotly layout image; headless strokes are merged into
+  five abundance-tier `Scattergl` traces per subplot, avoiding one trace or
+  shape per cell. The persisted maximum radius control spans 0.05–0.49 cell
+  widths; at 0.49 two adjacent inward-facing full-strength vectors stop just
+  short of touching. Top/right SVG marginals sum the active heatmap metric
+  across Z/X respectively and use matched spatial axes. Body
+  orientation and within-`_seg_id` movement heading share the polar convention.
+  Direction-source and moving-only controls refresh this field and polar;
+  heatmap metric/scale/range controls refresh only the field, without rebuilding
+  trajectories or occupancy bins. A CSS circular wheel and opacity/width key
+  provide the direction and abundance legends.
 - **Diagnostics**: velocity/displacement histograms are native load-time
   distributions and deliberately do not follow interactive filters. The
   starting-heading null diagnostic takes the first sorted sample of every
@@ -237,11 +260,14 @@ same cache key.
   draggable order list. The default order uses the sequenceConfig with the best
   coverage; missing configs remain alphabetic at the bottom.
 - `update_plots` takes one filtered snapshot and returns trajectory, heatmap
-  store/variants, target diagnostics, polar, trial metrics, raw traces, summary
-  and render state atomically. Retired split-view/lazy callbacks are not
-  registered. `update_polar_only` owns moving/R/quality changes and all three
-  polar mini-histograms; it reuses the filtered-frame and Rayleigh caches rather
-  than triggering the master renderer. Heatmap-colour distributions are derived
+  store/variants, local direction field, target diagnostics, polar, trial
+  metrics, raw traces, summary and render state atomically. Retired
+  split-view/lazy callbacks are not registered. `update_polar_only` owns
+  direction-source/moving/R/quality changes and all three polar mini-histograms;
+  moving/source changes also refresh the local direction field, while heatmap
+  metric/scale/range changes refresh only that field. It reuses the
+  filtered-frame and Rayleigh caches rather than triggering the master renderer.
+  Heatmap-colour distributions are derived
   from the already-computed bin matrices and sent as a small sorted sample;
   value/percentile changes update only `zmin`, `zmax`, and colorbar ticks in
   `assets/heatmap_colors.js`, without a dataframe pass or server render.
@@ -251,7 +277,10 @@ same cache key.
 - The master renderer writes heatmap JSON to `heatmap-figure-store`, not to
   `heatmap-plot.figure`, so Dash's `Plotly.react` path never applies the heatmap
   subplot figure. Metric/scale variants still update clientside without
-  re-binning.
+  re-binning. The local direction field similarly writes to
+  `flow-figure-store`; its RGBA layout images plus subplot scale lock trigger the
+  same Plotly-6 axis-scaling failure through `Plotly.react`, so a clientside
+  `Plotly.newPlot` paints each rebuilt field.
 - asset-level viewport sync — `assets/heatsync.js` attaches directly to Plotly
   `plotly_relayout`, immediately relayouts the peer spatial graph, and writes
   `viewport-store` only after an idle delay.
@@ -272,8 +301,9 @@ same cache key.
   to the previous stage, mirroring the actual filter pipeline.
 - `export_html` rebuilds figures server-side and emits one self-contained file.
   Plotly is embedded once (no CDN dependency). It includes trajectories,
-  heatmap, polar, target diagnostics, trial metrics, native velocity/displacement and
-  starting-heading diagnostics, and selected raw traces.
+  heatmap, local direction field, polar, target diagnostics, trial metrics,
+  native velocity/displacement and starting-heading diagnostics, and selected
+  raw traces.
 - The header `status-dock` mirrors load/filter/render/export state and uses
   Dash's body loading class for immediate Working/Ready feedback. Its hover text
   exposes the latest stage timings. Python logging records load, cache, polar,
@@ -289,12 +319,13 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Load / dropped folder | Load/cache data, options and metadata; reset range controls on a changed source; render once after that barrier | Stale prior-dataset ranges; URL from pan/zoom |
 | Update all plots (`btn-plot`) | Build every mounted section from one filtered state | Competing per-section builders; direct heatmap `dcc.Graph.figure` |
 | Heatmap bin/bound or data filter | Debounced all-section update; heatmap store + variants are built exactly | Concurrent heatmap sidebar aggregation |
-| Heatmap metric/scale/color range mode/value | Clientside `Plotly.restyle` from current binning variants and stored cell distribution | Dataframe filtering/binning, server rebuild or `newPlot` |
+| Heatmap metric/scale/color range mode/value | Clientside heatmap `Plotly.restyle` from current binning variants; rebuild the local direction field from the cached filtered frame so abundance matches | Dataframe refiltering, heatmap rebinning or master-section rebuild |
 | ROI entered/trim | Debounced atomic update of all affected sections | A second ROI/trajectory refresh callback |
 | Trajectory/heatmap pan/zoom | Immediate clientside peer relayout plus debounced `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
 | Section navigation | Clientside scroll only, including replay of the active tab | Any server render, graph hide/show or Plotly reinitialisation |
 | ROI reach/show | Debounced atomic update | Competing overlay/ROI callbacks |
-| Polar moving/R/quality controls | Cached polar figure + three quality histograms only; exact stats precede display thinning | Master trajectory/heatmap/ROI/raw rebuild |
+| Polar direction source/moving controls | Local direction field + cached polar figure and quality histograms; exact stats precede display thinning | Master trajectory/heatmap/ROI/raw rebuild |
+| Polar R/quality controls | Cached polar figure + three quality histograms only | Direction field or master trajectory/heatmap/ROI/raw rebuild |
 
 ---
 
@@ -310,14 +341,16 @@ These cost a very long debugging session; each is confirmed via Chrome CDP
    the browser and the heatmap is blank. **Fix: pass `z`/`customdata`/`x`/`y` as
    plain Python lists (`.tolist()`).** 1-D arrays (scattergl x/y) are fine.
 
-2. **The heatmap crashes `Plotly.react` (Dash's update path).** With a subplot
-   grid, applying a new figure to a graph that isn't full-size yet throws
+2. **The heatmap and local direction field crash `Plotly.react` (Dash's update
+   path).** With a subplot grid, applying a new heatmap or layout-image field to
+   a graph that isn't full-size yet throws
    *"Something went wrong with axis scaling"* in `setScale`, and it then never
    repaints. It happens **even without `scaleanchor`** (it's the subplot axis
    layout at a bad size). A fresh `Plotly.newPlot` re-initialises cleanly. **Fix:
-   the server writes the fresh heatmap figure to `heatmap-figure-store`; a
-   clientside callback re-runs `Plotly.newPlot(hg, hfig.data, hfig.layout)`.**
-   Do not restore a server Output to `heatmap-plot.figure`: even when the panel is
+   the server writes fresh figures to `heatmap-figure-store` /
+   `flow-figure-store`; clientside callbacks re-run `Plotly.newPlot` with the
+   fresh data and layout.** Do not restore server Outputs to either graph's
+   `figure`: even when the panel is
    visible, Dash's `Plotly.react` path can throw the axis-scaling error before
    the clientside newPlot gets a chance to recover.
    - **The newPlot is fingerprint-guarded (do not revert to unconditional).**

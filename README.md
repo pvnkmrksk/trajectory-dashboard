@@ -145,9 +145,11 @@ For a quick preprocessing check on the homing enemy data, run
 
 - **Load** by glob, folder path, or **drag-and-drop a folder** (finds every
   nested CSV and builds the glob). Reads `sequenceConfig.json` / `FlyMetaData.json`
-  for readable subplot titles. Each file is normalized and summarized before
-  endpoint-safe retention, so large folders never accumulate every raw CSV in
-  RAM. The header reports file/stage progress.
+  for readable subplot titles. When scene metadata is absent, grouping falls
+  back to the CSV's `CurrentSequenceScene`, then `Scene`; placeholder values are
+  ignored and each `_seg_id` is assigned one stable modal scene. Each file is
+  normalized and summarized before endpoint-safe retention, so large folders
+  never accumulate every raw CSV in RAM. The header reports file/stage progress.
 - **Pool / group** by config (treatment), scene, VR, fly, source folder, or
   all-pooled → a 2-col grid of square, axis-synced, scrollable subplots.
 - **Colour by** individual, VR, ROI outcome, trial, local time, or **velocity**
@@ -160,8 +162,8 @@ For a quick preprocessing check on the homing enemy data, run
   per criterion. Drag-select ranges on the velocity/displacement histograms.
 - **Playback**: native client-side animation with a sticky play/pause/scrub bar;
   each track grows from its first point over local time.
-- **Single-page plotting workspace**: trajectories, heatmap, polar, targets and
-  diagnostics stay mounted together. The sticky section bar scrolls to a
+- **Single-page plotting workspace**: trajectories, heatmap, local direction
+  field, polar, targets and diagnostics stay mounted together. The sticky section bar scrolls to a
   plot without hiding/reloading graphs, so zoom, hover and legend state survive.
   An optional comparison workspace puts trajectories and polar side-by-side,
   with the heatmap below. Speed is the default and adds a tighter browser
@@ -173,6 +175,18 @@ For a quick preprocessing check on the homing enemy data, run
   in each subplot's top corners. Heatmap and trajectory start from the same
   central-98% square extent, and pan/zoom propagate immediately in both
   directions without a server render.
+- **Local direction field**: a quiver/heatmap hybrid on the same selectable
+  spatial grid. Each cell is a circular summary of its samples: stroke angle and
+  hue show mean direction, stroke length and colour saturation show resultant
+  strength `R` (`0` scattered → `1` aligned), and stroke visibility/width plus
+  raster alpha show abundance using the heatmap's active count/time/percent
+  metric, linear/log scale, and colour-range semantics. A compact circular
+  colour wheel identifies direction, while a faint-to-bold stroke key explains
+  abundance. The maximum stroke radius is adjustable from 0.05–0.49 cell
+  widths. Aligned top/right marginals show X/Z abundance from the same active
+  heatmap metric and bins. It can use Unity body orientation or movement
+  heading, supports moving-only samples, follows every active data/ROI filter,
+  and shares live pan/zoom with the trajectory and occupancy views.
 - **ROI targets** auto-loaded from the scene configs (Choice/BinaryChoice; polar
   `{radius,angle}` or cartesian `{x,y,z}`, Unity left-handed). Adjustable **reach
   radius** slider, reach circles + per-subplot exclusive first-reached
@@ -196,7 +210,9 @@ For a quick preprocessing check on the homing enemy data, run
   pools all valid samples and is independent of display thinning. Moving-only
   and polar-quality changes use a cached polar-only update path; their R,
   valid-point and per-animal good-trial histograms use 36 fixed bins and stay
-  mounted and auditable. Each subplot title reports retained/available trials.
+  mounted and auditable. The angle-source and moving-only controls are shared
+  with the local direction field. Each subplot title reports
+  retained/available trials.
 - **Diagnostics section**: load-time native velocity/displacement histograms,
   an optional 36-bin polar null distribution of the first body heading in every
   segment (10° sectors centered on 0°, 10°, …), and optional raw time-series.
@@ -314,7 +330,7 @@ shareable URL.
 | Diagnostics section | Native velocity/displacement histograms, a toggleable 36-bin starting-heading null distribution per treatment, and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Preserves the original dataset baseline while filters change and exposes unexpected directional bias at segment starts. |
 | Trial metrics section | Per-trial path length, displacement, median smoothed speed, and median 15-sample local tortuosity grouped by the selected panel axis. | Makes treatment/scene/animal differences visible without reducing tortuosity to unstable whole-trial distance divided by displacement. |
 | Raw trace columns | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
-| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, polar, target diagnostics, trial metrics, native velocity/displacement and starting-heading diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
+| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, local direction field, polar, target diagnostics, trial metrics, native velocity/displacement and starting-heading diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
 | Header activity status | Reports the current load, filter/render, debounce, or export state plus retained points; hover exposes per-stage timings. | Makes slow work and failures visible, while the terminal retains full errors and tracebacks. |
 
 The dashboard's resident normalized frame defaults to 2,000,000 rows. Set

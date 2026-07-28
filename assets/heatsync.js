@@ -7,20 +7,31 @@
   function normaliseRelayout(source, ed) {
     if (!ed) return;
     var acc = {};
+    var priority = {};
     Object.keys(ed).forEach(function (k) {
       if (k.indexOf('autorange') >= 0 && ed[k] === true) {
         acc.reset = true;
         return;
       }
-      var whole = k.match(/^(x|y)axis\d*\.range$/);
+      var whole = k.match(/^(x|y)axis(\d*)\.range$/);
       if (whole && Array.isArray(ed[k]) && ed[k].length === 2) {
-        acc[whole[1] + 'axis'] = [ed[k][0], ed[k][1]];
+        var wholeAxis = whole[1] + 'axis';
+        var wholePriority = whole[2] ? Number(whole[2]) : 0;
+        if (priority[wholeAxis] === undefined || wholePriority < priority[wholeAxis]) {
+          acc[wholeAxis] = [ed[k][0], ed[k][1]];
+          priority[wholeAxis] = wholePriority;
+        }
         return;
       }
-      var m = k.match(/^(x|y)axis\d*\.range\[(0|1)\]$/);
+      var m = k.match(/^(x|y)axis(\d*)\.range\[(0|1)\]$/);
       if (m) {
         var ax = m[1] + 'axis';
-        (acc[ax] = acc[ax] || [null, null])[+m[2]] = ed[k];
+        var splitPriority = m[2] ? Number(m[2]) : 0;
+        if (priority[ax] === undefined || splitPriority < priority[ax]) {
+          acc[ax] = [null, null];
+          priority[ax] = splitPriority;
+        }
+        if (splitPriority === priority[ax]) acc[ax][+m[3]] = ed[k];
       }
     });
     var out = { source: source };
@@ -31,15 +42,18 @@
   }
 
   function graphFor(source) {
-    var id = source === 'traj' ? 'trajectory-plot' : 'heatmap-plot';
+    var ids = {
+      traj: 'trajectory-plot',
+      heat: 'heatmap-plot',
+      flow: 'flow-plot'
+    };
+    var id = ids[source];
     var host = document.getElementById(id);
     return host && host.querySelector('.js-plotly-plot');
   }
 
   function syncPeer(source, out) {
     if (!out || !window.Plotly) return;
-    var peer = graphFor(source === 'traj' ? 'heat' : 'traj');
-    if (!peer) return;
     var update = {};
     if (out.reset) {
       update['xaxis.autorange'] = true;
@@ -49,21 +63,27 @@
       if (out.yaxis) update['yaxis.range'] = out.yaxis.slice();
     }
     if (!Object.keys(update).length) return;
-    peer.__vpApplying = true;
-    try {
-      Promise.resolve(window.Plotly.relayout(peer, update)).finally(function () {
-        window.setTimeout(function () { peer.__vpApplying = false; }, 40);
-      });
-    } catch (e) {
-      peer.__vpApplying = false;
-    }
+    ['traj', 'heat', 'flow'].forEach(function (peerSource) {
+      if (peerSource === source) return;
+      var peer = graphFor(peerSource);
+      if (!peer) return;
+      peer.__vpApplying = true;
+      try {
+        Promise.resolve(window.Plotly.relayout(peer, update)).finally(function () {
+          window.setTimeout(function () { peer.__vpApplying = false; }, 40);
+        });
+      } catch (e) {
+        peer.__vpApplying = false;
+      }
+    });
   }
 
   function queueViewport(source, ed) {
     if (source === 'heat' && window.__hmSuppress) return;
     var out = normaliseRelayout(source, ed);
-    if (!out || !window.dash_clientside || !window.dash_clientside.set_props) return;
+    if (!out) return;
     syncPeer(source, out);
+    if (!window.dash_clientside || !window.dash_clientside.set_props) return;
     pendingViewport = out;
     clearTimeout(viewportTimer);
     viewportTimer = setTimeout(function () {
