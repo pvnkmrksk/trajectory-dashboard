@@ -92,6 +92,14 @@ Assets (Dash auto-serves `/assets`):
 - `assets/shared_legend.js` — shares categorical layer visibility between the
   trajectory and polar figures and reports counts for the currently visible
   layers.
+- `assets/loop_observer.js` — browser-local circle/polyline intersection and
+  first-entry path splitting for the movable curtain-ring trajectory observer.
+  The same module is inlined into offline exports.
+- `assets/region_observer.js` — editable rectangular window overlays for the
+  trajectory, heatmap and Gandiva graphs; shape edits update the compact region
+  store, not the master renderer.
+- `assets/clean_layout.js` — browser-only removal/restoration of grids, ticks,
+  titles and legends plus zoom-aware 1/2/5 scale bars in configured real units.
 
 ---
 
@@ -108,7 +116,9 @@ glob / dropped folder
             └─ trajectory_dashboard.filters.apply_filters
                velocity-jump (time-buffered), min-displacement, trim
                └─ _roi_apply(...)                    cached masks in _ROI_MASK_CACHE
-                  └─ build_* figures → dcc.Graph / figure stores
+                  ├─ analytical build_* figures → dcc.Graph / figure stores
+                  └─ _sample_trajectory_segments(...) (drawing only)
+                     └─ trajectory figure → browser-local loop observer
 ```
 
 **Everything downstream assumes the load-time time-sort** and uses
@@ -149,7 +159,33 @@ same cache key.
   Speed is the default and applies a second browser drawing budget. Both modes
   share the same retained analytical frame; file-level segment statistics were
   finalized before load-time sampling.
-- **Colour modes** (`color_by`): `individual`/`vr`/`roi` (categorical, lines,
+- **Whole-trial drawing sample**: `traj-trial-fraction` is applied by
+  `_sample_trajectory_segments` after analytical/ROI filtering but before point
+  decimation. It keeps complete `_seg_id` values using a stable seeded random
+  choice; `btn-traj-resample.n_clicks` is the seed. Trajectories, the loop
+  observer and polar use the same sample. Heatmap, Gandiva, ROI, trial-metric
+  and raw analytical inputs keep the complete filtered frame.
+- **Curtain-ring observer**: the main trajectory figure is also the browser
+  source for `assets/loop_observer.js`; no duplicate trajectory payload or
+  server callback is needed when the ring moves. The asset scans the
+  NaN-separated traces by the `_seg_id` stored in `customdata[6]`, tests both
+  vertices and polyline/circle intersections, and emits a few merged WebGL
+  traces per source trace: muted pre-entry, saturated post-entry, and entry
+  diamonds. Multiple editable Plotly rings can be added/deleted and combined
+  with Any/All matching. In All mode the future begins at the latest first hit,
+  i.e. the moment every ring has been satisfied.
+  Matching therefore has the spatial fidelity of the active rendered point
+  budget; Accuracy or a larger point budget is appropriate for tiny rings.
+- **Observation windows**: `_normalise_custom_regions`,
+  `_custom_region_subset` and `_custom_region_stats` use vectorised X/Z masks.
+  The main renderer applies the union only to polar rows and returns the small
+  diagnostics/panel-share payload. Subsequent shape edits call
+  `update_custom_region_analysis`, which rebuilds only polar and the
+  observation-window table; `assets/region_observer.js` repaints rectangles and
+  Gandiva percentage labels without rebuilding direction vectors.
+- **Colour modes** (`color_by`): `one` (default calm hue), `none` (neutral
+  translucent gray), `categorical` (one muted hue per current panel),
+  `individual`/`vr`/`roi` (categorical, lines,
   legend); `trial`/`local_time`/`velocity` (sequential; markers for per-point
   ones; a hidden anchor trace supplies the Viridis colourbar). ROI outcome is
   computed per segment from the first left/right ROI reached and falls back to
@@ -160,6 +196,10 @@ same cache key.
   aspect on trajectories via `scaleanchor` (see §7 for why the heatmap can't use
   it). The optional comparison workspace places trajectory and polar sections
   side-by-side, with heatmap and diagnostics full-width below.
+  `minimal-layout-store` is presentation-only state: `assets/clean_layout.js`
+  hides/restores spatial axis chrome and legends and derives a 1/2/5 scale bar
+  from the current visible range. `spatial_layout.unit_scale` maps one position
+  unit to `unit_label` (default `1 cm`). No dataframe or figure builder runs.
 - **Heatmap**: `build_heatmap_figure` bins X/Z with `np.histogram2d`.
   `bin_size` is in **data units** (blank → `default_bin_size` ≈ 1/20 of the
   95th-pct extent); `bound_pct` clips the extent to a central percentile;
@@ -172,7 +212,7 @@ same cache key.
   from the variant store. Per-side ROI heatmap labels use a boolean union of
   samples hit by any same-side ROI, not a sum over ROI centers, so percentages
   cannot exceed 100% under pooled/overlapping target states.
-- **Local direction field**: `build_direction_field_figure` uses the heatmap's
+- **Gandiva local direction field**: `build_direction_field_figure` uses the heatmap's
   shared spatial grid and computes one circular mean from valid heading samples
   per occupied cell. Hue/stroke angle encode mean direction, colour
   saturation/stroke length encode resultant `R`, and raster alpha/stroke
@@ -180,15 +220,26 @@ same cache key.
   scale, and value/percentile range semantics. The colour field is a tiny
   in-memory RGBA PNG attached as a Plotly layout image; headless strokes are merged into
   five abundance-tier `Scattergl` traces per subplot, avoiding one trace or
-  shape per cell. The persisted maximum radius control spans 0.05–0.49 cell
-  widths; at 0.49 two adjacent inward-facing full-strength vectors stop just
-  short of touching. Top/right SVG marginals sum the active heatmap metric
-  across Z/X respectively and use matched spatial axes. Body
+  shape per cell. The persisted maximum radius control spans 0.05–0.98 cell
+  widths; changes rescale the mounted NaN-joined strokes clientside using the
+  prior radius, without recomputing vector statistics. Top/right SVG marginals
+  use four subdivisions per heatmap bin. Dotted X/Z cuts use the densest shared
+  segment-start cell and annotate each quadrant's spatial-sample percentage. Body
   orientation and within-`_seg_id` movement heading share the polar convention.
   Direction-source and moving-only controls refresh this field and polar;
   heatmap metric/scale/range controls refresh only the field, without rebuilding
   trajectories or occupancy bins. A CSS circular wheel and opacity/width key
   provide the direction and abundance legends.
+- **Delayed inference**: `stats-delay-interval` arms after a completed visual
+  render. A separate callback uses SciPy Mann–Whitney/Kruskal–Wallis tests with
+  Holm correction for the four movement metrics, pooled-centred circular ranks
+  for polar groups, and Rayleigh uniformity for per-config start angles. A
+  clientside relayout appends the labels/stars to already-mounted plots.
+- **Style JSON**: Advanced exposes `_VISUAL_STYLE_DEFAULTS` with
+  `group_labels` first (config, scene, VR, fly, source folder), then core
+  trajectory/spatial/ring/region/Gandiva/heatmap sections and finally
+  per-series overrides. `_deep_merge` preserves shipped keys and still reads
+  legacy `categories` objects.
 - **Diagnostics**: velocity/displacement histograms are native load-time
   distributions and deliberately do not follow interactive filters. The
   starting-heading null diagnostic takes the first sorted sample of every
@@ -253,6 +304,12 @@ same cache key.
   `roi-reach` is the authoritative exact number input; `roi-reach-slider` is a
   0.5–100 convenience view whose handle clamps visually without changing an
   exact value above 100.
+- The loop state persists as `loop=`, `lx=`, `lz=`, and `lr=`. The displayed
+  whole-trial percentage persists as `tf=`. Ring movement updates these small
+  controls/URL state, but the geometry scan and redraw remain browser-local.
+- Observation windows persist as `region=`, `regions=` and `ractive=`; clean
+  presentation state persists as `minimal=`. Both restore alongside the plot
+  controls without forcing viewport interaction through the server.
 - Peak velocity's robust slider can be overridden by unbounded exact min/max
   inputs; those values persist as `vrmin=`/`vrmax=`. Workspace mode persists as
   `layout=sections|compare`.
@@ -260,8 +317,9 @@ same cache key.
   draggable order list. The default order uses the sequenceConfig with the best
   coverage; missing configs remain alphabetic at the bottom.
 - `update_plots` takes one filtered snapshot and returns trajectory, heatmap
-  store/variants, local direction field, target diagnostics, polar, trial
-  metrics, raw traces, summary and render state atomically. Retired
+  store/variants, local direction field, target diagnostics, custom-window
+  diagnostics/shares, polar, trial metrics, raw traces, summary and render
+  state atomically. Retired
   split-view/lazy callbacks are not registered. `update_polar_only` owns
   direction-source/moving/R/quality changes and all three polar mini-histograms;
   moving/source changes also refresh the local direction field, while heatmap
@@ -301,9 +359,9 @@ same cache key.
   to the previous stage, mirroring the actual filter pipeline.
 - `export_html` rebuilds figures server-side and emits one self-contained file.
   Plotly is embedded once (no CDN dependency). It includes trajectories,
-  heatmap, local direction field, polar, target diagnostics, trial metrics,
-  native velocity/displacement and starting-heading diagnostics, and selected
-  raw traces.
+  an interactive curtain-ring observer, heatmap, local direction field, polar,
+  target diagnostics, trial metrics, native velocity/displacement and
+  starting-heading diagnostics, and selected raw traces.
 - The header `status-dock` mirrors load/filter/render/export state and uses
   Dash's body loading class for immediate Working/Ready feedback. Its hover text
   exposes the latest stage timings. Python logging records load, cache, polar,
@@ -321,10 +379,15 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Heatmap bin/bound or data filter | Debounced all-section update; heatmap store + variants are built exactly | Concurrent heatmap sidebar aggregation |
 | Heatmap metric/scale/color range mode/value | Clientside heatmap `Plotly.restyle` from current binning variants; rebuild the local direction field from the cached filtered frame so abundance matches | Dataframe refiltering, heatmap rebinning or master-section rebuild |
 | ROI entered/trim | Debounced atomic update of all affected sections | A second ROI/trajectory refresh callback |
+| Displayed-trial fraction / resample | Rebuild trajectory and polar drawings from one whole-`_seg_id` sample; analytical spatial/ROI/metric panels retain the complete filtered frame | Row-level random sampling; changes to target/metric denominators |
+| Loop add/delete/select/match, centre/radius or ring drag | Browser-local multi-circle intersection, qualifying-entry split and observer redraw; persist small ring-set state in the URL | Dataframe filtering, master render, heatmap/polar/ROI changes |
+| Observation-window add/delete/select/bounds or box drag | Rebuild polar + custom diagnostics from cached filtered rows; repaint rectangles and Gandiva percentages in the browser | Trajectory, heatmap or Gandiva-vector recomputation; master render |
+| Clean layout | Browser-local relayout, adaptive scale bars and URL state | Figure/data rebuilds or viewport callback traffic |
+| Gandiva maximum radius | Browser-local scaling of existing arrow tips and URL state | Direction recomputation, dataframe filtering or another figure build |
 | Trajectory/heatmap pan/zoom | Immediate clientside peer relayout plus debounced `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
 | Section navigation | Clientside scroll only, including replay of the active tab | Any server render, graph hide/show or Plotly reinitialisation |
 | ROI reach/show | Debounced atomic update | Competing overlay/ROI callbacks |
-| Polar direction source/moving controls | Local direction field + cached polar figure and quality histograms; exact stats precede display thinning | Master trajectory/heatmap/ROI/raw rebuild |
+| Polar direction source/moving controls | Gandiva + cached polar figure and quality histograms; delayed inferential stats follow the visual render | Master trajectory/heatmap/ROI/raw rebuild |
 | Polar R/quality controls | Cached polar figure + three quality histograms only | Direction field or master trajectory/heatmap/ROI/raw rebuild |
 
 ---

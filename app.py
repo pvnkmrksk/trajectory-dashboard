@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.colors as pcolors
+from scipy import stats as scipy_stats
 from plotly.subplots import make_subplots
 from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 
@@ -1101,11 +1102,181 @@ def filter_by_stat_range(df, stats, stat_col, lo, hi):
 # ---------------------------------------------------------------------------
 
 COLORS = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-    "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
-    "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5",
+    # Muted, contemporary categorical hues chosen to stay calm when hundreds
+    # of translucent paths accumulate.  The order deliberately alternates hue
+    # families so neighbouring subplot categories remain distinguishable.
+    "#5f7f92", "#a97863", "#6f8d78", "#8f7182", "#7779a0",
+    "#9a875f", "#5f8b88", "#887c70", "#6f86ad", "#9b725f",
+    "#7f946c", "#927da0", "#66879b", "#a18472", "#738b82",
+    "#8b788d", "#7c8398", "#95896f", "#688f91", "#857e78",
 ]
+
+_VISUAL_STYLE_DEFAULTS = {
+    "group_labels": {
+        "config": {},
+        "scene": {},
+        "vr": {},
+        "flyid": {},
+        "file": {},
+    },
+    "trajectory": {
+        "name": "Trajectory paths",
+        "line_width": 1.2,
+        "opacity": 0.58,
+        "neutral_color": "#4f7f75",
+        "gray_color": "#737b85",
+        "gray_opacity": 0.28,
+        "palette": COLORS,
+    },
+    "spatial_layout": {
+        "name": "Spatial presentation",
+        "unit_scale": 1.0,
+        "unit_label": "cm",
+        "scale_bar_color": "#38444f",
+        "scale_bar_width": 3.0,
+    },
+    "loop_observer": {
+        "name": "Curtain rings",
+        "ring_color": "#c88a00",
+        "ring_fill": "rgba(245,183,0,0.10)",
+        "inactive_ring_color": "rgba(190,134,14,0.55)",
+        "before_color": "#7b8798",
+        "before_opacity": 0.34,
+        "future_opacity": 0.90,
+        "entry_fill": "#fff7d1",
+        "entry_line": "#6b4800",
+    },
+    "region_observer": {
+        "name": "Observation windows",
+        "active_line": "#b87917",
+        "inactive_line": "rgba(168,122,52,0.62)",
+        "fill": "rgba(207,157,68,0.065)",
+        "label_background": "rgba(255,250,235,0.88)",
+        "line_width": 2.2,
+    },
+    "gandiva": {
+        "name": "Gandiva plot",
+        "arrow_color": "#594324",
+        "arrow_widths": [1.0, 1.35, 1.8, 2.3, 3.0],
+        "arrow_opacities": [0.10, 0.24, 0.44, 0.70, 0.94],
+        "density_breaks": [0.0, 0.12, 0.28, 0.48, 0.72, 1.000001],
+        "marginal_line": "rgba(183,126,28,0.92)",
+        "marginal_fill": "rgba(218,164,55,0.20)",
+        "quadrant_line": "rgba(130,91,27,0.58)",
+        "quadrant_label_bg": "rgba(255,250,235,0.82)",
+        "raster_saturation": 0.60,
+        "raster_value_min": 0.84,
+        "raster_value_span": 0.09,
+    },
+    "heatmap": {
+        "name": "Occupancy heatmap",
+        "colorscale": "Viridis",
+    },
+    "series": {
+        "individual": {},
+    },
+}
+_VISUAL_STYLE = copy.deepcopy(_VISUAL_STYLE_DEFAULTS)
+
+
+def _deep_merge(base, override):
+    """Return a recursively merged copy while preserving shipped defaults."""
+    out = copy.deepcopy(base)
+    if not isinstance(override, dict):
+        return out
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _visual(section, key, default=None):
+    return _VISUAL_STYLE.get(section, {}).get(key, default)
+
+
+def _category_style(kind, raw):
+    kind, raw = str(kind), str(raw)
+    for section in ("group_labels", "series", "categories"):
+        entry = _VISUAL_STYLE.get(section, {}).get(kind, {}).get(raw, {})
+        if isinstance(entry, dict) and entry:
+            return entry
+    return {}
+
+
+_GROUP_STYLE_KIND = {
+    "config": "config",
+    "scene": "scene",
+    "vr": "vr",
+    "flyid": "flyid",
+    "file": "file",
+}
+
+
+def _group_label(group_by, raw):
+    """Human-readable, style-overridable label for any panel grouping."""
+    text = str(raw)
+    entry = _category_style(_GROUP_STYLE_KIND.get(str(group_by), ""), text)
+    if entry.get("name") not in (None, ""):
+        return str(entry["name"])
+    return humanise_config(text) if group_by == "config" else text
+
+
+def _visual_style_payload(df=None):
+    """Prefilled, self-documenting style JSON with current category labels."""
+    payload = copy.deepcopy(_VISUAL_STYLE)
+    # Migrate older saved JSON without making users memorise a new schema.
+    legacy = payload.pop("categories", {})
+    group_labels = payload.setdefault("group_labels", {})
+    series = payload.setdefault("series", {})
+    for kind, entries in legacy.items():
+        target = series if kind == "individual" else group_labels
+        target.setdefault(kind, {}).update(entries if isinstance(entries, dict) else {})
+    if df is not None and len(df):
+        category_specs = (
+            ("config", "ConfigFile"),
+            ("scene", "SceneName"),
+            ("vr", "VR"),
+            ("flyid", "FlyID"),
+            ("file", "SourceFolder"),
+        )
+        for kind, column in category_specs:
+            if column not in df:
+                continue
+            entries = payload["group_labels"].setdefault(kind, {})
+            for index, raw in enumerate(_ordered_values(
+                    df[column].dropna().astype(str).unique())):
+                current = entries.get(str(raw), {})
+                entries[str(raw)] = {
+                    "name": (
+                        humanise_config(str(raw)) if kind == "config"
+                        else str(raw)
+                    ),
+                    "color": current.get(
+                        "color", COLORS[index % len(COLORS)]),
+                    "line_width": current.get(
+                        "line_width",
+                        float(_visual("trajectory", "line_width", 1.2))),
+                }
+        if {"VR", "FlyID"}.issubset(df.columns):
+            entries = payload["series"].setdefault("individual", {})
+            pairs = sorted(
+                df[["VR", "FlyID"]].drop_duplicates()
+                .astype(str).itertuples(index=False, name=None))
+            for index, (vr_value, fly_value) in enumerate(pairs):
+                key = f"{fly_value}@{vr_value}"
+                current = entries.get(key, {})
+                entries[key] = {
+                    "name": current.get(
+                        "name", f"{vr_value} fly{fly_value}"),
+                    "color": current.get(
+                        "color", COLORS[index % len(COLORS)]),
+                    "line_width": current.get(
+                        "line_width",
+                        float(_visual("trajectory", "line_width", 1.2))),
+                }
+    return payload
 
 
 def _downsample(x, y, max_pts=5000):
@@ -1190,6 +1361,49 @@ def _decimate_frame(df: pd.DataFrame, max_points=None) -> pd.DataFrame:
     return out
 
 
+def _trial_display_fraction(value) -> float:
+    """Normalise the trajectory-only whole-segment sampling control to 0..1."""
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        pct = 100.0
+    if not np.isfinite(pct):
+        pct = 100.0
+    return min(1.0, max(0.01, pct / 100.0))
+
+
+def _sample_trajectory_segments(
+        df: pd.DataFrame, display_percent=100, seed=0) -> pd.DataFrame:
+    """Keep a stable random subset of complete ``_seg_id`` segments.
+
+    This is a drawing modifier, not an analytical filter: callers apply it only
+    to the trajectory figure (and therefore the browser-local loop observer)
+    after all data/ROI filters have been evaluated. Row order remains the
+    load-time order and no segment is split.
+    """
+    if df is None or len(df) == 0:
+        return df
+    fraction = _trial_display_fraction(display_percent)
+    segids = pd.unique(df["_seg_id"])
+    if fraction >= 1.0 or len(segids) <= 1:
+        return df
+
+    keep_count = max(1, int(math.ceil(fraction * len(segids))))
+    try:
+        seed_value = int(seed or 0)
+    except (TypeError, ValueError):
+        seed_value = 0
+    rng = np.random.default_rng(seed_value)
+    chosen = segids[rng.choice(len(segids), size=keep_count, replace=False)]
+    keep = df["_seg_id"].isin(chosen).to_numpy()
+    out = df.loc[keep]
+    out.attrs["_frame_token"] = (
+        "trajectory-segment-sample", _frame_cache_token(df),
+        round(fraction, 6), seed_value, int(len(out)),
+    )
+    return out
+
+
 def _decimation_budget(n_traces, animate, max_points=None):
     """
     Decide (can_animate, total_point_budget).
@@ -1253,10 +1467,22 @@ def _numeric_labels(values) -> np.ndarray:
 
 
 def _color_maps(df):
+    palette = _visual("trajectory", "palette", COLORS)
+    if not isinstance(palette, list) or not palette:
+        palette = COLORS
     individuals = sorted(df[["VR", "FlyID"]].drop_duplicates().itertuples(index=False, name=None))
-    ind_color = {k: COLORS[i % len(COLORS)] for i, k in enumerate(individuals)}
+    ind_color = {
+        k: _category_style(
+            "individual", f"{str(k[1])}@{str(k[0])}").get(
+                "color", palette[i % len(palette)])
+        for i, k in enumerate(individuals)
+    }
     vr_cats = sorted(df["VR"].dropna().unique())
-    vr_color = {v: COLORS[i % len(COLORS)] for i, v in enumerate(vr_cats)}
+    vr_color = {
+        v: _category_style("vr", str(v)).get(
+            "color", palette[i % len(palette)])
+        for i, v in enumerate(vr_cats)
+    }
     tmin = float(df["CurrentTrial"].min()) if "CurrentTrial" in df else 0.0
     tmax = float(df["CurrentTrial"].max()) if "CurrentTrial" in df else 1.0
     return ind_color, vr_color, tmin, tmax
@@ -1302,6 +1528,7 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
     decimated arrays plus per-segment structure (dpos/dlen) so animation frames
     can be sliced by time without any re-grouping.
     """
+    color_by = str(color_by or "one")
     groups = _group_frames(df, group_by, pool_mode, ncols)
     group_names = list(groups.keys())
     total_segs = sum(g["_seg_id"].nunique() for g in groups.values())
@@ -1366,6 +1593,8 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
         elif color_by == "roi":
             ck = (dec["_seg_id"].astype(str).map(outcome_map)
                   .fillna("No ROI").to_numpy(dtype=str))
+        elif color_by in ("one", "none", "gray", "categorical"):
+            ck = np.zeros(len(dec), dtype=int)
         else:  # individual
             fid = dec["FlyID"].to_numpy()
             ck = np.char.add(np.char.add(vr.astype(str), "|"), fid.astype(str))
@@ -1376,10 +1605,18 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
                        dpos=dpos[m], dlen=dlen[m], customdata=custom_all[m],
                        mc=None, mode="lines",
                        color=COLORS[0], label="", legendgroup=None,
+                       line_width=float(_visual(
+                           "trajectory", "line_width", 1.2)),
+                       opacity=float(_visual(
+                           "trajectory", "opacity", 0.58)),
                        showlegend=False, colorscale=None, cmin=None, cmax=None)
 
             if color_by == "vr":
                 rec["color"], rec["label"] = vr_color.get(key, COLORS[0]), str(key)
+                entry = _category_style("vr", str(key))
+                rec["label"] = str(entry.get("name", rec["label"]))
+                rec["line_width"] = float(entry.get(
+                    "line_width", rec["line_width"]))
             elif color_by == "trial":
                 tv = float(key)
                 rec["color"] = _sample_scale((tv - tmin) / tspan)
@@ -1395,12 +1632,38 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
                 label = str(key)
                 rec["color"] = _ROI_OUTCOME_COLOR.get(label, _ROI_OUTCOME_COLOR["No ROI"])
                 rec["label"] = label
+            elif color_by == "one":
+                rec["color"] = _visual(
+                    "trajectory", "neutral_color", "#4f7f75")
+                rec["label"] = "All trajectories"
+            elif color_by in ("none", "gray"):
+                rec["color"] = _visual(
+                    "trajectory", "gray_color", "#737b85")
+                rec["label"] = "All trajectories · neutral"
+                rec["opacity"] = float(_visual(
+                    "trajectory", "gray_opacity", 0.28))
+            elif color_by == "categorical":
+                palette = _visual("trajectory", "palette", COLORS)
+                if not isinstance(palette, list) or not palette:
+                    palette = COLORS
+                entry = _category_style(
+                    _GROUP_STYLE_KIND.get(str(group_by), ""), str(gname))
+                rec["color"] = entry.get(
+                    "color", palette[idx % len(palette)])
+                rec["label"] = _group_label(group_by, gname)
+                rec["line_width"] = float(entry.get(
+                    "line_width", rec["line_width"]))
             else:  # individual
                 vrv, fidv = str(key).split("|", 1)
                 rec["color"] = ind_color.get((vrv, fidv), COLORS[0])
+                entry = _category_style(
+                    "individual", f"{fidv}@{vrv}")
                 parts = [p for p in (vrv if vrv and vrv != "unknown" else None,
                                      f"fly{fidv}" if fidv and fidv != "unknown" else None) if p]
-                rec["label"] = " ".join(parts) or str(key)
+                rec["label"] = str(
+                    entry.get("name", " ".join(parts) or str(key)))
+                rec["line_width"] = float(entry.get(
+                    "line_width", rec["line_width"]))
 
             if color_by in ("individual", "vr", "roi"):
                 if color_by == "individual":
@@ -1416,7 +1679,9 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
 
 def _add_traj_trace(fig, td, TraceType, hover=True):
     common = dict(name=td["label"], legendgroup=td["legendgroup"],
-                  showlegend=td["showlegend"], opacity=0.75)
+                  showlegend=td["showlegend"],
+                  opacity=float(td.get(
+                      "opacity", _visual("trajectory", "opacity", 0.58))))
     if td.get("customdata") is not None:
         common["customdata"] = td["customdata"]
     if td["mode"] == "markers":
@@ -1424,7 +1689,10 @@ def _add_traj_trace(fig, td, TraceType, hover=True):
                                  colorscale=td["colorscale"],
                                  cmin=td["cmin"], cmax=td["cmax"])
     else:
-        common["line"] = dict(color=td["line_color"], width=1.2)
+        common["line"] = dict(
+            color=td["line_color"],
+            width=float(td.get(
+                "line_width", _visual("trajectory", "line_width", 1.2))))
     if hover:
         common["hovertemplate"] = (
             "<b>%{customdata[2]} @ %{customdata[3]}</b><br>"
@@ -1674,7 +1942,7 @@ def roi_outcome_by_segment(df, rois_by_cfg, reach) -> dict[str, str]:
 
 
 def build_trajectory_figure(df, group_by="config", pool_mode="separate",
-                            ncols=2, color_by="individual", animate=True,
+                            ncols=2, color_by="one", animate=True,
                             max_points=None, rois=None, reach_radius=3.0,
                             show_rois=False, roi_counts=None,
                             roi_outcomes=None, view_range=None):
@@ -1690,7 +1958,7 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
     group_names = list(groups.keys())
     n = len(group_names)
     nrows = max(1, (n + ncols - 1) // ncols)
-    titles = [humanise_config(t) for t in group_names]
+    titles = [_group_label(group_by, t) for t in group_names]
 
     fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=titles,
                         horizontal_spacing=0.05,
@@ -1713,7 +1981,9 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                     line_color=rec["color"], marker_color=mc,
                     colorscale=rec["colorscale"], cmin=rec["cmin"], cmax=rec["cmax"],
                     showlegend=rec["showlegend"], legendgroup=rec["legendgroup"],
-                    label=rec["label"], customdata=rec.get("customdata_joined"))
+                    label=rec["label"], line_width=rec.get("line_width"),
+                    opacity=rec.get("opacity"),
+                    customdata=rec.get("customdata_joined"))
 
     # Base traces (full extent)
     for rec in records:
@@ -1750,13 +2020,16 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                 x, y, mc, _custom = _record_arrays(rec, frac)
                 if rec["mode"] == "markers":
                     frame_traces.append(dict(
-                        type="scattergl", x=x, y=y, mode="markers", opacity=0.75,
+                        type="scattergl", x=x, y=y, mode="markers",
+                        opacity=rec.get("opacity", 0.58),
                         marker=dict(size=3, color=mc, colorscale=SEQ_COLORSCALE,
                                     cmin=rec["cmin"], cmax=rec["cmax"])))
                 else:
                     frame_traces.append(dict(
-                        type="scattergl", x=x, y=y, mode="lines", opacity=0.75,
-                        line=dict(color=rec["color"], width=1.2)))
+                        type="scattergl", x=x, y=y, mode="lines",
+                        opacity=rec.get("opacity", 0.58),
+                        line=dict(color=rec["color"],
+                                  width=rec.get("line_width", 1.2))))
             frames.append(dict(data=frame_traces, name=str(fi)))
         fig.frames = frames
 
@@ -1843,6 +2116,201 @@ def _rgba(hex_color: str, alpha: float) -> str:
         return f"rgba(102,102,102,{alpha:g})"
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return f"rgba({r},{g},{b},{alpha:g})"
+
+
+def _normalise_custom_regions(regions):
+    """Validate browser-edited rectangular observation windows."""
+    clean = []
+    for index, region in enumerate(regions or []):
+        if not isinstance(region, dict):
+            continue
+        try:
+            x0, x1 = sorted((
+                float(region.get("x0", -3.0)),
+                float(region.get("x1", 3.0)),
+            ))
+            z0, z1 = sorted((
+                float(region.get("z0", -3.0)),
+                float(region.get("z1", 3.0)),
+            ))
+        except (TypeError, ValueError):
+            continue
+        if not all(np.isfinite(v) for v in (x0, x1, z0, z1)):
+            continue
+        if x1 <= x0 or z1 <= z0:
+            continue
+        clean.append({
+            "id": str(region.get("id", f"region-{index + 1}")),
+            "name": str(region.get("name", f"Window {index + 1}")),
+            "x0": x0, "x1": x1, "z0": z0, "z1": z1,
+        })
+    return clean
+
+
+def _custom_region_masks(frame, regions):
+    """One vectorised point-membership mask per custom window."""
+    clean = _normalise_custom_regions(regions)
+    if frame is None or len(frame) == 0:
+        return clean, [np.zeros(0, dtype=bool) for _ in clean]
+    x = frame["GameObjectPosX"].to_numpy(dtype=float)
+    z = frame["GameObjectPosZ"].to_numpy(dtype=float)
+    masks = [
+        ((x >= region["x0"]) & (x <= region["x1"])
+         & (z >= region["z0"]) & (z <= region["z1"]))
+        for region in clean
+    ]
+    return clean, masks
+
+
+def _custom_region_subset(frame, regions, position_frame=None):
+    """Return rows inside the union of windows while preserving `_seg_id`."""
+    if frame is None or len(frame) == 0:
+        return frame
+    positions = position_frame if position_frame is not None else frame
+    clean, masks = _custom_region_masks(positions, regions)
+    if not clean:
+        return frame
+    union = np.logical_or.reduce(masks) if masks else np.zeros(len(frame), dtype=bool)
+    out = frame.loc[union]
+    out.attrs["_frame_token"] = (
+        "custom-regions", _frame_cache_token(frame),
+        tuple((r["id"], r["x0"], r["x1"], r["z0"], r["z1"]) for r in clean),
+        int(len(out)),
+    )
+    return out
+
+
+def _custom_region_stats(frame, regions, group_by="config",
+                         pool_mode="separate", ncols=2, position_frame=None):
+    """Fast sample/trial/geometry summaries plus per-Gandiva-panel shares."""
+    positions = position_frame if position_frame is not None else frame
+    clean, masks = _custom_region_masks(positions, regions)
+    if frame is None or len(frame) == 0 or not clean:
+        return {"enabled": bool(clean), "regions": [], "panels": []}
+
+    seg = frame["_seg_id"].astype(str).to_numpy()
+    x = positions["GameObjectPosX"].to_numpy(dtype=float)
+    z = positions["GameObjectPosZ"].to_numpy(dtype=float)
+    same = np.zeros(len(frame), dtype=bool)
+    same[1:] = seg[1:] == seg[:-1]
+    step = np.zeros(len(frame), dtype=float)
+    step[1:] = np.hypot(np.diff(x), np.diff(z))
+    velocity = smoothed_velocity(frame, 10)
+    tortuosity = compute_tortuosity(positions)
+    total_trials = max(1, int(pd.unique(seg).size))
+    region_rows = []
+
+    for region, mask in zip(clean, masks):
+        sample_count = int(mask.sum())
+        entered = int(pd.unique(seg[mask]).size) if sample_count else 0
+        inside_step = mask & np.concatenate(([False], mask[:-1])) & same
+        distance = float(np.nansum(step[inside_step]))
+        if sample_count:
+            sub = positions.loc[mask, ["_seg_id", "GameObjectPosX",
+                                       "GameObjectPosZ"]]
+            grouped = sub.groupby("_seg_id", sort=False, observed=True)
+            dx = (grouped["GameObjectPosX"].last()
+                  - grouped["GameObjectPosX"].first()).to_numpy(dtype=float)
+            dz = (grouped["GameObjectPosZ"].last()
+                  - grouped["GameObjectPosZ"].first()).to_numpy(dtype=float)
+            displacement = float(np.nansum(np.hypot(dx, dz)))
+            tort_values = tortuosity[mask]
+            tort_values = tort_values[np.isfinite(tort_values)]
+            vel_values = velocity[mask]
+            vel_values = vel_values[np.isfinite(vel_values)]
+            med_tort = (
+                float(np.median(tort_values))
+                if len(tort_values) else float("nan")
+            )
+            med_vel = (
+                float(np.median(vel_values))
+                if len(vel_values) else float("nan")
+            )
+        else:
+            displacement = med_tort = med_vel = float("nan")
+        region_rows.append({
+            **region,
+            "samples": sample_count,
+            "sample_percent": 100.0 * sample_count / max(1, len(frame)),
+            "trials": entered,
+            "total_trials": total_trials,
+            "trial_percent": 100.0 * entered / total_trials,
+            "distance_walked": distance,
+            "net_displacement": displacement,
+            "median_tortuosity": med_tort,
+            "median_velocity": med_vel,
+        })
+
+    panels = []
+    for raw_name, group in _group_frames(
+            positions, group_by, pool_mode, ncols).items():
+        group_x = group["GameObjectPosX"].to_numpy(dtype=float)
+        group_z = group["GameObjectPosZ"].to_numpy(dtype=float)
+        shares = []
+        for region in clean:
+            count = int(((group_x >= region["x0"]) & (group_x <= region["x1"])
+                         & (group_z >= region["z0"])
+                         & (group_z <= region["z1"])).sum())
+            shares.append({
+                "id": region["id"], "name": region["name"], "samples": count,
+                "percent": 100.0 * count / max(1, len(group)),
+            })
+        panels.append({
+            "raw": str(raw_name),
+            "name": _group_label(group_by, raw_name),
+            "regions": shares,
+        })
+    return {"enabled": True, "regions": region_rows, "panels": panels}
+
+
+def build_custom_region_diagnostics_figure(payload):
+    rows = (payload or {}).get("regions") or []
+    if not rows:
+        return _msg_figure(
+            "Enable an observation window to inspect its local trajectories.",
+            260,
+        )
+
+    def number(value, suffix="", digits=3):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return "—"
+        if not np.isfinite(numeric):
+            return "—"
+        return f"{numeric:,.{digits}g}{suffix}"
+
+    values = [
+        [row["name"] for row in rows],
+        [f"{row['samples']:,} ({row['sample_percent']:.1f}%)" for row in rows],
+        [f"{row['trials']:,}/{row['total_trials']:,} "
+         f"({row['trial_percent']:.1f}%)" for row in rows],
+        [number(row["distance_walked"]) for row in rows],
+        [number(row["net_displacement"]) for row in rows],
+        [number(row["median_tortuosity"]) for row in rows],
+        [number(row["median_velocity"]) for row in rows],
+    ]
+    fig = go.Figure(go.Table(
+        header=dict(
+            values=[
+                "<b>Window</b>", "<b>Samples</b>", "<b>Trials entered</b>",
+                "<b>Distance walked</b>", "<b>Net displacement</b>",
+                "<b>Median tortuosity</b>", "<b>Median velocity</b>",
+            ],
+            fill_color="#edf1f3", align=["left"] + ["right"] * 6,
+            font=dict(color="#34434d", size=10), height=30,
+        ),
+        cells=dict(
+            values=values, align=["left"] + ["right"] * 6,
+            fill_color="#fbfcfc", font=dict(color="#3f4c55", size=10),
+            height=27,
+        ),
+    ))
+    fig.update_layout(
+        template="plotly_white", height=max(210, 95 + 30 * len(rows)),
+        margin=dict(l=8, r=8, t=18, b=8),
+    )
+    return fig
 
 
 def _roi_metric_value(count: float, total: float, metric: str, dt: float) -> float:
@@ -1973,15 +2441,25 @@ def _log_colorbar(mmin, mmax, metric):
     # If the range is narrow, add 1-2-5 sub-ticks for readability
     mults = [1] if (hi - lo) > 4 else [1, 2, 5]
     vals, text = [], []
+
+    def plain(value):
+        if value >= 1:
+            if abs(value - round(value)) < max(1e-9, value * 1e-10):
+                return f"{int(round(value)):,}"
+            return f"{value:,.3g}"
+        return f"{value:.8f}".rstrip("0").rstrip(".")
+
     for d in decades:
         for m in mults:
             v = m * (10.0 ** d)
             if mmin * 0.999 <= v <= mmax * 1.001:
                 vals.append(np.log10(v))
-                text.append(_fmt_metric(v, metric))
+                text.append(
+                    f"{plain(v)}%" if metric == "percent" else plain(v)
+                )
     if not vals:  # degenerate
         vals = [np.log10(max(mmax, 1e-9))]
-        text = [_fmt_metric(mmax, metric)]
+        text = [f"{plain(mmax)}%" if metric == "percent" else plain(mmax)]
     return vals, text
 
 
@@ -2038,7 +2516,8 @@ def _heatmap_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
     xc = 0.5 * (xedges[:-1] + xedges[1:])
     yc = 0.5 * (yedges[:-1] + yedges[1:])
     reach_v = float(reach_radius or 3.0)
-    return dict(group_names=group_names, nrows=nrows, xc=xc.tolist(),
+    return dict(group_names=group_names, group_by=group_by,
+                nrows=nrows, xc=xc.tolist(),
                 yc=yc.tolist(), rng=rng, counts=counts, dt=_median_dt(df),
                 reach=reach_v,
                 roi_stats=_heatmap_roi_stats(group_items, rois_by_cfg,
@@ -2118,13 +2597,18 @@ def _assemble_heatmap(bins, var, ncols, df):
     z/customdata are plain lists (2-D numpy breaks Dash/Plotly-6 serialisation)."""
     group_names, nrows = bins["group_names"], bins["nrows"]
     fig = make_subplots(rows=nrows, cols=ncols,
-                        subplot_titles=[humanise_config(t) for t in group_names],
+                        subplot_titles=[
+                            _group_label(bins.get("group_by", "config"), t)
+                            for t in group_names
+                        ],
                         horizontal_spacing=0.05,
                         vertical_spacing=_subplot_spacing(nrows))
     for idx, (z, cd) in enumerate(zip(var["z"], var["customdata"])):
         fig.add_trace(
             go.Heatmap(x=bins["xc"], y=bins["yc"], z=z, customdata=cd,
-                       colorscale=HEATMAP_COLORSCALE, zmin=var["zmin"],
+                       colorscale=_visual(
+                           "heatmap", "colorscale", HEATMAP_COLORSCALE),
+                       zmin=var["zmin"],
                        zmax=var["zmax"], showscale=(idx == 0),
                        colorbar=var["colorbar"], hovertemplate=var["hovertemplate"]),
             row=idx // ncols + 1, col=idx % ncols + 1)
@@ -2238,6 +2722,24 @@ def _direction_field_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
     ux_by_index = pd.Series(ux, index=df.index)
     uz_by_index = pd.Series(uz, index=df.index)
     results = []
+    starts = df.drop_duplicates("_seg_id", keep="first")
+    start_x = pd.to_numeric(
+        starts["GameObjectPosX"], errors="coerce").to_numpy(dtype=float)
+    start_z = pd.to_numeric(
+        starts["GameObjectPosZ"], errors="coerce").to_numpy(dtype=float)
+    good_start = np.isfinite(start_x) & np.isfinite(start_z)
+    if np.any(good_start):
+        start_hist, _, _ = np.histogram2d(
+            start_x[good_start], start_z[good_start],
+            bins=[xedges, yedges])
+        start_ix, start_iz = np.unravel_index(
+            int(np.argmax(start_hist)), start_hist.shape)
+        start_cut = (
+            float(0.5 * (xedges[start_ix] + xedges[start_ix + 1])),
+            float(0.5 * (yedges[start_iz] + yedges[start_iz + 1])),
+        )
+    else:
+        start_cut = (0.0, 0.0)
 
     for gname, gdf in group_items:
         gx = gdf["GameObjectPosX"].to_numpy(dtype=float)
@@ -2354,6 +2856,7 @@ def _direction_field_bins(df, group_by, pool_mode, ncols, bin_size, bound_pct,
         "metric_scale": "log" if log_scale else "linear",
         "metric_min": float(metric_min),
         "metric_max": float(metric_max),
+        "start_cut": start_cut,
     }
 
 
@@ -2387,8 +2890,11 @@ def _direction_field_rgba(result, nz, nx):
     # Low-R bins are neutral grey rather than displaying a meaningless hue.
     # High-R bins approach a soft, high-chroma cyclic direction colour without
     # the eye-searing value/saturation of a raw HSV wheel.
-    saturation = 0.60 * strength
-    value = 0.84 + 0.09 * strength
+    saturation = float(_visual(
+        "gandiva", "raster_saturation", 0.60)) * strength
+    value = float(_visual(
+        "gandiva", "raster_value_min", 0.84)) + float(_visual(
+            "gandiva", "raster_value_span", 0.09)) * strength
     rgb = np.rint(
         255.0 * _hsv_rgb_arrays(hue, saturation, value)).astype(np.uint8)
     alpha = np.rint(255.0 * abundance).astype(np.uint8)
@@ -2433,7 +2939,7 @@ def _flow_arrow_arrays(x, z, strength, theta_deg, cell_size,
         return [], []
     theta = np.radians(theta_deg)
     vx, vz = np.sin(theta), np.cos(theta)
-    radius = max(0.01, min(0.49, float(max_radius or 0.49)))
+    radius = max(0.01, min(0.98, float(max_radius or 0.49)))
     length = radius * float(cell_size) * strength
     tip_x = x + length * vx
     tip_z = z + length * vz
@@ -2451,15 +2957,31 @@ def _layout_axis_key(axis_ref):
 
 
 def _add_direction_marginals(fig, bins, ncols):
-    """Add compact top/right abundance marginals aligned to every flow panel."""
+    """Add fine marginals and modal-start quadrant percentages to each panel."""
     results = bins["groups"]
     total_main_axes = bins["nrows"] * ncols
     main_fraction = 0.82
     gap_fraction = 0.025
-    line_color = "rgba(15,118,110,0.92)"
-    fill_color = "rgba(15,118,110,0.18)"
+    line_color = _visual(
+        "gandiva", "marginal_line", "rgba(183,126,28,0.92)")
+    fill_color = _visual(
+        "gandiva", "marginal_fill", "rgba(218,164,55,0.20)")
+    quadrant_line = _visual(
+        "gandiva", "quadrant_line", "rgba(130,91,27,0.58)")
+    quadrant_bg = _visual(
+        "gandiva", "quadrant_label_bg", "rgba(255,250,235,0.82)")
     unit = bins["metric_unit"]
-    nx, nz = len(bins["xc"]), len(bins["yc"])
+    # Four subdivisions per heatmap cell preserve the shared extent while
+    # producing genuinely finer marginal histograms.
+    fine_xedges = np.linspace(
+        bins["xedges"][0], bins["xedges"][-1],
+        (len(bins["xedges"]) - 1) * 4 + 1)
+    fine_yedges = np.linspace(
+        bins["yedges"][0], bins["yedges"][-1],
+        (len(bins["yedges"]) - 1) * 4 + 1)
+    fine_xc = 0.5 * (fine_xedges[:-1] + fine_xedges[1:])
+    fine_yc = 0.5 * (fine_yedges[:-1] + fine_yedges[1:])
+    cut_x, cut_z = bins.get("start_cut", (0.0, 0.0))
 
     for index, result in enumerate(results):
         main_x_ref, main_y_ref = _subplot_axis(index + 1)
@@ -2481,9 +3003,25 @@ def _add_direction_marginals(fig, bins, ncols):
         side_number = top_number + 1
         top_x_ref, top_y_ref = f"x{top_number}", f"y{top_number}"
         side_x_ref, side_y_ref = f"x{side_number}", f"y{side_number}"
-        metric_grid = np.asarray(result["metric"], dtype=float).reshape(nz, nx)
-        x_marginal = np.nansum(metric_grid, axis=0)
-        z_marginal = np.nansum(metric_grid, axis=1)
+        positions_x = pd.to_numeric(
+            result["frame"]["GameObjectPosX"], errors="coerce").to_numpy(dtype=float)
+        positions_z = pd.to_numeric(
+            result["frame"]["GameObjectPosZ"], errors="coerce").to_numpy(dtype=float)
+        spatial_ok = np.isfinite(positions_x) & np.isfinite(positions_z)
+        x_marginal, _ = np.histogram(
+            positions_x[spatial_ok], bins=fine_xedges)
+        z_marginal, _ = np.histogram(
+            positions_z[spatial_ok], bins=fine_yedges)
+        x_marginal = x_marginal.astype(float)
+        z_marginal = z_marginal.astype(float)
+        if bins["metric"] == "time":
+            x_marginal *= bins["dt"]
+            z_marginal *= bins["dt"]
+        elif bins["metric"] == "percent":
+            x_total = max(float(x_marginal.sum()), 1.0)
+            z_total = max(float(z_marginal.sum()), 1.0)
+            x_marginal *= 100.0 / x_total
+            z_marginal *= 100.0 / z_total
 
         fig.update_layout(**{
             _layout_axis_key(top_x_ref): dict(
@@ -2508,7 +3046,7 @@ def _add_direction_marginals(fig, bins, ncols):
             ),
         })
         fig.add_trace(go.Scatter(
-            x=bins["xc"].tolist(), y=x_marginal.tolist(),
+            x=fine_xc.tolist(), y=x_marginal.tolist(),
             xaxis=top_x_ref, yaxis=top_y_ref,
             mode="lines", fill="tozeroy", showlegend=False,
             line=dict(color=line_color, width=1.5), fillcolor=fill_color,
@@ -2519,7 +3057,7 @@ def _add_direction_marginals(fig, bins, ncols):
             ),
         ))
         fig.add_trace(go.Scatter(
-            x=z_marginal.tolist(), y=bins["yc"].tolist(),
+            x=z_marginal.tolist(), y=fine_yc.tolist(),
             xaxis=side_x_ref, yaxis=side_y_ref,
             mode="lines", fill="tozerox", showlegend=False,
             line=dict(color=line_color, width=1.5), fillcolor=fill_color,
@@ -2529,6 +3067,46 @@ def _add_direction_marginals(fig, bins, ncols):
                 f"{unit}<extra></extra>"
             ),
         ))
+
+        # The cut is the densest shared segment-start bin (usually 0,0). These
+        # percentages use spatial samples, independent of heading validity.
+        x_valid = positions_x[spatial_ok]
+        z_valid = positions_z[spatial_ok]
+        total = max(len(x_valid), 1)
+        quadrant_masks = (
+            (x_valid < cut_x) & (z_valid >= cut_z),
+            (x_valid >= cut_x) & (z_valid >= cut_z),
+            (x_valid < cut_x) & (z_valid < cut_z),
+            (x_valid >= cut_x) & (z_valid < cut_z),
+        )
+        percentages = [100.0 * np.count_nonzero(mask) / total
+                       for mask in quadrant_masks]
+        xlo, xhi = float(bins["xedges"][0]), float(bins["xedges"][-1])
+        zlo, zhi = float(bins["yedges"][0]), float(bins["yedges"][-1])
+        x_left = xlo + 0.07 * (xhi - xlo)
+        x_right = xhi - 0.07 * (xhi - xlo)
+        z_bottom = zlo + 0.07 * (zhi - zlo)
+        z_top = zhi - 0.07 * (zhi - zlo)
+        fig.add_shape(
+            type="line", x0=cut_x, x1=cut_x, y0=zlo, y1=zhi,
+            xref=main_x_ref, yref=main_y_ref,
+            line=dict(color=quadrant_line, width=1, dash="dot"))
+        fig.add_shape(
+            type="line", x0=xlo, x1=xhi, y0=cut_z, y1=cut_z,
+            xref=main_x_ref, yref=main_y_ref,
+            line=dict(color=quadrant_line, width=1, dash="dot"))
+        for xpos, zpos, pct, xanchor, yanchor in (
+            (x_left, z_top, percentages[0], "left", "top"),
+            (x_right, z_top, percentages[1], "right", "top"),
+            (x_left, z_bottom, percentages[2], "left", "bottom"),
+            (x_right, z_bottom, percentages[3], "right", "bottom"),
+        ):
+            fig.add_annotation(
+                x=xpos, y=zpos, xref=main_x_ref, yref=main_y_ref,
+                text=f"{pct:.1f}%", showarrow=False,
+                xanchor=xanchor, yanchor=yanchor,
+                bgcolor=quadrant_bg, borderpad=2,
+                font=dict(size=9, color="#594324"))
 
 
 def build_direction_field_figure(
@@ -2558,7 +3136,9 @@ def build_direction_field_figure(
 
     fig = make_subplots(
         rows=bins["nrows"], cols=ncols,
-        subplot_titles=[humanise_config(result["name"]) for result in results],
+        subplot_titles=[
+            _group_label(group_by, result["name"]) for result in results
+        ],
         horizontal_spacing=0.05,
         vertical_spacing=_subplot_spacing(bins["nrows"]),
     )
@@ -2625,10 +3205,23 @@ def build_direction_field_figure(
             np.isfinite(cell_r) & np.isfinite(cell_theta)
             & (cell_r >= 0.04) & (cell_abundance >= 0.02)
         )
+        density_breaks = np.asarray(_visual(
+            "gandiva", "density_breaks",
+            FLOW_ARROW_DENSITY_BREAKS.tolist()), dtype=float)
+        arrow_opacities = tuple(_visual(
+            "gandiva", "arrow_opacities", list(FLOW_ARROW_OPACITY)))
+        arrow_widths = tuple(_visual(
+            "gandiva", "arrow_widths", list(FLOW_ARROW_WIDTH)))
+        if len(density_breaks) != 6:
+            density_breaks = FLOW_ARROW_DENSITY_BREAKS
+        if len(arrow_opacities) != 5:
+            arrow_opacities = FLOW_ARROW_OPACITY
+        if len(arrow_widths) != 5:
+            arrow_widths = FLOW_ARROW_WIDTH
         tier = np.digitize(
-            cell_abundance, FLOW_ARROW_DENSITY_BREAKS[1:-1], right=False)
+            cell_abundance, density_breaks[1:-1], right=False)
         for tier_index, (opacity, width) in enumerate(
-                zip(FLOW_ARROW_OPACITY, FLOW_ARROW_WIDTH)):
+                zip(arrow_opacities, arrow_widths)):
             take = arrow_ok & (tier == tier_index)
             if not np.any(take):
                 continue
@@ -2637,8 +3230,11 @@ def build_direction_field_figure(
                 cell_theta[take], cell_size, max_radius=max_radius)
             fig.add_trace(go.Scattergl(
                 x=arrow_x, y=arrow_z, mode="lines",
-                line=dict(color="#18212f", width=width),
+                line=dict(
+                    color=_visual("gandiva", "arrow_color", "#594324"),
+                    width=float(width)),
                 opacity=opacity, hoverinfo="skip", showlegend=False,
+                meta={"gandiva_arrow": True},
             ), row=row, col=col)
 
     fig.update_layout(images=images)
@@ -2667,7 +3263,7 @@ def build_direction_field_figure(
             f"{source_label}{moving_label} · hue/angle = mean direction · "
             f"length/saturation = R · opacity/width = "
             f"{bins['metric_unit']} ({bins['metric_scale']}) · "
-            "top/right = X/Z abundance"
+            "top/right = 4×-fine X/Z marginals · dotted cut = modal start"
         ),
         font=dict(size=10, color="#5b6472"),
     )
@@ -2683,12 +3279,14 @@ def build_direction_field_figure(
         meta={
             "flow_cells": occupied_total,
             "heading_source": bins["source"],
-            "max_radius": max(0.01, min(0.49, float(max_radius or 0.49))),
+            "max_radius": max(0.01, min(0.98, float(max_radius or 0.49))),
             "abundance_metric": bins["metric"],
             "abundance_scale": bins["metric_scale"],
             "abundance_range": [bins["metric_min"], bins["metric_max"]],
             "spatial_axis_count": bins["nrows"] * ncols,
             "marginals": "active heatmap metric",
+            "marginal_resolution_multiplier": 4,
+            "quadrant_cut": list(bins.get("start_cut", (0.0, 0.0))),
         },
     )
     return fig
@@ -3766,7 +4364,7 @@ def _thin_ray_table(ray: pd.DataFrame, max_points=None) -> pd.DataFrame:
 
 
 def _polar_seq_values(ray: pd.DataFrame, color_by: str):
-    color_by = color_by or "individual"
+    color_by = color_by or "one"
     if color_by == "velocity":
         vals = ray["cval"].to_numpy(dtype=float)
         finite = vals[np.isfinite(vals)]
@@ -3819,7 +4417,7 @@ def _population_polar_vector(ray: pd.DataFrame) -> tuple[float, float, int]:
 
 
 def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
-                       color_by="individual", moving_only=False, walk_thresh=None,
+                       color_by="one", moving_only=False, walk_thresh=None,
                        max_points=None, rois=None, reach_radius=3.0, show_rois=False,
                        roi_outcomes=None, r_range=None, min_point_frac=0.0,
                        min_animal_trial_frac=0.0, return_summary=False,
@@ -3866,7 +4464,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
     specs = [[{"type": "polar"} for _ in range(ncols)] for _ in range(nrows)]
     vspace = min(0.12, 0.7 / max(nrows, 1))
     titles = [
-        (f"{_wrap_subplot_title(humanise_config(name))}<br>"
+        (f"{_wrap_subplot_title(_group_label(group_by, name))}<br>"
          f"{int(kept_by_group.get(name, 0)):,}/{total_by_group.get(name, 0):,} trials shown")
         for name in names
     ]
@@ -3919,8 +4517,8 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
             elif color_by == "roi":
                 outcome_map = {str(k): str(v) for k, v in (roi_outcomes or {}).items()}
                 keys = sub["_seg_id"].astype(str).map(outcome_map).fillna("No ROI").to_numpy()
-            elif color_by == "none":
-                keys = np.full(len(sub), "Polar", dtype=object)
+            elif color_by in ("one", "none", "gray", "categorical"):
+                keys = np.full(len(sub), color_by, dtype=object)
             else:
                 keys = sub["animal"].astype(str).to_numpy()
             for key in pd.unique(keys):
@@ -3935,9 +4533,24 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                     label = str(key)
                     colr = _ROI_OUTCOME_COLOR.get(label, _ROI_OUTCOME_COLOR["No ROI"])
                     legend_group = f"roi:{label}"
-                elif color_by == "none":
-                    label, colr = "Polar", "rgba(46,160,80,0.45)"
-                    legend_group = "polar"
+                elif color_by in ("one", "none", "gray", "categorical"):
+                    if color_by == "one":
+                        label = "All vectors"
+                        colr = _visual(
+                            "trajectory", "neutral_color", "#4f7f75")
+                    elif color_by == "categorical":
+                        palette = _visual("trajectory", "palette", COLORS)
+                        if not isinstance(palette, list) or not palette:
+                            palette = COLORS
+                        entry = _category_style(
+                            _GROUP_STYLE_KIND.get(str(group_by), ""), str(gname))
+                        label = _group_label(group_by, gname)
+                        colr = entry.get("color", palette[idx % len(palette)])
+                    else:
+                        label = "All vectors · neutral"
+                        colr = _visual(
+                            "trajectory", "gray_color", "#737b85")
+                    legend_group = f"polar:{color_by}"
                 else:
                     animal_key = str(key)
                     label = animal_key
@@ -3960,7 +4573,15 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                     name=label, legendgroup=legend_group,
                     showlegend=legend_group not in legend_seen,
                     customdata=cd.tolist(), hovertemplate=_POLAR_HOVER,
-                    line=dict(color=colr, width=1.15)),
+                    opacity=(
+                        float(_visual("trajectory", "gray_opacity", 0.36))
+                        if color_by in ("none", "gray") else
+                        float(_visual("trajectory", "opacity", 0.58))
+                    ),
+                    line=dict(
+                        color=colr,
+                        width=float(_visual(
+                            "trajectory", "line_width", 1.2)))),
                     row=row, col=col)
                 legend_seen.add(legend_group)
 
@@ -3984,7 +4605,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                       bgcolor="white")
     for ann in fig.layout.annotations:
         ann.update(font=dict(size=10), yshift=10)
-    show_legend = color_by in ("individual", "vr", "roi", "none")
+    show_legend = color_by in ("individual", "vr", "roi")
     legend_labels = [
         trace.name for trace in fig.data
         if bool(getattr(trace, "showlegend", False))
@@ -4075,7 +4696,7 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
         row, col = metric_index // 2 + 1, metric_index % 2 + 1
         ticktext = []
         for group_index, (raw_name, group) in enumerate(groups):
-            name = humanise_config(str(raw_name)) if group_by == "config" else str(raw_name)
+            name = _group_label(group_by, raw_name)
             if column not in group:
                 ticktext.append(f"{name}<br>n=0")
                 continue
@@ -4184,6 +4805,198 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
         font=dict(size=10, color="#667085"),
     )
     return fig
+
+
+def _p_stars(p_value) -> str:
+    try:
+        p_value = float(p_value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not np.isfinite(p_value):
+        return "n/a"
+    if p_value < 0.0001:
+        return "****"
+    if p_value < 0.001:
+        return "***"
+    if p_value < 0.01:
+        return "**"
+    if p_value < 0.05:
+        return "*"
+    return "ns"
+
+
+def _holm_adjust(p_values):
+    """Small dependency-free Holm correction for the four metric omnibus tests."""
+    values = np.asarray(p_values, dtype=float)
+    adjusted = np.full(values.shape, np.nan, dtype=float)
+    finite = np.flatnonzero(np.isfinite(values))
+    if not len(finite):
+        return adjusted
+    ordered = finite[np.argsort(values[finite])]
+    running = 0.0
+    m = len(ordered)
+    for rank, index in enumerate(ordered):
+        running = max(running, (m - rank) * values[index])
+        adjusted[index] = min(1.0, running)
+    return adjusted
+
+
+def _omnibus_nonparametric(groups, column):
+    arrays = []
+    for _name, group in groups:
+        if column not in group:
+            continue
+        values = pd.to_numeric(
+            group[column], errors="coerce").to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values):
+            arrays.append(values)
+    if len(arrays) < 2:
+        return np.nan, "not enough groups"
+    try:
+        if len(arrays) == 2:
+            result = scipy_stats.mannwhitneyu(
+                arrays[0], arrays[1], alternative="two-sided")
+            return float(result.pvalue), "Mann–Whitney U"
+        result = scipy_stats.kruskal(*arrays, nan_policy="omit")
+        return float(result.pvalue), "Kruskal–Wallis"
+    except ValueError:
+        return np.nan, "constant / insufficient"
+
+
+def _rayleigh_uniformity_p(angles_deg):
+    """Rayleigh uniformity p-value using the standard finite-n expansion."""
+    angles = np.radians(np.asarray(angles_deg, dtype=float))
+    angles = angles[np.isfinite(angles)]
+    n = len(angles)
+    if n < 3:
+        return np.nan
+    resultant = abs(np.exp(1j * angles).sum())
+    z_value = resultant * resultant / n
+    base = math.exp(-z_value)
+    correction = (
+        1.0
+        + (2.0 * z_value - z_value * z_value) / (4.0 * n)
+        - (
+            24.0 * z_value - 132.0 * z_value ** 2
+            + 76.0 * z_value ** 3 - 9.0 * z_value ** 4
+        ) / (288.0 * n * n)
+    )
+    return float(min(1.0, max(0.0, base * correction)))
+
+
+def _circular_group_test(ray):
+    """Non-parametric circular comparison using pooled-centred angular ranks."""
+    if ray is None or len(ray) == 0 or "group" not in ray:
+        return np.nan, "not enough groups"
+    arrays = []
+    labels = []
+    for name, group in ray.groupby("group", sort=False, observed=True):
+        values = pd.to_numeric(
+            group["theta_deg"], errors="coerce").to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values):
+            arrays.append(values)
+            labels.append(str(name))
+    if len(arrays) < 2:
+        return np.nan, "not enough groups"
+    pooled = np.concatenate(arrays)
+    centre = np.degrees(np.angle(
+        np.exp(1j * np.radians(pooled)).mean()))
+    centred = [
+        ((values - centre + 180.0) % 360.0) - 180.0
+        for values in arrays
+    ]
+    try:
+        if len(centred) == 2:
+            result = scipy_stats.cramervonmises_2samp(
+                centred[0], centred[1], method="auto")
+            return float(result.pvalue), "circular CvM"
+        result = scipy_stats.kruskal(*centred, nan_policy="omit")
+        return float(result.pvalue), "circular rank omnibus"
+    except ValueError:
+        return np.nan, "constant / insufficient"
+
+
+def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
+                        pool_mode, polar_moving, polar_walk,
+                        polar_angle_source, polar_r_range,
+                        polar_min_point_frac, polar_min_animal_frac):
+    groups = [
+        item for item in _metric_stat_groups(
+            metric_stats, group_by, pool_mode) if len(item[1])
+    ]
+    raw_metric = [
+        _omnibus_nonparametric(groups, column)
+        for column, _title, _axis in _TRIAL_METRIC_SPECS
+    ]
+    adjusted = _holm_adjust([item[0] for item in raw_metric])
+    metric_labels = []
+    for (p_value, method), q_value in zip(raw_metric, adjusted):
+        metric_labels.append(
+            f"{method} · Holm p={q_value:.3g} {_p_stars(q_value)}"
+            if np.isfinite(q_value) else f"{method} · n/a")
+
+    polar_ray = rayleigh_by_segment(
+        polar_frame, _on(polar_moving), polar_walk, "none",
+        angle_source=polar_angle_source)
+    polar_ray, _ = _filter_polar_ray_table(
+        polar_ray, polar_r_range, polar_min_point_frac,
+        polar_min_animal_frac)
+    polar_groups = _group_frames(
+        polar_frame, group_by, pool_mode, 2)
+    seg_group = (
+        pd.concat([
+            pd.Series(name, index=group["_seg_id"].astype(str).unique())
+            for name, group in polar_groups.items()
+        ])
+        if polar_groups else pd.Series(dtype=object)
+    )
+    polar_ray = polar_ray.assign(
+        group=polar_ray["_seg_id"].astype(str).map(seg_group))
+    polar_p, polar_method = _circular_group_test(polar_ray)
+    polar_label = (
+        f"{polar_method} · p={polar_p:.3g} {_p_stars(polar_p)}"
+        if np.isfinite(polar_p) else f"{polar_method} · n/a"
+    )
+
+    start_parts = []
+    if raw_frame is not None and len(raw_frame) and "GameObjectRotY" in raw_frame:
+        first = raw_frame.drop_duplicates("_seg_id", keep="first")
+        for raw_name, sub in first.groupby(
+                "ConfigFile", sort=False, observed=True):
+            p_value = _rayleigh_uniformity_p(
+                pd.to_numeric(
+                    sub["GameObjectRotY"], errors="coerce").to_numpy())
+            if np.isfinite(p_value):
+                start_parts.append((str(raw_name), float(p_value), len(sub)))
+    significant = sum(p_value < 0.05 for _, p_value, _ in start_parts)
+    min_p = min((p_value for _, p_value, _ in start_parts), default=np.nan)
+    start_label = (
+        f"Rayleigh uniformity · {significant}/{len(start_parts)} configs p<.05"
+        f" · min p={min_p:.3g} {_p_stars(min_p)}"
+        if start_parts else "Rayleigh uniformity · n/a"
+    )
+    return {
+        "pending": False,
+        "completed": time.time(),
+        "metric_labels": metric_labels,
+        "polar_label": polar_label,
+        "start_label": start_label,
+        "details": {
+            "metrics": [
+                {"metric": spec[0], "test": item[1],
+                 "raw_p": item[0],
+                 "holm_p": float(q) if np.isfinite(q) else None}
+                for spec, item, q in zip(
+                    _TRIAL_METRIC_SPECS, raw_metric, adjusted)
+            ],
+            "starting_heading": [
+                {"config": name, "rayleigh_p": p_value, "n": count}
+                for name, p_value, count in start_parts
+            ],
+        },
+    }
 
 
 
@@ -4751,6 +5564,14 @@ app.layout = html.Div([
                 {"label": " Trajectory + polar", "value": "compare"},
             ], value="sections", inline=True, className="segmented-control",
                style={"fontSize": "10px"}),
+            html.Button(
+                "Clean layout", id="btn-minimal-layout", n_clicks=0,
+                title=(
+                    "Hide spatial grids, axes and legends and replace them "
+                    "with an automatically sized scale bar."
+                ),
+                className="subtle-action-button",
+            ),
             dcc.Checklist(id="show-raw-config",
                           options=[{"label": " Show raw config filenames",
                                     "value": "on"}],
@@ -4764,13 +5585,16 @@ app.layout = html.Div([
             html.Label("Colour", title="Colour trajectories and polar vectors by the same metadata or metric.",
                        style={"fontSize": "10px"}),
             dcc.Dropdown(id="color-by", options=[
+                {"label": "One colour · calm", "value": "one"},
+                {"label": "None · neutral gray", "value": "none"},
+                {"label": "Categorical · current panels", "value": "categorical"},
                 {"label": "Individual (VR+Fly)", "value": "individual"},
                 {"label": "VR", "value": "vr"},
                 {"label": "ROI outcome", "value": "roi"},
                 {"label": "Trial (sequential)", "value": "trial"},
                 {"label": "Local time (sequential)", "value": "local_time"},
                 {"label": "Velocity (units/s, smoothed)", "value": "velocity"},
-            ], value="individual", clearable=False, style={"fontSize": "11px"}),
+            ], value="one", clearable=False, style={"fontSize": "11px"}),
             html.Label("Render mode",
                        title="Accuracy uses full filtered data for analysis views; Speed decimates plotted data more aggressively.",
                        style={"fontSize": "10px", "marginTop": "4px"}),
@@ -4784,6 +5608,161 @@ app.layout = html.Div([
                           value=[], style={"fontSize": "11px", "marginTop": "3px"}),
             html.Div(f"Playback uses {BUDGET_SVG//1000}k points; static uses {BUDGET_GL//1000}k by default.",
                      style={"fontSize": "9px", "color": "#888"}),
+            html.Label(
+                "Displayed trials (%)",
+                title=(
+                    "Randomly retain this fraction of complete trajectory "
+                    "segments for the trajectory and loop-observer drawings. "
+                    "Analytical panels still use all filtered trials."
+                ),
+                style={"fontSize": "10px", "marginTop": "5px"},
+            ),
+            dcc.Slider(
+                id="traj-trial-fraction", min=1, max=100, step=1, value=100,
+                updatemode="mouseup",
+                marks={1: "1", 25: "25", 50: "50", 75: "75", 100: "100"},
+                tooltip={"placement": "bottom", "always_visible": False},
+            ),
+            html.Button(
+                "New random subset", id="btn-traj-resample", n_clicks=0,
+                title="Draw a different whole-trial sample at the selected percentage.",
+                className="subtle-action-button",
+            ),
+            html.Div(
+                "Sampling removes whole SourceFile+Trial+Step segments before "
+                "point decimation; 100% keeps every trial.",
+                style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
+            ),
+
+            html.Hr(style={"margin": "6px 0"}),
+
+            html.Label("Loop observer",
+                       style={"fontWeight": "bold", "fontSize": "12px"}),
+            dcc.Checklist(
+                id="loop-enabled",
+                options=[{"label": " Show curtain-ring observer", "value": "on"}],
+                value=[], style={"fontSize": "11px"},
+            ),
+            html.Div([
+                dcc.Dropdown(
+                    id="loop-active-ring",
+                    options=[{"label": "Ring 1", "value": "ring-1"}],
+                    value="ring-1", clearable=False,
+                    style={"fontSize": "10px", "flex": "1", "minWidth": "0"},
+                ),
+                html.Button(
+                    "+", id="btn-loop-add", n_clicks=0,
+                    title="Add another curtain ring",
+                    className="subtle-action-button",
+                    style={"width": "34px", "margin": "0"},
+                ),
+                html.Button(
+                    "×", id="btn-loop-delete", n_clicks=0,
+                    title="Delete the selected curtain ring",
+                    className="subtle-action-button",
+                    style={"width": "34px", "margin": "0"},
+                ),
+            ], style={"display": "flex", "gap": "4px", "marginTop": "3px"}),
+            dcc.RadioItems(
+                id="loop-match-mode",
+                options=[
+                    {"label": " Any ring", "value": "any"},
+                    {"label": " All rings", "value": "all"},
+                ],
+                value="any", inline=True, className="segmented-control",
+                style={"fontSize": "10px", "marginTop": "3px"},
+            ),
+            html.Div([
+                html.Div([
+                    html.Label("Ring X", style={"fontSize": "10px"}),
+                    dcc.Input(id="loop-x", type="number", value=0, step="any",
+                              debounce=False, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label("Ring Z", style={"fontSize": "10px"}),
+                    dcc.Input(id="loop-z", type="number", value=0, step="any",
+                              debounce=False, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label("Radius", style={"fontSize": "10px"}),
+                    dcc.Input(id="loop-radius", type="number", value=3,
+                              min=0.001, step="any", debounce=False,
+                              style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "5px", "marginTop": "3px"}),
+            dcc.Slider(
+                id="loop-radius-slider", min=0.5, max=100, step=0.5, value=3,
+                marks={1: "1", 25: "25", 50: "50", 75: "75", 100: "100"},
+                tooltip={"placement": "bottom", "always_visible": False},
+            ),
+            html.Div(
+                "Drag any warm-gold curtain ring in the observer, or edit the "
+                "selected ring here. Resizing is always symmetric, so it "
+                "remains a circle. Matching stays entirely in the browser.",
+                style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
+            ),
+
+            html.Hr(style={"margin": "6px 0"}),
+
+            html.Label("Region observer",
+                       style={"fontWeight": "bold", "fontSize": "12px"}),
+            dcc.Checklist(
+                id="custom-region-enabled",
+                options=[{
+                    "label": " Use observation windows for polar + diagnostics",
+                    "value": "on",
+                }],
+                value=[], style={"fontSize": "11px"},
+            ),
+            html.Div([
+                dcc.Dropdown(
+                    id="custom-region-active",
+                    options=[{"label": "Window 1", "value": "region-1"}],
+                    value="region-1", clearable=False,
+                    style={"fontSize": "10px", "flex": "1", "minWidth": "0"},
+                ),
+                html.Button(
+                    "+", id="btn-custom-region-add", n_clicks=0,
+                    title="Add another observation window",
+                    className="subtle-action-button",
+                    style={"width": "34px", "margin": "0"},
+                ),
+                html.Button(
+                    "×", id="btn-custom-region-delete", n_clicks=0,
+                    title="Delete the selected observation window",
+                    className="subtle-action-button",
+                    style={"width": "34px", "margin": "0"},
+                ),
+            ], style={"display": "flex", "gap": "4px", "marginTop": "3px"}),
+            html.Div([
+                html.Div([
+                    html.Label("X min", style={"fontSize": "10px"}),
+                    dcc.Input(id="custom-region-x0", type="number", value=-3,
+                              step="any", debounce=False, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label("X max", style={"fontSize": "10px"}),
+                    dcc.Input(id="custom-region-x1", type="number", value=3,
+                              step="any", debounce=False, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label("Z min", style={"fontSize": "10px"}),
+                    dcc.Input(id="custom-region-z0", type="number", value=-3,
+                              step="any", debounce=False, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label("Z max", style={"fontSize": "10px"}),
+                    dcc.Input(id="custom-region-z1", type="number", value=3,
+                              step="any", debounce=False, style=_INPUT_STYLE),
+                ], style={"flex": "1"}),
+            ], style={"display": "grid", "gridTemplateColumns": "1fr 1fr",
+                      "gap": "4px", "marginTop": "3px"}),
+            html.Div(
+                "Drag the dashed boxes on Trajectory, Heatmap or Gandiva. "
+                "Percentages label each Gandiva panel; polar uses the union.",
+                id="custom-region-status",
+                style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
+            ),
 
             html.Hr(style={"margin": "6px 0"}),
 
@@ -4819,17 +5798,18 @@ app.layout = html.Div([
                 {"label": "Samples", "value": "count"},
             ], value="time", clearable=False, style={"fontSize": "10px"}),
             html.Label(
-                "Max direction radius (cell widths)",
+                "Max Gandiva radius (cell widths)",
                 title=(
                     "Maximum length of a fully directed local vector. "
-                    "Values below 0.49 leave more space between adjacent cells."
+                    "At 1.0 equal adjacent arrows just touch; 0.98 leaves a hairline gap. "
+                    "This slider rescales already-built arrows in the browser."
                 ),
                 style={"fontSize": "10px", "marginTop": "5px"},
             ),
             dcc.Slider(
-                id="flow-max-radius", min=0.05, max=0.49, step=0.01,
-                value=0.49, updatemode="mouseup",
-                marks={0.05: "0.05", 0.25: "0.25", 0.49: "0.49"},
+                id="flow-max-radius", min=0.05, max=0.98, step=0.01,
+                value=0.49, updatemode="drag",
+                marks={0.05: "0.05", 0.49: "0.49", 0.98: "0.98"},
                 tooltip={"placement": "bottom", "always_visible": False},
             ),
             html.Div([
@@ -5077,6 +6057,39 @@ app.layout = html.Div([
             html.Details([
                 html.Summary("Advanced", style={"fontSize": "12px", "cursor": "pointer",
                                                   "fontWeight": "bold"}),
+                html.Label(
+                    "Names and visual style",
+                    style={"fontSize": "10px", "fontWeight": "bold",
+                           "marginTop": "4px"},
+                ),
+                html.Div(
+                    "Prefilled with config, scene, VR, fly and folder names "
+                    "first; core trajectory, clean-layout units, Gandiva, "
+                    "curtain-ring and series styles follow.",
+                    style={"fontSize": "9px", "color": "#888"},
+                ),
+                dcc.Textarea(
+                    id="visual-style-editor",
+                    value=json.dumps(_VISUAL_STYLE_DEFAULTS, indent=2),
+                    style={"width": "100%", "height": "300px", "fontSize": "9px",
+                           "fontFamily": "monospace", "marginTop": "3px"},
+                ),
+                html.Button(
+                    "Apply names and styles", id="btn-apply-visual-style",
+                    n_clicks=0,
+                    style={"width": "100%", "marginTop": "3px", "padding": "4px",
+                           "fontSize": "11px", "cursor": "pointer"},
+                ),
+                html.Button(
+                    "Pre-fill from current data", id="btn-prefill-visual-style",
+                    n_clicks=0,
+                    style={"width": "100%", "marginTop": "3px", "padding": "4px",
+                           "fontSize": "10px", "cursor": "pointer"},
+                ),
+                html.Div(id="visual-style-status",
+                         style={"fontSize": "9px", "color": "#666",
+                                "marginTop": "2px"}),
+                html.Hr(style={"margin": "6px 0"}),
                 html.Label("Panel columns", style={"fontSize": "10px", "marginTop": "3px"}),
                 dcc.Input(id="subplot-ncols", type="number", value=2, min=1, max=6,
                           debounce=True, style=_INPUT_STYLE),
@@ -5089,8 +6102,11 @@ app.layout = html.Div([
                 html.Div("Blank = auto-decimate to a browser-safe budget.",
                          style={"fontSize": "9px", "color": "#888"}),
                 html.Hr(style={"margin": "6px 0"}),
-                html.Label("Outlier cleanup", style={"fontSize": "10px",
-                                                      "fontWeight": "bold"}),
+                html.Details([
+                html.Summary("Rare cleanup / outliers",
+                             style={"fontSize": "10px", "cursor": "pointer",
+                                    "fontWeight": "bold"}),
+                html.Div([
                 html.Div([
                     html.Div([
                         html.Label("Spike speed", title="Optional instantaneous speed spike removal.",
@@ -5126,15 +6142,18 @@ app.layout = html.Div([
                           debounce=True, style=_INPUT_STYLE),
                 html.Div("Usually 0. Removes N samples from both ends after spike filtering.",
                          style={"fontSize": "9px", "color": "#888"}),
+                ]),
+                ], style={"marginTop": "2px"}),
                 html.Label("Raw trace columns", style={"fontSize": "10px", "marginTop": "3px"}),
                 dcc.Dropdown(id="raw-columns", multi=True,
                              value=[],
                              style={"fontSize": "10px"}),
 
                 html.Hr(style={"margin": "6px 0"}),
-                html.Label("Config display names", style={"fontSize": "10px",
-                                                           "fontWeight": "bold"}),
-                html.Div("JSON map from config filename to display name.",
+                html.Details([
+                html.Summary("Legacy config-only names",
+                             style={"fontSize": "10px", "cursor": "pointer"}),
+                html.Div("Kept for older saved mappings; prefer Names and visual style above.",
                          style={"fontSize": "9px", "color": "#888"}),
                 dcc.Textarea(id="lut-editor", value="{}",
                              style={"width": "100%", "height": "120px", "fontSize": "10px",
@@ -5147,6 +6166,7 @@ app.layout = html.Div([
                                    "fontSize": "10px", "cursor": "pointer"}),
                 html.Div(id="lut-status", style={"fontSize": "9px", "color": "#666",
                                                   "marginTop": "2px"}),
+                ]),
             ]),
 
             html.Hr(style={"margin": "6px 0"}),
@@ -5195,7 +6215,7 @@ app.layout = html.Div([
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Heatmap", value="heat",
                         className="view-tab", selected_className="view-tab-selected"),
-                dcc.Tab(label="Flow field", value="flow",
+                dcc.Tab(label="Gandiva", value="flow",
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Polar", value="polar",
                         className="view-tab", selected_className="view-tab-selected"),
@@ -5242,6 +6262,32 @@ app.layout = html.Div([
                         overlay_style={"visibility": "visible", "opacity": 0.55,
                                        "transition": "opacity .2s",
                                        "pointerEvents": "none"}),
+                    html.Div([
+                        html.Div([
+                            html.Div([
+                                html.Strong("Curtain-ring selection"),
+                                html.Span(
+                                    "Muted paths precede first entry; saturated "
+                                    "paths continue into the future.",
+                                    className="loop-observer-note",
+                                ),
+                            ]),
+                            html.Div(
+                                "Enable the observer to inspect crossing trials.",
+                                id="loop-observer-status",
+                                className="loop-observer-status",
+                            ),
+                        ], className="loop-observer-heading"),
+                        dcc.Graph(
+                            id="loop-observer-plot", figure=_EMPTY,
+                            config={
+                                **GRAPH_CONFIG,
+                                "edits": {"shapePosition": True},
+                            },
+                            style={"width": "100%"},
+                        ),
+                    ], id="loop-observer-wrap", className="loop-observer-wrap",
+                       style={"display": "none"}),
                 ], id="view-traj", className="plot-section", style={**_PANEL_STYLE}),
 
                 # --- Heatmap ---
@@ -5259,11 +6305,17 @@ app.layout = html.Div([
                                        "pointerEvents": "none"})],
                     id="view-heat", className="plot-section", style={**_PANEL_STYLE}),
 
-                # --- Local direction field ---
+                # --- Gandiva local direction field ---
                 html.Div(
-                    [html.Div([html.H4("Local direction field"),
+                    [html.Div([html.H4(
+                                   "Gandiva plot",
+                                   title=(
+                                       "Named for Arjuna's divine bow: a local field "
+                                       "that can rain arrows in every direction, with "
+                                       "their strength and abundance visible at once."
+                                   )),
                                html.Span(
-                                   "Circular mean, directionality and abundance per spatial bin",
+                                   "Arjuna's bow · local direction, strength and abundance",
                                    className="plot-section-kicker")],
                               className="plot-section-heading"),
                      html.Div([
@@ -5327,7 +6379,9 @@ app.layout = html.Div([
                 # --- Polar ---
                 html.Div(
                     [html.Div([html.H4("Polar direction"),
-                               html.Span("Per-trial vectors and pooled population mean", className="plot-section-kicker")],
+                               html.Span("Per-trial vectors and pooled population mean", className="plot-section-kicker"),
+                               html.Span("stats queued", id="polar-stats-status",
+                                         className="stats-status-chip")],
                               className="plot-section-heading"),
                      dcc.Loading(
                         dcc.Graph(id="polar-plot", figure=_EMPTY, responsive=False,
@@ -5351,6 +6405,23 @@ app.layout = html.Div([
                         type="circle", delay_show=250, delay_hide=250,
                         overlay_style={"visibility": "visible", "opacity": 0.55,
                                        "transition": "opacity .2s",
+                                       "pointerEvents": "none"}),
+                     html.Div([
+                         html.H4("Observation-window diagnostics"),
+                         html.Span(
+                             "Samples, entering trials, path, displacement and tortuosity",
+                             className="plot-section-kicker",
+                         ),
+                     ], className="plot-section-heading"),
+                     dcc.Loading(
+                        dcc.Graph(id="custom-region-diagnostics-plot",
+                                  figure=_msg_figure(
+                                      "Enable an observation window to inspect it."),
+                                  config=GRAPH_CONFIG,
+                                  style={"width": "100%"}),
+                        type="circle", delay_show=250, delay_hide=250,
+                        overlay_style={"visibility": "visible", "opacity": 0.55,
+                                       "transition": "opacity .2s",
                                        "pointerEvents": "none"})],
                     id="view-roi", className="plot-section", style={**_PANEL_STYLE}),
 
@@ -5359,7 +6430,9 @@ app.layout = html.Div([
                     [html.Div([html.H4("Trial metrics"),
                                html.Span(
                                    "Per-trial distributions across the selected panel grouping",
-                                   className="plot-section-kicker")],
+                                   className="plot-section-kicker"),
+                               html.Span("stats queued", id="metrics-stats-status",
+                                         className="stats-status-chip")],
                               className="plot-section-heading"),
                      dcc.Loading(
                         dcc.Graph(id="trial-metrics-plot", figure=_EMPTY,
@@ -5393,6 +6466,9 @@ app.layout = html.Div([
                             value=["on"], inline=True,
                             style={"fontSize": "12px", "color": "#475569",
                                    "padding": "4px 8px"}),
+                        html.Span("start-angle stats queued",
+                                  id="initial-stats-status",
+                                  className="stats-status-chip"),
                         html.Div(
                             dcc.Graph(id="initial-heading-plot", figure=_EMPTY,
                                       config=GRAPH_CONFIG, style={"width": "100%"}),
@@ -5431,6 +6507,22 @@ app.layout = html.Div([
     dcc.Store(id="drop-data"),
     dcc.Store(id="view-render-state", data={}),
     dcc.Store(id="polar-render-state", data={}),
+    dcc.Store(
+        id="loop-rings-store",
+        data=[{"id": "ring-1", "name": "Ring 1",
+               "x": 0.0, "z": 0.0, "radius": 3.0}],
+    ),
+    dcc.Store(
+        id="custom-regions-store",
+        data=[{
+            "id": "region-1", "name": "Window 1",
+            "x0": -3.0, "x1": 3.0, "z0": -3.0, "z1": 3.0,
+        }],
+    ),
+    dcc.Store(id="custom-region-stats-store", data={}),
+    dcc.Store(id="minimal-layout-store", data=False),
+    dcc.Store(id="visual-style-store", data=_VISUAL_STYLE_DEFAULTS),
+    dcc.Store(id="stats-overlay-store", data={}),
     dcc.Store(id="operation-progress", data=_progress_snapshot()),
     dcc.Store(id="url-restored", data=False),
     dcc.Store(id="auto-replot-state"),
@@ -5440,6 +6532,8 @@ app.layout = html.Div([
     dcc.Interval(id="load-progress-interval", interval=200, disabled=True),
     dcc.Interval(id="auto-replot-interval", interval=PLOT_DEBOUNCE_MS,
                  max_intervals=-1, disabled=True),
+    dcc.Interval(id="stats-delay-interval", interval=650,
+                 max_intervals=1, disabled=True),
 ], className="td-app",
    style={"fontFamily": "system-ui, -apple-system, sans-serif", "margin": "0"})
 
@@ -5456,6 +6550,300 @@ app.clientside_callback(
     "'plot-drop-target plot-workspace';}",
     Output("plot-drop-target", "className"),
     Input("view-layout", "value"),
+)
+
+
+app.clientside_callback(
+    """
+    function(addClicks, deleteClicks, active, x0, x1, z0, z1, regions) {
+      var no = window.dash_clientside.no_update;
+      var cc = window.dash_clientside.callback_context || {};
+      var trigger = cc.triggered_id;
+      var clean = Array.isArray(regions) ?
+        JSON.parse(JSON.stringify(regions)) : [];
+      if (!clean.length) clean = [{
+        id:'region-1', name:'Window 1', x0:-3, x1:3, z0:-3, z1:3
+      }];
+      function options() {
+        return clean.map(function(r, i) {
+          return {label:String(r.name || ('Window '+(i+1))), value:String(r.id)};
+        });
+      }
+      function selected(id) {
+        return clean.filter(function(r){return String(r.id)===String(id);})[0] || clean[0];
+      }
+      function values(r) {
+        return [r.x0, r.x1, r.z0, r.z1].map(Number);
+      }
+      if (trigger === 'btn-custom-region-add') {
+        var suffix=1, used={};
+        clean.forEach(function(r){used[String(r.id)]=true;});
+        while (used['region-'+suffix]) suffix += 1;
+        var base=selected(active);
+        var width=Math.max(0.001,Number(base.x1)-Number(base.x0));
+        var height=Math.max(0.001,Number(base.z1)-Number(base.z0));
+        var next={
+          id:'region-'+suffix,name:'Window '+suffix,
+          x0:Number(base.x0)+width*0.25,x1:Number(base.x1)+width*0.25,
+          z0:Number(base.z0)+height*0.25,z1:Number(base.z1)+height*0.25
+        };
+        clean.push(next);
+        return [clean,options(),next.id,next.x0,next.x1,next.z0,next.z1];
+      }
+      if (trigger === 'btn-custom-region-delete') {
+        if (clean.length <= 1) return [no,no,no,no,no,no,no];
+        var oldIndex=clean.findIndex(function(r){return String(r.id)===String(active);});
+        clean=clean.filter(function(r){return String(r.id)!==String(active);});
+        var after=clean[Math.max(0,Math.min(clean.length-1,oldIndex))];
+        var av=values(after);
+        return [clean,options(),after.id,av[0],av[1],av[2],av[3]];
+      }
+      if (trigger === 'custom-region-active' || !active ||
+          trigger === 'custom-regions-store') {
+        var chosen=selected(active), cv=values(chosen);
+        return [no,options(),chosen.id,cv[0],cv[1],cv[2],cv[3]];
+      }
+      if (['custom-region-x0','custom-region-x1',
+           'custom-region-z0','custom-region-z1'].indexOf(trigger) >= 0) {
+        var nums=[Number(x0),Number(x1),Number(z0),Number(z1)];
+        if (!nums.every(Number.isFinite) || nums[1]<=nums[0] || nums[3]<=nums[2]) {
+          return [no,no,no,no,no,no,no];
+        }
+        var changed=false;
+        clean=clean.map(function(r){
+          if(String(r.id)!==String(active))return r;
+          if(Number(r.x0)!==nums[0]||Number(r.x1)!==nums[1]||
+             Number(r.z0)!==nums[2]||Number(r.z1)!==nums[3]){
+            changed=true;
+            return Object.assign({},r,{x0:nums[0],x1:nums[1],
+              z0:nums[2],z1:nums[3]});
+          }
+          return r;
+        });
+        return [changed?clean:no,no,no,no,no,no,no];
+      }
+      var initial=selected(active), iv=values(initial);
+      return [no,options(),initial.id,iv[0],iv[1],iv[2],iv[3]];
+    }
+    """,
+    Output("custom-regions-store", "data"),
+    Output("custom-region-active", "options"),
+    Output("custom-region-active", "value"),
+    Output("custom-region-x0", "value", allow_duplicate=True),
+    Output("custom-region-x1", "value", allow_duplicate=True),
+    Output("custom-region-z0", "value", allow_duplicate=True),
+    Output("custom-region-z1", "value", allow_duplicate=True),
+    Input("btn-custom-region-add", "n_clicks"),
+    Input("btn-custom-region-delete", "n_clicks"),
+    Input("custom-region-active", "value"),
+    Input("custom-region-x0", "value"),
+    Input("custom-region-x1", "value"),
+    Input("custom-region-z0", "value"),
+    Input("custom-region-z1", "value"),
+    State("custom-regions-store", "data"),
+    prevent_initial_call="initial_duplicate",
+)
+
+
+app.clientside_callback(
+    """
+    function(enabled, regions, active, stats, style, traj, heat, flow) {
+      if (window.dash_clientside.region_observer) {
+        return window.dash_clientside.region_observer.render(
+          enabled, regions, active, stats, style
+        );
+      }
+      return 'Loading observation windows…';
+    }
+    """,
+    Output("custom-region-status", "children"),
+    Input("custom-region-enabled", "value"),
+    Input("custom-regions-store", "data"),
+    Input("custom-region-active", "value"),
+    Input("custom-region-stats-store", "data"),
+    Input("visual-style-store", "data"),
+    Input("trajectory-plot", "figure"),
+    Input("heatmap-figure-store", "data"),
+    Input("flow-figure-store", "data"),
+)
+
+
+app.clientside_callback(
+    """
+    function(clicks, current) {
+      if (!clicks) return window.dash_clientside.no_update;
+      return !Boolean(current);
+    }
+    """,
+    Output("minimal-layout-store", "data"),
+    Input("btn-minimal-layout", "n_clicks"),
+    State("minimal-layout-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    "function(on){return on?'Restore axes':'Clean layout';}",
+    Output("btn-minimal-layout", "children"),
+    Input("minimal-layout-store", "data"),
+)
+
+
+app.clientside_callback(
+    """
+    function(on, style, traj, heat, flow) {
+      if (window.dash_clientside.clean_layout) {
+        return window.dash_clientside.clean_layout.render(on, style);
+      }
+      return on ? 'Clean layout is loading.' :
+        'Hide spatial grids, axes and legends and use a scale bar.';
+    }
+    """,
+    Output("btn-minimal-layout", "title"),
+    Input("minimal-layout-store", "data"),
+    Input("visual-style-store", "data"),
+    Input("trajectory-plot", "figure"),
+    Input("heatmap-figure-store", "data"),
+    Input("flow-figure-store", "data"),
+)
+
+
+app.clientside_callback(
+    "function(enabled){return {display:"
+    "(enabled&&enabled.indexOf('on')>=0)?'block':'none'};}",
+    Output("loop-observer-wrap", "style"),
+    Input("loop-enabled", "value"),
+)
+
+
+app.clientside_callback(
+    "function(fig,enabled,rings,active,matchMode,style){"
+    "if(window.dash_clientside.loop_observer){"
+    "return window.dash_clientside.loop_observer.render("
+    "fig,enabled,rings,active,matchMode,style);}"
+    "return 'Loading loop observer…';}",
+    Output("loop-observer-status", "children"),
+    Input("trajectory-plot", "figure"),
+    Input("loop-enabled", "value"),
+    Input("loop-rings-store", "data"),
+    Input("loop-active-ring", "value"),
+    Input("loop-match-mode", "value"),
+    Input("visual-style-store", "data"),
+)
+
+
+app.clientside_callback(
+    """
+    function(addClicks, deleteClicks, active, x, z, radius, rings) {
+      var no = window.dash_clientside.no_update;
+      var cc = window.dash_clientside.callback_context || {};
+      var trigger = cc.triggered_id;
+      var clean = Array.isArray(rings) ? JSON.parse(JSON.stringify(rings)) : [];
+      if (!clean.length) {
+        clean = [{id:'ring-1', name:'Ring 1', x:0, z:0, radius:3}];
+      }
+      function options() {
+        return clean.map(function(r, i) {
+          return {label:String(r.name || ('Ring '+(i+1))), value:String(r.id)};
+        });
+      }
+      function selected(id) {
+        return clean.filter(function(r){return String(r.id)===String(id);})[0] || clean[0];
+      }
+      if (trigger === 'btn-loop-add') {
+        var suffix = 1;
+        var used = {};
+        clean.forEach(function(r){used[String(r.id)] = true;});
+        while (used['ring-'+suffix]) suffix += 1;
+        var base = selected(active);
+        var next = {
+          id:'ring-'+suffix, name:'Ring '+suffix,
+          x:Number(base.x||0)+Number(base.radius||3)*0.55,
+          z:Number(base.z||0)+Number(base.radius||3)*0.55,
+          radius:Math.max(0.001, Number(base.radius||3))
+        };
+        clean.push(next);
+        return [clean, options(), next.id, next.x, next.z, next.radius];
+      }
+      if (trigger === 'btn-loop-delete') {
+        if (clean.length <= 1) return [no,no,no,no,no,no];
+        var oldIndex = clean.findIndex(function(r){return String(r.id)===String(active);});
+        clean = clean.filter(function(r){return String(r.id)!==String(active);});
+        var nextIndex = Math.max(0, Math.min(clean.length-1, oldIndex));
+        var after = clean[nextIndex];
+        return [clean, options(), after.id, after.x, after.z, after.radius];
+      }
+      if (trigger === 'loop-active-ring' || !active) {
+        var chosen = selected(active);
+        return [no, options(), chosen.id, chosen.x, chosen.z, chosen.radius];
+      }
+      if (trigger === 'loop-x' || trigger === 'loop-z' ||
+          trigger === 'loop-radius') {
+        var changed = false;
+        clean = clean.map(function(r) {
+          if (String(r.id)!==String(active)) return r;
+          var nx=Number(x), nz=Number(z), nr=Number(radius);
+          if (!Number.isFinite(nx) || !Number.isFinite(nz) ||
+              !Number.isFinite(nr) || nr<=0) return r;
+          if (Number(r.x)!==nx || Number(r.z)!==nz || Number(r.radius)!==nr) {
+            changed = true;
+            return Object.assign({}, r, {x:nx,z:nz,radius:nr});
+          }
+          return r;
+        });
+        return [changed ? clean : no, no, no, no, no, no];
+      }
+      var initial = selected(active);
+      return [no, options(), initial.id, initial.x, initial.z, initial.radius];
+    }
+    """,
+    Output("loop-rings-store", "data"),
+    Output("loop-active-ring", "options"),
+    Output("loop-active-ring", "value"),
+    Output("loop-x", "value", allow_duplicate=True),
+    Output("loop-z", "value", allow_duplicate=True),
+    Output("loop-radius", "value", allow_duplicate=True),
+    Input("btn-loop-add", "n_clicks"),
+    Input("btn-loop-delete", "n_clicks"),
+    Input("loop-active-ring", "value"),
+    Input("loop-x", "value"),
+    Input("loop-z", "value"),
+    Input("loop-radius", "value"),
+    State("loop-rings-store", "data"),
+    prevent_initial_call="initial_duplicate",
+)
+
+
+app.clientside_callback(
+    "function(exact,slider){"
+    "var no=window.dash_clientside.no_update;"
+    "var cc=window.dash_clientside.callback_context||{};"
+    "var trigger=cc.triggered_id;"
+    "if(trigger==='loop-radius-slider')return [slider,no];"
+    "if(trigger==='loop-radius'){"
+    "var value=Number(exact);"
+    "if(!isFinite(value)||value<=0)return [no,no];"
+    "return [no,Math.max(0.5,Math.min(100,value))];}"
+    "return [no,no];}",
+    Output("loop-radius", "value", allow_duplicate=True),
+    Output("loop-radius-slider", "value"),
+    Input("loop-radius", "value"),
+    Input("loop-radius-slider", "value"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    "function(n,fraction,clicks,pattern){"
+    "if(!n||!pattern||Number(fraction)>=100)"
+    "return window.dash_clientside.no_update;"
+    "return Number(clicks||0)+1;}",
+    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    Input("btn-traj-resample", "n_clicks"),
+    State("traj-trial-fraction", "value"),
+    State("btn-plot", "n_clicks"),
+    State("store-glob", "data"),
+    prevent_initial_call=True,
 )
 
 
@@ -5537,7 +6925,17 @@ app.clientside_callback(
     Input("polar-r-range", "value"),
     Input("polar-min-point-frac", "value"),
     Input("polar-min-animal-frac", "value"),
-    Input("flow-max-radius", "value"),
+    prevent_initial_call=True,
+)
+
+app.clientside_callback(
+    "function(n,pattern){if(!n)return window.dash_clientside.no_update;"
+    "if(!pattern)return 'Choose a data source before loading.';"
+    "return 'Started — processing in background threads; plots and delayed "
+    "statistics are staged separately.';}",
+    Output("load-status", "children", allow_duplicate=True),
+    Input("btn-load", "n_clicks"),
+    State("glob-input", "value"),
     prevent_initial_call=True,
 )
 
@@ -5579,6 +6977,8 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
             "pts": "plot-points", "tmin": "trial-min", "tmax": "trial-max",
             "smin": "step-min", "smax": "step-max",
             "reach": "roi-reach", "frad": "flow-max-radius",
+            "tf": "traj-trial-fraction",
+            "lx": "loop-x", "lz": "loop-z", "lr": "loop-radius",
             "rmin": "polar-r-range", "rmax": "polar-r-range",
             "vrmin": "vel-range", "vrmax": "vel-range",
             "drmin": "disp-range", "drmax": "disp-range",
@@ -5586,7 +6986,7 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
 _URL_STR = {"groupby": "group-by", "pool": "pool-mode", "color": "color-by",
             "hscale": "heatmap-scale", "hmetric": "heatmap-metric",
             "hcrange": "heatmap-crange", "pang": "polar-angle-source",
-            "layout": "view-layout"}
+            "layout": "view-layout", "ractive": "custom-region-active"}
 _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyids",
              "fscn": "filter-scenes", "ffld": "filter-folders", "raw": "raw-columns"}
 
@@ -5638,6 +7038,18 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("viewport-store", "data", allow_duplicate=True),
     Output("flow-max-radius", "value", allow_duplicate=True),
     Output("roi-reach", "value", allow_duplicate=True),
+    Output("traj-trial-fraction", "value", allow_duplicate=True),
+    Output("loop-enabled", "value", allow_duplicate=True),
+    Output("loop-x", "value", allow_duplicate=True),
+    Output("loop-z", "value", allow_duplicate=True),
+    Output("loop-radius", "value", allow_duplicate=True),
+    Output("loop-rings-store", "data", allow_duplicate=True),
+    Output("loop-active-ring", "value", allow_duplicate=True),
+    Output("loop-match-mode", "value", allow_duplicate=True),
+    Output("custom-region-enabled", "value", allow_duplicate=True),
+    Output("custom-regions-store", "data", allow_duplicate=True),
+    Output("custom-region-active", "value", allow_duplicate=True),
+    Output("minimal-layout-store", "data", allow_duplicate=True),
     Output("url-restored", "data"),
     Input("url", "search"),
     State("url-restored", "data"),
@@ -5646,7 +7058,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 46
+    n_out = 58
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -5669,6 +7081,18 @@ def restore_from_url(search, already):
             return no_update
         numeric = float(value)
         return value if np.isfinite(numeric) and numeric > 0 else no_update
+
+    def finite_num(k):
+        value = num(k)
+        if value is no_update:
+            return no_update
+        return value if np.isfinite(float(value)) else no_update
+
+    def display_percent():
+        value = finite_num("tf")
+        if value is no_update:
+            return no_update
+        return min(100.0, max(1.0, float(value)))
 
     def jump_ms():
         if "jb" not in p:
@@ -5733,6 +7157,15 @@ def restore_from_url(search, already):
         return rng
 
     anim = (["on"] if p["anim"][0] == "1" else []) if "anim" in p else no_update
+    loop_enabled = (
+        ["on"] if p["loop"][0] == "1" else []
+    ) if "loop" in p else no_update
+    custom_region_enabled = (
+        ["on"] if p["region"][0] == "1" else []
+    ) if "region" in p else no_update
+    minimal_layout = (
+        p["minimal"][0] == "1"
+    ) if "minimal" in p else no_update
     rebase = []
     view = (
         p["view"][0]
@@ -5759,9 +7192,51 @@ def restore_from_url(search, already):
             vp = no_update
 
     velocity_range = range_pair("vrmin", "vrmax")
+    rings = no_update
+    if "loops" in p:
+        try:
+            raw_rings = json.loads(p["loops"][0])
+            if isinstance(raw_rings, list) and raw_rings:
+                cleaned = []
+                for index, ring in enumerate(raw_rings):
+                    if not isinstance(ring, dict):
+                        continue
+                    radius = float(ring.get("radius", 3))
+                    x_value = float(ring.get("x", 0))
+                    z_value = float(ring.get("z", 0))
+                    if not (np.isfinite(radius) and radius > 0
+                            and np.isfinite(x_value) and np.isfinite(z_value)):
+                        continue
+                    cleaned.append({
+                        "id": str(ring.get("id", f"ring-{index + 1}")),
+                        "name": str(ring.get("name", f"Ring {index + 1}")),
+                        "x": x_value, "z": z_value, "radius": radius,
+                    })
+                if cleaned:
+                    rings = cleaned
+        except Exception:
+            rings = no_update
+    active_ring = s("lactive")
+    match_mode = (
+        p["lmode"][0]
+        if p.get("lmode", [""])[0] in ("any", "all")
+        else no_update
+    )
+    custom_regions = no_update
+    if "regions" in p:
+        try:
+            parsed_regions = json.loads(p["regions"][0])
+            cleaned_regions = _normalise_custom_regions(parsed_regions)
+            if cleaned_regions:
+                custom_regions = cleaned_regions
+        except Exception:
+            custom_regions = no_update
+    color_value = s("color")
+    if color_value == "gray":
+        color_value = "none"
     return (
         s("glob"), num("vel"), num("disp"), num("trim"), jump_ms(),
-        s("groupby"), s("pool"), s("color"), anim, rebase,
+        s("groupby"), s("pool"), color_value, anim, rebase,
         num("hbin"), s("hscale"), num("hbound"), s("hmetric"),
         num("hcmin"), num("hcmax"), s("hcrange"),
         lst("fcfg"), lst("fvr"), lst("ffly"), lst("fscn"), lst("ffld"),
@@ -5774,7 +7249,11 @@ def restore_from_url(search, already):
         trial_slider_range(),
         step_slider_range(),
         num("pmin"), num("amin"), angle_source, mode, view, view_layout, vp,
-        positive_num("frad"), positive_num("reach"), True,
+        positive_num("frad"), positive_num("reach"),
+        display_percent(), loop_enabled, finite_num("lx"), finite_num("lz"),
+        positive_num("lr"), rings, active_ring, match_mode,
+        custom_region_enabled, custom_regions, s("ractive"),
+        minimal_layout, True,
     )
 
 
@@ -5829,27 +7308,29 @@ def on_folder_drop(data, clicks):
     Input("heatmap-cmin", "value"),
     Input("heatmap-cmax", "value"),
     Input("heatmap-crange", "value"),
-    Input("flow-max-radius", "value"),
     State("store-glob", "data"),
     State("view-render-state", "data"),
     prevent_initial_call=True,
 )
 def start_progress(_load_n, _plot_n, _export_n, _moving, _walk, _angle,
                    _r_range, _point_frac, _animal_frac, _hm_metric, _hm_scale,
-                   _hm_cmin, _hm_cmax, _hm_crange, _flow_radius,
-                   pattern, render_state):
+                   _hm_cmin, _hm_cmax, _hm_crange, pattern, render_state):
     trigger = ctx.triggered_id
     is_direction = (
         str(trigger).startswith("polar-")
         or trigger in {
             "heatmap-metric", "heatmap-scale", "heatmap-cmin",
-            "heatmap-cmax", "heatmap-crange", "flow-max-radius",
+            "heatmap-cmax", "heatmap-crange",
         }
     )
     if is_direction and (not pattern or not render_state):
         return True
     labels = {
-        "btn-load": ("request", "Queuing dataset discovery…"),
+        "btn-load": (
+            "request",
+            "Started — processing data in a background thread; "
+            "plots and statistics will finish in separate stages.",
+        ),
         "btn-plot": ("request", "Queuing plot update…"),
         "btn-export": ("request", "Queuing offline HTML export…"),
     }
@@ -5939,6 +7420,18 @@ def tick_progress(n):
     Input("view-layout", "value"),
     Input("roi-reach", "value"),
     Input("flow-max-radius", "value"),
+    Input("traj-trial-fraction", "value"),
+    Input("loop-enabled", "value"),
+    Input("loop-x", "value"),
+    Input("loop-z", "value"),
+    Input("loop-radius", "value"),
+    Input("loop-rings-store", "data"),
+    Input("loop-active-ring", "value"),
+    Input("loop-match-mode", "value"),
+    Input("custom-region-enabled", "value"),
+    Input("custom-regions-store", "data"),
+    Input("custom-region-active", "value"),
+    Input("minimal-layout-store", "data"),
     State("viewport-store", "data"),
     State("url-restored", "data"),
     prevent_initial_call=True,
@@ -5947,7 +7440,11 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                hbin, hscale, hbound, hmetric, hcmin, hcmax, hcrange,
                fcfg, fvr, ffly, fscn, ffld, tmin, tmax, smin, smax, raw, ncols, pts,
                rrange, vrange, drange, pmin, amin, angle_source, mode, view,
-               view_layout, reach, flow_max_radius, vp, restored):
+               view_layout, reach, flow_max_radius, traj_fraction,
+               loop_enabled, loop_x, loop_z, loop_radius,
+               loop_rings, loop_active, loop_match_mode,
+               custom_region_enabled, custom_regions, custom_region_active,
+               minimal_layout, vp, restored):
     if not restored:
         return no_update
     params = {}
@@ -5957,7 +7454,9 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             "hbound": hbound, "hcmin": hcmin, "hcmax": hcmax, "ncols": ncols,
             "pts": pts, "tmin": tmin, "tmax": tmax,
             "smin": smin, "smax": smax, "pmin": pmin, "amin": amin,
-            "reach": reach, "frad": flow_max_radius}
+            "reach": reach, "frad": flow_max_radius,
+            "tf": traj_fraction, "lx": loop_x, "lz": loop_z,
+            "lr": loop_radius}
     for k, v in nums.items():
         if v is not None and v != "":
             if k == "trim" and float(v or 0) <= 0:
@@ -5971,6 +7470,21 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
         if v:
             params[k] = v
     params["anim"] = "1" if (anim and "on" in anim) else "0"
+    params["loop"] = "1" if _on(loop_enabled) else "0"
+    params["region"] = "1" if _on(custom_region_enabled) else "0"
+    params["minimal"] = "1" if minimal_layout else "0"
+    if loop_rings:
+        params["loops"] = json.dumps(
+            loop_rings, separators=(",", ":"), ensure_ascii=False)
+    if loop_active:
+        params["lactive"] = str(loop_active)
+    if loop_match_mode in ("any", "all"):
+        params["lmode"] = loop_match_mode
+    if custom_regions:
+        params["regions"] = json.dumps(
+            custom_regions, separators=(",", ":"), ensure_ascii=False)
+    if custom_region_active:
+        params["ractive"] = str(custom_region_active)
     lists = {"fcfg": fcfg, "fvr": fvr, "ffly": ffly, "fscn": fscn, "ffld": ffld, "raw": raw}
     for k, v in lists.items():
         if v:
@@ -6020,6 +7534,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     Input("raw-columns", "value"),
     Input("subplot-ncols", "value"),
     Input("plot-points", "value"),
+    Input("traj-trial-fraction", "value"),
     Input("roi-show", "value"),
     Input("roi-reach", "value"),
     Input("roi-entered", "value"),
@@ -6045,6 +7560,7 @@ def arm_auto_replot(*values):
         "filter-configs": "config subset", "filter-vrs": "VR subset",
         "filter-flyids": "animal subset", "filter-scenes": "scene subset",
         "filter-folders": "folder subset",
+        "traj-trial-fraction": "displayed-trial sample",
     }.get(str(trigger), str(trigger).replace("-", " "))
     return (
         {"clicks": int(clicks or 0), "trigger": str(trigger), "ts": time.time()},
@@ -7112,6 +8628,8 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     Output("heatmap-color-distributions", "data", allow_duplicate=True),
     Output("flow-figure-store", "data", allow_duplicate=True),
     Output("roi-plot", "figure", allow_duplicate=True),
+    Output("custom-region-diagnostics-plot", "figure", allow_duplicate=True),
+    Output("custom-region-stats-store", "data", allow_duplicate=True),
     Output("polar-plot", "figure", allow_duplicate=True),
     Output("trial-metrics-plot", "figure"),
     Output("raw-trace-plot", "figure"),
@@ -7151,6 +8669,8 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     State("raw-columns", "value"),
     State("subplot-ncols", "value"),
     State("plot-points", "value"),
+    State("traj-trial-fraction", "value"),
+    State("btn-traj-resample", "n_clicks"),
     State("render-mode", "value"),
     State("vel-range-effective", "data"),
     State("disp-range", "value"),
@@ -7166,28 +8686,31 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     State("polar-min-point-frac", "value"),
     State("polar-min-animal-frac", "value"),
     State("flow-max-radius", "value"),
+    State("custom-region-enabled", "value"),
+    State("custom-regions-store", "data"),
     prevent_initial_call=True,
 )
 def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
                  group_by, pool_mode, color_by, animate, rebase, hm_binsize, hm_scale,
                  hm_bound, hm_metric, hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids,
                  scenes, folders, trial_min, trial_max, step_min, step_max,
-                 raw_cols, ncols, max_points,
+                 raw_cols, ncols, max_points, traj_fraction, traj_sample_seed,
                  render_mode, vel_selection, disp_selection, viewport, roi_show, roi_reach,
                  roi_trim, roi_entered, polar_moving, polar_walk, polar_angle_source,
                  polar_r_range,
                  polar_min_point_frac, polar_min_animal_frac,
-                 flow_max_radius):
+                 flow_max_radius, custom_region_enabled, custom_regions):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     raw_hidden = {"display": "none"}
     if not pattern:
-        return (empty, empty, {}, {}, empty, empty, empty, empty, empty, raw_hidden,
+        return (empty, empty, {}, {}, empty, empty, empty, {}, empty, empty,
+                empty, raw_hidden,
                 "Choose a data folder or CSV glob to begin.",
                 "", {}, "Waiting for data.")
 
     op_id = _progress_begin(
         "render",
-        ["Filter/cache", "ROI masks", "Trajectories", "Heatmap", "Flow field",
+        ["Filter/cache", "ROI masks", "Trajectories", "Heatmap", "Gandiva",
          "Polar", "Trial metrics", "Raw traces"],
         "Applying filters from the retained in-memory dataset…",
     )
@@ -7223,14 +8746,14 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         msg = "No CSV rows matched the current data source."
         _progress_finish(op_id, msg, failed=True)
         LOGGER.warning("render.empty epoch=%s reason=no_rows source=%r", n, pattern)
-        return (empty, empty, {}, {}, empty, empty, empty, empty, empty,
+        return (empty, empty, {}, {}, empty, empty, empty, {}, empty, empty, empty,
                 raw_hidden, msg,
                 "", {"epoch": int(n or 0)}, msg)
     if len(df_sub) == 0:
         msg = "No trajectories match the active filters."
         _progress_finish(op_id, msg, failed=True)
         LOGGER.warning("render.empty epoch=%s reason=filters source=%r", n, pattern)
-        return (empty, empty, {}, {}, empty, empty, empty, empty, empty,
+        return (empty, empty, {}, {}, empty, empty, empty, {}, empty, empty, empty,
                 raw_hidden, msg,
                 "", {"epoch": int(n or 0)}, msg)
 
@@ -7266,19 +8789,28 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     )
 
     stage_started = time.perf_counter()
-    df_plot = rebase_to_origin(df_view) if do_rebase else df_view
+    # One stable whole-segment sample feeds both trajectory and polar display.
+    # Analytical heat/flow/ROI/metric inputs remain the complete filtered frame.
+    df_display = _sample_trajectory_segments(
+        df_view, traj_fraction, traj_sample_seed)
+    df_plot = rebase_to_origin(df_display) if do_rebase else df_display
+    df_spatial = rebase_to_origin(df_view) if do_rebase else df_view
     bound_pct = float(hm_bound) if hm_bound not in (None, "") else 98.0
-    shared_fit = ((_robust_range(df_plot, bound_pct)
-                   if bound_pct < 100 else _shared_range(df_plot))
-                  if len(df_plot) else None)
+    shared_fit = ((_robust_range(df_spatial, bound_pct)
+                   if bound_pct < 100 else _shared_range(df_spatial))
+                  if len(df_spatial) else None)
     traj_budget = _budget(BUDGET_SVG if do_animate else BUDGET_GL,
                           BUDGET_SVG_SPEED if do_animate else BUDGET_GL_SPEED,
                           mode, max_points)
-    df_plot_draw = _decimate_frame(df_plot, traj_budget) if mode == "speed" else df_plot
+    df_traj_sample = df_plot
+    df_plot_draw = (
+        _decimate_frame(df_traj_sample, traj_budget)
+        if mode == "speed" else df_traj_sample
+    )
     traj_max_points = len(df_plot_draw) if mode == "speed" else max_points
     traj_fig = build_trajectory_figure(
         df_plot_draw, group_by, pool_mode, ncols=ncols_val,
-        color_by=color_by or "individual", animate=do_animate,
+        color_by=color_by or "one", animate=do_animate,
         max_points=traj_max_points, rois=rois, reach_radius=reach,
         show_rois=want_rois and not do_rebase, roi_counts=roi_counts,
         roi_outcomes=roi_outcomes, view_range=shared_fit)
@@ -7309,7 +8841,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
 
     stage_started = time.perf_counter()
     flow_fig = build_direction_field_figure(
-        df_plot, group_by, pool_mode, ncols=ncols_val,
+        df_spatial, group_by, pool_mode, ncols=ncols_val,
         bin_size=hm_binsize, bound_pct=bound_pct,
         metric=hm_metric or "time", log_scale=(hm_scale == "log"),
         cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
@@ -7325,10 +8857,27 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     )
 
     stage_started = time.perf_counter()
+    region_on = _on(custom_region_enabled)
+    region_stats = (
+        _custom_region_stats(
+            df_view, custom_regions, group_by, pool_mode, ncols_val,
+            position_frame=df_spatial,
+        )
+        if region_on else {"enabled": False, "regions": [], "panels": []}
+    )
+    region_diag = build_custom_region_diagnostics_figure(region_stats)
+    polar_position_frame = (
+        rebase_to_origin(df_display) if do_rebase else df_display
+    )
+    polar_source = (
+        _custom_region_subset(
+            df_display, custom_regions, position_frame=polar_position_frame)
+        if region_on else df_display
+    )
     polar_budget = _budget(BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points)
     polar_fig, polar_quality = build_polar_figure(
-        df_view, group_by, pool_mode, ncols=ncols_val,
-        color_by=color_by or "individual", moving_only=_on(polar_moving),
+        polar_source, group_by, pool_mode, ncols=ncols_val,
+        color_by=color_by or "one", moving_only=_on(polar_moving),
         walk_thresh=polar_walk, max_points=polar_budget, rois=rois,
         reach_radius=reach, show_rois=want_rois and not do_rebase,
         roi_outcomes=roi_outcomes, r_range=polar_r_range,
@@ -7363,11 +8912,15 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
                 if getattr(t, "x", None) is not None)
     n_frames = len(traj_fig.frames)
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
+    n_displayed_traces = (
+        int(df_traj_sample["_seg_id"].nunique()) if len(df_traj_sample) else 0)
     n_segs_before = df_sub["_seg_id"].nunique()
     bt = time.perf_counter() - started
     timings["total"] = bt
     summary = (f"{_compact_count(len(df_view))}/{_compact_count(len(df_sub))} pts | "
                f"{_compact_count(n_traces)}/{_compact_count(n_segs_before)} segs | "
+               f"{_compact_count(n_displayed_traces)}/{_compact_count(n_traces)} "
+               f"displayed trials | "
                f"trajectory ~{drawn:,}/{traj_budget:,} drawn pts | "
                f"polar {polar_quality.get('after_animal', 0):,} trials | "
                f"{n_frames} frames | all sections {bt:.2f}s | colour: {color_by}")
@@ -7376,8 +8929,9 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
 
     LOGGER.info(
         "render.done epoch=%s mode=%s input_rows=%d visible_rows=%d "
-        "segments=%d drawn_points=%d polar_trials=%d seconds=%.3f",
-        int(n or 0), mode, len(df_sub), len(df_view), n_traces, drawn,
+        "segments=%d displayed_segments=%d drawn_points=%d polar_trials=%d seconds=%.3f",
+        int(n or 0), mode, len(df_sub), len(df_view), n_traces,
+        n_displayed_traces, drawn,
         int(polar_quality.get("after_animal", 0)), bt,
     )
 
@@ -7389,9 +8943,311 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     }
     _progress_finish(op_id, f"Ready — all sections updated in {bt:.2f}s.")
     return (traj_fig, heat_fig.to_plotly_json(), heat_variants,
-            heat_color_distributions, flow_fig.to_plotly_json(), roi_fig, polar_fig,
+            heat_color_distributions, flow_fig.to_plotly_json(), roi_fig,
+            region_diag, region_stats, polar_fig,
             metrics_fig, raw_fig, raw_style, summary, exclusion,
             render_state, f"Ready — all sections updated in {bt:.2f}s.")
+
+
+@app.callback(
+    Output("polar-plot", "figure", allow_duplicate=True),
+    Output("custom-region-diagnostics-plot", "figure", allow_duplicate=True),
+    Output("custom-region-stats-store", "data", allow_duplicate=True),
+    Output("polar-render-state", "data", allow_duplicate=True),
+    Output("plot-status", "children", allow_duplicate=True),
+    Input("custom-region-enabled", "value"),
+    Input("custom-regions-store", "data"),
+    State("view-render-state", "data"),
+    State("store-glob", "data"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("trial-min", "value"),
+    State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
+    State("vel-range-effective", "data"),
+    State("disp-range", "value"),
+    State("group-by", "value"),
+    State("pool-mode", "value"),
+    State("color-by", "value"),
+    State("subplot-ncols", "value"),
+    State("plot-points", "value"),
+    State("render-mode", "value"),
+    State("rebase-origin", "value"),
+    State("roi-show", "value"),
+    State("roi-reach", "value"),
+    State("roi-entered", "value"),
+    State("roi-trim", "value"),
+    State("traj-trial-fraction", "value"),
+    State("btn-traj-resample", "n_clicks"),
+    State("polar-moving", "value"),
+    State("polar-walk", "value"),
+    State("polar-angle-source", "value"),
+    State("polar-r-range", "value"),
+    State("polar-min-point-frac", "value"),
+    State("polar-min-animal-frac", "value"),
+    prevent_initial_call=True,
+)
+def update_custom_region_analysis(
+        enabled, regions, render_state, pattern, vel_thresh, min_disp, trim,
+        jump_buf, cfg, vrs, fids, scenes, folders, trial_min, trial_max,
+        step_min, step_max, vel_selection, disp_selection, group_by, pool_mode,
+        color_by, ncols, max_points, render_mode, rebase, roi_show, roi_reach,
+        roi_entered, roi_trim, traj_fraction, traj_sample_seed, polar_moving,
+        polar_walk, polar_angle_source, polar_r_range, polar_min_point_frac,
+        polar_min_animal_frac):
+    if not pattern or not render_state:
+        return no_update, no_update, no_update, no_update, no_update
+    started = time.perf_counter()
+    df_f, _, _ = _filtered_df(
+        pattern, vel_thresh, min_disp, trim, jump_buf,
+        cfg, vrs, fids, scenes, folders, trial_min, trial_max,
+        step_min, step_max, vel_selection, disp_selection)
+    if df_f is None or len(df_f) == 0:
+        message = _msg_figure("No rows match the active filters.")
+        return (
+            message, message, {}, no_update,
+            "Observation windows have no matching rows.",
+        )
+
+    _, _, metas = _load_data(pattern)
+    rois = rois_by_config(metas)
+    reach = float(roi_reach or 3.0)
+    df_view, _ = _roi_apply(
+        df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
+    ncols_value = max(1, int(ncols or 2))
+    do_rebase = _on(rebase)
+    position_frame = rebase_to_origin(df_view) if do_rebase else df_view
+    region_on = _on(enabled)
+    payload = (
+        _custom_region_stats(
+            df_view, regions, group_by, pool_mode, ncols_value,
+            position_frame=position_frame,
+        )
+        if region_on else {"enabled": False, "regions": [], "panels": []}
+    )
+    diagnostic = build_custom_region_diagnostics_figure(payload)
+
+    sampled = _sample_trajectory_segments(
+        df_view, traj_fraction, traj_sample_seed)
+    sampled_positions = rebase_to_origin(sampled) if do_rebase else sampled
+    polar_source = (
+        _custom_region_subset(sampled, regions, sampled_positions)
+        if region_on else sampled
+    )
+    roi_outcomes = (
+        roi_outcome_by_segment(df_view, rois, reach)
+        if color_by == "roi" and rois else None
+    )
+    polar_fig = build_polar_figure(
+        polar_source, group_by, pool_mode, ncols=ncols_value,
+        color_by=color_by or "one",
+        moving_only=_on(polar_moving), walk_thresh=polar_walk,
+        max_points=_budget(
+            BUDGET_POLAR, BUDGET_POLAR_SPEED,
+            _render_mode(render_mode), max_points),
+        rois=rois, reach_radius=reach,
+        show_rois=_on(roi_show) and bool(rois) and not do_rebase,
+        roi_outcomes=roi_outcomes, r_range=polar_r_range,
+        min_point_frac=polar_min_point_frac,
+        min_animal_trial_frac=polar_min_animal_frac,
+        angle_source=polar_angle_source,
+    )
+    elapsed = time.perf_counter() - started
+    state = {
+        "completed": time.time(),
+        "operation": "observation windows",
+        "epoch": int((render_state or {}).get("epoch", 0)),
+        "timings": {"observation windows": round(elapsed, 4)},
+    }
+    return (
+        polar_fig, diagnostic, payload, state,
+        f"Observation windows updated polar + diagnostics in {elapsed:.2f}s.",
+    )
+
+
+app.clientside_callback(
+    """
+    function(renderState, polarState) {
+      if (!renderState || !renderState.completed) {
+        return [true, window.dash_clientside.no_update,
+                window.dash_clientside.no_update];
+      }
+      return [false, 0, {
+        pending:true,
+        epoch:Number(renderState.epoch || 0),
+        requested:Date.now()/1000,
+        polarCompleted:Number((polarState || {}).completed || 0)
+      }];
+    }
+    """,
+    Output("stats-delay-interval", "disabled"),
+    Output("stats-delay-interval", "n_intervals"),
+    Output("stats-overlay-store", "data", allow_duplicate=True),
+    Input("view-render-state", "data"),
+    Input("polar-render-state", "data"),
+    prevent_initial_call=True,
+)
+
+
+@app.callback(
+    Output("stats-overlay-store", "data"),
+    Input("stats-delay-interval", "n_intervals"),
+    State("view-render-state", "data"),
+    State("store-glob", "data"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("trial-min", "value"),
+    State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
+    State("vel-range-effective", "data"),
+    State("disp-range", "value"),
+    State("group-by", "value"),
+    State("pool-mode", "value"),
+    State("roi-reach", "value"),
+    State("roi-entered", "value"),
+    State("roi-trim", "value"),
+    State("traj-trial-fraction", "value"),
+    State("btn-traj-resample", "n_clicks"),
+    State("polar-moving", "value"),
+    State("polar-walk", "value"),
+    State("polar-angle-source", "value"),
+    State("polar-r-range", "value"),
+    State("polar-min-point-frac", "value"),
+    State("polar-min-animal-frac", "value"),
+    State("custom-region-enabled", "value"),
+    State("custom-regions-store", "data"),
+    State("rebase-origin", "value"),
+    prevent_initial_call=True,
+)
+def compute_delayed_statistics(
+        n_intervals, render_state, pattern, vel_thresh, min_disp, trim,
+        jump_buf, cfg, vrs, fids, scenes, folders, trial_min, trial_max,
+        step_min, step_max, vel_selection, disp_selection, group_by,
+        pool_mode, roi_reach, roi_entered, roi_trim, traj_fraction,
+        traj_sample_seed, polar_moving, polar_walk, polar_angle_source,
+        polar_r_range, polar_min_point_frac, polar_min_animal_frac,
+        custom_region_enabled, custom_regions, rebase):
+    if not n_intervals or not pattern or not render_state:
+        return no_update
+    started = time.perf_counter()
+    try:
+        df_f, _, _ = _filtered_df(
+            pattern, vel_thresh, min_disp, trim, jump_buf,
+            cfg, vrs, fids, scenes, folders, trial_min, trial_max,
+            step_min, step_max, vel_selection, disp_selection)
+        raw_df, native_stats, _ = _load_data(pattern)
+        if df_f is None or len(df_f) == 0:
+            return {
+                "pending": False,
+                "error": "No rows available for statistical tests.",
+            }
+        reach = float(roi_reach or 3.0)
+        df_view, _ = _roi_apply(
+            df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
+        polar_frame = _sample_trajectory_segments(
+            df_view, traj_fraction, traj_sample_seed)
+        if _on(custom_region_enabled):
+            polar_positions = (
+                rebase_to_origin(polar_frame) if _on(rebase) else polar_frame
+            )
+            polar_frame = _custom_region_subset(
+                polar_frame, custom_regions, polar_positions)
+        metric_stats = _visible_segment_stats(native_stats, df_view)
+        payload = _statistics_payload(
+            metric_stats, polar_frame, raw_df, group_by, pool_mode,
+            polar_moving, polar_walk, polar_angle_source, polar_r_range,
+            polar_min_point_frac, polar_min_animal_frac)
+        payload["seconds"] = round(time.perf_counter() - started, 4)
+        payload["epoch"] = int(render_state.get("epoch", 0))
+        return payload
+    except Exception as exc:
+        LOGGER.exception("stats.failed")
+        return {"pending": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+app.clientside_callback(
+    """
+    function(payload) {
+      payload = payload || {};
+      if (payload.pending) {
+        return ['calculating…', 'calculating…', 'calculating…'];
+      }
+      if (payload.error) {
+        return ['stats unavailable', 'stats unavailable', 'stats unavailable'];
+      }
+      if (!payload.completed) {
+        return ['stats queued', 'stats queued', 'start-angle stats queued'];
+      }
+      function apply(graphId, additions) {
+        var container=document.getElementById(graphId);
+        var gd=container&&container.querySelector('.js-plotly-plot');
+        if (!gd||!window.Plotly||!gd.layout) return;
+        var base=(gd.layout.annotations||[]).filter(function(a){
+          return !a || a.name!=='td-stats';
+        });
+        window.Plotly.relayout(gd,{annotations:base.concat(additions)});
+      }
+      window.setTimeout(function(){
+        var metricContainer=document.getElementById('trial-metrics-plot');
+        var metricGd=metricContainer&&metricContainer.querySelector('.js-plotly-plot');
+        var metricBase=(metricGd&&metricGd.layout&&metricGd.layout.annotations)||[];
+        var labels=payload.metric_labels||[];
+        var metricAdds=[];
+        labels.forEach(function(label,index){
+          var title=metricBase[index]||{};
+          metricAdds.push({
+            name:'td-stats', xref:'paper', yref:'paper',
+            x:Number(title.x===undefined?0.5:title.x),
+            y:Number(title.y===undefined?1:title.y),
+            xanchor:'center', yanchor:'bottom', yshift:16,
+            showarrow:false, text:label,
+            bgcolor:'rgba(255,250,235,0.88)', borderpad:2,
+            font:{size:9,color:'#7a4f00'}
+          });
+        });
+        apply('trial-metrics-plot',metricAdds);
+        apply('polar-plot',[{
+          name:'td-stats',xref:'paper',yref:'paper',x:0.5,y:1.0,
+          xanchor:'center',yanchor:'bottom',yshift:38,showarrow:false,
+          text:payload.polar_label||'',bgcolor:'rgba(255,250,235,0.9)',
+          borderpad:3,font:{size:10,color:'#7a4f00'}
+        }]);
+        apply('initial-heading-plot',[{
+          name:'td-stats',xref:'paper',yref:'paper',x:0.5,y:1.0,
+          xanchor:'center',yanchor:'bottom',yshift:34,showarrow:false,
+          text:payload.start_label||'',bgcolor:'rgba(255,250,235,0.9)',
+          borderpad:3,font:{size:10,color:'#7a4f00'}
+        }]);
+      },30);
+      var elapsed=Number(payload.seconds||0).toFixed(2)+' s';
+      return [
+        (payload.polar_label||'stats ready')+' · '+elapsed,
+        'non-parametric + Holm · '+elapsed,
+        (payload.start_label||'stats ready')+' · '+elapsed
+      ];
+    }
+    """,
+    Output("polar-stats-status", "children"),
+    Output("metrics-stats-status", "children"),
+    Output("initial-stats-status", "children"),
+    Input("stats-overlay-store", "data"),
+)
 
 
 # Direction controls are intentionally isolated from the atomic dashboard
@@ -7401,7 +9257,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
 # rebuild trajectories, occupancy bins, ROI diagnostics, trial metrics, or raw
 # traces.
 app.clientside_callback(
-    "function(a,b,c,d,e,f,g,h,i,j,k,l,pattern){"
+    "function(a,b,c,d,e,f,g,h,i,j,k,pattern){"
     "if(!pattern)return window.dash_clientside.no_update;"
     "return 'Updating direction views…';}",
     Output("plot-status", "children", allow_duplicate=True),
@@ -7416,7 +9272,6 @@ app.clientside_callback(
     Input("heatmap-cmin", "value"),
     Input("heatmap-cmax", "value"),
     Input("heatmap-crange", "value"),
-    Input("flow-max-radius", "value"),
     State("store-glob", "data"),
     prevent_initial_call=True,
 )
@@ -7443,7 +9298,6 @@ app.clientside_callback(
     Input("heatmap-cmin", "value"),
     Input("heatmap-cmax", "value"),
     Input("heatmap-crange", "value"),
-    Input("flow-max-radius", "value"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
     State("min-disp", "value"),
@@ -7469,25 +9323,30 @@ app.clientside_callback(
     State("rebase-origin", "value"),
     State("heatmap-binsize", "value"),
     State("heatmap-bound", "value"),
+    State("flow-max-radius", "value"),
     State("viewport-store", "data"),
     State("roi-show", "value"),
     State("roi-reach", "value"),
     State("roi-entered", "value"),
     State("roi-trim", "value"),
+    State("traj-trial-fraction", "value"),
+    State("btn-traj-resample", "n_clicks"),
+    State("custom-region-enabled", "value"),
+    State("custom-regions-store", "data"),
     State("data-summary", "children"),
     prevent_initial_call=True,
 )
 def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source,
                       polar_r_range, polar_min_point_frac,
                       polar_min_animal_frac, hm_metric, hm_scale, hm_cmin,
-                      hm_cmax, hm_crange, flow_max_radius,
-                      pattern, vel_thresh, min_disp,
+                      hm_cmax, hm_crange, pattern, vel_thresh, min_disp,
                       trim, jump_buf, cfg, vrs, fids, scenes, folders,
                       trial_min, trial_max, step_min, step_max, vel_selection,
                       disp_selection, group_by, pool_mode, color_by, ncols,
                       max_points, render_mode, rebase, hm_binsize, hm_bound,
-                      viewport, roi_show, roi_reach,
-                      roi_entered, roi_trim, current_summary):
+                      flow_max_radius, viewport, roi_show, roi_reach,
+                      roi_entered, roi_trim, traj_fraction, traj_sample_seed,
+                      custom_region_enabled, custom_regions, current_summary):
     empty_hists = build_polar_quality_histograms(None, polar_r_range,
                                                   polar_min_point_frac,
                                                   polar_min_animal_frac)
@@ -7502,7 +9361,7 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
     flow_triggers = {
         "polar-moving", "polar-walk", "polar-angle-source",
         "heatmap-metric", "heatmap-scale", "heatmap-cmin",
-        "heatmap-cmax", "heatmap-crange", "flow-max-radius",
+        "heatmap-cmax", "heatmap-crange",
     }
     refresh_polar = trigger in polar_triggers
     refresh_flow = trigger in flow_triggers
@@ -7557,12 +9416,20 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
     rois = rois_by_config(metas)
     reach = float(roi_reach) if roi_reach else 3.0
     df_view, _ = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
+    df_polar = _sample_trajectory_segments(
+        df_view, traj_fraction, traj_sample_seed)
+    if _on(custom_region_enabled):
+        polar_positions = (
+            rebase_to_origin(df_polar) if _on(rebase) else df_polar
+        )
+        df_polar = _custom_region_subset(
+            df_polar, custom_regions, polar_positions)
     ray = None
     if refresh_hists:
         ray_metric = (
             color_by if color_by in ("velocity", "tortuosity") else "none")
         ray = rayleigh_by_segment(
-            df_view, _on(polar_moving), polar_walk, ray_metric,
+            df_polar, _on(polar_moving), polar_walk, ray_metric,
             angle_source=polar_angle_source)
     timings["ray aggregation"] = time.perf_counter() - stage_started
     if op_id is not None:
@@ -7591,10 +9458,10 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
         want_rois = _on(roi_show) and bool(rois)
         if refresh_polar:
             roi_outcomes = (
-                roi_outcome_by_segment(df_view, rois, reach)
+                roi_outcome_by_segment(df_polar, rois, reach)
                 if (color_by == "roi" or want_rois) and rois else None)
             polar_fig, quality = build_polar_figure(
-                df_view, group_by, pool_mode, ncols=ncols_val,
+                df_polar, group_by, pool_mode, ncols=ncols_val,
                 color_by=color_by or "individual",
                 moving_only=_on(polar_moving), walk_thresh=polar_walk,
                 max_points=_budget(
@@ -7744,6 +9611,44 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
+app.clientside_callback(
+    """
+    function(radius) {
+      var value = Math.max(0.01, Math.min(0.98, Number(radius || 0.49)));
+      var container = document.getElementById('flow-plot');
+      var gd = container && container.querySelector('.js-plotly-plot');
+      if (!gd || !window.Plotly || !gd.data || !gd.layout) {
+        return window.dash_clientside.no_update;
+      }
+      var meta = gd.layout.meta || {};
+      var previous = Math.max(0.01, Number(meta.max_radius || 0.49));
+      var ratio = value / previous;
+      if (!Number.isFinite(ratio) || Math.abs(ratio - 1) < 1e-9) {
+        return window.dash_clientside.no_update;
+      }
+      gd.data.forEach(function(trace, index) {
+        if (!trace || !trace.meta || !trace.meta.gandiva_arrow) return;
+        var xs = Array.from(trace.x || []);
+        var ys = Array.from(trace.y || []);
+        for (var i = 0; i + 1 < xs.length; i += 3) {
+          var ox = Number(xs[i]), oz = Number(ys[i]);
+          var tx = Number(xs[i+1]), tz = Number(ys[i+1]);
+          if (![ox,oz,tx,tz].every(Number.isFinite)) continue;
+          xs[i+1] = ox + ratio * (tx - ox);
+          ys[i+1] = oz + ratio * (tz - oz);
+        }
+        window.Plotly.restyle(gd, {x:[xs], y:[ys]}, [index]);
+      });
+      meta.max_radius = value;
+      window.Plotly.relayout(gd, {meta:meta});
+      return 'Gandiva arrows rescaled locally · radius ' + value.toFixed(2);
+    }
+    """,
+    Output("plot-status", "children", allow_duplicate=True),
+    Input("flow-max-radius", "value"),
+    prevent_initial_call=True,
+)
+
 
 # Pre-fill LUT editor with current configs → their auto-humanised names
 @app.callback(
@@ -7784,12 +9689,319 @@ def apply_lut(n, lut_text, plot_clicks):
         return f"Error: {e}", no_update
 
 
+@app.callback(
+    Output("visual-style-editor", "value"),
+    Input("btn-prefill-visual-style", "n_clicks"),
+    Input("data-generation", "data"),
+    State("store-glob", "data"),
+    prevent_initial_call=True,
+)
+def prefill_visual_style(_n, _generation, pattern):
+    df = None
+    if pattern:
+        df, _, _ = _load_data(pattern)
+    return json.dumps(_visual_style_payload(df), indent=2)
+
+
+@app.callback(
+    Output("visual-style-status", "children"),
+    Output("visual-style-store", "data"),
+    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    Input("btn-apply-visual-style", "n_clicks"),
+    State("visual-style-editor", "value"),
+    State("btn-plot", "n_clicks"),
+    prevent_initial_call=True,
+)
+def apply_visual_style(_n, style_text, plot_clicks):
+    global _VISUAL_STYLE, _USER_LUT
+    try:
+        parsed = json.loads(style_text or "{}")
+        if not isinstance(parsed, dict):
+            raise ValueError("must be a JSON object")
+        merged = _deep_merge(_VISUAL_STYLE_DEFAULTS, parsed)
+        widths = merged["gandiva"].get("arrow_widths", [])
+        opacities = merged["gandiva"].get("arrow_opacities", [])
+        breaks = merged["gandiva"].get("density_breaks", [])
+        if len(widths) != 5 or len(opacities) != 5 or len(breaks) != 6:
+            raise ValueError(
+                "gandiva requires 5 arrow_widths, 5 arrow_opacities and "
+                "6 density_breaks")
+        config_entries = merged.get("group_labels", {}).get(
+            "config", merged.get("categories", {}).get("config", {}))
+        for raw, entry in config_entries.items():
+            if isinstance(entry, dict) and entry.get("name"):
+                _USER_LUT[str(raw)] = str(entry["name"])
+        _VISUAL_STYLE = merged
+        return (
+            "Applied visual styles; rebuilding server-rendered layers.",
+            merged,
+            (plot_clicks or 0) + 1,
+        )
+    except Exception as exc:
+        return f"Style error: {exc}", no_update, no_update
+
+
+def _export_loop_observer_html(
+        enabled=False, x=0, z=0, radius=3, *, rings=None, active=None,
+        match_mode="any", visual_style=None):
+    """Standalone controls + browser-local loop renderer for offline exports."""
+    try:
+        cx = float(x)
+    except (TypeError, ValueError):
+        cx = 0.0
+    try:
+        cz = float(z)
+    except (TypeError, ValueError):
+        cz = 0.0
+    try:
+        radius_value = float(radius)
+    except (TypeError, ValueError):
+        radius_value = 3.0
+    cx = cx if np.isfinite(cx) else 0.0
+    cz = cz if np.isfinite(cz) else 0.0
+    radius_value = (
+        radius_value if np.isfinite(radius_value) and radius_value > 0 else 3.0)
+    cleaned_rings = []
+    for index, ring in enumerate(rings if isinstance(rings, list) else []):
+        if not isinstance(ring, dict):
+            continue
+        try:
+            ring_x = float(ring.get("x", 0))
+            ring_z = float(ring.get("z", 0))
+            ring_radius = float(ring.get("radius", 3))
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(ring_x) and np.isfinite(ring_z)
+                and np.isfinite(ring_radius) and ring_radius > 0):
+            continue
+        cleaned_rings.append({
+            "id": str(ring.get("id", f"ring-{index + 1}")),
+            "name": str(ring.get("name", f"Ring {index + 1}")),
+            "x": ring_x, "z": ring_z, "radius": ring_radius,
+        })
+    if not cleaned_rings:
+        cleaned_rings = [{
+            "id": "ring-1", "name": "Ring 1",
+            "x": cx, "z": cz, "radius": radius_value,
+        }]
+    active_id = str(active or cleaned_rings[0]["id"])
+    if active_id not in {ring["id"] for ring in cleaned_rings}:
+        active_id = cleaned_rings[0]["id"]
+    selected = next(ring for ring in cleaned_rings if ring["id"] == active_id)
+    cx, cz, radius_value = (
+        selected["x"], selected["z"], selected["radius"])
+    settings = json.dumps({
+        "enabled": bool(enabled),
+        "rings": cleaned_rings,
+        "active": active_id,
+        "matchMode": match_mode if match_mode in ("any", "all") else "any",
+        "style": visual_style or _VISUAL_STYLE_DEFAULTS,
+    })
+    module = (
+        Path(__file__).with_name("assets") / "loop_observer.js"
+    ).read_text(encoding="utf-8")
+    checked = " checked" if enabled else ""
+    controls = f"""
+<div class="loop-export">
+  <div class="loop-export-controls">
+    <label><input id="export-loop-enabled" type="checkbox"{checked}>
+      Curtain-ring observer</label>
+    <select id="export-loop-active"></select>
+    <button id="export-loop-add" type="button">+</button>
+    <button id="export-loop-delete" type="button">×</button>
+    <select id="export-loop-match">
+      <option value="any">Any ring</option>
+      <option value="all">All rings</option>
+    </select>
+    <label>X <input id="export-loop-x" type="number" step="any" value="{cx:g}"></label>
+    <label>Z <input id="export-loop-z" type="number" step="any" value="{cz:g}"></label>
+    <label>Radius <input id="export-loop-radius" type="number" min="0.001"
+      step="any" value="{radius_value:g}"></label>
+    <span id="export-loop-status">Enable the observer to inspect crossings.</span>
+  </div>
+  <div class="loop-export-note">Drag the gold ring. Muted paths are before first
+    entry; saturated paths show the future after entry.</div>
+  <div id="export-loop-plot"></div>
+</div>
+<script>{module}</script>
+"""
+    boot = r"""
+<script>
+(function (settings) {
+  "use strict";
+  var source = document.getElementById("export-trajectory-plot");
+  var plot = document.getElementById("export-loop-plot");
+  var enabled = document.getElementById("export-loop-enabled");
+  var activeSelect = document.getElementById("export-loop-active");
+  var addButton = document.getElementById("export-loop-add");
+  var deleteButton = document.getElementById("export-loop-delete");
+  var matchSelect = document.getElementById("export-loop-match");
+  var xInput = document.getElementById("export-loop-x");
+  var zInput = document.getElementById("export-loop-z");
+  var radiusInput = document.getElementById("export-loop-radius");
+  var status = document.getElementById("export-loop-status");
+
+  function value(input, fallback) {
+    var numeric = Number(input.value);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  }
+  function activeRing() {
+    return settings.rings.filter(function (ring) {
+      return String(ring.id) === String(settings.active);
+    })[0] || settings.rings[0];
+  }
+  function syncSelector() {
+    activeSelect.innerHTML = "";
+    settings.rings.forEach(function (ring) {
+      var option = document.createElement("option");
+      option.value = ring.id;
+      option.textContent = ring.name;
+      activeSelect.appendChild(option);
+    });
+    activeSelect.value = settings.active;
+    matchSelect.value = settings.matchMode;
+  }
+  function loadActive() {
+    var ring = activeRing();
+    settings.active = ring.id;
+    xInput.value = ring.x;
+    zInput.value = ring.z;
+    radiusInput.value = ring.radius;
+    syncSelector();
+  }
+  function updateActive() {
+    var ring = activeRing();
+    ring.x = value(xInput, ring.x);
+    ring.z = value(zInput, ring.z);
+    ring.radius = Math.max(0.001, value(radiusInput, ring.radius));
+  }
+  function attach() {
+    if (!plot || !plot.on) return;
+    if (plot.__exportLoopRelayout && plot.removeListener) {
+      plot.removeListener("plotly_relayout", plot.__exportLoopRelayout);
+    }
+    plot.__exportLoopRelayout = function (eventData) {
+      var index = null;
+      Object.keys(eventData || {}).some(function (key) {
+        var match = /^shapes\[(\d+)\]\./.exec(key);
+        if (!match) return false;
+        index = Number(match[1]);
+        return true;
+      });
+      var shape = index === null ? null :
+        ((plot.layout && plot.layout.shapes) || [])[index];
+      if (!shape) return;
+      var nameMatch = /^loop-observer-ring:(.+)$/.exec(String(shape.name || ""));
+      if (!nameMatch) return;
+      var ring = settings.rings.filter(function (item) {
+        return String(item.id) === nameMatch[1];
+      })[0];
+      if (!ring) return;
+      var cx = (Number(shape.x0) + Number(shape.x1)) / 2;
+      var cz = (Number(shape.y0) + Number(shape.y1)) / 2;
+      var radius = (
+        Math.abs(Number(shape.x1) - Number(shape.x0)) +
+        Math.abs(Number(shape.y1) - Number(shape.y0))
+      ) / 4;
+      ring.x = Number(cx.toPrecision(10));
+      ring.z = Number(cz.toPrecision(10));
+      ring.radius = Number(Math.max(0.001, radius).toPrecision(10));
+      settings.active = ring.id;
+      loadActive();
+      render();
+    };
+    plot.on("plotly_relayout", plot.__exportLoopRelayout);
+  }
+  function render() {
+    if (!enabled.checked) {
+      plot.style.display = "none";
+      status.textContent = "Loop observer off.";
+      return;
+    }
+    plot.style.display = "block";
+    updateActive();
+    var built = window.TrajectoryLoopObserver.build(
+      {data: source.data || [], layout: source.layout || {}},
+      settings.rings, settings.active, settings.matchMode, settings.style
+    );
+    status.textContent = built.status;
+    var config = {
+      scrollZoom: true,
+      displayModeBar: true,
+      displaylogo: false,
+      edits: {shapePosition: true}
+    };
+    var promise = plot.__loopPainted ?
+      Plotly.react(plot, built.data, built.layout, config) :
+      Plotly.newPlot(plot, built.data, built.layout, config);
+    Promise.resolve(promise).then(function () {
+      plot.__loopPainted = true;
+      attach();
+    });
+  }
+  enabled.checked = Boolean(settings.enabled);
+  syncSelector();
+  loadActive();
+  activeSelect.addEventListener("change", function () {
+    settings.active = activeSelect.value;
+    loadActive();
+    render();
+  });
+  matchSelect.addEventListener("change", function () {
+    settings.matchMode = matchSelect.value === "all" ? "all" : "any";
+    render();
+  });
+  addButton.addEventListener("click", function () {
+    var suffix = 1;
+    var used = {};
+    settings.rings.forEach(function (ring) { used[ring.id] = true; });
+    while (used["ring-" + suffix]) suffix += 1;
+    var base = activeRing();
+    var ring = {
+      id:"ring-" + suffix, name:"Ring " + suffix,
+      x:base.x + base.radius * 0.55,
+      z:base.z + base.radius * 0.55,
+      radius:base.radius
+    };
+    settings.rings.push(ring);
+    settings.active = ring.id;
+    loadActive();
+    render();
+  });
+  deleteButton.addEventListener("click", function () {
+    if (settings.rings.length <= 1) return;
+    settings.rings = settings.rings.filter(function (ring) {
+      return ring.id !== settings.active;
+    });
+    settings.active = settings.rings[0].id;
+    loadActive();
+    render();
+  });
+  [enabled, xInput, zInput, radiusInput].forEach(function (control) {
+    control.addEventListener("change", render);
+  });
+  render();
+}(__LOOP_SETTINGS__));
+</script>
+""".replace("__LOOP_SETTINGS__", settings)
+    return controls + boot
+
+
 def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
                          initial_heading, raw,
-                         *, include_raw, summary, share_state):
+                         *, include_raw, summary, share_state,
+                         loop_enabled=False, loop_x=0, loop_z=0, loop_radius=3,
+                         loop_rings=None, loop_active=None,
+                         loop_match_mode="any", visual_style=None):
     """Build one offline-capable report with a single embedded plotly.js."""
     cfgd = dict(scrollZoom=True, displaylogo=False)
-    traj_h = traj.to_html(full_html=False, include_plotlyjs=True, config=cfgd)
+    traj_h = traj.to_html(
+        full_html=False, include_plotlyjs=True, config=cfgd,
+        div_id="export-trajectory-plot")
+    loop_h = _export_loop_observer_html(
+        loop_enabled, loop_x, loop_z, loop_radius,
+        rings=loop_rings, active=loop_active, match_mode=loop_match_mode,
+        visual_style=visual_style)
     heat_h = heat.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     flow_h = flow.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     roi_h = roi.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
@@ -7810,6 +10022,13 @@ h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
 .share{{font-size:11px;color:#888;word-break:break-all}}
 .flowlegend{{display:flex;align-items:center;justify-content:flex-end;gap:24px;
 padding:5px 14px;border:1px solid #edf1f7;border-radius:6px;background:#fbfcfe}}
+.loop-export{{border:1px solid #ead79a;border-radius:7px;background:#fffdf7;
+padding:8px;margin:8px 0 14px}}
+.loop-export-controls{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+font-size:11px;color:#473a18}}
+.loop-export-controls input[type=number]{{width:72px}}
+.loop-export-controls span{{margin-left:auto;color:#6b5d32}}
+.loop-export-note{{font-size:10px;color:#75683f;margin:5px 0}}
 .flowlegend>span{{font-size:9px;font-weight:650;color:#475467;text-transform:uppercase}}
 .flowwheel{{position:relative;width:64px;height:64px;font-size:8px;font-weight:700;color:#667085}}
 .flowwheel i{{position:absolute;inset:8px;border-radius:50%;
@@ -7832,8 +10051,9 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
 <div class="info">{summary or ''}</div>
 <div class="share">State: <code>{share_state or ''}</code></div>
 <h3>Trajectories</h3>{traj_h}
+<h3>Loop observer</h3>{loop_h}
 <h3>Heatmap</h3>{heat_h}
-<h3>Local direction field</h3>
+<h3>Gandiva plot</h3>
 <div class="flowlegend"><span>Mean direction</span>
 <div class="flowwheel" aria-label="Circular direction colour legend">
 <b class="f">F</b><b class="r">R</b><b class="b">B</b><b class="l">L</b><i></i></div>
@@ -7883,6 +10103,15 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
     State("raw-columns", "value"),
     State("subplot-ncols", "value"),
     State("plot-points", "value"),
+    State("traj-trial-fraction", "value"),
+    State("btn-traj-resample", "n_clicks"),
+    State("loop-enabled", "value"),
+    State("loop-x", "value"),
+    State("loop-z", "value"),
+    State("loop-radius", "value"),
+    State("loop-rings-store", "data"),
+    State("loop-active-ring", "value"),
+    State("loop-match-mode", "value"),
     State("render-mode", "value"),
     State("rebase-origin", "value"),
     State("roi-show", "value"),
@@ -7907,7 +10136,9 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 color_by, animate, hm_binsize, hm_scale, hm_bound, hm_metric,
                 hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids, scenes, folders,
                 trial_min, trial_max, step_min, step_max,
-                raw_cols, ncols, max_points, render_mode,
+                raw_cols, ncols, max_points, traj_fraction, traj_sample_seed,
+                loop_enabled, loop_x, loop_z, loop_radius,
+                loop_rings, loop_active, loop_match_mode, render_mode,
                 rebase, roi_show, roi_reach, roi_entered, roi_trim,
                 polar_r_range, polar_min_point_frac, polar_min_animal_frac,
                 polar_moving, polar_walk, polar_angle_source,
@@ -7958,7 +10189,12 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
     traj_budget = _budget(BUDGET_SVG if do_animate else BUDGET_GL,
                           BUDGET_SVG_SPEED if do_animate else BUDGET_GL_SPEED,
                           mode, max_points)
-    df_traj = _decimate_frame(df_plot, traj_budget) if mode == "speed" else df_plot
+    df_traj_sample = _sample_trajectory_segments(
+        df_plot, traj_fraction, traj_sample_seed)
+    df_traj = (
+        _decimate_frame(df_traj_sample, traj_budget)
+        if mode == "speed" else df_traj_sample
+    )
     df_heat = df_plot
     df_polar = df_view
     bound_pct = float(hm_bound) if hm_bound not in (None, "") else 98.0
@@ -8038,6 +10274,10 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         initial_heading_fig, raw,
         include_raw=bool(raw_cols), summary=summary,
         share_state=url_search,
+        loop_enabled=_on(loop_enabled), loop_x=loop_x, loop_z=loop_z,
+        loop_radius=loop_radius, loop_rings=loop_rings,
+        loop_active=loop_active, loop_match_mode=loop_match_mode,
+        visual_style=_VISUAL_STYLE,
     )
 
     ts = time.strftime("%Y%m%d_%H%M%S")

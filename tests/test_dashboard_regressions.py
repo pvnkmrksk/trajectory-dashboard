@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 import numpy as np
 import pandas as pd
@@ -138,6 +138,8 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(fig.layout.meta["abundance_scale"], "linear")
         self.assertEqual(list(fig.layout.meta["abundance_range"]), [0.0, 10.0])
         self.assertEqual(fig.layout.meta["marginals"], "active heatmap metric")
+        self.assertEqual(fig.layout.meta["marginal_resolution_multiplier"], 4)
+        self.assertEqual(len(fig.layout.meta["quadrant_cut"]), 2)
         marginal_names = {
             trace.name for trace in fig.data
             if trace.name in ("X abundance", "Z abundance")
@@ -259,6 +261,40 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(median.y0), 7.5)
         self.assertIn("15-sample path/chord", swarm.layout.yaxis3.title.text)
 
+    def test_delayed_statistics_payload_covers_all_three_views(self):
+        rows = []
+        for group_index, config in enumerate(("cfg_a.json", "cfg_b.json")):
+            for trial in range(12):
+                base = float(trial + group_index * 50)
+                rows.append({
+                    "seg_id": f"{config}_{trial}",
+                    "config": config,
+                    "n_points": 30,
+                    "distance_walked": base + 1,
+                    "displacement": base + 2,
+                    "median_local_tortuosity": base + 3,
+                    "median_velocity": base + 4,
+                })
+        metric_stats = pd.DataFrame(rows)
+        first = _polar_frame().copy()
+        first["ConfigFile"] = "cfg_a.json"
+        second = _polar_frame().copy()
+        second["_seg_id"] = second["_seg_id"].astype(str) + "_b"
+        second["SourceFile"] = second["SourceFile"].astype(str) + "_b"
+        second["ConfigFile"] = "cfg_b.json"
+        second["GameObjectRotY"] = (
+            pd.to_numeric(second["GameObjectRotY"]) + 150.0) % 360.0
+        circular = pd.concat([first, second], ignore_index=True)
+        circular.attrs["_frame_token"] = ("test", "delayed-stats")
+        payload = app._statistics_payload(
+            metric_stats, circular, circular, "config", "separate",
+            [], 1, "orientation", [0, 1], 0, 0)
+        self.assertFalse(payload["pending"])
+        self.assertEqual(len(payload["metric_labels"]), 4)
+        self.assertTrue(all("p=" in label for label in payload["metric_labels"]))
+        self.assertIn("circular", payload["polar_label"])
+        self.assertIn("Rayleigh uniformity", payload["start_label"])
+
     def test_local_tortuosity_uses_matching_path_and_chord_intervals(self):
         straight = pd.DataFrame({
             "_seg_id": ["straight_T1_S0"] * 15,
@@ -299,6 +335,34 @@ class DashboardRegressionTests(unittest.TestCase):
             color_by="none", view_range=view)
         self.assertEqual(tuple(fig.layout.xaxis.range), view[0])
         self.assertEqual(tuple(fig.layout.yaxis.range), view[1])
+
+    def test_trajectory_trial_sampling_keeps_complete_segments(self):
+        frame = pd.concat([
+            _polar_frame().assign(
+                _seg_id=lambda d, i=i: d["_seg_id"] + f"_copy{i}")
+            for i in range(5)
+        ], ignore_index=True)
+        original_sizes = frame.groupby("_seg_id", sort=False).size()
+
+        sampled = app._sample_trajectory_segments(frame, 30, seed=7)
+        repeated = app._sample_trajectory_segments(frame, 30, seed=7)
+        alternate = app._sample_trajectory_segments(frame, 30, seed=8)
+
+        # Ten source segments × 30% = three complete displayed segments.
+        self.assertEqual(sampled["_seg_id"].nunique(), 3)
+        pd.testing.assert_series_equal(
+            sampled.groupby("_seg_id", sort=False).size(),
+            original_sizes.loc[pd.unique(sampled["_seg_id"])],
+        )
+        self.assertEqual(
+            pd.unique(sampled["_seg_id"]).tolist(),
+            pd.unique(repeated["_seg_id"]).tolist(),
+        )
+        self.assertNotEqual(
+            set(pd.unique(sampled["_seg_id"])),
+            set(pd.unique(alternate["_seg_id"])),
+        )
+        self.assertIs(app._sample_trajectory_segments(frame, 100, seed=99), frame)
 
     def test_inherited_frame_tokens_do_not_alias_different_row_subsets(self):
         frame = _polar_frame().reset_index(drop=True)
@@ -400,7 +464,9 @@ class DashboardRegressionTests(unittest.TestCase):
         fast_inputs = {item["id"] for item in fast["inputs"]}
         self.assertIn("view-render-state", fast_inputs)
         self.assertIn("polar-moving", fast_inputs)
-        self.assertIn("flow-max-radius", fast_inputs)
+        self.assertNotIn("flow-max-radius", fast_inputs)
+        fast_states = {item["id"] for item in fast["state"]}
+        self.assertIn("flow-max-radius", fast_states)
         self.assertIn("polar-min-animal-frac", fast_inputs)
         self.assertIn("heatmap-metric", fast_inputs)
         self.assertIn("heatmap-scale", fast_inputs)
@@ -457,14 +523,59 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("heatmap-crange").value, "percentile")
         self.assertEqual(_component("heatmap-color-range").value, [0, 99])
         self.assertEqual(_component("flow-max-radius").value, 0.49)
+        self.assertEqual(_component("traj-trial-fraction").value, 100)
+        self.assertEqual(_component("loop-radius").value, 3)
+        self.assertEqual(_component("loop-match-mode").value, "any")
+        self.assertEqual(len(_component("loop-rings-store").data), 1)
+        self.assertEqual(_component("color-by").value, "one")
+        self.assertFalse(_component("minimal-layout-store").data)
+        self.assertEqual(len(_component("custom-regions-store").data), 1)
+        self.assertIsNotNone(_component("loop-observer-plot"))
+        self.assertIsNotNone(_component("custom-region-diagnostics-plot"))
         self.assertIsNotNone(_component("step-range"))
         restored = app.restore_from_url(
-            "?smin=2&smax=4&hcrange=percentile&frad=0.31", False)
-        self.assertEqual(len(restored), 47)
+            "?smin=2&smax=4&hcrange=percentile&frad=0.31"
+            "&tf=37&loop=1&lx=-4.5&lz=2&lr=7&minimal=1", False)
+        self.assertEqual(len(restored), 59)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
         self.assertEqual(restored[44], 0.31)
-        self.assertEqual(len(app.restore_from_url("", True)), 47)
+        self.assertEqual(restored[46:51], (37.0, ["on"], -4.5, 2, 7))
+        self.assertTrue(restored[57])
+        self.assertEqual(len(app.restore_from_url("", True)), 59)
+        rings = [
+            {"id": "ring-1", "name": "Gate A",
+             "x": 0, "z": 1, "radius": 2},
+            {"id": "ring-2", "name": "Gate B",
+             "x": 4, "z": 5, "radius": 6},
+        ]
+        ring_restore = app.restore_from_url(
+            "?" + urlencode({
+                "loops": app.json.dumps(rings),
+                "lactive": "ring-2",
+                "lmode": "all",
+            }),
+            False,
+        )
+        self.assertEqual(ring_restore[51], rings)
+        self.assertEqual(ring_restore[52:54], ("ring-2", "all"))
+        regions = [
+            {"id": "region-1", "name": "Near",
+             "x0": -2, "x1": 2, "z0": -1, "z1": 4},
+            {"id": "region-2", "name": "Far",
+             "x0": 5, "x1": 9, "z0": 6, "z1": 11},
+        ]
+        region_restore = app.restore_from_url(
+            "?" + urlencode({
+                "region": "1",
+                "regions": app.json.dumps(regions),
+                "ractive": "region-2",
+            }),
+            False,
+        )
+        self.assertEqual(region_restore[54], ["on"])
+        self.assertEqual(region_restore[55], regions)
+        self.assertEqual(region_restore[56], "region-2")
         value_restore = app.restore_from_url(
             "?hcmin=150&hcmax=200&hcrange=value", False)
         self.assertEqual(value_restore[34], [150.0, 200.0])
@@ -481,6 +592,42 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(short_extra, 0)
         self.assertGreater(long_extra, short_extra)
         self.assertGreater(long_top, short_top)
+
+    def test_visual_style_prefills_every_panel_group_and_muted_defaults(self):
+        frame = _polar_frame().copy()
+        frame["SceneName"] = "forest"
+        frame["SourceFolder"] = "session-a"
+        payload = app._visual_style_payload(frame)
+        labels = payload["group_labels"]
+        self.assertIn("cfg.json", labels["config"])
+        self.assertIn("forest", labels["scene"])
+        self.assertIn("VR1", labels["vr"])
+        self.assertIn("1", labels["flyid"])
+        self.assertIn("session-a", labels["file"])
+        self.assertLess(payload["trajectory"]["opacity"], 0.7)
+        self.assertLess(payload["trajectory"]["gray_opacity"],
+                        payload["trajectory"]["opacity"])
+        self.assertEqual(payload["spatial_layout"]["unit_label"], "cm")
+
+    def test_custom_regions_subset_points_and_report_panel_percentages(self):
+        frame = _polar_frame().copy()
+        frame["SceneName"] = "forest"
+        frame["SourceFolder"] = "session-a"
+        region = [{
+            "id": "region-1", "name": "Start",
+            "x0": -0.1, "x1": 1.1, "z0": -1, "z1": 1,
+        }]
+        subset = app._custom_region_subset(frame, region)
+        self.assertEqual(len(subset), 4)
+        self.assertTrue(set(subset["_seg_id"]) == set(frame["_seg_id"]))
+        payload = app._custom_region_stats(
+            frame, region, group_by="vr", pool_mode="separate", ncols=2)
+        self.assertEqual(payload["regions"][0]["samples"], 4)
+        self.assertEqual(payload["regions"][0]["trials"], 2)
+        self.assertAlmostEqual(
+            payload["panels"][0]["regions"][0]["percent"],
+            100 * 4 / len(frame),
+        )
 
     def test_exact_velocity_bounds_are_unbounded_and_explicit(self):
         self.assertIsNone(getattr(_component("vel-range-min"), "min", None))
@@ -638,8 +785,8 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(slider.max, 100)
 
         restored = app.restore_from_url("?reach=250.5", False)
-        self.assertEqual(restored[-2], 250.5)
-        self.assertIs(app.restore_from_url("?reach=-1", False)[-2], app.no_update)
+        self.assertEqual(restored[45], 250.5)
+        self.assertIs(app.restore_from_url("?reach=-1", False)[45], app.no_update)
 
         args = {name: None for name in inspect.signature(app.update_url).parameters}
         args.update(restored=True, reach=250.5, rrange=[0, 1], anim=[])
@@ -668,7 +815,24 @@ class DashboardRegressionTests(unittest.TestCase):
         )
         self.assertNotIn('src="https://cdn.plot.ly', document)
         self.assertIn("plotly.js", document)
-        for heading in ("Trajectories", "Heatmap", "Local direction field",
+        self.assertIn("TrajectoryLoopObserver", document)
+        self.assertIn('id="export-loop-radius"', document)
+        node = shutil.which("node")
+        if node:
+            loop_scripts = [
+                body for body in re.findall(
+                    r"<script[^>]*>(.*?)</script>", document, re.DOTALL
+                )
+                if "TrajectoryLoopObserver" in body
+            ]
+            self.assertEqual(len(loop_scripts), 2)
+            for script in loop_scripts:
+                result = subprocess.run(
+                    [node, "--check"], input=script, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for heading in ("Trajectories", "Loop observer", "Heatmap", "Gandiva plot",
                         "Target diagnostics", "Polar",
                         "Trial metrics",
                         "Diagnostics: raw starting-heading null distribution",

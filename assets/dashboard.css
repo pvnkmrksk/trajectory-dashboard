@@ -95,7 +95,8 @@ body {
 #btn-plot,
 #btn-export,
 #btn-apply-lut,
-#btn-prefill-lut {
+#btn-prefill-lut,
+#btn-traj-resample {
   border-radius: 5px !important;
   font-weight: 600;
   box-shadow: none;
@@ -114,8 +115,20 @@ body {
 #btn-plot:hover,
 #btn-export:hover,
 #btn-apply-lut:hover,
-#btn-prefill-lut:hover {
+#btn-prefill-lut:hover,
+#btn-traj-resample:hover {
   background: #f2f6ff !important;
+}
+
+.subtle-action-button {
+  width: 100%;
+  margin-top: 3px;
+  padding: 3px 7px;
+  border: 1px solid var(--td-border);
+  background: #ffffff;
+  color: #475467;
+  cursor: pointer;
+  font-size: 10px;
 }
 
 .segmented-control {
@@ -516,6 +529,66 @@ body._dash-loading-callback .status-dot {
   color: var(--td-muted);
   font-size: 10px;
   text-align: right;
+}
+
+.loop-observer-wrap {
+  margin: 8px;
+  border: 1px solid #ead79a;
+  border-radius: 7px;
+  overflow: hidden;
+  background: #fffdf7;
+}
+
+.loop-observer-heading {
+  min-height: 38px;
+  box-sizing: border-box;
+  padding: 7px 11px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #f2e7be;
+  color: #473a18;
+  font-size: 11px;
+}
+
+.loop-observer-note {
+  display: block;
+  margin-top: 1px;
+  color: #75683f;
+  font-size: 9px;
+  font-weight: 400;
+}
+
+.loop-observer-status {
+  color: #6b5d32;
+  font-size: 10px;
+  text-align: right;
+}
+
+.stats-status-chip {
+  margin-left: auto;
+  max-width: 48%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid rgba(200, 138, 0, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 248, 224, 0.78);
+  color: #795300;
+  padding: 2px 7px;
+  font-size: 9px;
+}
+
+#view-flow {
+  background:
+    linear-gradient(180deg, rgba(255, 249, 231, 0.62), rgba(255,255,255,0) 92px),
+    #fff;
+  border-color: rgba(190, 134, 14, 0.28);
+}
+
+#view-flow .plot-section-heading h4 {
+  color: #6b4800;
 }
 
 .flow-field-legend {

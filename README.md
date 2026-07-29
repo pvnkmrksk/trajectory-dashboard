@@ -152,8 +152,10 @@ For a quick preprocessing check on the homing enemy data, run
   never accumulate every raw CSV in RAM. The header reports file/stage progress.
 - **Pool / group** by config (treatment), scene, VR, fly, source folder, or
   all-pooled → a 2-col grid of square, axis-synced, scrollable subplots.
-- **Colour by** individual, VR, ROI outcome, trial, local time, or **velocity**
-  (units/s, rolling-smoothed, reset-spikes removed).
+- **Colour by** one calm translucent hue (default), neutral gray (“None”),
+  the current panel categories, individual, VR, ROI outcome, trial, local time,
+  or **velocity** (units/s, rolling-smoothed, reset-spikes removed). The
+  categorical palette is deliberately muted for dense overplotting.
 - **Filters**: max-velocity jump removal (time-buffered), min net displacement,
   inclusive trial and step ranges, trim N edge samples/end, ROI entered-only,
   and after-exit ROI trim. Velocity
@@ -162,29 +164,52 @@ For a quick preprocessing check on the homing enemy data, run
   per criterion. Drag-select ranges on the velocity/displacement histograms.
 - **Playback**: native client-side animation with a sticky play/pause/scrub bar;
   each track grows from its first point over local time.
-- **Single-page plotting workspace**: trajectories, heatmap, local direction
-  field, polar, targets and diagnostics stay mounted together. The sticky section bar scrolls to a
+- **Curtain-ring loop observer**: add, select, drag and delete circular probes
+  in trajectory space, then match trials that crossed **any** or **all** rings.
+  The browser immediately keeps only matching displayed `_seg_id` paths and
+  shows the muted past, saturated future, and first/last qualifying entry point.
+  Ring edits do not refilter data or call the server.
+- **Observation windows**: add, select, drag, resize and delete rectangular
+  regions on Trajectory, Heatmap or Gandiva. Gandiva labels the sample share in
+  each window; polar uses the union of window samples; the Targets section
+  reports samples, entering trials, distance walked, net displacement,
+  tortuosity and velocity. Window edits refresh only polar and this compact
+  diagnostic table.
+- **Whole-trial display sampling**: randomly retain 1–100% of complete
+  `_seg_id` segments before point decimation, with a button for a fresh sample.
+  The same sampled trials feed trajectories, the loop observer and polar
+  vectors; heatmaps, Gandiva, targets and movement-metric denominators keep the
+  complete filtered frame.
+- **Single-page plotting workspace**: trajectories, heatmap, Gandiva, polar,
+  targets and diagnostics stay mounted together. The sticky section bar scrolls to a
   plot without hiding/reloading graphs, so zoom, hover and legend state survive.
   An optional comparison workspace puts trajectories and polar side-by-side,
   with the heatmap below. Speed is the default and adds a tighter browser
   drawing budget; both modes share the same memory-bounded retained frame.
+- **Clean layout**: one button hides spatial grids, tick/axis labels and
+  legends—even on Gandiva—and replaces them with an adaptive scale bar. Units
+  default to `cm`; `spatial_layout.unit_scale` and `unit_label` in the style
+  JSON describe how one data unit maps to real-world units.
 - **Heatmap**: occupancy density — bin size in **data units**, lin/log with
-  human-readable log labels (100 ms / 1 s / 10 s), percentile-bounded extent,
+  plain log labels (`1`, `10`, `100`, `1,000`, never `1e+3`),
+  percentile-bounded extent,
   metric = count / occupancy-seconds / % of time, explicit `cmin/cmax`
   (absolute or percentile), and faint ROI rings with left/right occupancy labels
   in each subplot's top corners. Heatmap and trajectory start from the same
   central-98% square extent, and pan/zoom propagate immediately in both
   directions without a server render.
-- **Local direction field**: a quiver/heatmap hybrid on the same selectable
+- **Gandiva plot**: a quiver/heatmap hybrid named for Arjuna's divine bow on the same selectable
   spatial grid. Each cell is a circular summary of its samples: stroke angle and
   hue show mean direction, stroke length and colour saturation show resultant
   strength `R` (`0` scattered → `1` aligned), and stroke visibility/width plus
   raster alpha show abundance using the heatmap's active count/time/percent
   metric, linear/log scale, and colour-range semantics. A compact circular
   colour wheel identifies direction, while a faint-to-bold stroke key explains
-  abundance. The maximum stroke radius is adjustable from 0.05–0.49 cell
-  widths. Aligned top/right marginals show X/Z abundance from the same active
-  heatmap metric and bins. It can use Unity body orientation or movement
+  abundance. The maximum stroke radius is adjustable from 0.05–0.98 cell
+  widths and rescales existing browser traces without recomputing vectors.
+  Aligned top/right marginals use bins 4× finer than the heatmap. A dotted
+  modal-start cut reports the percentage of spatial samples in each quadrant.
+  It can use Unity body orientation or movement
   heading, supports moving-only samples, follows every active data/ROI filter,
   and shares live pan/zoom with the trajectory and occupancy views.
 - **ROI targets** auto-loaded from the scene configs (Choice/BinaryChoice; polar
@@ -204,6 +229,10 @@ For a quick preprocessing check on the homing enemy data, run
   panel grouping. Groups with up to 200 visible trials use deterministic
   jittered swarms; larger groups use count-scaled violins. Both show a
   full-width shaded IQR with a bold median overlay.
+- **Delayed statistics**: plots render first, then a separate callback adds
+  SciPy non-parametric omnibus tests with Holm-adjusted stars to the four trial
+  metrics, a circular group comparison to polar, and per-config Rayleigh
+  uniformity checks to the starting-angle diagnostic.
 - **Polar view**: one circular resultant per trial from Unity body orientation
   (`GameObjectRotY`) by default, with movement heading as an alternative. 0° is
   forward/+Z and positive angles turn right/+X. The bold population ray exactly
@@ -223,6 +252,10 @@ For a quick preprocessing check on the homing enemy data, run
   it for a completed/current checklist, progress and per-stage timings. Detailed Python
   errors and tracebacks are written to the server terminal with timestamps,
   thread names and operation context.
+- **Visual style JSON**: Advanced exposes a prefilled editable object for the
+  current config, scene, VR, fly and folder display names first, followed by
+  trajectory opacity/width/palette, clean-layout units, curtain rings,
+  observation windows, Gandiva tiers/marginals/raster and heatmap colourscale.
 - **Shareable URL**: every control *and the current zoom box* is in the URL.
 - **Export**: one offline, self-contained `.html` with Plotly, every panel and
   the filtered data embedded.
@@ -259,15 +292,44 @@ shareable URL.
 | Plot order | Drag the loaded config list. | Keeps figures aligned to experimental order instead of arbitrary filename order. |
 | Panel columns | Number of columns in the grid. | Wide screens can use 2-4 columns; narrow screens are easier with 1. |
 | Show raw config filenames | Uses exact config filenames instead of readable labels. | Debugs metadata/name mapping when labels look surprising. |
+| Clean layout | Hides spatial grids, ticks, axis titles and legends and adds an automatically sized scale bar. | Produces publication/presentation-ready Trajectory, Heatmap and Gandiva views without recomputing data. |
 
 ### Trajectories
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Colour | Individual, VR, trial, local time, or smoothed velocity. | Categorical colors identify animals/runs; sequential colors reveal progression or speed structure. |
+| Colour | One calm hue (default), None/neutral gray, categorical current panels, individual, VR, ROI, trial, local time, or smoothed velocity. | Low-opacity muted colors stay legible under overplotting; categorical current panels works for config, scene, VR, fly, folder, or pooled grouping. |
 | Render mode | Speed (default) or Accuracy. | Speed reduces browser drawing primitives further; both modes use the same retained analytical frame and exact pre-retention segment summaries. |
 | Playback animation | Builds animated frames and shows play/pause/scrub controls. | Good for presentations and temporal intuition; off is faster and crisper for analysis. |
+| Displayed trials (%) | Randomly keeps this fraction of complete `_seg_id` paths in trajectory, loop and polar drawings. | Reduces browser load by removing whole trials instead of thinning their data; 100% is the default and keeps everything. |
+| New random subset | Changes the sampling seed and redraws at the current displayed-trial percentage. | Lets you check that a visual impression is not peculiar to one random subset. |
 | Point budget | Optional decimation budget. | Larger values preserve detail but increase browser cost; blank uses the app's safe default. |
+
+### Loop Observer
+
+| Control | Meaning | Rationale |
+|---|---|---|
+| Show curtain-ring observer | Opens a second trajectory view driven entirely by browser-side geometry. | The main trajectory overview stays intact while the observer isolates crossing trials. |
+| Add / delete / selected ring | Builds a small set of curtain rings and chooses which exact X/Z/radius fields edit. | Supports sequential or distributed spatial gates without cluttering the overview. |
+| Any / all rings | Keeps a trial after its earliest hit of any ring, or after it has hit every ring. | Separates alternate routes from multi-gate passage. |
+| Ring X / Z | Sets the ring centre; dragging the gold circle updates both fields. | Makes coarse placement tactile and exact placement reproducible. |
+| Radius | Sets the circular crossing radius. The slider spans 0.5–100 and the exact field accepts any positive value. | Supports both small local probes and large arena-scale gates. |
+| Past / future paths | Splits every matching segment at its first plotted intersection with the ring. | Muted paths show where trials came from; saturated paths and entry diamonds show what happened afterward. |
+
+Loop matching uses the browser-resident, point-budgeted trajectory polylines and
+also tests line-segment/circle intersections, not only retained vertices. Raise
+the point budget or use Accuracy mode when a very small ring needs the finest
+available spatial fidelity.
+
+### Region Observer
+
+| Control | Meaning | Rationale |
+|---|---|---|
+| Use observation windows | Draws editable rectangles on all three spatial views and applies their union to polar. | Lets you ask how headings and movement statistics change inside arbitrary arena windows. |
+| Add / delete / selected window | Maintains a small named set of rectangular windows. | Makes side-by-side local comparisons easy while keeping deletion explicit. |
+| X/Z min/max | Exact reproducible bounds; dragging/resizing any dashed box updates these fields. | Supports tactile exploration and precise repeated analyses. |
+| Gandiva labels | Reports each window’s sample percentage per current panel. | Provides immediate spatial prevalence without recomputing local vectors. |
+| Observation-window diagnostics | Reports samples, entered trials, local distance, net displacement, tortuosity and velocity. | Keeps the custom-region readout beside the existing target diagnostics. |
 
 ### Filters
 
@@ -330,7 +392,7 @@ shareable URL.
 | Diagnostics section | Native velocity/displacement histograms, a toggleable 36-bin starting-heading null distribution per treatment, and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Preserves the original dataset baseline while filters change and exposes unexpected directional bias at segment starts. |
 | Trial metrics section | Per-trial path length, displacement, median smoothed speed, and median 15-sample local tortuosity grouped by the selected panel axis. | Makes treatment/scene/animal differences visible without reducing tortuosity to unstable whole-trial distance divided by displacement. |
 | Raw trace columns | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
-| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, local direction field, polar, target diagnostics, trial metrics, native velocity/displacement and starting-heading diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
+| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, Gandiva, polar, target diagnostics, trial metrics, native velocity/displacement and starting-heading diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
 | Header activity status | Reports the current load, filter/render, debounce, or export state plus retained points; hover exposes per-stage timings. | Makes slow work and failures visible, while the terminal retains full errors and tracebacks. |
 
 The dashboard's resident normalized frame defaults to 2,000,000 rows. Set
@@ -358,6 +420,8 @@ assets/dropzone.js             # folder drag-and-drop
 assets/dashboard.css           # dashboard chrome and sticky section styling
 assets/heatsync.js             # heatmap zoom viewport sync after newPlot
 assets/heatmap_colors.js       # browser-local metric/scale/color-limit restyles
+assets/clean_layout.js         # grid-free spatial mode + adaptive scale bars
+assets/region_observer.js      # draggable rectangular observation windows
 assets/section_nav.js          # section scroll, including active-tab replay
 assets/plot_wheel_guard.js     # Plotly wheel zoom without page scroll
 assets/config_order.js         # draggable config subplot order list

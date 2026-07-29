@@ -17,9 +17,15 @@
 
   function metricLabel(value, metric) {
     if (!Number.isFinite(value)) return '';
-    if (metric === 'percent') return value.toPrecision(3) + '%';
-    if (metric === 'time') return value.toPrecision(3) + 's';
-    return value >= 1000 ? value.toExponential(1) : Number(value.toPrecision(3)).toString();
+    var label;
+    if (Math.abs(value) >= 1) {
+      label = Math.abs(value - Math.round(value)) <= Math.max(1e-9, Math.abs(value) * 1e-10)
+        ? Math.round(value).toLocaleString('en-US')
+        : Number(value.toPrecision(3)).toLocaleString('en-US');
+    } else {
+      label = value.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+    }
+    return metric === 'percent' ? label + '%' : label;
   }
 
   function logTicks(minimum, maximum, metric) {
