@@ -149,7 +149,10 @@ For a quick preprocessing check on the homing enemy data, run
   back to the CSV's `CurrentSequenceScene`, then `Scene`; placeholder values are
   ignored and each `_seg_id` is assigned one stable modal scene. Each file is
   normalized and summarized before endpoint-safe retention, so large folders
-  never accumulate every raw CSV in RAM. The header reports file/stage progress.
+  never accumulate every raw CSV in RAM. A dropped folder is acknowledged
+  immediately, its inferred glob appears before parsing begins, and the header
+  reports file/stage progress while a small parallel worker pool preprocesses
+  source files in their original order.
 - **Pool / group** by config (treatment), scene, VR, fly, source folder, or
   all-pooled → a 2-col grid of square, axis-synced, scrollable subplots.
 - **Colour by** the current panel categories (default), neutral gray (“None”),
@@ -180,7 +183,8 @@ For a quick preprocessing check on the homing enemy data, run
   button for a fresh sample. The same selected trials feed trajectories, the
   loop observer, polar vectors and the visible polar population ray; heatmaps,
   Gandiva, targets and movement-metric denominators keep the complete filtered
-  frame.
+  frame. The browser retains an immutable copy of the complete mounted drawing,
+  so moving the percentage upward restores trials as quickly as moving it down.
 - **Single-page plotting workspace**: trajectories, heatmap, Gandiva, polar,
   targets and diagnostics stay mounted together. The sticky section bar scrolls to a
   plot without hiding/reloading graphs, so zoom, hover and legend state survive.
@@ -190,8 +194,11 @@ For a quick preprocessing check on the homing enemy data, run
 - **Clean layout**: one passive browser-only button prepares uncluttered Plotly
   downloads without rebuilding data or touching the viewport. Spatial axes,
   Cartesian grids/zero-lines, legends and colourbars disappear; polar rings
-  and angular ticks remain for context. The implementation only toggles CSS
-  classes, so pan, zoom and editable shapes keep their native Plotly behavior.
+  and angular ticks remain for context. Each spatial panel receives a passive
+  scale bar whose numeric conversion and unit label are editable (default:
+  `1 data unit = 1 cm`). The implementation only toggles CSS classes and
+  lightweight DOM overlays, so pan, zoom and editable shapes keep their native
+  Plotly behavior.
 - **Heatmap**: occupancy density — bin size in **data units**, lin/log with
   plain log labels (`1`, `10`, `100`, `1,000`, never `1e+3`),
   percentile-bounded extent,
@@ -234,15 +241,19 @@ For a quick preprocessing check on the homing enemy data, run
   violins can retain their dots. The independent unit can be each trial or an
   animal mean. Both encodings show a full-width shaded IQR with a bold median.
 - **Delayed statistics**: plots render first, then a separate callback adds
-  SciPy non-parametric pairwise tests with Holm-adjusted stars and named pairs
-  to trial metrics, window diagnostics, and left/right target comparisons.
-  Polar adds per-group Rayleigh non-uniformity plus Holm-adjusted pairwise
-  circular comparisons; the starting-angle diagnostic retains its Rayleigh
-  check.
+  SciPy non-parametric pairwise tests with Holm-adjusted compact-letter labels
+  directly above trial/window/target distributions. Full methods, sample sizes
+  and adjusted probabilities remain available on hover instead of occupying
+  plot titles. Polar puts each group's Rayleigh non-uniformity stars and
+  pairwise compact letter in the padded subplot subtitle; the starting-angle
+  diagnostic retains its per-group Rayleigh check there as well.
 - **Polar view**: one circular resultant per trial from Unity body orientation
   (`GameObjectRotY`) by default, with movement heading as an alternative. 0° is
-  forward/+Z and positive angles turn right/+X. The bold population ray exactly
-  pools the valid samples in the currently displayed trial subset. Moving-only
+  forward/+Z and positive angles turn right/+X. In Trial mode the bold
+  population ray exactly pools the valid samples in the currently displayed
+  trial subset. In Animal mode, each animal's trials first form one
+  sample-weighted circular vector and those animal vectors then contribute
+  equally to the population ray and circular tests. Moving-only
   and polar-quality changes use a cached polar-only update path; their R,
   valid-point and per-animal good-trial histograms use 36 fixed bins and stay
   mounted and auditable. The angle-source and moving-only controls are shared
@@ -287,7 +298,11 @@ shareable URL.
 |---|---|---|
 | Glob / folder path | A file glob, folder, or dropped folder. Dropped folders are expanded into nested CSV globs. | Keeps loading flexible: paste an exact experiment glob or just drop the top-level folder. |
 | Load | Loads CSVs, metadata, filter choices and auto thresholds, resets range controls when the data source changes, then renders all sections once. | Prevents new data from racing stale ranges from the previous source. |
-| Drag-drop target | Drop folders on the folder control or the plotting workspace. | Keeps data loading easy without intercepting the config-order drag list. |
+| Drag-drop target | Drop folders on the folder control or the plotting workspace; the inferred glob and loading spinner update before file parsing starts. | Gives immediate acknowledgement and keeps loading easy without intercepting the config-order drag list. |
+
+File preprocessing uses two workers by default. Set `TRAJ_LOAD_WORKERS=1` for
+minimum peak memory or up to `8` when storage and memory comfortably support
+more concurrent source files.
 
 ### Grouping And Layout
 
@@ -299,6 +314,7 @@ shareable URL.
 | Panel columns | Number of columns in the grid. | Wide screens can use 2-4 columns; narrow screens are easier with 1. |
 | Show raw config filenames | Uses exact config filenames instead of readable labels. | Debugs metadata/name mapping when labels look surprising. |
 | Clean layout | Hides spatial axes, Cartesian grids/zero-lines, legends and colourbars while retaining polar rings; the button changes to Full layout for exact restoration. | Produces PNG-ready Plotly figures with a CSS-only appearance change and no viewport mutation. |
+| Scale-bar conversion / unit | Multiplies data units for the clean-layout scale label and sets its text (default `1`, `cm`). | Keeps the same geometry usable for centimetres, metres, or experiment-specific calibration. |
 
 ### Trajectories
 
@@ -350,7 +366,7 @@ available spatial fidelity.
 | Trial range | Inclusive `CurrentTrial` min/max fields in the Subset section. | Splits early vs late trials without changing segment identity or writing a separate preprocessing script. |
 | Step range | Inclusive `CurrentStep` min/max fields in the Subset section. | Selects repeated scene steps while preserving complete `SourceFile+Trial+Step` segments. |
 | Trim segment edges (Advanced) | Removes N samples from both ends of every segment after spike filtering. | Blunt instrument for start/end artifacts; normally leave at `0` and prefer the time-based spike buffer. |
-| Histogram range selections | Drag-select velocity/displacement histogram ranges. Peak velocity also has unbounded exact min/max boxes. | Keeps the slider robust to outliers while still allowing a precise range outside its displayed 99th-percentile span. |
+| Histogram range selections | Drag-select velocity/displacement histogram ranges. Both have synchronized, unbounded exact min/max boxes. | Keeps the sliders robust to outliers while still allowing a precise range outside their displayed 99th-percentile spans. |
 | Retention summary | Reports final retained/discarded points, trials, and animals. The sidebar audit shows each criterion serially, relative to the previous step. | Makes active filters auditable without mixing independent and sequential denominators. |
 
 ### Heatmap

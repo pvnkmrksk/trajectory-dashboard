@@ -102,6 +102,26 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(means[0].r[-1]), expected[0], places=10)
         self.assertAlmostEqual(float(means[0].theta[-1]), expected[1], places=10)
 
+    def test_animal_polar_pooling_gives_each_animal_one_population_vote(self):
+        ray = pd.DataFrame({
+            "_seg_id": ["a1", "a2", "b1"],
+            "group": ["cfg"] * 3,
+            "animal": ["fly-a", "fly-a", "fly-b"],
+            "R": [1.0, 1.0, 1.0],
+            "theta_deg": [0.0, 0.0, 180.0],
+            "valid_points": [100, 100, 5],
+            "n_points": [100, 100, 5],
+            "cval": [1.0, 1.0, 2.0],
+            "CurrentTrial": [1, 2, 1],
+        })
+        animals = app._polar_by_animal(ray)
+        self.assertEqual(len(animals), 2)
+        self.assertEqual(animals["unit_trials"].tolist(), [2, 1])
+        rbar, _theta, support = app._population_polar_vector(
+            animals, equal_units=True)
+        self.assertEqual(support, 2)
+        self.assertAlmostEqual(rbar, 0.0, places=10)
+
     def test_local_direction_field_encodes_cell_strength_and_abundance(self):
         frame = _polar_frame().iloc[:2].copy()
         frame["GameObjectPosX"] = 0.0
@@ -330,8 +350,21 @@ class DashboardRegressionTests(unittest.TestCase):
             [], 1, "orientation", [0, 1], 0, 0)
         self.assertFalse(payload["pending"])
         self.assertEqual(len(payload["metric_labels"]), 4)
+        self.assertEqual(len(payload["metric_marks"]), 4)
+        self.assertEqual(
+            [mark["group"] for mark in payload["metric_marks"][0]],
+            ["cfg_a.json", "cfg_b.json"],
+        )
+        self.assertTrue(all(
+            mark["letters"] for mark in payload["metric_marks"][0]))
         self.assertTrue(all("p=" in label for label in payload["metric_labels"]))
         self.assertIn("circular", payload["polar_label"])
+        self.assertEqual(
+            [mark["group"] for mark in payload["polar_marks"]],
+            ["cfg_a.json", "cfg_b.json"],
+        )
+        self.assertTrue(all(
+            "rayleigh_stars" in mark for mark in payload["polar_marks"]))
         self.assertIn("Rayleigh uniformity", payload["start_label"])
 
     def test_local_tortuosity_uses_matching_path_and_chord_intervals(self):
@@ -437,6 +470,7 @@ class DashboardRegressionTests(unittest.TestCase):
             if output.startswith("..auto-replot-state.data...")
         )
         auto_inputs = {item["id"] for item in auto["inputs"]}
+        self.assertNotIn("roi-show", auto_inputs)
         for control in ("heatmap-color-range", "heatmap-cmin",
                         "heatmap-cmax", "heatmap-crange"):
             self.assertNotIn(control, auto_inputs)
@@ -539,10 +573,17 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_clean_layout_is_css_only_and_cannot_emit_relayout_events(self):
         source = Path("assets/clean_layout.js").read_text()
         self.assertIn('classList.toggle("td-clean-layout"', source)
+        self.assertIn("td-clean-scale-overlay", source)
         self.assertNotIn("window.Plotly", source)
         self.assertNotIn('.on("plotly_relayout"', source)
         self.assertNotIn(".relayout(", source)
         self.assertNotIn(".restyle(", source)
+
+    def test_trial_subset_keeps_an_immutable_source_for_fraction_increases(self):
+        source = Path("assets/trial_subset.js").read_text()
+        self.assertIn("var baseFigures = {}", source)
+        self.assertIn("sourceFigure(", source)
+        self.assertIn("finiteCoordinateCount", source)
 
     def test_inline_clientside_callbacks_are_valid_javascript(self):
         node = shutil.which("node")
@@ -588,20 +629,26 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("distribution-mode").value, "auto")
         self.assertEqual(_component("distribution-show-points").value, ["on"])
         self.assertEqual(_component("stats-unit").value, "trial")
+        self.assertEqual(_component("spatial-unit-scale").value, 1)
+        self.assertEqual(_component("spatial-unit-label").value, "cm")
+        self.assertIsNotNone(_component("disp-range-min"))
+        self.assertIsNotNone(_component("disp-range-max"))
         self.assertEqual(len(_component("custom-regions-store").data), 1)
         self.assertIsNotNone(_component("loop-observer-plot"))
         self.assertIsNotNone(_component("custom-region-diagnostics-plot"))
         self.assertIsNotNone(_component("step-range"))
         restored = app.restore_from_url(
             "?smin=2&smax=4&hcrange=percentile&frad=0.31"
-            "&tf=37&loop=1&lx=-4.5&lz=2&lr=7&minimal=1", False)
-        self.assertEqual(len(restored), 62)
+            "&tf=37&loop=1&lx=-4.5&lz=2&lr=7"
+            "&uscale=0.1&ulabel=mm&minimal=1", False)
+        self.assertEqual(len(restored), 64)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
         self.assertEqual(restored[44], 0.31)
         self.assertEqual(restored[46:51], (37.0, ["on"], -4.5, 2, 7))
-        self.assertTrue(restored[60])
-        self.assertEqual(len(app.restore_from_url("", True)), 62)
+        self.assertEqual(restored[60:62], (0.1, "mm"))
+        self.assertTrue(restored[62])
+        self.assertEqual(len(app.restore_from_url("", True)), 64)
         legacy_color = app.restore_from_url("?color=one", False)
         self.assertEqual(legacy_color[7], "categorical")
         rings = [

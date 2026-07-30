@@ -8,6 +8,8 @@
 (function () {
   "use strict";
 
+  var baseFigures = {};
+
   function clone(value) {
     if (value === undefined) return undefined;
     return JSON.parse(JSON.stringify(value, function (_key, item) {
@@ -58,6 +60,57 @@
   function segId(row) {
     if (!Array.isArray(row) || row.length < 7) return "";
     return String(row[6] || "");
+  }
+
+  function figureSignature(fig) {
+    var ids = {};
+    var points = 0;
+    ((fig && fig.data) || []).forEach(function (trace) {
+      var customdata = sequence(trace && trace.customdata) || [];
+      points += customdata.length;
+      customdata.forEach(function (row) {
+        var id = segId(row);
+        if (id) ids[id] = true;
+      });
+    });
+    var meta = (fig && fig.layout && fig.layout.meta) || {};
+    return [
+      ((fig && fig.data) || []).length,
+      points,
+      Object.keys(ids).sort().join("\u001f"),
+      JSON.stringify(meta.panel_order_values || []),
+      String(meta.stats_unit || "trial")
+    ].join("\u001e");
+  }
+
+  function finiteCoordinateCount(fig) {
+    var total = 0;
+    ((fig && fig.data) || []).forEach(function (trace) {
+      ["x", "y", "r", "theta"].forEach(function (key) {
+        var values = sequence(trace && trace[key]);
+        if (!values) return;
+        values.forEach(function (value) {
+          if (Number.isFinite(Number(value))) total += 1;
+        });
+      });
+    });
+    return total;
+  }
+
+  function sourceFigure(id, figure) {
+    var signature = figureSignature(figure);
+    var finite = finiteCoordinateCount(figure);
+    var cached = baseFigures[id];
+    if (!cached || cached.signature !== signature ||
+        finite >= cached.finite) {
+      cached = {
+        signature: signature,
+        finite: finite,
+        figure: clone(figure || {data: [], layout: {}})
+      };
+      baseFigures[id] = cached;
+    }
+    return cached.figure;
   }
 
   function selectedSegments(fig, fraction, seed) {
@@ -176,7 +229,7 @@
   }
 
   function filterFigure(fig, fraction, seed) {
-    var source = clone(fig || {data: [], layout: {}});
+    var source = clone(sourceFigure("trajectory-plot", fig));
     var selected = selectedSegments(source, fraction, seed);
     if (selected.all) return source;
     source.data = (source.data || []).map(function (trace) {
@@ -226,7 +279,10 @@
           seen[uniqueKey] = true;
           var strength = Number(row[7]);
           var theta = Number(row[8]) * Math.PI / 180;
-          var weight = Number(row[10]);
+          var animalMode = String(
+            ((figure.layout || {}).meta || {}).stats_unit || "trial"
+          ) === "animal";
+          var weight = animalMode ? 1 : Number(row[10]);
           if (![strength, theta, weight].every(Number.isFinite) || weight <= 0) {
             return;
           }
@@ -254,11 +310,23 @@
   }
 
   function render(trajectoryFigure, polarFigure, fraction, seed) {
-    var selected = selectedSegments(trajectoryFigure, fraction, seed);
+    var trajectorySource = sourceFigure(
+      "trajectory-plot", trajectoryFigure || {data: [], layout: {}}
+    );
+    var polarSource = sourceFigure(
+      "polar-plot", polarFigure || {data: [], layout: {}}
+    );
+    var selected = selectedSegments(trajectorySource, fraction, seed);
+    var polarAnimalMode = String(
+      ((polarSource.layout || {}).meta || {}).stats_unit || "trial"
+    ) === "animal";
+    var polarSelected = polarAnimalMode ?
+      selectedSegments(polarSource, fraction, seed) : selected;
     window.setTimeout(function () {
-      applyGraph("trajectory-plot", trajectoryFigure, selected);
-      // Polar and trajectory customdata share the exact `_seg_id` identity.
-      applyGraph("polar-plot", polarFigure, selected);
+      applyGraph("trajectory-plot", trajectorySource, selected);
+      // Trial-mode polar and trajectory customdata share `_seg_id`. Animal
+      // mode deliberately samples its independent animal vectors instead.
+      applyGraph("polar-plot", polarSource, polarSelected);
     }, 35);
     return {
       selected: selected.count,

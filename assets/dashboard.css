@@ -192,6 +192,32 @@ body {
   flex-shrink: 0;
 }
 
+.sidebar-arrow-button {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 !important;
+  font-size: 22px !important;
+  line-height: 24px;
+}
+
+#drop-zone.is-receiving-data #drop-label::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border: 2px solid rgba(164, 95, 0, 0.22);
+  border-top-color: #a45f00;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: td-spin 0.75s linear infinite;
+}
+
+@keyframes td-spin {
+  to { transform: rotate(360deg); }
+}
+
 #vel-range-hist,
 #disp-range-hist,
 #trial-range-hist,
@@ -804,4 +830,42 @@ body._dash-loading-callback .status-dot {
 
 .td-clean-layout #flow-field-legend {
   display: none !important;
+}
+
+.td-clean-scale-overlay {
+  position: absolute;
+  z-index: 8;
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  pointer-events: none;
+  color: #5f6368;
+  font-size: 11px;
+  line-height: 1;
+  text-shadow:
+    -1px -1px 0 rgba(255, 255, 255, 0.96),
+    1px -1px 0 rgba(255, 255, 255, 0.96),
+    -1px 1px 0 rgba(255, 255, 255, 0.96),
+    1px 1px 0 rgba(255, 255, 255, 0.96);
+}
+
+.td-clean-scale-overlay i {
+  display: block;
+  width: 100%;
+  border-top: 4px solid #666;
+}
+
+.td-clean-scale-overlay span {
+  white-space: nowrap;
+}
+
+.td-plain-number {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+.td-plain-number::-webkit-inner-spin-button,
+.td-plain-number::-webkit-outer-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
 }

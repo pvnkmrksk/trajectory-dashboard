@@ -7,8 +7,10 @@
 
   var GRAPH_IDS = [
     "trajectory-plot", "loop-observer-plot", "heatmap-plot",
-    "flow-plot", "polar-plot"
+    "flow-plot", "polar-plot", "initial-heading-plot",
+    "roi-plot", "custom-region-diagnostics-plot", "trial-metrics-plot"
   ];
+  var activeOrder = null;
 
   function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -35,6 +37,123 @@
     return ((gd.layout && gd.layout.annotations) || []).filter(function (ann) {
       return ann && wantedSet[String(ann.hovertext)] === true;
     });
+  }
+
+  function numericCache(gd) {
+    var meta = (gd.layout && gd.layout.meta) || {};
+    var raw = (meta.panel_order_values || []).map(String);
+    if (!raw.length) return null;
+    var oldIndex = {};
+    raw.forEach(function (name, index) { oldIndex[name] = index; });
+    return {
+      dataRef: gd.data,
+      raw: raw,
+      labels: (meta.panel_order_labels || raw).map(String),
+      mixedX: Boolean(meta.td_mixed_group_x),
+      oldIndex: oldIndex,
+      traces: (gd.data || []).map(function (trace) {
+        return {
+          group: String(((trace || {}).meta || {}).td_group_value || ""),
+          x: Array.isArray(trace && trace.x) ?
+            trace.x.slice() : (
+              ArrayBuffer.isView(trace && trace.x) ?
+                Array.from(trace.x) : null
+            )
+        };
+      }),
+      shapes: (gd.layout.shapes || []).map(function (shape) {
+        var match = /^td-group-shape:(.*)$/.exec(
+          String((shape && shape.name) || "")
+        );
+        return {
+          group: match ? match[1] : "",
+          x0: Number(shape && shape.x0),
+          x1: Number(shape && shape.x1)
+        };
+      })
+    };
+  }
+
+  function applyNumericGraph(gd, order) {
+    var cache = gd.__tdNumericOrder;
+    if (!cache || cache.dataRef !== gd.data) {
+      cache = numericCache(gd);
+      gd.__tdNumericOrder = cache;
+    }
+    if (!cache) return false;
+    var desired = (order || []).map(String).filter(function (name) {
+      return Object.prototype.hasOwnProperty.call(cache.oldIndex, name);
+    });
+    cache.raw.forEach(function (name) {
+      if (desired.indexOf(name) < 0) desired.push(name);
+    });
+    if (desired.length !== cache.raw.length) return false;
+    var newIndex = {};
+    desired.forEach(function (name, index) { newIndex[name] = index; });
+    var jobs = [];
+    cache.traces.forEach(function (item, index) {
+      if (!item.x || !(item.group in newIndex)) return;
+      var delta = newIndex[item.group] - cache.oldIndex[item.group];
+      jobs.push(window.Plotly.restyle(
+        gd, {x: [item.x.map(function (value) {
+          var numeric = Number(value);
+          return Number.isFinite(numeric) ? numeric + delta : value;
+        })]}, [index]
+      ));
+    });
+    if (cache.mixedX) {
+      cache.traces.forEach(function (item, index) {
+        if (!item.x || item.group) return;
+        jobs.push(window.Plotly.restyle(
+          gd, {x: [item.x.map(function (value) {
+            var numeric = Number(value);
+            if (!Number.isFinite(numeric)) return value;
+            var baseIndex = Math.round(numeric);
+            if (baseIndex < 0 || baseIndex >= cache.raw.length) return value;
+            var rawName = cache.raw[baseIndex];
+            return numeric + newIndex[rawName] - baseIndex;
+          })]}, [index]
+        ));
+      });
+    }
+    var update = {};
+    cache.shapes.forEach(function (item, index) {
+      if (!(item.group in newIndex)) return;
+      var delta = newIndex[item.group] - cache.oldIndex[item.group];
+      if (Number.isFinite(item.x0)) {
+        update["shapes[" + index + "].x0"] = item.x0 + delta;
+      }
+      if (Number.isFinite(item.x1)) {
+        update["shapes[" + index + "].x1"] = item.x1 + delta;
+      }
+    });
+    var labelByRaw = {};
+    cache.raw.forEach(function (name, index) {
+      labelByRaw[name] = cache.labels[index] || name;
+    });
+    Object.keys(gd.layout || {}).forEach(function (key) {
+      if (!/^xaxis\d*$/.test(key)) return;
+      update[key + ".tickvals"] = desired.map(function (_name, index) {
+        return index;
+      });
+      update[key + ".ticktext"] = desired.map(function (name) {
+        return labelByRaw[name] || name;
+      });
+    });
+    var annotations = clone(gd.layout.annotations || []);
+    annotations.forEach(function (annotation) {
+      var match = /^td-stats:(.*)$/.exec(
+        String((annotation && annotation.name) || "")
+      );
+      if (!match || !(match[1] in newIndex)) return;
+      var offset = Number(annotation.x) - cache.oldIndex[match[1]];
+      annotation.x = newIndex[match[1]] +
+        (Number.isFinite(offset) ? offset : 0);
+    });
+    update.annotations = annotations;
+    jobs.push(window.Plotly.relayout(gd, update));
+    Promise.all(jobs);
+    return true;
   }
 
   function buildCache(gd, id, wanted) {
@@ -87,6 +206,10 @@
   function applyToGraph(id, order) {
     var gd = graphDiv(id);
     if (!gd || !gd.layout || !window.Plotly) return;
+    if ((id === "roi-plot" ||
+         id === "custom-region-diagnostics-plot" ||
+         id === "trial-metrics-plot") &&
+        applyNumericGraph(gd, order)) return;
     var cache = gd.__tdPanelOrder;
     if (!cache || cache.dataRef !== gd.data) {
       cache = buildCache(gd, id, order);
@@ -133,6 +256,7 @@
   function apply(orderData) {
     var order = (orderData && orderData.order) || [];
     if (!order.length) return;
+    activeOrder = clone(orderData);
     GRAPH_IDS.forEach(function (id) { applyToGraph(id, order); });
   }
 
@@ -207,6 +331,11 @@
   else document.addEventListener('DOMContentLoaded', bind);
 
   window.dash_clientside = Object.assign({}, window.dash_clientside, {
-    panel_order: {apply: apply}
+    panel_order: {
+      apply: apply,
+      reapply: function () {
+        if (activeOrder) apply(activeOrder);
+      }
+    }
   });
 })();

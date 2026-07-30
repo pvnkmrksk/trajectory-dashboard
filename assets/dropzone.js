@@ -4,6 +4,19 @@
 (function () {
   function send(folder, files) {
     if (window.dash_clientside && window.dash_clientside.set_props) {
+      var hasVr = files.some(function (path) {
+        return /_VR[^/]*\.csv$/i.test(String(path));
+      });
+      var guessed = (folder ? folder.replace(/\/+$/, '') + '/' : '') +
+        '**/' + (hasVr ? '*_VR*.csv' : '*.csv');
+      window.dash_clientside.set_props('glob-input', {value: guessed});
+      window.dash_clientside.set_props('load-status', {
+        children: 'Received ' + files.length.toLocaleString() +
+          ' CSV path(s) — resolving the folder and starting parallel loading…'
+      });
+      window.dash_clientside.set_props(
+        'load-progress-interval', {disabled: false}
+      );
       window.dash_clientside.set_props('drop-data', {
         data: { folder: folder, files: files.slice(0, 4000), n: files.length, ts: Date.now() }
       });
@@ -34,7 +47,11 @@
         if (rp.toLowerCase().endsWith('.csv')) files.push(rp);
         if (!folder && rp.indexOf('/') >= 0) folder = rp.split('/')[0];
       }
-      if (files.length && zone.__setBusy) zone.__setBusy();
+      if (files.length && zone.__setBusy) {
+        zone.__setBusy(
+          'Received ' + files.length.toLocaleString() + ' CSV path(s)…'
+        );
+      }
       send(folder, files);
     });
 
@@ -93,8 +110,9 @@
       zone.style.minHeight = '92px';
       zone.style.transform = 'scale(1)';
       zone.style.boxShadow = 'none';
-      if (label) label.textContent = msg || 'Processing...';
-      if (sub) sub.textContent = 'Locating the folder on disk...';
+      zone.classList.add('is-receiving-data');
+      if (label) label.textContent = msg || 'Processing…';
+      if (sub) sub.textContent = 'Message received · resolving path…';
     }
     zone.__setBusy = busy;
     // Clear the busy state once loading actually starts (progress bar shows).
@@ -103,6 +121,7 @@
       new MutationObserver(function () {
         if (getComputedStyle(track).display !== 'none') {
           zone.__busy = false;
+          zone.classList.remove('is-receiving-data');
           if (label) label.textContent = defLabel;
           if (sub) sub.textContent = defSub;
         }
@@ -133,7 +152,8 @@
     function handleDrop(e) {
       if (!isFileDrag(e) || !isDropSurface(e.target)) return;
       dragDepth = 0;
-      e.preventDefault(); e.stopPropagation(); hi(false); busy('Processing...');
+      e.preventDefault(); e.stopPropagation(); hi(false);
+      busy('Reading dropped folder…');
       var items = e.dataTransfer.items;
       var files = [], folderName = '', pending = 0, done = false;
 

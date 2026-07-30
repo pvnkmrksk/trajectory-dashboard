@@ -12,6 +12,7 @@ Usage:
 import argparse
 import base64
 import copy
+import concurrent.futures
 import glob
 import json
 import logging
@@ -1984,10 +1985,12 @@ def _roi_overlay_shapes(group_items, rois_by_cfg, reach) -> list:
         for roi in rlist:
             col = _ROI_SIDE_COLOR.get(roi["side"], "#6c757d")
             shapes.append(dict(type="circle", xref=sx, yref=sy, layer="below",
+                name="td-target-overlay",
                 x0=roi["x"] - reach, x1=roi["x"] + reach,
                 y0=roi["z"] - reach, y1=roi["z"] + reach, opacity=0.12,
                 fillcolor=col, line=dict(color=col, width=1.4, dash="dot")))
             shapes.append(dict(type="circle", xref=sx, yref=sy, layer="above",
+                name="td-target-overlay",
                 x0=roi["x"] - dot, x1=roi["x"] + dot,
                 y0=roi["z"] - dot, y1=roi["z"] + dot, opacity=0.95,
                 fillcolor=col, line=dict(color=col, width=0)))
@@ -2042,12 +2045,14 @@ def _roi_count_annotations(group_items, counts, outcomes=None) -> list:
         sx, sy = _subplot_axis(i + 1)
         left_txt, right_txt = _roi_count_texts(gname, gdf, counts, outcomes)
         anns.append(dict(text=left_txt, showarrow=False,
+            name="td-target-overlay",
             xref=f"{sx} domain", yref=f"{sy} domain", x=0.01, y=0.98,
             xanchor="left", yanchor="top", align="left",
             font=dict(size=10, color=_ROI_SIDE_COLOR["left"]),
             bgcolor="rgba(255,255,255,0.76)",
             bordercolor=_ROI_SIDE_COLOR["left"], borderwidth=0.6))
         anns.append(dict(text=right_txt, showarrow=False,
+            name="td-target-overlay",
             xref=f"{sx} domain", yref=f"{sy} domain", x=0.99, y=0.98,
             xanchor="right", yanchor="top", align="right",
             font=dict(size=10, color=_ROI_SIDE_COLOR["right"]),
@@ -2833,6 +2838,11 @@ def build_custom_region_diagnostics_figure(
                         legendgroup=f"window:{region_id}",
                         showlegend=False,
                         marker=dict(color=color, size=5, opacity=0.62),
+                        meta={
+                            "td_group_value": str(
+                                panel.get("raw", panel_names[group_index])),
+                            "td_region_value": str(region_id),
+                        },
                         customdata=custom,
                         hovertemplate=hover,
                     ), row=row, col=col)
@@ -2859,6 +2869,11 @@ def build_custom_region_diagnostics_figure(
                         line_color=color,
                         fillcolor=color,
                         opacity=0.48,
+                        meta={
+                            "td_group_value": str(
+                                panel.get("raw", panel_names[group_index])),
+                            "td_region_value": str(region_id),
+                        },
                         customdata=custom,
                         hovertemplate=hover,
                     ), row=row, col=col)
@@ -2873,6 +2888,10 @@ def build_custom_region_diagnostics_figure(
                     fillcolor=_rgba(color, 0.14),
                     line=dict(color=_rgba(color, 0.72), width=1.3),
                     layer="above",
+                    name=(
+                        f"td-group-shape:"
+                        f"{panel.get('raw', panel_names[group_index])}"
+                    ),
                     row=row,
                     col=col,
                 )
@@ -2884,6 +2903,10 @@ def build_custom_region_diagnostics_figure(
                     y1=float(median),
                     line=dict(color=color, width=2.1),
                     layer="above",
+                    name=(
+                        f"td-group-shape:"
+                        f"{panel.get('raw', panel_names[group_index])}"
+                    ),
                     row=row,
                     col=col,
                 )
@@ -2909,6 +2932,14 @@ def build_custom_region_diagnostics_figure(
             xanchor="left", x=0,
         ),
         hoverlabel=dict(namelength=-1),
+        meta={
+            "panel_order_values": [
+                str(panel.get("raw", panel.get("name", "Group")))
+                for panel in panels
+            ],
+            "panel_order_labels": panel_names,
+            "region_count": region_count,
+        },
     )
     fig.add_annotation(
         x=0.5, y=-0.16, xref="paper", yref="paper", showarrow=False,
@@ -3008,6 +3039,7 @@ def _heatmap_roi_shapes(group_roi_stats, reach) -> list[dict]:
             x, z = float(stat["x"]), float(stat["z"])
             shapes.append(dict(
                 type="circle", xref=sx, yref=sy, layer="above",
+                name="td-target-overlay",
                 x0=x - reach, x1=x + reach, y0=z - reach, y1=z + reach,
                 fillcolor="rgba(0,0,0,0)", opacity=0.32,
                 line=dict(color=_rgba(col, 0.72), width=1.1, dash="dot"),
@@ -3027,7 +3059,8 @@ def _heatmap_roi_annotations(group_roi_stats, roi_texts) -> list[dict]:
         ):
             col = _ROI_SIDE_COLOR[side]
             anns.append(dict(
-                name=f"hm-roi-{side}", text=text, showarrow=False,
+                name=f"td-target-overlay:hm-roi-{side}",
+                text=text, showarrow=False,
                 xref=f"{sx} domain", yref=f"{sy} domain",
                 x=x, y=1.025, xanchor=anchor, yanchor="bottom",
                 align=anchor, font=dict(size=10, color=_rgba(col, 0.95)),
@@ -4012,7 +4045,7 @@ def build_velocity_histogram(df, vel_threshold=None, velocity_values=None):
 
     cap = float(np.quantile(vel, 0.99))
     shown = vel[(vel >= 0) & (vel <= cap)] if cap > 0 else vel
-    edges = _histogram_edges(shown, 0.0, cap, max_bins=72)
+    edges = _histogram_edges(shown, 0.0, cap, max_bins=144)
     counts, edges = np.histogram(shown, bins=edges)
     centres = 0.5 * (edges[:-1] + edges[1:])
 
@@ -4048,7 +4081,7 @@ def build_displacement_histogram(stats_df, min_disp=None):
     disp = disp[np.isfinite(disp)]
     cap = float(np.quantile(disp, 0.99)) if disp.size else None
     shown = disp[(disp >= 0) & (disp <= cap)] if cap and cap > 0 else disp
-    edges = _histogram_edges(shown, 0.0, cap, max_bins=60)
+    edges = _histogram_edges(shown, 0.0, cap, max_bins=120)
     counts, edges = np.histogram(shown, bins=edges)
     centres = 0.5 * (edges[:-1] + edges[1:])
     fig = go.Figure()
@@ -4077,7 +4110,7 @@ def build_displacement_histogram(stats_df, min_disp=None):
     return fig
 
 
-MINI_HIST_BINS = 36
+MINI_HIST_BINS = 72
 MINI_HIST_UPPER_PCT = 99.5
 
 
@@ -4457,8 +4490,10 @@ def build_initial_heading_distribution(df, ncols=2, bins=36) -> go.Figure:
                          tickmode="array", tickvals=list(range(0, 360, 45))),
         radialaxis=dict(angle=90, tickangle=90, rangemode="tozero"),
         bgcolor="white")
-    for ann in fig.layout.annotations:
-        ann.update(font=dict(size=10), yshift=8)
+    for index, ann in enumerate(fig.layout.annotations):
+        ann.update(font=dict(size=10), yshift=14)
+        if index < len(names):
+            ann.update(hovertext=str(names[index]))
     fig.update_layout(
         height=80 + nrows * 380, template="plotly_white",
         margin=dict(l=45, r=45, t=72, b=35), showlegend=False,
@@ -4509,7 +4544,13 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
         reach_right=("reached_right", "sum"),
         trials=("_seg_id", "size")).reset_index()
     grp["label"] = grp["ConfigFile"].map(humanise_config)
-    labels = sorted(grp["label"].unique())
+    raw_config_order = _ordered_group_values(
+        grp["ConfigFile"].astype(str).unique(), "config")
+    labels = list(dict.fromkeys(
+        humanise_config(raw) for raw in raw_config_order))
+    raw_by_label = {
+        humanise_config(raw): str(raw) for raw in raw_config_order
+    }
     xpos = {lab: i for i, lab in enumerate(labels)}
     n_animals = grp["animal"].nunique()
     lc, rc = _ROI_SIDE_COLOR["left"], _ROI_SIDE_COLOR["right"]
@@ -4660,7 +4701,13 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
 
     fig.update_layout(template="plotly_white", height=1220, violinmode="overlay",
         legend=dict(orientation="h", y=1.05, yanchor="bottom", x=1, xanchor="right"),
-        margin=dict(l=60, r=20, t=50, b=80), dragmode="pan")
+        margin=dict(l=60, r=20, t=50, b=80), dragmode="pan",
+        meta={
+            "panel_order_values": [
+                raw_by_label[label] for label in labels],
+            "panel_order_labels": labels,
+            "td_mixed_group_x": True,
+        })
     fig.update_yaxes(title_text="fraction reaching", range=[-0.03, 1.03], row=1, col=1)
     fig.update_yaxes(title_text="residence (s/trial)", rangemode="tozero", row=2, col=1)
     fig.update_yaxes(title_text="time to reach (s)", rangemode="tozero", row=3, col=1)
@@ -4765,27 +4812,33 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     ]
     for row, tests in enumerate(panel_tests, start=1):
         adjusted = _holm_adjust([item["raw_p"] for item in tests])
-        parts = []
         for item, q_value in zip(tests, adjusted):
             item["holm_p"] = (
                 float(q_value) if np.isfinite(q_value) else None)
             item["stars"] = _p_stars(q_value)
-            if item["holm_p"] is not None and item["holm_p"] < 0.05:
-                parts.append(f"{item['left']} {item['stars']}")
-        label = (
-            "L↔R Holm: " + " · ".join(parts[:6])
-            if parts else "L↔R Holm: no q<.05"
-        )
-        xref, yref = _subplot_axis(row)
-        fig.add_annotation(
-            name="td-target-stats",
-            x=0.99, y=0.98,
-            xref=f"{xref} domain", yref=f"{yref} domain",
-            xanchor="right", yanchor="top",
-            showarrow=False, text=label,
-            bgcolor="rgba(255,250,235,0.88)", borderpad=2,
-            font=dict(size=9, color="#7a4f00"),
-        )
+            if item["left"] not in xpos:
+                continue
+            xref, yref = _subplot_axis(row)
+            q_text = (
+                f"{item['holm_p']:.3g}"
+                if item["holm_p"] is not None else "n/a"
+            )
+            fig.add_annotation(
+                name=(
+                    f"td-stats:"
+                    f"{raw_by_label.get(item['left'], item['left'])}"
+                ),
+                x=xpos[item["left"]], y=0.98,
+                xref=xref, yref=f"{yref} domain",
+                xanchor="center", yanchor="top",
+                showarrow=False, text=f"<b>{item['stars']}</b>",
+                hovertext=(
+                    f"{item['left']} · left versus right"
+                    f"<br>Holm q={q_text}"
+                ),
+                bgcolor="rgba(255,255,255,0.76)", borderpad=1,
+                font=dict(size=10, color="#7a4f00"),
+            )
     return fig
 
 
@@ -4953,6 +5006,15 @@ _POLAR_HOVER = (
     "%{customdata[9]}<extra></extra>"
 )
 
+_POLAR_ANIMAL_HOVER = (
+    "<b>%{customdata[2]} @ %{customdata[3]}</b><br>"
+    "%{customdata[13]:.0f} trials pooled within animal<br>"
+    "config=%{customdata[4]}<br>"
+    "R=%{customdata[7]:.2f} theta=%{customdata[8]:.0f}°<br>"
+    "valid heading=%{customdata[10]:.0f}/%{customdata[11]:.0f} pts "
+    "(%{customdata[12]:.0%})<extra></extra>"
+)
+
 
 def _frac_value(v, default=0.0) -> float:
     if v is None or v == "":
@@ -5077,6 +5139,10 @@ def _polar_custom_base(sub: pd.DataFrame, roi_outcomes=None) -> np.ndarray:
         sub["valid_points"].to_numpy(),
         sub["n_points"].to_numpy(),
         sub["valid_frac"].to_numpy(),
+        pd.to_numeric(
+            sub.get("unit_trials", pd.Series(1, index=sub.index)),
+            errors="coerce",
+        ).fillna(1).to_numpy(dtype=float),
     ])
 
 
@@ -5140,7 +5206,121 @@ def _polar_seq_values(ray: pd.DataFrame, color_by: str):
     return None, None, None, ""
 
 
-def _population_polar_vector(ray: pd.DataFrame) -> tuple[float, float, int]:
+def _polar_by_animal(ray: pd.DataFrame) -> pd.DataFrame:
+    """Collapse trial rays to one sample-weighted circular vector per animal.
+
+    The collapse happens within the active subplot group.  An animal may
+    therefore contribute once to each treatment/scene panel it actually
+    experienced, but never more than once within that panel.
+    """
+    if ray is None or len(ray) == 0:
+        return ray
+    required = {"animal", "R", "theta_deg", "valid_points", "group"}
+    if not required.issubset(ray.columns):
+        return ray
+    work = ray.copy()
+    radius = pd.to_numeric(work["R"], errors="coerce").to_numpy(dtype=float)
+    theta = np.radians(pd.to_numeric(
+        work["theta_deg"], errors="coerce").to_numpy(dtype=float))
+    weight = pd.to_numeric(
+        work["valid_points"], errors="coerce").to_numpy(dtype=float)
+    good = (
+        np.isfinite(radius) & np.isfinite(theta)
+        & np.isfinite(weight) & (weight > 0)
+    )
+    work = work.loc[good].copy()
+    if len(work) == 0:
+        return work
+    radius, theta, weight = radius[good], theta[good], weight[good]
+    work["_wx"] = weight * radius * np.sin(theta)
+    work["_wz"] = weight * radius * np.cos(theta)
+    work["_weight"] = weight
+    work["_trial_count"] = 1
+    if "cval" in work:
+        cval = pd.to_numeric(work["cval"], errors="coerce").to_numpy(dtype=float)
+        work["_weighted_cval"] = np.where(
+            np.isfinite(cval), cval * weight, 0.0)
+        work["_cval_weight"] = np.where(np.isfinite(cval), weight, 0.0)
+    else:
+        work["_weighted_cval"] = 0.0
+        work["_cval_weight"] = 0.0
+
+    keys = ["group", "animal"]
+    sums = work.groupby(
+        keys, sort=False, observed=True, dropna=False,
+    ).agg(
+        _wx=("_wx", "sum"),
+        _wz=("_wz", "sum"),
+        valid_points=("_weight", "sum"),
+        n_points=("n_points", "sum"),
+        unit_trials=("_trial_count", "sum"),
+        _weighted_cval=("_weighted_cval", "sum"),
+        _cval_weight=("_cval_weight", "sum"),
+    ).reset_index()
+    first_columns = [
+        column for column in (
+            "ConfigFile", "SceneName", "SourceFolder", "VR", "FlyID",
+            "CurrentTrial", "CurrentStep", "SourceFile", "StartTime",
+        ) if column in work
+    ]
+    first = (
+        work.groupby(keys, sort=False, observed=True, dropna=False)[
+            first_columns
+        ].first().reset_index()
+        if first_columns else work[keys].drop_duplicates()
+    )
+    out = sums.merge(first, on=keys, how="left", sort=False)
+    total = out["valid_points"].to_numpy(dtype=float)
+    ux = np.divide(
+        out["_wx"].to_numpy(dtype=float), total,
+        out=np.zeros(len(out), dtype=float), where=total > 0)
+    uz = np.divide(
+        out["_wz"].to_numpy(dtype=float), total,
+        out=np.zeros(len(out), dtype=float), where=total > 0)
+    out["R"] = np.hypot(ux, uz)
+    out["theta_deg"] = np.degrees(np.arctan2(ux, uz))
+    cweight = out["_cval_weight"].to_numpy(dtype=float)
+    out["cval"] = np.divide(
+        out["_weighted_cval"].to_numpy(dtype=float), cweight,
+        out=np.full(len(out), np.nan), where=cweight > 0)
+    out["valid_points"] = out["valid_points"].round().astype(np.int64)
+    out["n_points"] = pd.to_numeric(
+        out["n_points"], errors="coerce").fillna(0).round().astype(np.int64)
+    out["valid_frac"] = np.divide(
+        out["valid_points"].to_numpy(dtype=float),
+        out["n_points"].to_numpy(dtype=float),
+        out=np.zeros(len(out), dtype=float),
+        where=out["n_points"].to_numpy(dtype=float) > 0,
+    )
+    out["_seg_id"] = (
+        "animal:" + out["group"].astype(str)
+        + "|" + out["animal"].astype(str)
+    )
+    # Keep the trial colour mode meaningful as the mean trial number.
+    work["_numeric_trial"] = pd.to_numeric(
+        work.get("CurrentTrial", pd.Series(np.nan, index=work.index)),
+        errors="coerce",
+    )
+    trial_mean = work.groupby(
+        keys, sort=False, observed=True, dropna=False)["_numeric_trial"].mean()
+    if len(trial_mean):
+        out["CurrentTrial"] = [
+            trial_mean.get((group, animal), np.nan)
+            for group, animal in zip(out["group"], out["animal"])
+        ]
+    out["CurrentStep"] = out.get("CurrentStep", "")
+    for column in (
+            "ConfigFile", "SceneName", "SourceFolder", "VR", "FlyID",
+            "SourceFile", "StartTime"):
+        if column not in out:
+            out[column] = ""
+    return out.drop(columns=[
+        "_wx", "_wz", "_weighted_cval", "_cval_weight",
+    ], errors="ignore")
+
+
+def _population_polar_vector(
+        ray: pd.DataFrame, *, equal_units=False) -> tuple[float, float, int]:
     """Exact pooled mean of all valid circular samples represented by rays.
 
     A trial ray is the mean of its unit sample vectors. Multiplying that vector
@@ -5151,7 +5331,10 @@ def _population_polar_vector(ray: pd.DataFrame) -> tuple[float, float, int]:
         return 0.0, 0.0, 0
     r = ray["R"].to_numpy(dtype=float)
     th = np.radians(ray["theta_deg"].to_numpy(dtype=float))
-    w = ray["valid_points"].to_numpy(dtype=float)
+    w = (
+        np.ones(len(ray), dtype=float)
+        if equal_units else ray["valid_points"].to_numpy(dtype=float)
+    )
     good = np.isfinite(r) & np.isfinite(th) & np.isfinite(w) & (w > 0)
     if not np.any(good):
         return 0.0, 0.0, 0
@@ -5159,7 +5342,8 @@ def _population_polar_vector(ray: pd.DataFrame) -> tuple[float, float, int]:
     total = float(w.sum())
     vx = float(np.sum(w * r * np.sin(th)) / total)
     vz = float(np.sum(w * r * np.cos(th)) / total)
-    return math.hypot(vx, vz), math.degrees(math.atan2(vx, vz)), int(total)
+    support = int(np.sum(good)) if equal_units else int(total)
+    return math.hypot(vx, vz), math.degrees(math.atan2(vx, vz)), support
 
 
 def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
@@ -5167,13 +5351,14 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                        max_points=None, rois=None, reach_radius=3.0, show_rois=False,
                        roi_outcomes=None, r_range=None, min_point_frac=0.0,
                        min_animal_trial_frac=0.0, return_summary=False,
-                       angle_source="orientation"):
-    """One Rayleigh vector per trial from body yaw or movement heading.
+                       angle_source="orientation", stats_unit="trial"):
+    """One Rayleigh vector per trial or animal from yaw/movement heading.
 
     Radius ``R`` is circular concentration (0 = scattered, 1 = aligned). Unity's
     left-handed convention is used throughout: 0° forward/+Z and clockwise
-    positive. The bold population ray is the exact sample-weighted circular mean
-    computed before display thinning. ROI directions are reference spokes.
+    positive. Trial mode uses the exact sample-weighted population mean. Animal
+    mode first pools each animal's valid trial samples, then gives every animal
+    equal weight in the bold population vector. ROI directions are references.
     """
     if df is None or len(df) == 0:
         return _msg_figure("No trajectories match the active filters.")
@@ -5184,8 +5369,17 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
     names = list(groups.keys())
     n = len(names)
     nrows = max(1, (n + ncols - 1) // ncols)
-    total_by_group = {name: int(group["_seg_id"].nunique())
-                      for name, group in groups.items()}
+    animal_mode = str(stats_unit or "trial") == "animal"
+    total_by_group = {}
+    for name, group in groups.items():
+        if animal_mode:
+            animals = (
+                group["FlyID"].astype(str) + "@"
+                + group["VR"].astype(str)
+            )
+            total_by_group[name] = int(animals.nunique())
+        else:
+            total_by_group[name] = int(group["_seg_id"].nunique())
     # seg -> subplot-group map (vectorised via concat of per-group index labels)
     seg_group = pd.concat([pd.Series(gname, index=g["_seg_id"].unique())
                            for gname, g in groups.items()]) if names else pd.Series(dtype=object)
@@ -5200,9 +5394,13 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
     ray, quality = _filter_polar_ray_table(ray, r_range, min_point_frac,
                                            min_animal_trial_frac)
     ray = ray.assign(group=ray["_seg_id"].map(seg_group))
+    if animal_mode:
+        ray = _polar_by_animal(ray)
     population_ray = ray
-    kept_by_group = (population_ray.groupby("group", sort=False, observed=True)["_seg_id"]
-                     .nunique().to_dict() if len(population_ray) else {})
+    kept_by_group = (
+        population_ray.groupby("group", sort=False, observed=True)["_seg_id"]
+        .nunique().to_dict() if len(population_ray) else {}
+    )
     ray = _thin_ray_table(ray, max_points=max_points)
     seq_vals, seq_cmin, seq_cmax, seq_title = _polar_seq_values(ray, color_by)
     if seq_vals is not None:
@@ -5230,7 +5428,9 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
     vspace = min(0.12, 0.7 / max(nrows, 1))
     titles = [
         (f"{_wrap_subplot_title(_group_label(group_by, name))}<br>"
-         f"{int(kept_by_group.get(name, 0)):,}/{total_by_group.get(name, 0):,} trials shown")
+         f"<sup>{int(kept_by_group.get(name, 0)):,}/"
+         f"{total_by_group.get(name, 0):,} "
+         f"{'animals' if animal_mode else 'trials'} shown</sup>")
         for name in names
     ]
     fig = make_subplots(rows=nrows, cols=ncols, specs=specs,
@@ -5249,6 +5449,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                 th_ = math.degrees(math.atan2(roi["x"], roi["z"]))
                 fig.add_trace(go.Scatterpolar(
                     r=[0, 1], theta=[th_, th_], mode="lines", showlegend=False,
+                    meta={"td_target_overlay": True},
                     hoverinfo="skip", line=dict(width=1.4, dash="dot",
                     color=_ROI_SIDE_COLOR.get(roi["side"], "#999"))),
                     row=row, col=col)
@@ -5261,7 +5462,10 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
             fig.add_trace(go.Scatterpolar(
                 r=rr.tolist(), theta=tt.tolist(), mode="lines", showlegend=False,
                 hoverinfo="skip", customdata=_cd.tolist(),
-                meta={"td_trial_source": True},
+                meta={
+                    "td_trial_source": True,
+                    "td_independent_unit": "animal" if animal_mode else "trial",
+                },
                 line=dict(color="rgba(90,96,110,0.32)", width=1)),
                 row=row, col=col)
             base_cd = _polar_custom_base(sub, roi_outcomes)
@@ -5270,7 +5474,8 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                 theta=sub["theta_deg"].to_numpy().tolist(),
                 mode="markers", showlegend=False, customdata=base_cd.tolist(),
                 meta={"td_trial_auxiliary": True},
-                hovertemplate=_POLAR_HOVER,
+                hovertemplate=(
+                    _POLAR_ANIMAL_HOVER if animal_mode else _POLAR_HOVER),
                 marker=dict(size=6, opacity=0.82,
                             color=sub["_seq_color"].to_numpy().tolist(),
                             colorscale=SEQ_COLORSCALE, cmin=seq_cmin, cmax=seq_cmax,
@@ -5348,8 +5553,14 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                     r=rr.tolist(), theta=tt.tolist(), mode="lines",
                     name=label, legendgroup=legend_group,
                     showlegend=legend_group not in legend_seen,
-                    customdata=cd.tolist(), hovertemplate=_POLAR_HOVER,
-                    meta={"td_trial_source": True},
+                    customdata=cd.tolist(),
+                    hovertemplate=(
+                        _POLAR_ANIMAL_HOVER if animal_mode else _POLAR_HOVER),
+                    meta={
+                        "td_trial_source": True,
+                        "td_independent_unit": (
+                            "animal" if animal_mode else "trial"),
+                    },
                     opacity=(
                         float(_visual("trajectory", "gray_opacity", 0.36))
                         if color_by in ("none", "gray") else
@@ -5366,13 +5577,19 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
         # ray table and weighted by each trial's valid sample count. This exactly
         # reconstructs the circular mean across all underlying samples.
         pop_sub = population_ray[population_ray["group"] == gname]
-        Rpop, thpop, n_heading = _population_polar_vector(pop_sub)
+        Rpop, thpop, n_heading = _population_polar_vector(
+            pop_sub, equal_units=animal_mode)
         source_label = "body orientation" if angle_source == "orientation" else "movement heading"
+        support_label = (
+            f"independent animals={n_heading:,}"
+            if animal_mode else f"valid samples={n_heading:,}"
+        )
         fig.add_trace(go.Scatterpolar(
             r=[0, Rpop], theta=[thpop, thpop], mode="lines+markers", showlegend=False,
             meta={"td_population": True},
-            hovertemplate=(f"pooled {source_label}<br>R={Rpop:.3f} θ={thpop:.1f}°"
-                           f"<br>valid samples={n_heading:,}<extra></extra>"),
+            hovertemplate=(
+                f"pooled {source_label}<br>R={Rpop:.3f} θ={thpop:.1f}°"
+                f"<br>{support_label}<extra></extra>"),
             line=dict(color="#0b6b2e", width=3),
             marker=dict(size=[0, 7], color="#0b6b2e")), row=row, col=col)
     # 0° at top, clockwise — matches the trajectory frame. R is a 0..1 unit disk.
@@ -5382,7 +5599,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                                       tickvals=[0.25, 0.5, 0.75, 1.0]),
                       bgcolor="white")
     for index, ann in enumerate(fig.layout.annotations):
-        ann.update(font=dict(size=10), yshift=10)
+        ann.update(font=dict(size=10), yshift=17)
         if index < len(names):
             ann.update(hovertext=names[index])
     show_legend = color_by in (
@@ -5395,10 +5612,18 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
         _horizontal_legend_layout(legend_labels, ncols, base_top=74)
         if show_legend else (54, 0)
     )
-    fig.update_layout(height=90 + nrows * 450 + legend_extra,
+    fig.update_layout(height=102 + nrows * 458 + legend_extra,
                       template="plotly_white",
-                      margin=dict(l=42, r=112, t=legend_top, b=44),
+                      margin=dict(l=42, r=112, t=legend_top + 10, b=44),
                       showlegend=show_legend,
+                      meta={
+                          "stats_unit": (
+                              "animal" if animal_mode else "trial"),
+                          "panel_order_values": [str(name) for name in names],
+                          "panel_order_labels": [
+                              _group_label(group_by, name) for name in names
+                          ],
+                      },
                       legend=dict(
                           orientation="h", yanchor="bottom", y=1.02,
                           xanchor="left", x=0, font_size=10,
@@ -5585,6 +5810,7 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                     legendgroup=f"metric:{raw_name}", showlegend=False,
                     mode="markers",
                     marker=dict(color=color, size=5, opacity=0.68),
+                    meta={"td_group_value": str(raw_name)},
                     customdata=custom, hovertemplate=hover,
                 ), row=row, col=col)
             else:
@@ -5603,6 +5829,7 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                     marker=dict(color=color, size=4, opacity=0.48),
                     width=half_width * 2,
                     line_color=color, fillcolor=color, opacity=0.55,
+                    meta={"td_group_value": str(raw_name)},
                     customdata=custom, hovertemplate=hover,
                 ), row=row, col=col)
 
@@ -5618,6 +5845,7 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                 fillcolor=_rgba(color, 0.14),
                 line=dict(color=_rgba(color, 0.72), width=1.4),
                 layer="above",
+                name=f"td-group-shape:{raw_name}",
                 row=row,
                 col=col,
             )
@@ -5629,6 +5857,7 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                 y1=float(median),
                 line=dict(color=_rgba(color, 1.0), width=3),
                 layer="above",
+                name=f"td-group-shape:{raw_name}",
                 row=row,
                 col=col,
             )
@@ -5652,6 +5881,12 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
         boxmode="group",
         showlegend=False,
         hovermode="closest",
+        meta={
+            "panel_order_values": [str(name) for name, _group in groups],
+            "panel_order_labels": [
+                _group_label(group_by, name) for name, _group in groups
+            ],
+        },
     )
     fig.add_annotation(
         x=0.5, y=-0.13, xref="paper", yref="paper", showarrow=False,
@@ -5782,6 +6017,81 @@ def _pairwise_label(pairs, group_by=None, max_pairs=6):
     if len(significant) > max_pairs:
         parts.append(f"+{len(significant) - max_pairs} more")
     return "pairwise Holm: " + " · ".join(parts)
+
+
+def _letter_token(index: int) -> str:
+    """Spreadsheet-style compact-letter token: A..Z, AA..AZ, BA..."""
+    value = max(0, int(index))
+    out = ""
+    while True:
+        out = chr(ord("A") + value % 26) + out
+        value = value // 26 - 1
+        if value < 0:
+            return out
+
+
+def _compact_letter_display(names, pairs, alpha=0.05) -> dict[str, str]:
+    """Compact letter display from Holm-adjusted pairwise comparisons.
+
+    Groups sharing a letter were not separated by a significant comparison;
+    every significant pair shares no letter.  The insert/absorb construction
+    keeps the result compact without putting an O(n²) comparison list in a
+    subplot title.
+    """
+    ordered = list(dict.fromkeys(str(name) for name in names))
+    if not ordered:
+        return {}
+    significant = {
+        frozenset((str(item.get("left")), str(item.get("right"))))
+        for item in (pairs or [])
+        if item.get("holm_p") is not None
+        and float(item["holm_p"]) < float(alpha)
+        and str(item.get("left")) != str(item.get("right"))
+    }
+    columns = [set(ordered)]
+    for pair in significant:
+        if len(pair) != 2:
+            continue
+        left, right = tuple(pair)
+        split = []
+        for column in columns:
+            if left in column and right in column:
+                split.extend((column - {left}, column - {right}))
+            else:
+                split.append(column)
+        unique = []
+        for column in split:
+            if column and column not in unique:
+                unique.append(column)
+        # A subset column adds no information when a superset remains.
+        columns = [
+            column for column in unique
+            if not any(column < other for other in unique)
+        ]
+    rank = {name: index for index, name in enumerate(ordered)}
+    columns.sort(key=lambda column: (
+        min(rank[name] for name in column), -len(column),
+        tuple(rank[name] for name in ordered if name in column),
+    ))
+    labels = {name: "" for name in ordered}
+    for index, column in enumerate(columns):
+        token = _letter_token(index)
+        for name in ordered:
+            if name in column:
+                labels[name] += token
+    return {name: (letters or _letter_token(i))
+            for i, (name, letters) in enumerate(labels.items())}
+
+
+def _compact_stat_marks(names, pairs, group_by=None) -> list[dict]:
+    """Browser-ready group labels for distribution/polar annotations."""
+    ordered = [str(name) for name in names]
+    letters = _compact_letter_display(ordered, pairs)
+    return [{
+        "group": name,
+        "label": _group_label(group_by, name) if group_by else name,
+        "letters": letters.get(name, ""),
+    } for name in ordered]
 
 
 def _rayleigh_uniformity_p(angles_deg):
@@ -5920,6 +6230,101 @@ def _custom_region_stat_labels(payload, stats_unit="trial"):
     return output
 
 
+def _custom_region_stat_marks(payload, stats_unit="trial"):
+    """Compact-letter marks above every grouped observation distribution."""
+    panels = (payload or {}).get("panels") or []
+    regions = (payload or {}).get("regions") or []
+    if not panels or not regions:
+        return []
+    keys = (
+        "sample_percent", "trial_percent", "distance_walked", "displacement",
+        "median_local_tortuosity", "median_velocity",
+    )
+    output = []
+    for metric_index, key in enumerate(keys):
+        prepared = []
+        for group_index, panel in enumerate(panels):
+            summaries = {
+                str(item.get("id")): item
+                for item in panel.get("regions", [])
+            }
+            for region_index, region in enumerate(regions):
+                region_id = str(region.get("id"))
+                values, _identities, _support = (
+                    _observation_distribution_values(
+                        summaries.get(region_id, {}), key, stats_unit)
+                )
+                values = np.asarray(values, dtype=float)
+                values = values[np.isfinite(values)]
+                raw_group = str(
+                    panel.get("raw", panel.get("name", "Group")))
+                region_name = str(region.get("name", region_id))
+                category = f"{raw_group}\x1f{region_id}"
+                prepared.append({
+                    "category": category,
+                    "group": raw_group,
+                    "group_index": group_index,
+                    "region": region_id,
+                    "region_name": region_name,
+                    "region_index": region_index,
+                    "values": values,
+                })
+        raw_pairs = []
+        for left_index in range(len(prepared)):
+            for right_index in range(left_index + 1, len(prepared)):
+                left = prepared[left_index]
+                right = prepared[right_index]
+                if not len(left["values"]) or not len(right["values"]):
+                    continue
+                try:
+                    p_value = float(scipy_stats.mannwhitneyu(
+                        left["values"], right["values"],
+                        alternative="two-sided",
+                    ).pvalue)
+                except ValueError:
+                    p_value = np.nan
+                raw_pairs.append({
+                    "left": left["category"],
+                    "right": right["category"],
+                    "raw_p": p_value,
+                    "n_left": int(len(left["values"])),
+                    "n_right": int(len(right["values"])),
+                })
+        adjusted = _holm_adjust([item["raw_p"] for item in raw_pairs])
+        for pair, q_value in zip(raw_pairs, adjusted):
+            pair["holm_p"] = (
+                float(q_value) if np.isfinite(q_value) else None)
+            pair["stars"] = _p_stars(q_value)
+        categories = [item["category"] for item in prepared]
+        letters = _compact_letter_display(categories, raw_pairs)
+        marks = []
+        for item in prepared:
+            if not len(item["values"]):
+                continue
+            relevant = [
+                pair for pair in raw_pairs
+                if item["category"] in (pair["left"], pair["right"])
+            ]
+            significant = sum(
+                pair.get("holm_p") is not None
+                and pair["holm_p"] < 0.05
+                for pair in relevant
+            )
+            marks.append({
+                "metric_index": metric_index,
+                "group": item["group"],
+                "group_index": item["group_index"],
+                "region": item["region"],
+                "region_name": item["region_name"],
+                "region_index": item["region_index"],
+                "letters": letters.get(item["category"], ""),
+                "n": int(len(item["values"])),
+                "significant_pairs": int(significant),
+            })
+        output.append(marks)
+    return output
+
+
 def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
                         pool_mode, polar_moving, polar_walk,
                         polar_angle_source, polar_r_range,
@@ -5941,6 +6346,8 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
         for column, _title, _axis in _TRIAL_METRIC_SPECS
     ]
     metric_labels = []
+    group_names = [str(name) for name, _group in groups]
+    metric_marks = []
     for (p_value, method), q_value, pairs in zip(
             raw_metric, adjusted, metric_pairs):
         omnibus = (
@@ -5951,6 +6358,13 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
             omnibus + "<br><sup>"
             + _pairwise_label(pairs, group_by) + "</sup>"
         )
+        marks = _compact_stat_marks(group_names, pairs, group_by)
+        for group_index, mark in enumerate(marks):
+            mark["group_index"] = group_index
+            mark["hover"] = (
+                f"{omnibus}<br>{_pairwise_label(pairs, group_by)}"
+            )
+        metric_marks.append(marks)
 
     polar_ray = rayleigh_by_segment(
         polar_frame, _on(polar_moving), polar_walk, "none",
@@ -5969,6 +6383,9 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
     )
     polar_ray = polar_ray.assign(
         group=polar_ray["_seg_id"].astype(str).map(seg_group))
+    polar_ray = polar_ray[polar_ray["group"].notna()]
+    if str(stats_unit or "trial") == "animal":
+        polar_ray = _polar_by_animal(polar_ray)
     polar_p, polar_method = _circular_group_test(polar_ray)
     polar_omnibus = (
         f"{polar_method} · p={polar_p:.3g} {_p_stars(polar_p)}"
@@ -6016,6 +6433,29 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
         polar_omnibus + "<br><sup>" + uniform_label + " · "
         + _pairwise_label(polar_pairs_raw, group_by) + "</sup>"
     )
+    polar_letters = _compact_letter_display(
+        polar_names, polar_pairs_raw)
+    polar_marks = []
+    uniform_by_group = {
+        item["group"]: item for item in polar_uniformity
+    }
+    for name in polar_names:
+        uniform = uniform_by_group.get(name, {})
+        p_value = uniform.get("rayleigh_p")
+        polar_marks.append({
+            "group": name,
+            "label": _group_label(group_by, name),
+            "letters": polar_letters.get(name, ""),
+            "rayleigh_p": p_value,
+            "rayleigh_stars": uniform.get("stars", "n/a"),
+            "n": int(uniform.get("n", 0)),
+            "hover": (
+                f"Rayleigh p={p_value:.3g} {_p_stars(p_value)}"
+                if p_value is not None and np.isfinite(p_value)
+                else "Rayleigh p=n/a"
+            ) + f"<br>{polar_omnibus}<br>"
+            + _pairwise_label(polar_pairs_raw, group_by),
+        })
 
     start_parts = []
     if raw_frame is not None and len(raw_frame) and "GameObjectRotY" in raw_frame:
@@ -6036,13 +6476,28 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
     )
     region_labels = _custom_region_stat_labels(
         custom_region_payload, stats_unit)
+    region_marks = _custom_region_stat_marks(
+        custom_region_payload, stats_unit)
     return {
         "pending": False,
         "completed": time.time(),
         "metric_labels": metric_labels,
+        "metric_marks": metric_marks,
         "region_labels": region_labels,
+        "region_marks": region_marks,
         "polar_label": polar_label,
+        "polar_marks": polar_marks,
         "start_label": start_label,
+        "start_marks": [{
+            "group": name,
+            "rayleigh_p": p_value,
+            "rayleigh_stars": _p_stars(p_value),
+            "n": count,
+            "hover": (
+                f"Rayleigh p={p_value:.3g} {_p_stars(p_value)}"
+                f"<br>n={count:,} initial headings"
+            ),
+        } for name, p_value, count in start_parts],
         "details": {
             "metrics": [
                 {"metric": spec[0], "test": item[1],
@@ -6087,13 +6542,18 @@ _DATA_CACHE_MAX = 3
 _DATA_LOCK = threading.RLock()
 _FILTER_LOCK = threading.RLock()
 
-# Loading keeps at most one complete source file in memory. The retained row
-# budget can be raised for unusually large-memory workstations or set to 0 to
-# opt into retaining every normalized row.
+# Loading keeps at most ``LOAD_WORKERS`` complete source files in memory. The
+# retained row budget can be raised for unusually large-memory workstations or
+# set to 0 to opt into retaining every normalized row.
 try:
     LOAD_ROW_BUDGET = max(0, int(os.environ.get("TRAJ_LOAD_ROW_BUDGET", "2000000")))
 except (TypeError, ValueError):
     LOAD_ROW_BUDGET = 2_000_000
+try:
+    LOAD_WORKERS = max(1, min(
+        8, int(os.environ.get("TRAJ_LOAD_WORKERS", "2"))))
+except (TypeError, ValueError):
+    LOAD_WORKERS = 2
 
 # Unified operation progress, polled while loads/renders run in Dash's worker
 # thread. Replacing the whole snapshot under a lock keeps hover/checklist state
@@ -6425,40 +6885,74 @@ def _load_data_locked(pattern):
     total_bytes = sum(max(1, int(sig[2] or 1)) for sig in key[1])
     dfs, stat_parts, metas, seen = [], [], [], set()
     raw_rows = 0
-    for i, f in enumerate(files):
+    retained_rows = 0
+    workers = min(LOAD_WORKERS, len(files))
+    _progress_stage(
+        op_id, 1, done=0, total=len(files),
+        message=(
+            f"Loading {len(files):,} files with {workers} parallel "
+            f"worker{'s' if workers != 1 else ''}…"
+        ),
+    )
+
+    def _load_one(index_and_file):
+        i, f = index_and_file
         file_started = time.perf_counter()
-        _progress_stage(
-            op_id, 1, done=i, total=len(files),
-            message=f"Loading {i + 1:,}/{len(files):,}: {os.path.basename(f)}",
-        )
         d = td_io.load_csv_fast(f)
-        if d is not None:
-            raw_rows += len(d)
-            smooth = smoothed_velocity(d, 10)
-            stat_parts.append(compute_segment_stats(d, smooth))
-            quota = _file_retention_quota(f, total_bytes, LOAD_ROW_BUDGET)
-            retained = _retain_loaded_file(d, quota, smooth)
-            dfs.append(retained)
-            LOGGER.info(
-                "data.file_ready file=%r raw_rows=%d retained_rows=%d "
-                "segments=%d seconds=%.3f",
-                f, len(d), len(retained), int(d["_seg_id"].nunique()),
-                time.perf_counter() - file_started,
+        if d is None:
+            return i, f, None, None, 0, 0, 0, (
+                time.perf_counter() - file_started)
+        n_raw = len(d)
+        segments = int(d["_seg_id"].nunique())
+        smooth = smoothed_velocity(d, 10)
+        stats_part = compute_segment_stats(d, smooth)
+        quota = _file_retention_quota(f, total_bytes, LOAD_ROW_BUDGET)
+        retained = _retain_loaded_file(d, quota, smooth)
+        n_retained = len(retained)
+        del d, smooth
+        return (
+            i, f, retained, stats_part, n_raw, n_retained, segments,
+            time.perf_counter() - file_started,
+        )
+
+    completed_results = []
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="trajectory-load") as pool:
+        futures = {
+            pool.submit(_load_one, item): item
+            for item in enumerate(files)
+        }
+        for completed, future in enumerate(
+                concurrent.futures.as_completed(futures), start=1):
+            result = future.result()
+            completed_results.append(result)
+            i, f, retained, stats_part, n_raw, n_retained, segments, seconds = result
+            raw_rows += n_raw
+            retained_rows += n_retained
+            if retained is not None:
+                LOGGER.info(
+                    "data.file_ready file=%r raw_rows=%d retained_rows=%d "
+                    "segments=%d seconds=%.3f worker=%d",
+                    f, n_raw, n_retained, segments, seconds, i,
+                )
+            _progress_stage(
+                op_id, 1, done=completed, total=len(files),
+                message=(
+                    f"Preprocessed {completed:,}/{len(files):,} files in "
+                    f"parallel — {retained_rows:,}/{raw_rows:,} rows retained."
+                ),
             )
-            # Do not let the previous full-resolution source frame survive
-            # while pandas starts reading the next file.
-            del d, smooth, retained
+
+    for _i, _f, retained, stats_part, _raw, _kept, _segments, _seconds in sorted(
+            completed_results, key=lambda item: item[0]):
+        if retained is not None:
+            dfs.append(retained)
+            stat_parts.append(stats_part)
+    for f in files:
         folder = os.path.dirname(f)
         if folder not in seen:
             seen.add(folder)
             metas.append(td_io.load_folder_metadata(folder))
-        _progress_stage(
-            op_id, 1, done=i + 1, total=len(files),
-            message=(
-                f"Preprocessed {i + 1:,}/{len(files):,} files — "
-                f"{sum(len(frame) for frame in dfs):,}/{raw_rows:,} rows retained."
-            ),
-        )
 
     if not dfs:
         _progress_finish(op_id, "No valid trajectory rows were found.", failed=True)
@@ -6575,9 +7069,9 @@ app.layout = html.Div([
         ], id="status-dock", className="status-dock header-status",
            title="No completed operation yet."),
         html.Button(
-            "Hide controls", id="btn-toggle-sidebar", n_clicks=0,
+            "‹", id="btn-toggle-sidebar", n_clicks=0,
             title="Collapse the control sidebar to give plots the full width.",
-            className="subtle-action-button header-action-button",
+            className="subtle-action-button header-action-button sidebar-arrow-button",
         ),
         html.Button("Export HTML", id="btn-export", n_clicks=0,
                     title="Download a standalone HTML report with the current views.",
@@ -6665,6 +7159,29 @@ app.layout = html.Div([
                 ),
                 className="subtle-action-button",
             ),
+            html.Div([
+                html.Label(
+                    "Spatial units",
+                    title=(
+                        "Publication scale bar conversion. Enter how many "
+                        "real-world units equal one plotted position unit, "
+                        "then name that unit (cm by default)."
+                    ),
+                    style={"fontSize": "9px", "whiteSpace": "nowrap"},
+                ),
+                dcc.Input(
+                    id="spatial-unit-scale", type="number", value=1,
+                    min=1e-12, step="any", debounce=True,
+                    className="td-plain-number",
+                    style={**_INPUT_STYLE, "width": "58px"},
+                ),
+                dcc.Input(
+                    id="spatial-unit-label", type="text", value="cm",
+                    debounce=True, placeholder="cm",
+                    style={**_INPUT_STYLE, "width": "48px"},
+                ),
+            ], className="compact-control-row",
+               style={"marginTop": "3px"}),
             dcc.Checklist(id="show-raw-config",
                           options=[{"label": " Show raw config filenames",
                                     "value": "on"}],
@@ -7135,21 +7652,18 @@ app.layout = html.Div([
                             value=[0, 1], updatemode="mouseup",
                             marks={0: "0", 1: "1"},
                             tooltip={"placement": "bottom", "always_visible": False}),
-            html.Details([
-                html.Summary("Exact velocity bounds",
-                             style={"fontSize": "9px", "cursor": "pointer"}),
-                html.Div([
-                    dcc.Input(id="vel-range-min", type="number", value=None,
-                              placeholder="slider min", step="any", debounce=True,
-                              style=_INPUT_STYLE),
-                    dcc.Input(id="vel-range-max", type="number", value=None,
-                              placeholder="slider max", step="any", debounce=True,
-                              style=_INPUT_STYLE),
-                ], style={"display": "grid", "gridTemplateColumns": "1fr 1fr",
-                          "gap": "5px", "marginTop": "3px"}),
-                html.Div("Blank uses the robust slider. Exact values may extend beyond its display range.",
-                         style={"fontSize": "8.5px", "color": "#888"}),
-            ]),
+            html.Div([
+                dcc.Input(id="vel-range-min", type="number", value=None,
+                          placeholder="min", step="any", debounce=True,
+                          className="td-plain-number", style=_INPUT_STYLE),
+                dcc.Input(id="vel-range-max", type="number", value=None,
+                          placeholder="max", step="any", debounce=True,
+                          className="td-plain-number", style=_INPUT_STYLE),
+            ], title=(
+                "Editable slider bounds. Typing a value also moves and, if "
+                "necessary, extends the slider."
+            ), style={"display": "grid", "gridTemplateColumns": "1fr 1fr",
+                      "gap": "5px", "marginTop": "3px"}),
             html.Label("Net displacement range",
                        title="Per-trial start-to-end displacement range. Full span is treated as no range filter.",
                        style={"fontSize": "10px", "marginTop": "3px"}),
@@ -7160,6 +7674,18 @@ app.layout = html.Div([
                             value=[0, 1], updatemode="mouseup",
                             marks={0: "0", 1: "1"},
                             tooltip={"placement": "bottom", "always_visible": False}),
+            html.Div([
+                dcc.Input(id="disp-range-min", type="number", value=None,
+                          placeholder="min", step="any", debounce=True,
+                          className="td-plain-number", style=_INPUT_STYLE),
+                dcc.Input(id="disp-range-max", type="number", value=None,
+                          placeholder="max", step="any", debounce=True,
+                          className="td-plain-number", style=_INPUT_STYLE),
+            ], title=(
+                "Editable slider bounds. Typing a value also moves and, if "
+                "necessary, extends the slider."
+            ), style={"display": "grid", "gridTemplateColumns": "1fr 1fr",
+                      "gap": "5px", "marginTop": "3px"}),
             html.Button("Update all plots", id="btn-plot", n_clicks=0,
                         title=f"Rebuild all sections now. Changes auto-update after {PLOT_DEBOUNCE_MS / 1000:g}s idle.",
                         style={"width": "100%", "marginTop": "4px", "padding": "5px",
@@ -7781,7 +8307,7 @@ app.clientside_callback(
       }, 80);
       return [
         hidden ? 'td-sidebar is-collapsed' : 'td-sidebar',
-        hidden ? 'Show controls' : 'Hide controls',
+        hidden ? '›' : '‹',
         hidden ? 'Restore the control sidebar.' :
           'Collapse the control sidebar to give plots the full width.'
       ];
@@ -7955,9 +8481,11 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
-    function(on) {
+    function(on, unitScale, unitLabel) {
       if (window.dash_clientside.clean_layout) {
-        return window.dash_clientside.clean_layout.render(on);
+        return window.dash_clientside.clean_layout.render(
+          on, unitScale, unitLabel
+        );
       }
       return on ? 'Clean layout is loading.' :
         'Hide spatial axes and Cartesian grids without changing plot data.';
@@ -7965,6 +8493,8 @@ app.clientside_callback(
     """,
     Output("btn-minimal-layout", "title"),
     Input("minimal-layout-store", "data"),
+    Input("spatial-unit-scale", "value"),
+    Input("spatial-unit-label", "value"),
 )
 
 
@@ -7973,6 +8503,25 @@ app.clientside_callback(
     "(enabled&&enabled.indexOf('on')>=0)?'block':'none'};}",
     Output("loop-observer-wrap", "style"),
     Input("loop-enabled", "value"),
+)
+
+
+app.clientside_callback(
+    """
+    function(value, trajectory, heatmap, flow, polar) {
+      if (window.dash_clientside.target_visibility) {
+        return window.dash_clientside.target_visibility.render(value);
+      }
+      return '';
+    }
+    """,
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("roi-show", "value"),
+    Input("trajectory-plot", "figure"),
+    Input("heatmap-figure-store", "data"),
+    Input("flow-figure-store", "data"),
+    Input("polar-plot", "figure"),
+    prevent_initial_call="initial_duplicate",
 )
 
 
@@ -8262,12 +8811,14 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
             "rmin": "polar-r-range", "rmax": "polar-r-range",
             "vrmin": "vel-range", "vrmax": "vel-range",
             "drmin": "disp-range", "drmax": "disp-range",
-            "pmin": "polar-min-point-frac", "amin": "polar-min-animal-frac"}
+            "pmin": "polar-min-point-frac", "amin": "polar-min-animal-frac",
+            "uscale": "spatial-unit-scale"}
 _URL_STR = {"groupby": "group-by", "pool": "pool-mode", "color": "color-by",
             "hscale": "heatmap-scale", "hmetric": "heatmap-metric",
             "hcrange": "heatmap-crange", "pang": "polar-angle-source",
             "layout": "view-layout", "ractive": "custom-region-active",
-            "dist": "distribution-mode", "sunit": "stats-unit"}
+            "dist": "distribution-mode", "sunit": "stats-unit",
+            "ulabel": "spatial-unit-label"}
 _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyids",
              "fscn": "filter-scenes", "ffld": "filter-folders", "raw": "raw-columns"}
 
@@ -8333,6 +8884,8 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("distribution-mode", "value", allow_duplicate=True),
     Output("distribution-show-points", "value", allow_duplicate=True),
     Output("stats-unit", "value", allow_duplicate=True),
+    Output("spatial-unit-scale", "value", allow_duplicate=True),
+    Output("spatial-unit-label", "value", allow_duplicate=True),
     Output("minimal-layout-store", "data", allow_duplicate=True),
     Output("url-restored", "data"),
     Input("url", "search"),
@@ -8342,7 +8895,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 61
+    n_out = 63
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -8561,6 +9114,7 @@ def restore_from_url(search, already):
         positive_num("lr"), rings, active_ring, match_mode,
         custom_region_enabled, custom_regions, s("ractive"),
         distribution_mode, distribution_points, stats_unit,
+        positive_num("uscale"), s("ulabel"),
         minimal_layout, True,
     )
 
@@ -8594,7 +9148,13 @@ def on_folder_drop(data, clicks):
     if not pat:
         return (no_update, no_update,
                 f"Could not locate '{data.get('folder','')}' on disk. Enter the folder path instead.")
-    return pat, (clicks or 0) + 1, f"Data source resolved: {pat}"
+    workers = min(LOAD_WORKERS, max(1, int(data.get("n") or 1)))
+    return (
+        pat,
+        (clicks or 0) + 1,
+        f"Data source resolved: {pat} · starting {workers} parallel "
+        f"worker{'s' if workers != 1 else ''}…",
+    )
 
 
 # Start polling the unified header status the moment work is requested.  The
@@ -8636,7 +9196,7 @@ def start_progress(_load_n, _plot_n, _export_n, _moving, _walk, _angle,
     labels = {
         "btn-load": (
             "request",
-            "Started — processing data in a background thread; "
+            "Started — preprocessing files in parallel background workers; "
             "plots and statistics will finish in separate stages.",
         ),
         "btn-plot": ("request", "Queuing plot update…"),
@@ -8742,6 +9302,8 @@ def tick_progress(n):
     Input("distribution-mode", "value"),
     Input("distribution-show-points", "value"),
     Input("stats-unit", "value"),
+    Input("spatial-unit-scale", "value"),
+    Input("spatial-unit-label", "value"),
     Input("minimal-layout-store", "data"),
     State("viewport-store", "data"),
     State("url-restored", "data"),
@@ -8756,6 +9318,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                loop_rings, loop_active, loop_match_mode,
                custom_region_enabled, custom_regions, custom_region_active,
                distribution_mode, distribution_show_points, stats_unit,
+               spatial_unit_scale, spatial_unit_label,
                minimal_layout, vp, restored):
     if not restored:
         return no_update
@@ -8768,7 +9331,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             "smin": smin, "smax": smax, "pmin": pmin, "amin": amin,
             "reach": reach, "frad": flow_max_radius,
             "tf": traj_fraction, "lx": loop_x, "lz": loop_z,
-            "lr": loop_radius}
+            "lr": loop_radius, "uscale": spatial_unit_scale}
     for k, v in nums.items():
         if v is not None and v != "":
             if k == "trim" and float(v or 0) <= 0:
@@ -8778,6 +9341,8 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             "hscale": hscale,
             "hmetric": hmetric, "hcrange": hcrange, "pang": angle_source,
             "view": view, "layout": view_layout}
+    if spatial_unit_label:
+        strs["ulabel"] = spatial_unit_label
     for k, v in strs.items():
         if v:
             params[k] = v
@@ -8850,7 +9415,6 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     Input("raw-columns", "value"),
     Input("subplot-ncols", "value"),
     Input("plot-points", "value"),
-    Input("roi-show", "value"),
     Input("roi-reach", "value"),
     Input("roi-entered", "value"),
     Input("roi-trim", "value"),
@@ -9160,6 +9724,70 @@ def effective_velocity_range(slider_value, exact_min, exact_max):
     if not (np.isfinite(lo) and np.isfinite(hi)):
         return {"range": list(slider), "explicit": False}
     return {"range": [min(lo, hi), max(lo, hi)], "explicit": True}
+
+
+def _register_editable_range_sync(prefix: str) -> None:
+    """Register a browser-local two-way slider ↔ plain-number synchroniser."""
+    app.clientside_callback(
+        """
+        function(value, exactMin, exactMax, fullMin, fullMax) {
+          var no=window.dash_clientside.no_update;
+          var cc=window.dash_clientside.callback_context||{};
+          var trigger=String(cc.triggered_id||'');
+          var current=Array.isArray(value)&&value.length>=2
+            ? [Number(value[0]),Number(value[1])] : [Number(fullMin),Number(fullMax)];
+          function valid(number){return Number.isFinite(Number(number));}
+          function label(number){
+            number=Number(number);var absolute=Math.abs(number);
+            if(absolute>=1000000)return (number/1000000).toFixed(1)+'M';
+            if(absolute>=1000)return (number/1000).toFixed(1)+'K';
+            if(absolute>=100)return number.toFixed(0);
+            if(absolute>=10)return Number(number.toFixed(1)).toString();
+            return Number(number.toPrecision(2)).toString();
+          }
+          function marks(lo,hi){
+            var out={};[lo,(lo+hi)/2,hi].forEach(function(number){
+              out[Number(number.toFixed(6))]=label(number);
+            });return out;
+          }
+          if(trigger.indexOf('-range')>=0 &&
+             trigger.indexOf('-range-min')<0 &&
+             trigger.indexOf('-range-max')<0) {
+            if(!current.every(valid))return [no,no,no,no,no,no];
+            return [no,no,no,no,current[0],current[1]];
+          }
+          if(trigger.indexOf('-range-min')>=0 ||
+             trigger.indexOf('-range-max')>=0) {
+            var lo=valid(exactMin)?Number(exactMin):current[0];
+            var hi=valid(exactMax)?Number(exactMax):current[1];
+            if(!valid(lo)||!valid(hi))return [no,no,no,no,no,no];
+            if(lo>hi){var swap=lo;lo=hi;hi=swap;}
+            var boundLo=Math.min(Number(fullMin),lo);
+            var boundHi=Math.max(Number(fullMax),hi);
+            return [
+              boundLo,boundHi,marks(boundLo,boundHi),[lo,hi],lo,hi
+            ];
+          }
+          return [no,no,no,no,no,no];
+        }
+        """,
+        Output(f"{prefix}-range", "min", allow_duplicate=True),
+        Output(f"{prefix}-range", "max", allow_duplicate=True),
+        Output(f"{prefix}-range", "marks", allow_duplicate=True),
+        Output(f"{prefix}-range", "value", allow_duplicate=True),
+        Output(f"{prefix}-range-min", "value", allow_duplicate=True),
+        Output(f"{prefix}-range-max", "value", allow_duplicate=True),
+        Input(f"{prefix}-range", "value"),
+        Input(f"{prefix}-range-min", "value"),
+        Input(f"{prefix}-range-max", "value"),
+        State(f"{prefix}-range", "min"),
+        State(f"{prefix}-range", "max"),
+        prevent_initial_call="initial_duplicate",
+    )
+
+
+_register_editable_range_sync("vel")
+_register_editable_range_sync("disp")
 
 
 @app.callback(
@@ -10161,7 +10789,9 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     stage_started = time.perf_counter()
     rois = rois_by_config(metas)
     reach = float(roi_reach) if roi_reach else 3.0
-    want_rois = _on(roi_show) and bool(rois)
+    # Target marks and diagnostics stay mounted; roi-show is a browser-local
+    # visibility switch so toggling it never recomputes analytical figures.
+    want_rois = bool(rois)
     df_view, table = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
     exclusion = _retention_summary(df, df_view)
     roi_counts = table if (want_rois and table is not None) else None
@@ -10279,7 +10909,8 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         roi_outcomes=roi_outcomes, r_range=polar_r_range,
         min_point_frac=polar_min_point_frac,
         min_animal_trial_frac=polar_min_animal_frac,
-        return_summary=True, angle_source=polar_angle_source)
+        return_summary=True, angle_source=polar_angle_source,
+        stats_unit=stats_unit)
     timings["polar"] = time.perf_counter() - stage_started
     _progress_stage(
         op_id, 6, done=0, total=1,
@@ -10404,6 +11035,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     State("polar-min-animal-frac", "value"),
     State("custom-region-enabled", "value"),
     State("custom-regions-store", "data"),
+    State("stats-unit", "value"),
     State("data-summary", "children"),
     prevent_initial_call=True,
 )
@@ -10415,7 +11047,7 @@ def update_colour_views(
         roi_reach, roi_entered, roi_trim, polar_moving, polar_walk,
         polar_angle_source, polar_r_range, polar_min_point_frac,
         polar_min_animal_frac, custom_region_enabled, custom_regions,
-        current_summary):
+        stats_unit, current_summary):
     """Recolour only the two views whose marks encode ``color-by``."""
     if not pattern or not render_state:
         return no_update, no_update, no_update, no_update
@@ -10434,7 +11066,7 @@ def update_colour_views(
     _, _, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     reach = float(roi_reach or 3.0)
-    want_rois = _on(roi_show) and bool(rois)
+    want_rois = bool(rois)
     df_view, table = _roi_apply(
         df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
     ncols_value = max(1, int(ncols or 2))
@@ -10487,6 +11119,7 @@ def update_colour_views(
         min_point_frac=polar_min_point_frac,
         min_animal_trial_frac=polar_min_animal_frac,
         return_summary=True, angle_source=polar_angle_source,
+        stats_unit=stats_unit,
     )
     elapsed = time.perf_counter() - started
     updated_summary = (
@@ -10640,11 +11273,12 @@ def update_custom_region_analysis(
                 BUDGET_POLAR, BUDGET_POLAR_SPEED,
                 _render_mode(render_mode), max_points),
             rois=rois, reach_radius=reach,
-            show_rois=_on(roi_show) and bool(rois) and not do_rebase,
+            show_rois=bool(rois) and not do_rebase,
             roi_outcomes=roi_outcomes, r_range=polar_r_range,
             min_point_frac=polar_min_point_frac,
             min_animal_trial_frac=polar_min_animal_frac,
             angle_source=polar_angle_source,
+            stats_unit=stats_unit,
         )
     elapsed = time.perf_counter() - started
     state = {
@@ -10806,67 +11440,100 @@ app.clientside_callback(
         var gd=container&&container.querySelector('.js-plotly-plot');
         if (!gd||!window.Plotly||!gd.layout) return;
         var base=(gd.layout.annotations||[]).filter(function(a){
-          return !a || a.name!=='td-stats';
+          return !a || String(a.name||'').indexOf('td-stats:')!==0;
         });
         window.Plotly.relayout(gd,{annotations:base.concat(additions)});
       }
+      function axisRef(prefix,index) {
+        return prefix+(index===0?'':String(index+1));
+      }
+      function statAnnotation(mark,metricIndex,x,hover) {
+        var raw=String(mark.group||'');
+        return {
+          name:'td-stats:'+raw,
+          xref:axisRef('x',metricIndex),
+          yref:axisRef('y',metricIndex)+' domain',
+          x:Number(x),y:0.985,xanchor:'center',yanchor:'top',
+          showarrow:false,text:'<b>'+String(mark.letters||'')+'</b>',
+          hovertext:hover||mark.hover||'',hoverlabel:{namelength:-1},
+          bgcolor:'rgba(255,255,255,0.74)',borderpad:1,
+          font:{size:11,color:'#6b4f00'}
+        };
+      }
+      function appendSubtitle(graphId,marks,prefix) {
+        var container=document.getElementById(graphId);
+        var gd=container&&container.querySelector('.js-plotly-plot');
+        if (!gd||!window.Plotly||!gd.layout) return;
+        var byGroup={};
+        (marks||[]).forEach(function(mark){
+          byGroup[String(mark.group||'')]=mark;
+        });
+        gd.__tdStatsTitleBase=gd.__tdStatsTitleBase||{};
+        var annotations=JSON.parse(JSON.stringify(gd.layout.annotations||[]));
+        annotations.forEach(function(ann){
+          var group=String((ann&&ann.hovertext)||'');
+          var mark=byGroup[group];
+          if(!mark)return;
+          if(!gd.__tdStatsTitleBase[group] ||
+             String(ann.text||'').indexOf('<br><sup>Rayleigh ')<0){
+            gd.__tdStatsTitleBase[group]=String(ann.text||'');
+          }
+          var base=gd.__tdStatsTitleBase[group];
+          var text=prefix==='polar'
+            ? ('Rayleigh '+String(mark.rayleigh_stars||'n/a')+
+               ' · group '+String(mark.letters||''))
+            : ('Rayleigh '+String(mark.rayleigh_stars||'n/a'));
+          ann.text=base+'<br><sup>'+text+'</sup>';
+          ann.hovertext=group;
+          ann.hoverlabel={namelength:-1};
+          ann.captureevents=true;
+          ann.yshift=Math.max(Number(ann.yshift||0),18);
+        });
+        window.Plotly.relayout(gd,{annotations:annotations});
+      }
       window.setTimeout(function(){
-        var metricContainer=document.getElementById('trial-metrics-plot');
-        var metricGd=metricContainer&&metricContainer.querySelector('.js-plotly-plot');
-        var metricBase=(metricGd&&metricGd.layout&&metricGd.layout.annotations)||[];
-        var labels=payload.metric_labels||[];
         var metricAdds=[];
-        labels.forEach(function(label,index){
-          var title=metricBase[index]||{};
-          metricAdds.push({
-            name:'td-stats', xref:'paper', yref:'paper',
-            x:Number(title.x===undefined?0.5:title.x),
-            y:Number(title.y===undefined?1:title.y),
-            xanchor:'center', yanchor:'bottom', yshift:16,
-            showarrow:false, text:label,
-            bgcolor:'rgba(255,250,235,0.88)', borderpad:2,
-            font:{size:9,color:'#7a4f00'}
+        (payload.metric_marks||[]).forEach(function(marks,index){
+          (marks||[]).forEach(function(mark){
+            metricAdds.push(statAnnotation(
+              mark,index,mark.group_index,mark.hover
+            ));
           });
         });
         apply('trial-metrics-plot',metricAdds);
-        var regionContainer=document.getElementById(
-          'custom-region-diagnostics-plot');
-        var regionGd=regionContainer&&regionContainer.querySelector(
-          '.js-plotly-plot');
-        var regionBase=(regionGd&&regionGd.layout&&
-          regionGd.layout.annotations)||[];
         var regionAdds=[];
-        (payload.region_labels||[]).forEach(function(label,index){
-          var title=regionBase[index]||{};
-          regionAdds.push({
-            name:'td-stats',xref:'paper',yref:'paper',
-            x:Number(title.x===undefined?0.5:title.x),
-            y:Number(title.y===undefined?1:title.y),
-            xanchor:'center',yanchor:'bottom',yshift:15,
-            showarrow:false,text:label,
-            bgcolor:'rgba(255,250,235,0.88)',borderpad:2,
-            font:{size:8,color:'#7a4f00'}
+        (payload.region_marks||[]).forEach(function(marks,index){
+          var count=Math.max(1,(marks||[]).reduce(function(best,mark){
+            return Math.max(best,Number(mark.region_index||0)+1);
+          },0));
+          var spacing=0.72/count;
+          (marks||[]).forEach(function(mark){
+            var centre=Number(mark.group_index||0)+
+              (Number(mark.region_index||0)-(count-1)/2)*spacing;
+            var hover=String(mark.region_name||'Window')+
+              ' · n='+Number(mark.n||0).toLocaleString()+
+              ' · '+Number(mark.significant_pairs||0)+
+              ' significant adjusted pair(s)';
+            regionAdds.push(statAnnotation(mark,index,centre,hover));
           });
         });
         apply('custom-region-diagnostics-plot',regionAdds);
-        apply('polar-plot',[{
-          name:'td-stats',xref:'paper',yref:'paper',x:0.5,y:1.0,
-          xanchor:'center',yanchor:'bottom',yshift:38,showarrow:false,
-          text:payload.polar_label||'',bgcolor:'rgba(255,250,235,0.9)',
-          borderpad:3,font:{size:10,color:'#7a4f00'}
-        }]);
-        apply('initial-heading-plot',[{
-          name:'td-stats',xref:'paper',yref:'paper',x:0.5,y:1.0,
-          xanchor:'center',yanchor:'bottom',yshift:34,showarrow:false,
-          text:payload.start_label||'',bgcolor:'rgba(255,250,235,0.9)',
-          borderpad:3,font:{size:10,color:'#7a4f00'}
-        }]);
+        appendSubtitle('polar-plot',payload.polar_marks||[],'polar');
+        appendSubtitle(
+          'initial-heading-plot',payload.start_marks||[],'initial'
+        );
+        if(window.dash_clientside.panel_order &&
+           window.dash_clientside.panel_order.reapply){
+          window.setTimeout(function(){
+            window.dash_clientside.panel_order.reapply();
+          },20);
+        }
       },30);
       var elapsed=Number(payload.seconds||0).toFixed(2)+' s';
       return [
-        (payload.polar_label||'stats ready')+' · '+elapsed,
-        'non-parametric + Holm · '+elapsed,
-        (payload.start_label||'stats ready')+' · '+elapsed
+        'Rayleigh + circular pairwise labels ready · '+elapsed,
+        'non-parametric compact-letter labels ready · '+elapsed,
+        'initial-angle Rayleigh labels ready · '+elapsed
       ];
     }
     """,
@@ -10960,6 +11627,7 @@ app.clientside_callback(
     State("btn-traj-resample", "n_clicks"),
     State("custom-region-enabled", "value"),
     State("custom-regions-store", "data"),
+    State("stats-unit", "value"),
     State("data-summary", "children"),
     prevent_initial_call=True,
 )
@@ -10973,7 +11641,8 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
                       max_points, render_mode, rebase, hm_binsize, hm_bound,
                       flow_max_radius, viewport, roi_show, roi_reach,
                       roi_entered, roi_trim, traj_fraction, traj_sample_seed,
-                      custom_region_enabled, custom_regions, current_summary):
+                      custom_region_enabled, custom_regions, stats_unit,
+                      current_summary):
     empty_hists = build_polar_quality_histograms(None, polar_r_range,
                                                   polar_min_point_frac,
                                                   polar_min_animal_frac)
@@ -11081,7 +11750,7 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
     if refresh_direction:
         ncols_val = int(ncols) if ncols and ncols >= 1 else 2
         mode = _render_mode(render_mode)
-        want_rois = _on(roi_show) and bool(rois)
+        want_rois = bool(rois)
         if refresh_polar:
             roi_outcomes = (
                 roi_outcome_by_segment(df_polar, rois, reach)
@@ -11097,7 +11766,8 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
                 roi_outcomes=roi_outcomes,
                 r_range=polar_r_range, min_point_frac=polar_min_point_frac,
                 min_animal_trial_frac=polar_min_animal_frac,
-                return_summary=True, angle_source=polar_angle_source)
+                return_summary=True, angle_source=polar_angle_source,
+                stats_unit=stats_unit)
         if refresh_flow:
             df_flow = rebase_to_origin(df_view) if _on(rebase) else df_view
             bound_pct = (
@@ -11827,6 +12497,9 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
     State("vel-range-effective", "data"),
     State("disp-range", "value"),
     State("flow-max-radius", "value"),
+    State("stats-unit", "value"),
+    State("distribution-mode", "value"),
+    State("distribution-show-points", "value"),
     State("viewport-store", "data"),
     State("data-summary", "children"),
     State("url", "search"),
@@ -11843,6 +12516,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 polar_r_range, polar_min_point_frac, polar_min_animal_frac,
                 polar_moving, polar_walk, polar_angle_source,
                 vel_selection, disp_selection, flow_max_radius,
+                stats_unit, distribution_mode, distribution_show_points,
                 viewport, summary, url_search):
     if not pattern:
         LOGGER.warning("export.rejected reason=missing_source")
@@ -11935,7 +12609,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         roi_outcomes=roi_outcomes, r_range=polar_r_range,
         min_point_frac=polar_min_point_frac,
         min_animal_trial_frac=polar_min_animal_frac,
-        angle_source=polar_angle_source)
+        angle_source=polar_angle_source, stats_unit=stats_unit)
     roi_fig = (build_roi_swarm_figure(df_view, rois, reach, table=table)
                if want_rois and table is not None
                else _msg_figure("No target diagnostics are available for this selection."))
@@ -11943,6 +12617,9 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         _visible_segment_stats(native_stats, df_view),
         group_by=group_by,
         pool_mode=pool_mode,
+        distribution_mode=distribution_mode,
+        show_violin_points=_on(distribution_show_points),
+        stats_unit=stats_unit,
     )
     token = _DATA_TOKEN_BY_PATTERN.get(_pattern_key(pattern))
     native_velocity = _VELOCITY_CACHE.get(token)

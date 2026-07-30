@@ -100,11 +100,15 @@ Assets (Dash auto-serves `/assets`):
   trajectory, heatmap and Gandiva graphs; shape edits update the compact region
   store, not the master renderer.
 - `assets/clean_layout.js` — passive browser-only publication styling. It
-  toggles CSS classes only: spatial axes and Cartesian grids disappear,
+  toggles CSS classes: spatial axes and Cartesian grids disappear,
   legends/colorbars are hidden, and polar rings remain for angular context.
-  It never calls Plotly or observes relayout events.
+  Passive DOM scale bars read the already-mounted axis ranges after Plotly
+  draws; the asset never calls Plotly or observes relayout events.
 - `assets/trial_subset.js` — browser-local whole-`_seg_id` visibility sampling
-  shared by trajectory, curtain-ring and polar views.
+  shared by trajectory, curtain-ring and polar views. It keeps an immutable
+  complete source figure so an increased fraction restores prior trials.
+- `assets/target_visibility.js` — browser-local visibility of already-mounted
+  target shapes, spokes, labels, and diagnostic section.
 
 ---
 
@@ -133,7 +137,9 @@ perf killer).
 The dashboard retains at most `TRAJ_LOAD_ROW_BUDGET` normalized rows across the
 matched files (default 2,000,000; `0` opts into retaining all rows). Quotas are
 proportional to source-file byte size and preserve every segment's endpoints.
-Only one complete source file is resident during preprocessing. Exact
+`TRAJ_LOAD_WORKERS` source files (default 2, bounded to 1–8) can be resident
+during parallel preprocessing; results are concatenated in original file order.
+Use one worker when peak memory matters most. Exact
 per-segment point counts, displacement, and smoothed velocity summaries are
 finalized before sampling; spatial bins, ROI sample masks, and circular panels
 operate on the retained frame.
@@ -164,12 +170,13 @@ same cache key.
   Speed is the default and applies a second browser drawing budget. Both modes
   share the same retained analytical frame; file-level segment statistics were
   finalized before load-time sampling.
-- **Whole-trial drawing sample**: `traj-trial-fraction` is applied by
-  `_sample_trajectory_segments` after analytical/ROI filtering but before point
-  decimation. It keeps complete `_seg_id` values using a stable seeded random
-  choice; `btn-traj-resample.n_clicks` is the seed. Trajectories, the loop
-  observer and polar use the same sample. Heatmap, Gandiva, ROI, trial-metric
-  and raw analytical inputs keep the complete filtered frame.
+- **Whole-trial drawing sample**: the server sends the complete decimated
+  drawing and `assets/trial_subset.js` locally masks whole `_seg_id` values
+  using a stable seeded random choice; `btn-traj-resample.n_clicks` is the seed.
+  An immutable browser-side source prevents a reduced figure from becoming the
+  source for a later increase. Trajectories, the loop observer and polar use the
+  same sample. Heatmap, Gandiva, ROI, trial-metric and raw analytical inputs keep
+  the complete filtered frame.
 - **Curtain-ring observer**: the main trajectory figure is also the browser
   source for `assets/loop_observer.js`; no duplicate trajectory payload or
   server callback is needed when the ring moves. The asset scans the
@@ -204,9 +211,10 @@ same cache key.
   `minimal-layout-store` is presentation-only state: `assets/clean_layout.js`
   synchronously toggles CSS classes. Spatial figures lose their axis chrome;
   Cartesian diagnostics lose grids/zero-lines; legends and colourbars are
-  hidden; polar rings and angular ticks remain for context. No scale-bar shape,
-  Plotly relayout, dataframe operation, or figure builder runs, so the active
-  viewport and drag interaction remain untouched.
+  hidden; polar rings and angular ticks remain for context. Lightweight DOM
+  scale bars use each mounted spatial axis range plus `spatial-unit-scale` and
+  `spatial-unit-label`; no Plotly relayout, dataframe operation, or figure
+  builder runs, so the active viewport and drag interaction remain untouched.
 - **Heatmap**: `build_heatmap_figure` bins X/Z with `np.histogram2d`.
   `bin_size` is in **data units** (blank → `default_bin_size` ≈ 1/20 of the
   95th-pct extent); `bound_pct` clips the extent to a central percentile;
@@ -241,7 +249,9 @@ same cache key.
   render. A separate callback uses SciPy Mann–Whitney/Kruskal–Wallis tests with
   Holm correction for the four movement metrics, pooled-centred circular ranks
   for polar groups, and Rayleigh uniformity for per-config start angles. A
-  clientside relayout appends the labels/stars to already-mounted plots.
+  clientside relayout places compact-letter labels over the mounted Cartesian
+  distributions and Rayleigh stars/pairwise letters in padded polar subtitles;
+  detailed named comparisons remain in annotation hover text.
 - **Style JSON**: Advanced exposes `_VISUAL_STYLE_DEFAULTS` with
   `group_labels` first (config, scene, VR, fly, source folder), then core
   trajectory/spatial/ring/region/Gandiva/heatmap sections and finally
@@ -265,7 +275,8 @@ same cache key.
   otherwise; explicit Swarm/Violin always wins. Optional dots are drawn on
   violins only at `n <= 200`. Trial is the default independent unit; Animal
   first averages trials within active group and `FlyID@VR`. Both encodings
-  share a full-width IQR band and median line overlay.
+  share a full-width IQR band and median line overlay. Velocity/displacement
+  range histograms use finer explicit bins and synchronized editable bounds.
   The starting-heading diagnostic uses 36 fixed sectors with edges
   `[-5°, 5°], [5°, 15°], …`, so cardinal 0° is a bin centre.
 - **Trajectory ROI labels**: corner labels are exclusive first-reached outcome
@@ -284,7 +295,10 @@ same cache key.
   Movement heading is an explicit alternative. The bold population vector is
   pooled over all valid samples by weighting each trial resultant by its
   `valid_points`; it is calculated before display thinning, so Speed and
-  Accuracy return identical circular statistics.
+  Accuracy return identical circular statistics. In Animal mode,
+  `_polar_by_animal` first reconstructs one sample-weighted circular vector per
+  `FlyID@VR` within each active group, then the bold population vector and
+  circular tests give each animal one equal vote.
 
 ---
 
@@ -325,9 +339,10 @@ same cache key.
 - Peak velocity's robust slider can be overridden by unbounded exact min/max
   inputs; those values persist as `vrmin=`/`vrmax=`. Workspace mode persists as
   `layout=sections|compare`.
-- `render_config_order_list`/`apply_config_order` expose all loaded configs as a
-  draggable order list. The default order uses the sequenceConfig with the best
-  coverage; missing configs remain alphabetic at the bottom.
+- `render_panel_order_list`/`apply_panel_order` expose the visible values of the
+  active config/scene/VR/fly/folder grouping as a draggable order list. The
+  default preserves loaded/config order; `assets/config_order.js` moves every
+  compatible mounted subplot domain and numeric diagnostic category locally.
 - `update_plots` takes one filtered snapshot and returns trajectory, heatmap
   store/variants, local direction field, target diagnostics, custom-window
   diagnostics/shares, polar, trial metrics, raw traces, summary and render
@@ -400,7 +415,8 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Gandiva maximum radius | Browser-local scaling of existing arrow tips and URL state | Direction recomputation, dataframe filtering or another figure build |
 | Trajectory/heatmap pan/zoom | Immediate clientside peer relayout plus debounced `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
 | Section navigation | Clientside scroll only, including replay of the active tab | Any server render, graph hide/show or Plotly reinitialisation |
-| ROI reach/show | Debounced atomic update | Competing overlay/ROI callbacks |
+| ROI reach | Debounced atomic update of geometry-dependent target calculations | Competing overlay/ROI callbacks |
+| Show targets | Browser-local visibility of already-mounted target shapes, spokes, labels, and diagnostics | Filtering, target calculation, or any figure rebuild |
 | Polar direction source/moving controls | Gandiva + cached polar figure and quality histograms; delayed inferential stats follow the visual render | Master trajectory/heatmap/ROI/raw rebuild |
 | Polar R/quality controls | Cached polar figure + three quality histograms only | Direction field or master trajectory/heatmap/ROI/raw rebuild |
 
