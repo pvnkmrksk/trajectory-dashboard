@@ -2,8 +2,9 @@
  * Browser-local rectangular observation windows.
  *
  * Shapes are painted over the already-rendered spatial plots. Dragging or
- * resizing a box updates one compact Dash store; only polar and the custom
- * diagnostic table are recomputed on the server.
+ * resizing a box updates one compact Dash store immediately; grouped window
+ * diagnostics, polar and window-scoped trial metrics refresh after a quiet
+ * debounce interval on the server.
  */
 (function () {
   "use strict";
@@ -263,7 +264,7 @@
         window.setTimeout(paintAll, 35);
         window.setTimeout(paintAll, 180);
         if (!state.enabled) {
-          return "Observation windows off; enable them to subset polar and diagnostics.";
+          return "Observation windows off; enable them to subset polar and trial metrics.";
         }
         var samples = ((state.stats || {}).regions || []).reduce(function (sum, row) {
           return sum + numberOr(row.samples, 0);
@@ -271,7 +272,8 @@
         return state.regions.length.toLocaleString() + " observation window" +
           (state.regions.length === 1 ? "" : "s") +
           " · drag or resize any dashed box · " +
-          samples.toLocaleString() + " window-memberships";
+          samples.toLocaleString() + " window-memberships · analytics refresh " +
+          "4.5 s after editing stops";
       }
     }
   });

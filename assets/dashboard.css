@@ -56,6 +56,17 @@ body {
   box-shadow: 1px 0 0 rgba(15, 23, 42, 0.02);
 }
 
+.td-sidebar.is-collapsed {
+  display: none;
+}
+
+.header-action-button {
+  width: auto;
+  margin: 0 0 0 auto;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
 .td-sidebar label {
   color: #27364d;
 }
@@ -740,13 +751,13 @@ body._dash-loading-callback .status-dot {
   }
 }
 
-#config-order-list li {
+#panel-order-list li {
   border-color: var(--td-border) !important;
   border-radius: 5px !important;
   background: #ffffff !important;
 }
 
-#config-order-list li:hover {
+#panel-order-list li:hover {
   border-color: var(--td-blue) !important;
   background: #f7faff !important;
 }

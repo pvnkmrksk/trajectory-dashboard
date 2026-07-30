@@ -152,10 +152,9 @@ For a quick preprocessing check on the homing enemy data, run
   never accumulate every raw CSV in RAM. The header reports file/stage progress.
 - **Pool / group** by config (treatment), scene, VR, fly, source folder, or
   all-pooled → a 2-col grid of square, axis-synced, scrollable subplots.
-- **Colour by** one calm translucent hue (default), neutral gray (“None”),
-  the current panel categories, individual, VR, ROI outcome, trial, local time,
-  or **velocity** (units/s, rolling-smoothed, reset-spikes removed). The
-  categorical palette is deliberately muted for dense overplotting.
+- **Colour by** the current panel categories (default) or neutral gray
+  (“None”). The categorical palette uses distinct but deliberately muted,
+  translucent hues for dense overplotting.
 - **Filters**: max-velocity jump removal (time-buffered), min net displacement,
   inclusive trial and step ranges, trim N edge samples/end, ROI entered-only,
   and after-exit ROI trim. Velocity
@@ -186,10 +185,12 @@ For a quick preprocessing check on the homing enemy data, run
   An optional comparison workspace puts trajectories and polar side-by-side,
   with the heatmap below. Speed is the default and adds a tighter browser
   drawing budget; both modes share the same memory-bounded retained frame.
-- **Clean layout**: one button hides spatial grids, tick/axis labels and
-  legends—even on Gandiva—and replaces them with an adaptive scale bar. Units
-  default to `cm`; `spatial_layout.unit_scale` and `unit_label` in the style
-  JSON describe how one data unit maps to real-world units.
+- **Clean layout**: one fast, browser-only button makes every Plotly download
+  publication-ready without rebuilding data. Spatial views keep titles and an
+  adaptive scale bar but lose axes/grids/legends; box, violin and other
+  Cartesian diagnostics use a professional left/bottom despined frame; polar
+  grids are removed. Units default to `cm`; `spatial_layout.unit_scale` and
+  `unit_label` describe how one data unit maps to real-world units.
 - **Heatmap**: occupancy density — bin size in **data units**, lin/log with
   plain log labels (`1`, `10`, `100`, `1,000`, never `1e+3`),
   percentile-bounded extent,
@@ -289,16 +290,16 @@ shareable URL.
 |---|---|---|
 | Panels | Subplot split: config/treatment, scene, VR, fly, source folder, or all pooled. | Lets you move between treatment-level comparison and individual-level debugging. |
 | Pool Mode | Separate subplots or one pooled subplot. | Separate is better for comparison; pooled is better for quick global density/shape checks. |
-| Plot order | Drag the loaded config list. | Keeps figures aligned to experimental order instead of arbitrary filename order. |
+| Plot order | Drag the values of the active config, scene, VR, fly, or folder grouping. The list follows the active filter selection. | Keeps every grouped figure aligned to the comparison order you intend. |
 | Panel columns | Number of columns in the grid. | Wide screens can use 2-4 columns; narrow screens are easier with 1. |
 | Show raw config filenames | Uses exact config filenames instead of readable labels. | Debugs metadata/name mapping when labels look surprising. |
-| Clean layout | Hides spatial grids, ticks, axis titles and legends and adds an automatically sized scale bar. | Produces publication/presentation-ready Trajectory, Heatmap and Gandiva views without recomputing data. |
+| Clean layout | Applies title-only spatial axes with scale bars, clean polar axes, and despined statistical axes; the button changes to Full layout for exact restoration. | Produces PNG-ready Plotly figures without recomputing data. |
 
 ### Trajectories
 
 | Control | Meaning | Rationale |
 |---|---|---|
-| Colour | One calm hue (default), None/neutral gray, categorical current panels, individual, VR, ROI, trial, local time, or smoothed velocity. | Low-opacity muted colors stay legible under overplotting; categorical current panels works for config, scene, VR, fly, folder, or pooled grouping. |
+| Colour | Categorical current panels (default) or None/neutral gray. | Low-opacity muted hues stay legible under overplotting and follow config, scene, VR, fly, folder, or pooled grouping. |
 | Render mode | Speed (default) or Accuracy. | Speed reduces browser drawing primitives further; both modes use the same retained analytical frame and exact pre-retention segment summaries. |
 | Playback animation | Builds animated frames and shows play/pause/scrub controls. | Good for presentations and temporal intuition; off is faster and crisper for analysis. |
 | Displayed trials (%) | Randomly keeps this fraction of complete `_seg_id` paths in trajectory, loop and polar drawings. | Reduces browser load by removing whole trials instead of thinning their data; 100% is the default and keeps everything. |
@@ -363,7 +364,6 @@ available spatial fidelity.
 | Reach radius (units) | Distance from target center counted as entering/reaching. The slider spans 0.5–100; the adjacent exact input and `reach=` URL parameter accept any positive value. | Lets you tune strict vs forgiving target contact without silently clipping large arenas. |
 | Only trials that entered an ROI | Shows only segments that reached either left or right ROI. | Focuses plots on successful/target-engaged behavior. Trajectory denominators change because whole trials are filtered. |
 | Trim trial tail after ROI exit | Keeps approach and first contact, then drops samples after the first post-ROI exit. | Focuses heatmaps/trajectories on approach/interaction instead of post-choice wandering. Trial-level reached counts usually do not change because the trial still reached. |
-| Trajectory colour: ROI outcome | Colours each segment by first reached side: left ROI, right ROI, or no ROI. | Highlights target outcome while preserving the merged-trace renderer. |
 
 ### ROI Tab
 
@@ -381,7 +381,7 @@ available spatial fidelity.
 | Angle source | Body orientation (`GameObjectRotY`, degrees) or movement heading from consecutive X/Z samples. | Separates where the animal faced from where it moved; body orientation is the default analysis variable. |
 | Rayleigh R range | Filters trial resultants by circular concentration from 0 (dispersed) to 1 (aligned). | Excludes poorly directed trials without changing the meaning of angle. |
 | Valid-point / good-trial fractions | Trial and animal quality gates. | Makes missing/filtered heading coverage explicit. |
-| Colour by | Individual/VR/ROI or a sequential trial metric. | Preserves the same identity/sequence encoding used by trajectories. |
+| Colour by | Uses the shared Categorical or None trajectory choice. | Keeps trajectory and polar semantics consistent and restrained. |
 | Moving samples only | Uses only samples above the walk-speed threshold. | Prevents stationary jitter from dominating heading vectors. |
 | Walk speed threshold (units/s) | Minimum smoothed speed for the moving-only polar mode. | Tune this to the dataset's speed scale. |
 
@@ -424,7 +424,7 @@ assets/clean_layout.js         # grid-free spatial mode + adaptive scale bars
 assets/region_observer.js      # draggable rectangular observation windows
 assets/section_nav.js          # section scroll, including active-tab replay
 assets/plot_wheel_guard.js     # Plotly wheel zoom without page scroll
-assets/config_order.js         # draggable config subplot order list
+assets/config_order.js         # draggable active-group subplot order list
 requirements.txt
 ARCHITECTURE.md                # deep context for humans and coding agents
 AGENTS.md                      # short agent entry point

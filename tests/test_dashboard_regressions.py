@@ -527,7 +527,12 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("loop-radius").value, 3)
         self.assertEqual(_component("loop-match-mode").value, "any")
         self.assertEqual(len(_component("loop-rings-store").data), 1)
-        self.assertEqual(_component("color-by").value, "one")
+        color_control = _component("color-by")
+        self.assertEqual(color_control.value, "categorical")
+        self.assertEqual(
+            [option["value"] for option in color_control.options],
+            ["categorical", "none"],
+        )
         self.assertFalse(_component("minimal-layout-store").data)
         self.assertEqual(len(_component("custom-regions-store").data), 1)
         self.assertIsNotNone(_component("loop-observer-plot"))
@@ -543,6 +548,8 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(restored[46:51], (37.0, ["on"], -4.5, 2, 7))
         self.assertTrue(restored[57])
         self.assertEqual(len(app.restore_from_url("", True)), 59)
+        legacy_color = app.restore_from_url("?color=one", False)
+        self.assertEqual(legacy_color[7], "categorical")
         rings = [
             {"id": "ring-1", "name": "Gate A",
              "x": 0, "z": 1, "radius": 2},
@@ -710,6 +717,44 @@ class DashboardRegressionTests(unittest.TestCase):
                 frame, "scene", "separate", ncols=2)
             self.assertEqual(
                 set(groups), {"seq_scene", "scene_b", "metadata_scene"})
+
+    def test_panel_order_follows_the_active_grouping(self):
+        frame = _polar_frame().copy()
+        frame["SceneName"] = np.where(
+            frame["_seg_id"].str.contains("file_a"), "scene_a", "scene_b")
+        previous = {
+            key: dict(value)
+            for key, value in app._USER_GROUP_ORDERS.items()
+        }
+        try:
+            app._USER_GROUP_ORDERS["scene"] = {
+                "scene_b": 0,
+                "scene_a": 1,
+            }
+            groups = app._group_frames(
+                frame, "scene", "separate", ncols=2)
+            self.assertEqual(list(groups), ["scene_b", "scene_a"])
+            summary, children = app.render_panel_order_list(
+                "scene", "separate",
+                [], [], [],
+                [
+                    {"label": "scene_a", "value": "scene_a"},
+                    {"label": "scene_b", "value": "scene_b"},
+                ],
+                [],
+                [], [], [], [], [],
+                {},
+                None,
+            )
+            self.assertEqual(summary, "Plot order · Scene")
+            self.assertEqual(
+                [item.to_plotly_json()["props"]["data-order-value"]
+                 for item in children],
+                ["scene_b", "scene_a"],
+            )
+        finally:
+            app._USER_GROUP_ORDERS.clear()
+            app._USER_GROUP_ORDERS.update(previous)
 
     def test_streaming_loader_retains_a_bounded_frame_but_exact_point_counts(self):
         old_budget = app.LOAD_ROW_BUDGET

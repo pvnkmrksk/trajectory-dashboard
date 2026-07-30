@@ -97,7 +97,7 @@ _AUTO_LUT: dict[str, str] = {}
 # When on, subplot titles show the raw config filename instead of a readable name.
 _SHOW_RAW_CONFIG: dict[str, bool] = {"on": False}
 _CONFIG_ORDER: dict[str, int] = {}
-_USER_CONFIG_ORDER: dict[str, int] = {}
+_USER_GROUP_ORDERS: dict[str, dict[str, int]] = {}
 
 
 def humanise_config(raw: str) -> str:
@@ -435,11 +435,6 @@ def _set_config_order(metas: list[dict]) -> None:
     Prefer the sequenceConfig that covers the most loaded configs. Missing
     configs sort alphabetically after the known sequenceConfig entries.
     """
-    if _USER_CONFIG_ORDER:
-        _CONFIG_ORDER.clear()
-        _CONFIG_ORDER.update(_USER_CONFIG_ORDER)
-        return
-
     _CONFIG_ORDER.clear()
     all_cfgs = set()
     candidates = []
@@ -465,13 +460,39 @@ def _set_config_order(metas: list[dict]) -> None:
         _CONFIG_ORDER.setdefault(cfg, len(_CONFIG_ORDER))
 
 
-def _ordered_values(vals) -> list:
+def _ordered_group_values(vals, group_by="config") -> list:
+    """Order values for the current panel axis, including user drag order."""
     vals = [v for v in vals if pd.notna(v)]
     if not vals:
         return []
-    if _CONFIG_ORDER:
-        return sorted(vals, key=lambda v: (_CONFIG_ORDER.get(v, 10**9), humanise_config(str(v)).lower(), str(v)))
-    return sorted(vals, key=lambda v: humanise_config(str(v)).lower())
+    group_by = str(group_by or "config")
+    user_order = _USER_GROUP_ORDERS.get(group_by) or {}
+    if user_order:
+        return sorted(
+            vals,
+            key=lambda value: (
+                user_order.get(str(value), 10**9),
+                _group_label(group_by, str(value)).lower(),
+                str(value),
+            ),
+        )
+    if group_by == "config" and _CONFIG_ORDER:
+        return sorted(
+            vals,
+            key=lambda value: (
+                _CONFIG_ORDER.get(str(value), 10**9),
+                humanise_config(str(value)).lower(),
+                str(value),
+            ),
+        )
+    # Non-config groupings historically preserve load-time encounter order.
+    # Keep that stable until the user explicitly drags a new order.
+    return list(dict.fromkeys(vals))
+
+
+def _ordered_values(vals) -> list:
+    """Backward-compatible config ordering helper."""
+    return _ordered_group_values(vals, "config")
 
 
 _CONFIG_LUT_PATH = "config_names.json"
@@ -1122,10 +1143,9 @@ _VISUAL_STYLE_DEFAULTS = {
     "trajectory": {
         "name": "Trajectory paths",
         "line_width": 1.2,
-        "opacity": 0.58,
-        "neutral_color": "#4f7f75",
+        "opacity": 0.50,
         "gray_color": "#737b85",
-        "gray_opacity": 0.28,
+        "gray_opacity": 0.25,
         "palette": COLORS,
     },
     "spatial_layout": {
@@ -1192,6 +1212,55 @@ def _deep_merge(base, override):
     return out
 
 
+def _style_diff_paths(old, new, prefix=()):
+    """Return leaf JSON paths whose values differ between two style payloads."""
+    old = old if isinstance(old, dict) else {}
+    new = new if isinstance(new, dict) else {}
+    changed = []
+    for key in sorted(set(old) | set(new), key=str):
+        old_value = old.get(key, object())
+        new_value = new.get(key, object())
+        path = prefix + (str(key),)
+        if isinstance(old_value, dict) and isinstance(new_value, dict):
+            changed.extend(_style_diff_paths(old_value, new_value, path))
+        elif old_value != new_value:
+            changed.append(path)
+    return changed
+
+
+def _style_rename_entries(old, new, paths):
+    """Describe group-label renames so mounted Plotly figures can patch text."""
+    renames = []
+    old_groups = (
+        old.get("group_labels", {}) if isinstance(old, dict) else {})
+    new_groups = (
+        new.get("group_labels", {}) if isinstance(new, dict) else {})
+    for path in paths:
+        if (len(path) != 4 or path[0] != "group_labels"
+                or path[3] != "name"):
+            continue
+        kind, raw = path[1], path[2]
+        fallback = humanise_config(raw) if kind == "config" else str(raw)
+        old_entry = old_groups.get(kind, {}).get(raw, {})
+        new_entry = new_groups.get(kind, {}).get(raw, {})
+        old_name = (
+            old_entry.get("name", fallback)
+            if isinstance(old_entry, dict) else fallback
+        )
+        new_name = (
+            new_entry.get("name", fallback)
+            if isinstance(new_entry, dict) else fallback
+        )
+        if str(old_name) != str(new_name):
+            renames.append({
+                "kind": str(kind),
+                "raw": str(raw),
+                "old": str(old_name),
+                "new": str(new_name),
+            })
+    return renames
+
+
 def _visual(section, key, default=None):
     return _VISUAL_STYLE.get(section, {}).get(key, default)
 
@@ -1245,8 +1314,8 @@ def _visual_style_payload(df=None):
             if column not in df:
                 continue
             entries = payload["group_labels"].setdefault(kind, {})
-            for index, raw in enumerate(_ordered_values(
-                    df[column].dropna().astype(str).unique())):
+            for index, raw in enumerate(_ordered_group_values(
+                    df[column].dropna().astype(str).unique(), kind)):
                 current = entries.get(str(raw), {})
                 entries[str(raw)] = {
                     "name": (
@@ -1446,10 +1515,14 @@ def _horizontal_legend_layout(labels, ncols, base_top=78):
 
 
 def _group_frames(df, group_by, pool_mode, ncols):
-    return td_grouping.group_frames(
+    groups = td_grouping.group_frames(
         df, group_by, pool_mode, config_order=_CONFIG_ORDER,
         labeler=humanise_config,
     )
+    if len(groups) <= 1:
+        return groups
+    ordered = _ordered_group_values(groups.keys(), group_by)
+    return {name: groups[name] for name in ordered if name in groups}
 
 
 def _sample_scale(t):
@@ -1528,7 +1601,10 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
     decimated arrays plus per-segment structure (dpos/dlen) so animation frames
     can be sliced by time without any re-grouping.
     """
-    color_by = str(color_by or "one")
+    color_by = str(color_by or "categorical")
+    # Old saved URLs used "one"; it is now the active panel's categorical hue.
+    if color_by == "one":
+        color_by = "categorical"
     groups = _group_frames(df, group_by, pool_mode, ncols)
     group_names = list(groups.keys())
     total_segs = sum(g["_seg_id"].nunique() for g in groups.values())
@@ -1632,10 +1708,6 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
                 label = str(key)
                 rec["color"] = _ROI_OUTCOME_COLOR.get(label, _ROI_OUTCOME_COLOR["No ROI"])
                 rec["label"] = label
-            elif color_by == "one":
-                rec["color"] = _visual(
-                    "trajectory", "neutral_color", "#4f7f75")
-                rec["label"] = "All trajectories"
             elif color_by in ("none", "gray"):
                 rec["color"] = _visual(
                     "trajectory", "gray_color", "#737b85")
@@ -1942,7 +2014,7 @@ def roi_outcome_by_segment(df, rois_by_cfg, reach) -> dict[str, str]:
 
 
 def build_trajectory_figure(df, group_by="config", pool_mode="separate",
-                            ncols=2, color_by="one", animate=True,
+                            ncols=2, color_by="categorical", animate=True,
                             max_points=None, rois=None, reach_radius=3.0,
                             show_rois=False, roi_counts=None,
                             roi_outcomes=None, view_range=None):
@@ -2180,54 +2252,177 @@ def _custom_region_subset(frame, regions, position_frame=None):
     return out
 
 
-def _custom_region_stats(frame, regions, group_by="config",
-                         pool_mode="separate", ncols=2, position_frame=None):
-    """Fast sample/trial/geometry summaries plus per-Gandiva-panel shares."""
+_CUSTOM_REGION_STATS_COLUMNS = [
+    "seg_id", "n_points", "distance_walked", "displacement",
+    "peak_velocity", "median_velocity", "median_local_tortuosity",
+    "config", "vr", "fly_id", "scene", "source_folder",
+]
+
+
+def _finite_median(values):
+    """Median of finite numeric values, or NaN without noisy empty warnings."""
+    numeric = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    numeric = numeric[np.isfinite(numeric)]
+    return float(np.median(numeric)) if len(numeric) else float("nan")
+
+
+def _custom_region_segment_stats(
+        frame, regions, position_frame=None, *,
+        _velocity=None, _tortuosity=None):
+    """Summarise each trial using only its observed window sections.
+
+    Membership is the union of all supplied rectangles. Distance only includes
+    steps whose two endpoints are inside that union. Net displacement is the
+    sum of the start-to-end chords of each contiguous observed visit, so leaving
+    a window and later re-entering never creates an artificial jump across the
+    unobserved portion. The original load-time `_seg_id` remains the grouping
+    key throughout.
+    """
+    if frame is None or len(frame) == 0:
+        return pd.DataFrame(columns=_CUSTOM_REGION_STATS_COLUMNS)
     positions = position_frame if position_frame is not None else frame
     clean, masks = _custom_region_masks(positions, regions)
-    if frame is None or len(frame) == 0 or not clean:
-        return {"enabled": bool(clean), "regions": [], "panels": []}
+    if not clean or len(positions) != len(frame):
+        return pd.DataFrame(columns=_CUSTOM_REGION_STATS_COLUMNS)
+
+    selected = np.logical_or.reduce(masks)
+    if not selected.any():
+        return pd.DataFrame(columns=_CUSTOM_REGION_STATS_COLUMNS)
 
     seg = frame["_seg_id"].astype(str).to_numpy()
     x = positions["GameObjectPosX"].to_numpy(dtype=float)
     z = positions["GameObjectPosZ"].to_numpy(dtype=float)
     same = np.zeros(len(frame), dtype=bool)
     same[1:] = seg[1:] == seg[:-1]
+    previous_selected = np.concatenate(([False], selected[:-1]))
+    inside_step = selected & previous_selected & same
     step = np.zeros(len(frame), dtype=float)
     step[1:] = np.hypot(np.diff(x), np.diff(z))
+    inside_distance = np.where(inside_step, step, 0.0)
+
+    selected_seg = seg[selected]
+    seg_order = pd.Index(pd.unique(selected_seg), name="seg_id")
+    n_points = (
+        pd.Series(1, index=selected_seg)
+        .groupby(level=0, sort=False).sum().reindex(seg_order)
+    )
+    distance = (
+        pd.Series(inside_distance[selected], index=selected_seg)
+        .groupby(level=0, sort=False).sum().reindex(seg_order).fillna(0.0)
+    )
+
+    run_start = selected & ~(previous_selected & same)
+    run_id = np.cumsum(run_start)[selected]
+    visits = pd.DataFrame({
+        "seg_id": selected_seg,
+        "run_id": run_id,
+        "x": x[selected],
+        "z": z[selected],
+    })
+    visit_groups = visits.groupby(
+        ["seg_id", "run_id"], sort=False, observed=True)
+    visit_dx = visit_groups["x"].last() - visit_groups["x"].first()
+    visit_dz = visit_groups["z"].last() - visit_groups["z"].first()
+    displacement = (
+        pd.Series(np.hypot(
+            visit_dx.to_numpy(dtype=float),
+            visit_dz.to_numpy(dtype=float),
+        ), index=visit_dx.index)
+        .groupby(level=0, sort=False).sum().reindex(seg_order).fillna(0.0)
+    )
+
+    velocity = (
+        smoothed_velocity(frame, 10)
+        if _velocity is None else np.asarray(_velocity, dtype=float)
+    )
+    tortuosity = (
+        compute_tortuosity(positions)
+        if _tortuosity is None else np.asarray(_tortuosity, dtype=float)
+    )
+    velocity_by_seg = pd.Series(
+        velocity[selected], index=selected_seg)
+    median_velocity = (
+        velocity_by_seg.groupby(level=0, sort=False)
+        .median().reindex(seg_order)
+    )
+    peak_velocity = (
+        velocity_by_seg.groupby(level=0, sort=False)
+        .max().reindex(seg_order)
+    )
+    median_tortuosity = (
+        pd.Series(tortuosity[selected], index=selected_seg)
+        .groupby(level=0, sort=False).median().reindex(seg_order)
+    )
+
+    first_rows = (
+        frame.loc[selected]
+        .drop_duplicates("_seg_id", keep="first")
+        .assign(_seg_text=lambda value: value["_seg_id"].astype(str))
+        .set_index("_seg_text")
+        .reindex(seg_order)
+    )
+    out = pd.DataFrame({
+        "seg_id": seg_order.astype(str),
+        "n_points": n_points.to_numpy(dtype=int),
+        "distance_walked": distance.to_numpy(dtype=float),
+        "displacement": displacement.to_numpy(dtype=float),
+        "peak_velocity": peak_velocity.to_numpy(dtype=float),
+        "median_velocity": median_velocity.to_numpy(dtype=float),
+        "median_local_tortuosity": median_tortuosity.to_numpy(dtype=float),
+    })
+    metadata = {
+        "config": "ConfigFile",
+        "vr": "VR",
+        "fly_id": "FlyID",
+        "scene": "SceneName",
+        "source_folder": "SourceFolder",
+    }
+    for output, source in metadata.items():
+        out[output] = (
+            first_rows[source].astype(str).to_numpy()
+            if source in first_rows else ""
+        )
+    return out[_CUSTOM_REGION_STATS_COLUMNS].reset_index(drop=True)
+
+
+def _custom_region_stats(frame, regions, group_by="config",
+                         pool_mode="separate", ncols=2, position_frame=None):
+    """Window summaries globally and split by the active panel grouping.
+
+    The returned ``panels`` payload is deliberately figure-ready: every active
+    scene/config/VR/fly/folder group receives comparable sample and entering
+    trial percentages plus robust per-entered-trial movement summaries.
+    """
+    positions = position_frame if position_frame is not None else frame
+    clean, masks = _custom_region_masks(positions, regions)
+    if frame is None or len(frame) == 0 or not clean:
+        return {"enabled": bool(clean), "regions": [], "panels": []}
+
+    seg = frame["_seg_id"].astype(str).to_numpy()
     velocity = smoothed_velocity(frame, 10)
     tortuosity = compute_tortuosity(positions)
     total_trials = max(1, int(pd.unique(seg).size))
     region_rows = []
+    per_region_stats = {}
 
     for region, mask in zip(clean, masks):
+        stats = _custom_region_segment_stats(
+            frame, [region], positions,
+            _velocity=velocity, _tortuosity=tortuosity,
+        )
+        per_region_stats[region["id"]] = stats
         sample_count = int(mask.sum())
-        entered = int(pd.unique(seg[mask]).size) if sample_count else 0
-        inside_step = mask & np.concatenate(([False], mask[:-1])) & same
-        distance = float(np.nansum(step[inside_step]))
-        if sample_count:
-            sub = positions.loc[mask, ["_seg_id", "GameObjectPosX",
-                                       "GameObjectPosZ"]]
-            grouped = sub.groupby("_seg_id", sort=False, observed=True)
-            dx = (grouped["GameObjectPosX"].last()
-                  - grouped["GameObjectPosX"].first()).to_numpy(dtype=float)
-            dz = (grouped["GameObjectPosZ"].last()
-                  - grouped["GameObjectPosZ"].first()).to_numpy(dtype=float)
-            displacement = float(np.nansum(np.hypot(dx, dz)))
-            tort_values = tortuosity[mask]
-            tort_values = tort_values[np.isfinite(tort_values)]
-            vel_values = velocity[mask]
-            vel_values = vel_values[np.isfinite(vel_values)]
-            med_tort = (
-                float(np.median(tort_values))
-                if len(tort_values) else float("nan")
-            )
-            med_vel = (
-                float(np.median(vel_values))
-                if len(vel_values) else float("nan")
-            )
-        else:
-            displacement = med_tort = med_vel = float("nan")
+        entered = int(len(stats))
+        distance = float(stats["distance_walked"].sum()) if entered else 0.0
+        displacement = float(stats["displacement"].sum()) if entered else 0.0
+        med_tort = (
+            _finite_median(stats["median_local_tortuosity"])
+            if entered else float("nan")
+        )
+        med_vel = (
+            _finite_median(stats["median_velocity"])
+            if entered else float("nan")
+        )
         region_rows.append({
             **region,
             "samples": sample_count,
@@ -2244,71 +2439,311 @@ def _custom_region_stats(frame, regions, group_by="config",
     panels = []
     for raw_name, group in _group_frames(
             positions, group_by, pool_mode, ncols).items():
-        group_x = group["GameObjectPosX"].to_numpy(dtype=float)
-        group_z = group["GameObjectPosZ"].to_numpy(dtype=float)
-        shares = []
-        for region in clean:
-            count = int(((group_x >= region["x0"]) & (group_x <= region["x1"])
-                         & (group_z >= region["z0"])
-                         & (group_z <= region["z1"])).sum())
-            shares.append({
-                "id": region["id"], "name": region["name"], "samples": count,
+        group_membership = positions.index.isin(group.index)
+        group_segments = pd.Index(group["_seg_id"].astype(str).unique())
+        group_trial_count = max(1, len(group_segments))
+        summaries = []
+        for region, mask in zip(clean, masks):
+            stats = per_region_stats[region["id"]]
+            substats = stats[
+                stats["seg_id"].astype(str).isin(group_segments)]
+            count = int((mask & group_membership).sum())
+            entered = int(len(substats))
+            summaries.append({
+                "id": region["id"],
+                "name": region["name"],
+                "samples": count,
+                "total_samples": int(len(group)),
                 "percent": 100.0 * count / max(1, len(group)),
+                "trials": entered,
+                "total_trials": int(group_trial_count),
+                "trial_percent": 100.0 * entered / group_trial_count,
+                "total_distance_walked": (
+                    float(substats["distance_walked"].sum())
+                    if entered else 0.0
+                ),
+                "total_displacement": (
+                    float(substats["displacement"].sum())
+                    if entered else 0.0
+                ),
+                "median_distance_walked": (
+                    _finite_median(substats["distance_walked"])
+                    if entered else float("nan")
+                ),
+                "median_displacement": (
+                    _finite_median(substats["displacement"])
+                    if entered else float("nan")
+                ),
+                "median_tortuosity": (
+                    _finite_median(substats["median_local_tortuosity"])
+                    if entered else float("nan")
+                ),
+                "median_velocity": (
+                    _finite_median(substats["median_velocity"])
+                    if entered else float("nan")
+                ),
+                # Retained only long enough to build the diagnostic figure.
+                # The compact browser store strips this field below.
+                "segment_values": {
+                    "seg_id": substats["seg_id"].astype(str).tolist(),
+                    "n_points": substats["n_points"].astype(int).tolist(),
+                    "distance_walked": (
+                        substats["distance_walked"].astype(float).tolist()
+                    ),
+                    "displacement": (
+                        substats["displacement"].astype(float).tolist()
+                    ),
+                    "median_local_tortuosity": (
+                        substats["median_local_tortuosity"]
+                        .astype(float).tolist()
+                    ),
+                    "median_velocity": (
+                        substats["median_velocity"].astype(float).tolist()
+                    ),
+                },
             })
         panels.append({
             "raw": str(raw_name),
             "name": _group_label(group_by, raw_name),
-            "regions": shares,
+            "regions": summaries,
         })
     return {"enabled": True, "regions": region_rows, "panels": panels}
 
 
+def _custom_region_store_payload(payload):
+    """Strip diagnostic-only segment arrays from the browser-facing store."""
+    payload = payload or {}
+    return {
+        "enabled": bool(payload.get("enabled")),
+        "regions": payload.get("regions") or [],
+        "panels": [
+            {
+                **{key: value for key, value in panel.items()
+                   if key != "regions"},
+                "regions": [
+                    {key: value for key, value in region.items()
+                     if key != "segment_values"}
+                    for region in panel.get("regions", [])
+                ],
+            }
+            for panel in (payload.get("panels") or [])
+        ],
+    }
+
+
 def build_custom_region_diagnostics_figure(payload):
-    rows = (payload or {}).get("regions") or []
-    if not rows:
+    """Plot observation-window summaries split by the active panel groups."""
+    panels = (payload or {}).get("panels") or []
+    region_rows = (payload or {}).get("regions") or []
+    if not panels or not region_rows:
         return _msg_figure(
             "Enable an observation window to inspect its local trajectories.",
             260,
         )
 
-    def number(value, suffix="", digits=3):
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return "—"
-        if not np.isfinite(numeric):
-            return "—"
-        return f"{numeric:,.{digits}g}{suffix}"
+    aggregate_specs = (
+        ("percent", "Samples inside", "% of group samples"),
+        ("trial_percent", "Trials entering", "% of group trials"),
+    )
+    distribution_specs = (
+        ("distance_walked", "Distance walked", "Per observed segment"),
+        ("displacement", "Net displacement", "Per observed segment"),
+        (
+            "median_local_tortuosity",
+            "Local tortuosity",
+            "Per observed segment",
+        ),
+        ("median_velocity", "Velocity", "Per observed segment"),
+    )
+    specs = aggregate_specs + distribution_specs
+    fig = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=[f"{title}<br><sup>{subtitle}</sup>"
+                        for _key, title, subtitle in specs],
+        horizontal_spacing=0.08, vertical_spacing=0.22,
+    )
+    panel_names = [str(panel.get("name", panel.get("raw", "Group")))
+                   for panel in panels]
+    region_ids = [str(region["id"]) for region in region_rows]
+    region_names = {
+        str(region["id"]): str(region["name"]) for region in region_rows
+    }
 
-    values = [
-        [row["name"] for row in rows],
-        [f"{row['samples']:,} ({row['sample_percent']:.1f}%)" for row in rows],
-        [f"{row['trials']:,}/{row['total_trials']:,} "
-         f"({row['trial_percent']:.1f}%)" for row in rows],
-        [number(row["distance_walked"]) for row in rows],
-        [number(row["net_displacement"]) for row in rows],
-        [number(row["median_tortuosity"]) for row in rows],
-        [number(row["median_velocity"]) for row in rows],
-    ]
-    fig = go.Figure(go.Table(
-        header=dict(
-            values=[
-                "<b>Window</b>", "<b>Samples</b>", "<b>Trials entered</b>",
-                "<b>Distance walked</b>", "<b>Net displacement</b>",
-                "<b>Median tortuosity</b>", "<b>Median velocity</b>",
-            ],
-            fill_color="#edf1f3", align=["left"] + ["right"] * 6,
-            font=dict(color="#34434d", size=10), height=30,
-        ),
-        cells=dict(
-            values=values, align=["left"] + ["right"] * 6,
-            fill_color="#fbfcfc", font=dict(color="#3f4c55", size=10),
-            height=27,
-        ),
-    ))
+    # Sample and entering-trial shares are group-level proportions, so grouped
+    # bars remain the honest encoding for the first two panels.
+    for metric_index, (key, title, _subtitle) in enumerate(aggregate_specs):
+        row, col = metric_index // 3 + 1, metric_index % 3 + 1
+        for region_index, region_id in enumerate(region_ids):
+            values, custom = [], []
+            for panel in panels:
+                summary = next((
+                    item for item in panel.get("regions", [])
+                    if str(item.get("id")) == region_id
+                ), {})
+                values.append(summary.get(key))
+                custom.append([
+                    int(summary.get("samples", 0)),
+                    int(summary.get("total_samples", 0)),
+                    int(summary.get("trials", 0)),
+                    int(summary.get("total_trials", 0)),
+                    float(summary.get("total_distance_walked", 0.0)),
+                    float(summary.get("total_displacement", 0.0)),
+                ])
+            fig.add_trace(go.Bar(
+                x=panel_names,
+                y=values,
+                name=region_names[region_id],
+                legendgroup=f"window:{region_id}",
+                showlegend=metric_index == 0,
+                marker=dict(
+                    color=COLORS[region_index % len(COLORS)],
+                    line=dict(color=_rgba(
+                        COLORS[region_index % len(COLORS)], 0.92), width=0.8),
+                ),
+                opacity=0.78,
+                customdata=custom,
+                hovertemplate=(
+                    "<b>%{x} · " + region_names[region_id] + "</b>"
+                    f"<br>{title}: %{{y:.4g}}%"
+                    "<br>samples: %{customdata[0]:,}/%{customdata[1]:,}"
+                    "<br>trials entered: %{customdata[2]:,}/%{customdata[3]:,}"
+                    "<br>total observed distance: %{customdata[4]:.4g}"
+                    "<br>total observed displacement: %{customdata[5]:.4g}"
+                    "<extra></extra>"
+                ),
+            ), row=row, col=col)
+        fig.update_xaxes(tickangle=-22, row=row, col=col)
+        fig.update_yaxes(range=[0, 100], ticksuffix="%",
+                         row=row, col=col)
+
+    # Movement quantities are trial/segment-level estimates. Small groups show
+    # every segment as a deterministic swarm; larger groups switch to a violin.
+    # Both get an identical IQR band and median line, matching Trial Metrics.
+    group_count = len(panels)
+    region_count = max(1, len(region_ids))
+    region_spacing = 0.72 / region_count
+    half_width = min(0.28, region_spacing * 0.38)
+    for offset, (key, title, _subtitle) in enumerate(distribution_specs, start=2):
+        row, col = offset // 3 + 1, offset % 3 + 1
+        for group_index, panel in enumerate(panels):
+            summaries = {
+                str(item.get("id")): item
+                for item in panel.get("regions", [])
+            }
+            for region_index, region_id in enumerate(region_ids):
+                summary = summaries.get(region_id, {})
+                segment_values = summary.get("segment_values") or {}
+                values = np.asarray(
+                    segment_values.get(key) or [], dtype=float)
+                keep = np.isfinite(values)
+                if not keep.any():
+                    continue
+                values = values[keep]
+                seg_ids = np.asarray(
+                    segment_values.get("seg_id") or [], dtype=object)[keep]
+                point_counts = np.asarray(
+                    segment_values.get("n_points") or [], dtype=int)[keep]
+                centre = (
+                    group_index
+                    + (region_index - (region_count - 1) / 2) * region_spacing
+                )
+                color = COLORS[region_index % len(COLORS)]
+                custom = np.column_stack([
+                    seg_ids.astype(str), point_counts,
+                ]).tolist()
+                hover = (
+                    f"<b>{panel_names[group_index]} · "
+                    f"{region_names[region_id]}</b>"
+                    f"<br>{title}: %{{y:.4g}}"
+                    "<br>segment: %{customdata[0]}"
+                    "<br>observed samples: %{customdata[1]:,}"
+                    "<extra></extra>"
+                )
+                if len(values) <= 200:
+                    rng = np.random.default_rng(
+                        2903 + offset * 1009
+                        + group_index * 101 + region_index * 17
+                    )
+                    jitter = rng.uniform(
+                        -half_width, half_width, len(values))
+                    fig.add_trace(go.Scatter(
+                        x=(centre + jitter).tolist(),
+                        y=values.tolist(),
+                        mode="markers",
+                        name=region_names[region_id],
+                        legendgroup=f"window:{region_id}",
+                        showlegend=False,
+                        marker=dict(color=color, size=5, opacity=0.62),
+                        customdata=custom,
+                        hovertemplate=hover,
+                    ), row=row, col=col)
+                else:
+                    fig.add_trace(go.Violin(
+                        x=[centre] * len(values),
+                        y=values.tolist(),
+                        name=region_names[region_id],
+                        legendgroup=f"window:{region_id}",
+                        scalegroup=(
+                            f"window:{region_id}:metric:{key}"
+                        ),
+                        showlegend=False,
+                        scalemode="count",
+                        spanmode="hard",
+                        box_visible=False,
+                        meanline_visible=False,
+                        points=False,
+                        width=half_width * 2,
+                        line_color=color,
+                        fillcolor=color,
+                        opacity=0.48,
+                        customdata=custom,
+                        hovertemplate=hover,
+                    ), row=row, col=col)
+
+                q1, median, q3 = np.percentile(values, [25, 50, 75])
+                fig.add_shape(
+                    type="rect",
+                    x0=centre - half_width,
+                    x1=centre + half_width,
+                    y0=float(q1),
+                    y1=float(q3),
+                    fillcolor=_rgba(color, 0.14),
+                    line=dict(color=_rgba(color, 0.72), width=1.3),
+                    layer="above",
+                    row=row,
+                    col=col,
+                )
+                fig.add_shape(
+                    type="line",
+                    x0=centre - half_width,
+                    x1=centre + half_width,
+                    y0=float(median),
+                    y1=float(median),
+                    line=dict(color=color, width=2.1),
+                    layer="above",
+                    row=row,
+                    col=col,
+                )
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=list(range(group_count)),
+            ticktext=panel_names,
+            tickangle=-22,
+            range=[-0.55, max(0.55, group_count - 0.45)],
+            row=row,
+            col=col,
+        )
     fig.update_layout(
-        template="plotly_white", height=max(210, 95 + 30 * len(rows)),
-        margin=dict(l=8, r=8, t=18, b=8),
+        template="plotly_white",
+        height=680,
+        barmode="group",
+        violinmode="overlay",
+        margin=dict(l=52, r=28, t=118, b=90),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.10,
+            xanchor="left", x=0,
+        ),
+        hoverlabel=dict(namelength=-1),
     )
     return fig
 
@@ -4364,7 +4799,9 @@ def _thin_ray_table(ray: pd.DataFrame, max_points=None) -> pd.DataFrame:
 
 
 def _polar_seq_values(ray: pd.DataFrame, color_by: str):
-    color_by = color_by or "one"
+    color_by = color_by or "categorical"
+    if color_by == "one":
+        color_by = "categorical"
     if color_by == "velocity":
         vals = ray["cval"].to_numpy(dtype=float)
         finite = vals[np.isfinite(vals)]
@@ -4417,7 +4854,7 @@ def _population_polar_vector(ray: pd.DataFrame) -> tuple[float, float, int]:
 
 
 def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
-                       color_by="one", moving_only=False, walk_thresh=None,
+                       color_by="categorical", moving_only=False, walk_thresh=None,
                        max_points=None, rois=None, reach_radius=3.0, show_rois=False,
                        roi_outcomes=None, r_range=None, min_point_frac=0.0,
                        min_animal_trial_frac=0.0, return_summary=False,
@@ -4431,7 +4868,9 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
     """
     if df is None or len(df) == 0:
         return _msg_figure("No trajectories match the active filters.")
-    color_by = color_by or "individual"
+    color_by = color_by or "categorical"
+    if color_by == "one":
+        color_by = "categorical"
     groups = _group_frames(df, group_by, pool_mode, ncols)
     names = list(groups.keys())
     n = len(names)
@@ -4534,11 +4973,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                     colr = _ROI_OUTCOME_COLOR.get(label, _ROI_OUTCOME_COLOR["No ROI"])
                     legend_group = f"roi:{label}"
                 elif color_by in ("one", "none", "gray", "categorical"):
-                    if color_by == "one":
-                        label = "All vectors"
-                        colr = _visual(
-                            "trajectory", "neutral_color", "#4f7f75")
-                    elif color_by == "categorical":
+                    if color_by == "categorical":
                         palette = _visual("trajectory", "palette", COLORS)
                         if not isinstance(palette, list) or not palette:
                             palette = COLORS
@@ -4660,12 +5095,10 @@ def _metric_stat_groups(stats: pd.DataFrame, group_by="config",
     column = columns.get(group_by, "config")
     if column not in stats:
         return [("All Data", stats)]
-    if column == "config":
-        values = _ordered_values(stats[column].dropna().astype(str).unique())
-        return [(value, stats[stats[column].astype(str) == str(value)])
-                for value in values]
-    return [(str(value), group)
-            for value, group in stats.groupby(column, sort=False, observed=True)]
+    values = _ordered_group_values(
+        stats[column].dropna().astype(str).unique(), group_by)
+    text = stats[column].astype(str)
+    return [(value, stats[text == str(value)]) for value in values]
 
 
 def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
@@ -5468,7 +5901,16 @@ def _load_data(pattern):
 _EMPTY = go.Figure().update_layout(height=190, template="plotly_white")
 _INPUT_STYLE = {"width": "100%", "fontSize": "11px", "padding": "3px",
                 "boxSizing": "border-box"}
-GRAPH_CONFIG = {"scrollZoom": True, "displayModeBar": True, "displaylogo": False}
+GRAPH_CONFIG = {
+    "scrollZoom": True,
+    "displayModeBar": True,
+    "displaylogo": False,
+    "edits": {"shapePosition": True},
+    "toImageButtonOptions": {
+        "format": "png",
+        "scale": 3,
+    },
+}
 
 # Every plot is part of one normal document flow. Navigation scrolls to these
 # sections; no graph is ever measured, resized, or re-rendered while hidden.
@@ -5502,6 +5944,11 @@ app.layout = html.Div([
             html.Div(id="plot-status", className="status-raw-hidden"),
         ], id="status-dock", className="status-dock header-status",
            title="No completed operation yet."),
+        html.Button(
+            "Hide controls", id="btn-toggle-sidebar", n_clicks=0,
+            title="Collapse the control sidebar to give plots the full width.",
+            className="subtle-action-button header-action-button",
+        ),
         html.Button("Export HTML", id="btn-export", n_clicks=0,
                     title="Download a standalone HTML report with the current views.",
                     style={"fontSize": "11px", "padding": "4px 10px"}),
@@ -5558,6 +6005,21 @@ app.layout = html.Div([
                 {"label": "Pooled", "value": "pooled"},
             ], value="separate", className="segmented-control",
                style={"fontSize": "11px", "marginTop": "3px"}),
+            html.Details([
+                html.Summary(
+                    "Plot order · Config / Treatment",
+                    id="panel-order-summary",
+                    title=(
+                        "Drag the values to reorder every subplot and grouped "
+                        "diagnostic for the active panel grouping."
+                    ),
+                    style={"fontSize": "10px", "cursor": "pointer"},
+                ),
+                html.Ol(id="panel-order-list", style={
+                    "margin": "4px 0 0 16px", "padding": "0", "fontSize": "9px",
+                    "maxHeight": "150px", "overflowY": "auto",
+                }),
+            ], style={"marginTop": "3px"}),
             html.Label("Workspace", style={"fontSize": "10px", "marginTop": "3px"}),
             dcc.RadioItems(id="view-layout", options=[
                 {"label": " Sections", "value": "sections"},
@@ -5567,8 +6029,8 @@ app.layout = html.Div([
             html.Button(
                 "Clean layout", id="btn-minimal-layout", n_clicks=0,
                 title=(
-                    "Hide spatial grids, axes and legends and replace them "
-                    "with an automatically sized scale bar."
+                    "Prepare PNG-ready plots in place: spatial scale bars, "
+                    "despined statistical axes, clean polar axes, no legends."
                 ),
                 className="subtle-action-button",
             ),
@@ -5582,19 +6044,14 @@ app.layout = html.Div([
             html.Hr(style={"margin": "6px 0"}),
 
             html.Label("Trajectories", style={"fontWeight": "bold", "fontSize": "12px"}),
-            html.Label("Colour", title="Colour trajectories and polar vectors by the same metadata or metric.",
+            html.Label("Colour", title=(
+                           "Use one muted hue per current panel, or draw every "
+                           "trajectory and polar vector in neutral gray."),
                        style={"fontSize": "10px"}),
             dcc.Dropdown(id="color-by", options=[
-                {"label": "One colour · calm", "value": "one"},
-                {"label": "None · neutral gray", "value": "none"},
                 {"label": "Categorical · current panels", "value": "categorical"},
-                {"label": "Individual (VR+Fly)", "value": "individual"},
-                {"label": "VR", "value": "vr"},
-                {"label": "ROI outcome", "value": "roi"},
-                {"label": "Trial (sequential)", "value": "trial"},
-                {"label": "Local time (sequential)", "value": "local_time"},
-                {"label": "Velocity (units/s, smoothed)", "value": "velocity"},
-            ], value="one", clearable=False, style={"fontSize": "11px"}),
+                {"label": "None · neutral gray", "value": "none"},
+            ], value="categorical", clearable=False, style={"fontSize": "11px"}),
             html.Label("Render mode",
                        title="Accuracy uses full filtered data for analysis views; Speed decimates plotted data more aggressively.",
                        style={"fontSize": "10px", "marginTop": "4px"}),
@@ -5704,15 +6161,29 @@ app.layout = html.Div([
 
             html.Hr(style={"margin": "6px 0"}),
 
-            html.Label("Region observer",
-                       style={"fontWeight": "bold", "fontSize": "12px"}),
-            dcc.Checklist(
-                id="custom-region-enabled",
-                options=[{
-                    "label": " Use observation windows for polar + diagnostics",
-                    "value": "on",
-                }],
-                value=[], style={"fontSize": "11px"},
+            html.Label(
+                "Region observer",
+                title=(
+                    "Draw movable rectangular observation windows. Their union "
+                    "subsets polar directions and every per-trial movement "
+                    "metric; grouped diagnostics compare each window separately."
+                ),
+                style={"fontWeight": "bold", "fontSize": "12px"},
+            ),
+            html.Div(
+                dcc.Checklist(
+                    id="custom-region-enabled",
+                    options=[{
+                        "label": " Use windows for polar + trial metrics",
+                        "value": "on",
+                    }],
+                    value=[], style={"fontSize": "11px"},
+                ),
+                title=(
+                    "When enabled, polar uses samples inside the union of all "
+                    "windows. Distance, displacement, tortuosity and velocity "
+                    "are recomputed from those observed trial sections."
+                ),
             ),
             html.Div([
                 dcc.Dropdown(
@@ -5736,22 +6207,38 @@ app.layout = html.Div([
             ], style={"display": "flex", "gap": "4px", "marginTop": "3px"}),
             html.Div([
                 html.Div([
-                    html.Label("X min", style={"fontSize": "10px"}),
+                    html.Label(
+                        "X min",
+                        title="Left edge. Dragging a dashed box updates this value.",
+                        style={"fontSize": "10px"},
+                    ),
                     dcc.Input(id="custom-region-x0", type="number", value=-3,
                               step="any", debounce=False, style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
                 html.Div([
-                    html.Label("X max", style={"fontSize": "10px"}),
+                    html.Label(
+                        "X max",
+                        title="Right edge. Analytics wait until editing pauses.",
+                        style={"fontSize": "10px"},
+                    ),
                     dcc.Input(id="custom-region-x1", type="number", value=3,
                               step="any", debounce=False, style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
                 html.Div([
-                    html.Label("Z min", style={"fontSize": "10px"}),
+                    html.Label(
+                        "Z min",
+                        title="Bottom edge in the spatial Z coordinate.",
+                        style={"fontSize": "10px"},
+                    ),
                     dcc.Input(id="custom-region-z0", type="number", value=-3,
                               step="any", debounce=False, style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
                 html.Div([
-                    html.Label("Z max", style={"fontSize": "10px"}),
+                    html.Label(
+                        "Z max",
+                        title="Top edge in the spatial Z coordinate.",
+                        style={"fontSize": "10px"},
+                    ),
                     dcc.Input(id="custom-region-z1", type="number", value=3,
                               step="any", debounce=False, style=_INPUT_STYLE),
                 ], style={"flex": "1"}),
@@ -5759,7 +6246,8 @@ app.layout = html.Div([
                       "gap": "4px", "marginTop": "3px"}),
             html.Div(
                 "Drag the dashed boxes on Trajectory, Heatmap or Gandiva. "
-                "Percentages label each Gandiva panel; polar uses the union.",
+                "The box moves immediately; analytics refresh after a 4.5 s "
+                "pause. Polar and trial metrics use the union.",
                 id="custom-region-status",
                 style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
             ),
@@ -6030,13 +6518,6 @@ app.layout = html.Div([
             html.Label("Configs", style={"fontSize": "10px"}),
             dcc.Dropdown(id="filter-configs", multi=True, placeholder="All",
                          style={"fontSize": "10px"}),
-            html.Details([
-                html.Summary("Plot order", style={"fontSize": "10px", "cursor": "pointer"}),
-                html.Ol(id="config-order-list", style={
-                    "margin": "4px 0 0 16px", "padding": "0", "fontSize": "9px",
-                    "maxHeight": "150px", "overflowY": "auto",
-                }),
-            ], style={"marginTop": "3px"}),
             html.Label("VRs", style={"fontSize": "10px", "marginTop": "2px"}),
             dcc.Dropdown(id="filter-vrs", multi=True, placeholder="All",
                          style={"fontSize": "10px"}),
@@ -6059,6 +6540,11 @@ app.layout = html.Div([
                                                   "fontWeight": "bold"}),
                 html.Label(
                     "Names and visual style",
+                    title=(
+                        "Edit only the values you need. Name-only, clean-layout, "
+                        "observer and heatmap-colour changes patch mounted plots; "
+                        "mark styling changes rebuild rendered traces."
+                    ),
                     style={"fontSize": "10px", "fontWeight": "bold",
                            "marginTop": "4px"},
                 ),
@@ -6077,6 +6563,10 @@ app.layout = html.Div([
                 html.Button(
                     "Apply names and styles", id="btn-apply-visual-style",
                     n_clicks=0,
+                    title=(
+                        "Diff this JSON against the active style. Lightweight "
+                        "presentation changes apply in place."
+                    ),
                     style={"width": "100%", "marginTop": "3px", "padding": "4px",
                            "fontSize": "11px", "cursor": "pointer"},
                 ),
@@ -6189,7 +6679,7 @@ app.layout = html.Div([
                style={"fontSize": "10px", "marginTop": "10px", "paddingTop": "7px",
                       "borderTop": "1px solid #e7ebf2", "color": "#667085"}),
 
-        ], className="td-sidebar",
+        ], id="sidebar-panel", className="td-sidebar",
            style={"width": "255px", "padding": "8px", "overflowY": "auto",
                    "overflowX": "hidden",
                    "borderRight": "1px solid #ddd", "background": "#fafafa",
@@ -6407,9 +6897,17 @@ app.layout = html.Div([
                                        "transition": "opacity .2s",
                                        "pointerEvents": "none"}),
                      html.Div([
-                         html.H4("Observation-window diagnostics"),
+                         html.H4(
+                             "Observation-window diagnostics",
+                             title=(
+                                 "Each subplot compares the current panel groups "
+                                 "(scene, config, VR, fly or folder). Bars are "
+                                 "used for proportions; movement panels show "
+                                 "segment-level swarms or violins per window."
+                             ),
+                         ),
                          html.Span(
-                             "Samples, entering trials, path, displacement and tortuosity",
+                             "Grouped proportions + segment-level movement distributions",
                              className="plot-section-kicker",
                          ),
                      ], className="plot-section-heading"),
@@ -6427,9 +6925,15 @@ app.layout = html.Div([
 
                 # --- Per-trial movement metrics ---
                 html.Div(
-                    [html.Div([html.H4("Trial metrics"),
+                    [html.Div([html.H4(
+                                   "Trial metrics",
+                                   title=(
+                                       "One point is one SourceFile+Trial+Step "
+                                       "segment. With observation windows enabled, "
+                                       "all four values use only observed sections."
+                                   )),
                                html.Span(
-                                   "Per-trial distributions across the selected panel grouping",
+                                   "Per-trial distributions · window-scoped when enabled",
                                    className="plot-section-kicker"),
                                html.Span("stats queued", id="metrics-stats-status",
                                          className="stats-status-chip")],
@@ -6502,7 +7006,7 @@ app.layout = html.Div([
     dcc.Store(id="heatmap-color-distributions"),
     dcc.Store(id="heatmap-color-values"),
     dcc.Store(id="vel-range-effective"),
-    dcc.Store(id="config-order-store"),
+    dcc.Store(id="panel-order-store"),
     dcc.Store(id="auto-thresholds"),
     dcc.Store(id="drop-data"),
     dcc.Store(id="view-render-state", data={}),
@@ -6521,7 +7025,9 @@ app.layout = html.Div([
     ),
     dcc.Store(id="custom-region-stats-store", data={}),
     dcc.Store(id="minimal-layout-store", data=False),
+    dcc.Store(id="sidebar-collapsed-store", data=False),
     dcc.Store(id="visual-style-store", data=_VISUAL_STYLE_DEFAULTS),
+    dcc.Store(id="visual-style-diff-store", data={}),
     dcc.Store(id="stats-overlay-store", data={}),
     dcc.Store(id="operation-progress", data=_progress_snapshot()),
     dcc.Store(id="url-restored", data=False),
@@ -6534,6 +7040,8 @@ app.layout = html.Div([
                  max_intervals=-1, disabled=True),
     dcc.Interval(id="stats-delay-interval", interval=650,
                  max_intervals=1, disabled=True),
+    dcc.Interval(id="custom-region-analysis-interval", interval=4500,
+                 max_intervals=1, disabled=True),
 ], className="td-app",
    style={"fontFamily": "system-ui, -apple-system, sans-serif", "margin": "0"})
 
@@ -6543,6 +7051,46 @@ app.clientside_callback(
     Output("diag-start-heading-wrap", "style"),
     Input("diag-start-heading-toggle", "value"),
 )
+
+
+app.clientside_callback(
+    """
+    function(clicks, collapsed) {
+      if (!clicks) return window.dash_clientside.no_update;
+      return !Boolean(collapsed);
+    }
+    """,
+    Output("sidebar-collapsed-store", "data"),
+    Input("btn-toggle-sidebar", "n_clicks"),
+    State("sidebar-collapsed-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(collapsed) {
+      var hidden = Boolean(collapsed);
+      window.setTimeout(function () {
+        if (!window.Plotly) return;
+        document.querySelectorAll('.js-plotly-plot').forEach(function (gd) {
+          try { window.Plotly.Plots.resize(gd); } catch (error) {}
+        });
+      }, 80);
+      return [
+        hidden ? 'td-sidebar is-collapsed' : 'td-sidebar',
+        hidden ? 'Show controls' : 'Hide controls',
+        hidden ? 'Restore the control sidebar.' :
+          'Collapse the control sidebar to give plots the full width.'
+      ];
+    }
+    """,
+    Output("sidebar-panel", "className"),
+    Output("btn-toggle-sidebar", "children"),
+    Output("btn-toggle-sidebar", "title"),
+    Input("sidebar-collapsed-store", "data"),
+)
+
 
 app.clientside_callback(
     "function(mode){return mode==='compare'?"
@@ -6670,6 +7218,20 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
+    function(enabled, regions) {
+      return [false, 0];
+    }
+    """,
+    Output("custom-region-analysis-interval", "disabled"),
+    Output("custom-region-analysis-interval", "n_intervals"),
+    Input("custom-region-enabled", "value"),
+    Input("custom-regions-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
     function(clicks, current) {
       if (!clicks) return window.dash_clientside.no_update;
       return !Boolean(current);
@@ -6683,7 +7245,7 @@ app.clientside_callback(
 
 
 app.clientside_callback(
-    "function(on){return on?'Restore axes':'Clean layout';}",
+    "function(on){return on?'Full layout':'Clean layout';}",
     Output("btn-minimal-layout", "children"),
     Input("minimal-layout-store", "data"),
 )
@@ -6691,7 +7253,7 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
-    function(on, style, traj, heat, flow) {
+    function(on, style) {
       if (window.dash_clientside.clean_layout) {
         return window.dash_clientside.clean_layout.render(on, style);
       }
@@ -6705,6 +7267,14 @@ app.clientside_callback(
     Input("trajectory-plot", "figure"),
     Input("heatmap-figure-store", "data"),
     Input("flow-figure-store", "data"),
+    Input("polar-plot", "figure"),
+    Input("roi-plot", "figure"),
+    Input("custom-region-diagnostics-plot", "figure"),
+    Input("trial-metrics-plot", "figure"),
+    Input("vel-histogram", "figure"),
+    Input("disp-histogram", "figure"),
+    Input("initial-heading-plot", "figure"),
+    Input("raw-trace-plot", "figure"),
 )
 
 
@@ -7232,8 +7802,11 @@ def restore_from_url(search, already):
         except Exception:
             custom_regions = no_update
     color_value = s("color")
-    if color_value == "gray":
-        color_value = "none"
+    if color_value is not no_update:
+        color_value = (
+            "none" if str(color_value).lower() in ("none", "gray")
+            else "categorical"
+        )
     return (
         s("glob"), num("vel"), num("disp"), num("trim"), jump_ms(),
         s("groupby"), s("pool"), color_value, anim, rebase,
@@ -7656,7 +8229,14 @@ def load_data_cb(n_clicks, pattern, plot_clicks, cur_binsize, previous_pattern):
     def opts(col):
         if col not in df.columns:
             return []
-        vals = _ordered_values(df[col].unique()) if col == "ConfigFile" else sorted(df[col].unique())
+        group_kind = {
+            "ConfigFile": "config",
+            "SceneName": "scene",
+            "VR": "vr",
+            "FlyID": "flyid",
+            "SourceFolder": "file",
+        }.get(col, "config")
+        vals = _ordered_group_values(df[col].unique(), group_kind)
         if col == "ConfigFile":
             return [{"label": humanise_config(v), "value": v, "title": v} for v in vals]
         return [{"label": str(v), "value": v} for v in vals]
@@ -8049,50 +8629,117 @@ def sync_heatmap_color_range(value, mode, data, current_cmin, current_cmax):
             no_update if cmax == current_cmax else cmax, fig)
 
 
+_PANEL_ORDER_CONTROLS = {
+    "config": ("Config / Treatment", "filter-configs"),
+    "scene": ("Scene", "filter-scenes"),
+    "vr": ("VR", "filter-vrs"),
+    "flyid": ("Fly ID", "filter-flyids"),
+    "file": ("Source Folder", "filter-folders"),
+}
+
+
 @app.callback(
-    Output("config-order-list", "children"),
+    Output("panel-order-summary", "children"),
+    Output("panel-order-list", "children"),
+    Input("group-by", "value"),
+    Input("pool-mode", "value"),
     Input("filter-configs", "options"),
+    Input("filter-vrs", "options"),
+    Input("filter-flyids", "options"),
+    Input("filter-scenes", "options"),
+    Input("filter-folders", "options"),
+    Input("filter-configs", "value"),
+    Input("filter-vrs", "value"),
+    Input("filter-flyids", "value"),
+    Input("filter-scenes", "value"),
+    Input("filter-folders", "value"),
+    Input("view-render-state", "data"),
+    Input("panel-order-store", "data"),
 )
-def render_config_order_list(options):
+def render_panel_order_list(group_by, pool_mode, config_options, vr_options,
+                            fly_options, scene_options, folder_options,
+                            configs, vrs, flies, scenes, folders,
+                            render_state, _panel_order_data):
+    """Expose the values actually used by the active subplot grouping."""
+    option_sets = {
+        "config": config_options,
+        "scene": scene_options,
+        "vr": vr_options,
+        "flyid": fly_options,
+        "file": folder_options,
+    }
+    selections = {
+        "config": configs,
+        "scene": scenes,
+        "vr": vrs,
+        "flyid": flies,
+        "file": folders,
+    }
+    if pool_mode == "pooled" or group_by == "all":
+        return "Plot order · All pooled", [
+            html.Li("All Data", style={"padding": "2px 4px"})
+        ]
+
+    group_by = group_by if group_by in _PANEL_ORDER_CONTROLS else "config"
+    group_label, _control_id = _PANEL_ORDER_CONTROLS[group_by]
+    options = option_sets.get(group_by) or []
+    selected = {str(value) for value in (selections.get(group_by) or [])}
+    option_map = {
+        str(option.get("value")): str(
+            option.get("label", option.get("value")))
+        for option in options
+    }
+    render_state = render_state if isinstance(render_state, dict) else {}
+    state_matches = (
+        render_state.get("group_by") == group_by
+        and render_state.get("pool_mode") == pool_mode
+    )
+    rendered_values = (
+        [str(value) for value in (render_state.get("groups") or [])]
+        if state_matches else []
+    )
+    values = (
+        [value for value in rendered_values if value in option_map]
+        if rendered_values else list(option_map)
+    )
+    if selected:
+        values = [value for value in values if value in selected]
+    values = _ordered_group_values(values, group_by)
     children = []
-    for opt in options or []:
-        value = opt.get("value")
-        label = opt.get("label", value)
+    for value in values:
+        label = _group_label(group_by, value)
         children.append(html.Li(
-            str(label), draggable="true", **{"data-cfg": value},
+            str(label), draggable="true",
+            **{
+                "data-order-value": value,
+                "data-order-group": group_by,
+                "title": option_map.get(value, value),
+            },
             style={
                 "cursor": "grab", "padding": "2px 4px", "marginBottom": "2px",
                 "border": "1px solid #dde2ee", "borderRadius": "3px",
                 "background": "#fff", "lineHeight": "1.2",
             }))
-    return children
+    return f"Plot order · {group_label}", children
 
 
 @app.callback(
-    Output("filter-configs", "options", allow_duplicate=True),
     Output("btn-plot", "n_clicks", allow_duplicate=True),
-    Input("config-order-store", "data"),
-    State("filter-configs", "options"),
+    Input("panel-order-store", "data"),
     State("btn-plot", "n_clicks"),
     State("store-glob", "data"),
     prevent_initial_call=True,
 )
-def apply_config_order(order_data, options, clicks, pattern):
+def apply_panel_order(order_data, clicks, pattern):
+    group_by = str((order_data or {}).get("group_by") or "")
     order = (order_data or {}).get("order") or []
-    if not order or not options:
-        return no_update, no_update
-    rank = {str(v): i for i, v in enumerate(order)}
-    _USER_CONFIG_ORDER.clear()
-    _CONFIG_ORDER.clear()
-    for cfg in order:
-        _USER_CONFIG_ORDER.setdefault(str(cfg), len(_USER_CONFIG_ORDER))
-        _CONFIG_ORDER.setdefault(str(cfg), len(_CONFIG_ORDER))
-
-    def key(opt):
-        value = str(opt.get("value"))
-        return (rank.get(value, 10**9), humanise_config(value).lower(), value)
-
-    return sorted(options, key=key), (clicks or 0) + 1 if pattern else no_update
+    if group_by not in _PANEL_ORDER_CONTROLS or not order:
+        return no_update
+    rank = {}
+    for value in order:
+        rank.setdefault(str(value), len(rank))
+    _USER_GROUP_ORDERS[group_by] = rank
+    return (clicks or 0) + 1 if pattern else no_update
 
 
 # Auto thresholds: when a box is ticked, fill its field with the computed value
@@ -8810,7 +9457,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     traj_max_points = len(df_plot_draw) if mode == "speed" else max_points
     traj_fig = build_trajectory_figure(
         df_plot_draw, group_by, pool_mode, ncols=ncols_val,
-        color_by=color_by or "one", animate=do_animate,
+        color_by=color_by or "categorical", animate=do_animate,
         max_points=traj_max_points, rois=rois, reach_radius=reach,
         show_rois=want_rois and not do_rebase, roi_counts=roi_counts,
         roi_outcomes=roi_outcomes, view_range=shared_fit)
@@ -8866,6 +9513,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         if region_on else {"enabled": False, "regions": [], "panels": []}
     )
     region_diag = build_custom_region_diagnostics_figure(region_stats)
+    region_store = _custom_region_store_payload(region_stats)
     polar_position_frame = (
         rebase_to_origin(df_display) if do_rebase else df_display
     )
@@ -8877,7 +9525,7 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     polar_budget = _budget(BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points)
     polar_fig, polar_quality = build_polar_figure(
         polar_source, group_by, pool_mode, ncols=ncols_val,
-        color_by=color_by or "one", moving_only=_on(polar_moving),
+        color_by=color_by or "categorical", moving_only=_on(polar_moving),
         walk_thresh=polar_walk, max_points=polar_budget, rois=rois,
         reach_radius=reach, show_rois=want_rois and not do_rebase,
         roi_outcomes=roi_outcomes, r_range=polar_r_range,
@@ -8891,7 +9539,11 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     )
 
     stage_started = time.perf_counter()
-    metric_stats = _visible_segment_stats(native_stats, df_view)
+    metric_stats = (
+        _custom_region_segment_stats(
+            df_view, custom_regions, position_frame=df_spatial)
+        if region_on else _visible_segment_stats(native_stats, df_view)
+    )
     metrics_fig = build_trial_metrics_figure(
         metric_stats, group_by=group_by, pool_mode=pool_mode)
     timings["trial metrics"] = time.perf_counter() - stage_started
@@ -8940,11 +9592,15 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         "mode": mode, "completed": time.time(),
         "timings": {k: round(float(v), 4) for k, v in timings.items()},
         "operation": "all sections",
+        "group_by": str(group_by or "config"),
+        "pool_mode": str(pool_mode or "separate"),
+        "groups": list(_group_frames(
+            df_view, group_by, pool_mode, ncols_val).keys()),
     }
     _progress_finish(op_id, f"Ready — all sections updated in {bt:.2f}s.")
     return (traj_fig, heat_fig.to_plotly_json(), heat_variants,
             heat_color_distributions, flow_fig.to_plotly_json(), roi_fig,
-            region_diag, region_stats, polar_fig,
+            region_diag, region_store, polar_fig,
             metrics_fig, raw_fig, raw_style, summary, exclusion,
             render_state, f"Ready — all sections updated in {bt:.2f}s.")
 
@@ -8952,11 +9608,11 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
 @app.callback(
     Output("polar-plot", "figure", allow_duplicate=True),
     Output("custom-region-diagnostics-plot", "figure", allow_duplicate=True),
+    Output("trial-metrics-plot", "figure", allow_duplicate=True),
     Output("custom-region-stats-store", "data", allow_duplicate=True),
     Output("polar-render-state", "data", allow_duplicate=True),
     Output("plot-status", "children", allow_duplicate=True),
-    Input("custom-region-enabled", "value"),
-    Input("custom-regions-store", "data"),
+    Input("custom-region-analysis-interval", "n_intervals"),
     State("view-render-state", "data"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
@@ -8993,18 +9649,20 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     State("polar-r-range", "value"),
     State("polar-min-point-frac", "value"),
     State("polar-min-animal-frac", "value"),
+    State("custom-region-enabled", "value"),
+    State("custom-regions-store", "data"),
     prevent_initial_call=True,
 )
 def update_custom_region_analysis(
-        enabled, regions, render_state, pattern, vel_thresh, min_disp, trim,
+        n_intervals, render_state, pattern, vel_thresh, min_disp, trim,
         jump_buf, cfg, vrs, fids, scenes, folders, trial_min, trial_max,
         step_min, step_max, vel_selection, disp_selection, group_by, pool_mode,
         color_by, ncols, max_points, render_mode, rebase, roi_show, roi_reach,
         roi_entered, roi_trim, traj_fraction, traj_sample_seed, polar_moving,
         polar_walk, polar_angle_source, polar_r_range, polar_min_point_frac,
-        polar_min_animal_frac):
-    if not pattern or not render_state:
-        return no_update, no_update, no_update, no_update, no_update
+        polar_min_animal_frac, enabled, regions):
+    if not n_intervals or not pattern or not render_state:
+        return (no_update,) * 6
     started = time.perf_counter()
     df_f, _, _ = _filtered_df(
         pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -9013,11 +9671,11 @@ def update_custom_region_analysis(
     if df_f is None or len(df_f) == 0:
         message = _msg_figure("No rows match the active filters.")
         return (
-            message, message, {}, no_update,
+            message, message, message, {}, no_update,
             "Observation windows have no matching rows.",
         )
 
-    _, _, metas = _load_data(pattern)
+    _, native_stats, metas = _load_data(pattern)
     rois = rois_by_config(metas)
     reach = float(roi_reach or 3.0)
     df_view, _ = _roi_apply(
@@ -9034,6 +9692,14 @@ def update_custom_region_analysis(
         if region_on else {"enabled": False, "regions": [], "panels": []}
     )
     diagnostic = build_custom_region_diagnostics_figure(payload)
+    store_payload = _custom_region_store_payload(payload)
+    metric_stats = (
+        _custom_region_segment_stats(
+            df_view, regions, position_frame=position_frame)
+        if region_on else _visible_segment_stats(native_stats, df_view)
+    )
+    metrics_fig = build_trial_metrics_figure(
+        metric_stats, group_by=group_by, pool_mode=pool_mode)
 
     sampled = _sample_trajectory_segments(
         df_view, traj_fraction, traj_sample_seed)
@@ -9048,7 +9714,7 @@ def update_custom_region_analysis(
     )
     polar_fig = build_polar_figure(
         polar_source, group_by, pool_mode, ncols=ncols_value,
-        color_by=color_by or "one",
+        color_by=color_by or "categorical",
         moving_only=_on(polar_moving), walk_thresh=polar_walk,
         max_points=_budget(
             BUDGET_POLAR, BUDGET_POLAR_SPEED,
@@ -9068,8 +9734,9 @@ def update_custom_region_analysis(
         "timings": {"observation windows": round(elapsed, 4)},
     }
     return (
-        polar_fig, diagnostic, payload, state,
-        f"Observation windows updated polar + diagnostics in {elapsed:.2f}s.",
+        polar_fig, diagnostic, metrics_fig, store_payload, state,
+        "Observation windows updated polar, grouped diagnostics and trial "
+        f"metrics in {elapsed:.2f}s.",
     )
 
 
@@ -9163,12 +9830,18 @@ def compute_delayed_statistics(
         polar_frame = _sample_trajectory_segments(
             df_view, traj_fraction, traj_sample_seed)
         if _on(custom_region_enabled):
+            metric_positions = (
+                rebase_to_origin(df_view) if _on(rebase) else df_view
+            )
+            metric_stats = _custom_region_segment_stats(
+                df_view, custom_regions, metric_positions)
             polar_positions = (
                 rebase_to_origin(polar_frame) if _on(rebase) else polar_frame
             )
             polar_frame = _custom_region_subset(
                 polar_frame, custom_regions, polar_positions)
-        metric_stats = _visible_segment_stats(native_stats, df_view)
+        else:
+            metric_stats = _visible_segment_stats(native_stats, df_view)
         payload = _statistics_payload(
             metric_stats, polar_frame, raw_df, group_by, pool_mode,
             polar_moving, polar_walk, polar_angle_source, polar_r_range,
@@ -9462,7 +10135,7 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
                 if (color_by == "roi" or want_rois) and rois else None)
             polar_fig, quality = build_polar_figure(
                 df_polar, group_by, pool_mode, ncols=ncols_val,
-                color_by=color_by or "individual",
+                color_by=color_by or "categorical",
                 moving_only=_on(polar_moving), walk_thresh=polar_walk,
                 max_points=_budget(
                     BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points),
@@ -9566,11 +10239,21 @@ app.clientside_callback(
     "if(needPaint){"
     "window.__hmSuppress=true;"
     "try{hc.style.transition='none';hc.style.opacity='1';}catch(e){}"
-    "try{window.Plotly.newPlot(hg,hfig.data,hfig.layout,{scrollZoom:true,displayModeBar:true,displaylogo:false});"
+    "try{window.Plotly.newPlot(hg,hfig.data,hfig.layout,{scrollZoom:true,displayModeBar:true,displaylogo:false,"
+    "toImageButtonOptions:{format:'png',scale:3},edits:{shapePosition:true}});"
     "hg.__hmfp=fp;hg.__hmPainted=true;"
     "if(window.__attachHeatSync){window.__attachHeatSync(hg,true);}}catch(e){}"
     "try{hc.style.opacity='1';}catch(e){}"
     "setTimeout(function(){window.__hmSuppress=false;},250);"
+    "}else{try{"
+    "var incoming=((hfig.layout||{}).annotations||[]);"
+    "var extras=((hg.layout||{}).annotations||[]).filter(function(a){"
+    "return a&&['custom-region-label','td-clean-scale','td-stats'].indexOf(a.name)>=0;});"
+    "window.Plotly.relayout(hg,{annotations:incoming.concat(extras)});"
+    "(hfig.data||[]).forEach(function(trace,index){"
+    "if(trace&&trace.colorscale){window.Plotly.restyle(hg,{colorscale:[trace.colorscale]},[index]);}"
+    "});"
+    "}catch(e){}"
     "}"
     # Swap in the current metric/scale variant IN PLACE (Plotly.restyle) — instant,
     # no re-init, no flash. Every metric×scale was precomputed at bin time, so
@@ -9581,7 +10264,8 @@ app.clientside_callback(
     "var v=variants&&variants[key];"
     "if(v&&window.__restyleHeatmap){"
     "window.__restyleHeatmap(hg,v,metric,scale,colorRange,rangeMode,colorData);"
-    "}}catch(e){}}"
+    "}}catch(e){}"
+    "if(window.dash_clientside.clean_layout){window.dash_clientside.clean_layout.refresh();}}"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
     Input("heatmap-figure-store", "data"),
@@ -9602,8 +10286,10 @@ app.clientside_callback(
     "var fg=fc&&fc.querySelector('.js-plotly-plot');"
     "if(fg&&window.Plotly&&ffig&&ffig.data&&ffig.data.length){"
     "try{window.Plotly.newPlot(fg,ffig.data,ffig.layout,"
-    "{scrollZoom:true,displayModeBar:true,displaylogo:false});"
+    "{scrollZoom:true,displayModeBar:true,displaylogo:false,"
+    "toImageButtonOptions:{format:'png',scale:3},edits:{shapePosition:true}});"
     "if(window.__attachViewportSync){window.__attachViewportSync(fg,'flow',true);}"
+    "if(window.dash_clientside.clean_layout){window.dash_clientside.clean_layout.refresh();}"
     "}catch(e){}}"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
@@ -9646,6 +10332,21 @@ app.clientside_callback(
     """,
     Output("plot-status", "children", allow_duplicate=True),
     Input("flow-max-radius", "value"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(diff) {
+      if (window.dash_clientside.style_patch) {
+        return window.dash_clientside.style_patch.render(diff);
+      }
+      return 'Loading mounted style patcher…';
+    }
+    """,
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("visual-style-diff-store", "data"),
     prevent_initial_call=True,
 )
 
@@ -9706,13 +10407,16 @@ def prefill_visual_style(_n, _generation, pattern):
 @app.callback(
     Output("visual-style-status", "children"),
     Output("visual-style-store", "data"),
+    Output("visual-style-diff-store", "data"),
     Output("btn-plot", "n_clicks", allow_duplicate=True),
     Input("btn-apply-visual-style", "n_clicks"),
     State("visual-style-editor", "value"),
+    State("visual-style-store", "data"),
     State("btn-plot", "n_clicks"),
     prevent_initial_call=True,
 )
-def apply_visual_style(_n, style_text, plot_clicks):
+def apply_visual_style(_n, style_text, previous_style, plot_clicks):
+    """Apply JSON styles, patching browser-only diffs without a full rebuild."""
     global _VISUAL_STYLE, _USER_LUT
     try:
         parsed = json.loads(style_text or "{}")
@@ -9731,14 +10435,56 @@ def apply_visual_style(_n, style_text, plot_clicks):
         for raw, entry in config_entries.items():
             if isinstance(entry, dict) and entry.get("name"):
                 _USER_LUT[str(raw)] = str(entry["name"])
+        previous = (
+            previous_style
+            if isinstance(previous_style, dict) else _VISUAL_STYLE)
+        changed_paths = _style_diff_paths(previous, merged)
+        renames = _style_rename_entries(previous, merged, changed_paths)
+        browser_sections = {
+            "loop_observer", "region_observer", "spatial_layout",
+        }
+        browser_only = all(
+            (
+                len(path) == 4
+                and path[0] == "group_labels"
+                and path[3] == "name"
+            )
+            or path[:2] == ("heatmap", "colorscale")
+            or (path and path[0] in browser_sections)
+            for path in changed_paths
+        )
+        diff_payload = {
+            "changed_paths": [".".join(path) for path in changed_paths],
+            "renames": renames,
+            "heatmap_colorscale": merged.get(
+                "heatmap", {}).get("colorscale"),
+            "requires_replot": bool(changed_paths and not browser_only),
+            "applied": time.time(),
+        }
         _VISUAL_STYLE = merged
+        if not changed_paths:
+            message = "No style changes detected."
+            next_clicks = no_update
+        elif browser_only:
+            message = (
+                f"Applied {len(changed_paths)} text/layout style "
+                "change(s) directly to mounted plots."
+            )
+            next_clicks = no_update
+        else:
+            message = (
+                f"Applied {len(changed_paths)} style change(s); rebuilding "
+                "only because rendered marks changed."
+            )
+            next_clicks = (plot_clicks or 0) + 1
         return (
-            "Applied visual styles; rebuilding server-rendered layers.",
+            message,
             merged,
-            (plot_clicks or 0) + 1,
+            diff_payload,
+            next_clicks,
         )
     except Exception as exc:
-        return f"Style error: {exc}", no_update, no_update
+        return f"Style error: {exc}", no_update, no_update, no_update
 
 
 def _export_loop_observer_html(
@@ -10202,7 +10948,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                    if bound_pct < 100 else _shared_range(df_plot))
                   if len(df_plot) else None)
     traj = build_trajectory_figure(df_traj, group_by, pool_mode, ncols=ncols_val,
-                                   color_by=color_by or "individual",
+                                   color_by=color_by or "categorical",
                                    animate=do_animate,
                                    max_points=len(df_traj) if mode == "speed" else max_points,
                                    rois=rois, reach_radius=reach,
@@ -10228,7 +10974,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         max_radius=flow_max_radius)
     polar = build_polar_figure(
         df_polar, group_by, pool_mode, ncols=ncols_val,
-        color_by=color_by or "individual",
+        color_by=color_by or "categorical",
         moving_only=_on(polar_moving), walk_thresh=polar_walk,
         max_points=_budget(BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points),
         rois=rois, reach_radius=reach, show_rois=want_rois and not do_rebase,

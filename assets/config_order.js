@@ -1,23 +1,30 @@
-// Drag-to-reorder the config plotting order list. The list is generated from
-// all configs in the loaded dataset; dropping updates config-order-store.
+// Drag-to-reorder the active panel axis (config, scene, VR, fly or folder).
+// Dropping updates one compact store; the server then rebuilds in that order.
 (function () {
   function values(list) {
-    return Array.prototype.map.call(list.querySelectorAll('li[data-cfg]'), function (li) {
-      return li.getAttribute('data-cfg');
+    return Array.prototype.map.call(
+      list.querySelectorAll('li[data-order-value]'), function (li) {
+      return li.getAttribute('data-order-value');
     });
   }
 
   function publish(list) {
     if (!window.dash_clientside || !window.dash_clientside.set_props) return;
-    window.dash_clientside.set_props('config-order-store', {
-      data: { order: values(list), ts: Date.now() }
+    var first = list.querySelector('li[data-order-group]');
+    if (!first) return;
+    window.dash_clientside.set_props('panel-order-store', {
+      data: {
+        group_by: first.getAttribute('data-order-group'),
+        order: values(list),
+        ts: Date.now()
+      }
     });
   }
 
   function after(list, y) {
-    var els = Array.prototype.filter.call(list.querySelectorAll('li[data-cfg]:not(.dragging)'), function (el) {
-      return true;
-    });
+    var els = Array.prototype.slice.call(
+      list.querySelectorAll('li[data-order-value]:not(.dragging)')
+    );
     var best = { offset: Number.NEGATIVE_INFINITY, el: null };
     els.forEach(function (el) {
       var box = el.getBoundingClientRect();
@@ -28,13 +35,14 @@
   }
 
   function bind() {
-    var list = document.getElementById('config-order-list');
+    var list = document.getElementById('panel-order-list');
     if (!list) { setTimeout(bind, 300); return; }
     if (list.__orderBound) return;
     list.__orderBound = true;
 
     list.addEventListener('dragstart', function (e) {
-      var li = e.target && e.target.closest && e.target.closest('li[data-cfg]');
+      var li = e.target && e.target.closest &&
+        e.target.closest('li[data-order-value]');
       if (!li) return;
       li.classList.add('dragging');
       li.style.opacity = '0.45';
@@ -42,7 +50,8 @@
     });
 
     list.addEventListener('dragend', function (e) {
-      var li = e.target && e.target.closest && e.target.closest('li[data-cfg]');
+      var li = e.target && e.target.closest &&
+        e.target.closest('li[data-order-value]');
       if (!li) return;
       li.classList.remove('dragging');
       li.style.opacity = '1';

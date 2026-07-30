@@ -512,6 +512,7 @@
       scrollZoom: true,
       displayModeBar: true,
       displaylogo: false,
+      toImageButtonOptions: {format: "png", scale: 3},
       edits: {shapePosition: true}
     };
     var method = gd.__loopObserverPainted ?
@@ -521,6 +522,9 @@
         gd.__loopObserverPainting = false;
         gd.__loopObserverPainted = true;
         attachDrag(gd);
+        if (window.dash_clientside.clean_layout) {
+          window.dash_clientside.clean_layout.refresh();
+        }
       })
       .catch(function () {
         gd.__loopObserverPainting = false;

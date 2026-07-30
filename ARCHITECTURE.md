@@ -87,8 +87,8 @@ Assets (Dash auto-serves `/assets`):
   restyles directly to the mounted heatmap from the binned cell distribution.
 - `assets/plot_wheel_guard.js` — prevents page/panel scroll while the pointer is
   over Plotly's central wheel-zoom plane; margins still scroll normally.
-- `assets/config_order.js` — drag-to-reorder the full loaded config subplot order
-  via `config-order-store` (independent of active filters).
+- `assets/config_order.js` — drag-to-reorder the visible values of the active
+  config/scene/VR/fly/folder panel axis via `panel-order-store`.
 - `assets/shared_legend.js` — shares categorical layer visibility between the
   trajectory and polar figures and reports counts for the currently visible
   layers.
@@ -98,8 +98,9 @@ Assets (Dash auto-serves `/assets`):
 - `assets/region_observer.js` — editable rectangular window overlays for the
   trajectory, heatmap and Gandiva graphs; shape edits update the compact region
   store, not the master renderer.
-- `assets/clean_layout.js` — browser-only removal/restoration of grids, ticks,
-  titles and legends plus zoom-aware 1/2/5 scale bars in configured real units.
+- `assets/clean_layout.js` — one-pass browser-only publication styling:
+  title-only spatial panels with zoom-aware 1/2/5 scale bars, despined
+  statistical panels, clean polar axes, and exact Full-layout restoration.
 
 ---
 
@@ -183,13 +184,10 @@ same cache key.
   `update_custom_region_analysis`, which rebuilds only polar and the
   observation-window table; `assets/region_observer.js` repaints rectangles and
   Gandiva percentage labels without rebuilding direction vectors.
-- **Colour modes** (`color_by`): `one` (default calm hue), `none` (neutral
-  translucent gray), `categorical` (one muted hue per current panel),
-  `individual`/`vr`/`roi` (categorical, lines,
-  legend); `trial`/`local_time`/`velocity` (sequential; markers for per-point
-  ones; a hidden anchor trace supplies the Viridis colourbar). ROI outcome is
-  computed per segment from the first left/right ROI reached and falls back to
-  "No ROI". Velocity is rolling-smoothed (10 frames) and spike-clipped.
+- **Colour modes** (`color_by`): the UI intentionally exposes only
+  `categorical` (default: one muted hue per current panel) and `none` (neutral
+  translucent gray). Older URL values are restored as `categorical` so obsolete
+  modes cannot leave the dropdown in an invalid hidden state.
 - **Layout**: 2-col grid, `SUBPLOT_PX=480` per subplot → the figure is its
   natural full height and the panel scrolls (no squishing). Subplot vertical
   spacing is deliberately tight so Plotly drag rectangles are easy to hit. 1:1
@@ -197,9 +195,11 @@ same cache key.
   it). The optional comparison workspace places trajectory and polar sections
   side-by-side, with heatmap and diagnostics full-width below.
   `minimal-layout-store` is presentation-only state: `assets/clean_layout.js`
-  hides/restores spatial axis chrome and legends and derives a 1/2/5 scale bar
-  from the current visible range. `spatial_layout.unit_scale` maps one position
-  unit to `unit_label` (default `1 cm`). No dataframe or figure builder runs.
+  performs one debounced in-place styling pass. Spatial figures lose all axis
+  chrome and gain a 1/2/5 scale bar; Cartesian diagnostics keep labels/ticks but
+  use left/bottom despined axes; polar grids are removed. Legends and trace
+  colourbars are hidden. `spatial_layout.unit_scale` maps one position unit to
+  `unit_label` (default `1 cm`). No dataframe or figure builder runs.
 - **Heatmap**: `build_heatmap_figure` bins X/Z with `np.histogram2d`.
   `bin_size` is in **data units** (blank → `default_bin_size` ≈ 1/20 of the
   95th-pct extent); `bound_pct` clips the extent to a central percentile;
@@ -471,7 +471,7 @@ the reached counts, and the polar all agree. Left ROI ⇔ X<0, right ⇔ X>0.
   don't expose absolute paths; `resolve_dropped_folder` searches the working dir,
   nearby ancestors, and optional `TRAJ_DATA_ROOT`. Data elsewhere -> type/paste a
   path. Drop handling is scoped to the folder control and plot workspace, and
-  ignores internal drags so config-order reordering remains reliable.
+  ignores internal drags so active-panel ordering remains reliable.
 - **Two copies of the code** (`Plotting/dashboard.py` and `trajectory-dashboard/
   app.py`) can drift. Decide on one source of truth.
 - **`raw-columns` default** doesn't always stick in the control; `update_plots`
