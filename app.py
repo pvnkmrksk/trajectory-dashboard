@@ -2489,9 +2489,21 @@ def _custom_region_stats(frame, regions, group_by="config",
     seg = frame["_seg_id"].astype(str).to_numpy()
     velocity = smoothed_velocity(frame, 10)
     tortuosity = compute_tortuosity(positions)
-    total_trials = max(1, int(pd.unique(seg).size))
+    segment_order = pd.Index(pd.unique(seg), name="seg_id")
+    total_trials = max(1, int(len(segment_order)))
+    total_samples_by_segment = (
+        pd.Series(1, index=seg)
+        .groupby(level=0, sort=False).sum().reindex(segment_order)
+    )
+    first_by_segment = (
+        frame.drop_duplicates("_seg_id", keep="first")
+        .assign(_seg_text=lambda value: value["_seg_id"].astype(str))
+        .set_index("_seg_text")
+        .reindex(segment_order)
+    )
     region_rows = []
     per_region_stats = {}
+    per_region_sample_percent = {}
 
     for region, mask in zip(clean, masks):
         stats = _custom_region_segment_stats(
@@ -2499,6 +2511,15 @@ def _custom_region_stats(frame, regions, group_by="config",
             _velocity=velocity, _tortuosity=tortuosity,
         )
         per_region_stats[region["id"]] = stats
+        inside_by_segment = (
+            pd.Series(mask.astype(np.int64), index=seg)
+            .groupby(level=0, sort=False).sum().reindex(
+                segment_order, fill_value=0)
+        )
+        per_region_sample_percent[region["id"]] = (
+            100.0 * inside_by_segment
+            / total_samples_by_segment.clip(lower=1)
+        )
         sample_count = int(mask.sum())
         entered = int(len(stats))
         distance = float(stats["distance_walked"].sum()) if entered else 0.0
@@ -2535,6 +2556,15 @@ def _custom_region_stats(frame, regions, group_by="config",
             stats = per_region_stats[region["id"]]
             substats = stats[
                 stats["seg_id"].astype(str).isin(group_segments)]
+            aligned = (
+                stats.assign(_seg_text=stats["seg_id"].astype(str))
+                .set_index("_seg_text").reindex(group_segments)
+            )
+            aligned_meta = first_by_segment.reindex(group_segments)
+            sample_percent = (
+                per_region_sample_percent[region["id"]]
+                .reindex(group_segments).fillna(0.0)
+            )
             count = int((mask & group_membership).sum())
             entered = int(len(substats))
             summaries.append({
@@ -2573,20 +2603,54 @@ def _custom_region_stats(frame, regions, group_by="config",
                 # Retained only long enough to build the diagnostic figure.
                 # The compact browser store strips this field below.
                 "segment_values": {
-                    "seg_id": substats["seg_id"].astype(str).tolist(),
-                    "n_points": substats["n_points"].astype(int).tolist(),
+                    "seg_id": group_segments.astype(str).tolist(),
+                    "n_points": (
+                        pd.to_numeric(aligned["n_points"], errors="coerce")
+                        .fillna(0).astype(int).tolist()
+                    ),
+                    "sample_percent": sample_percent.astype(float).tolist(),
+                    "trial_percent": (
+                        100.0 * (sample_percent.to_numpy(dtype=float) > 0)
+                    ).tolist(),
                     "distance_walked": (
-                        substats["distance_walked"].astype(float).tolist()
+                        pd.to_numeric(
+                            aligned["distance_walked"], errors="coerce"
+                        ).astype(float).tolist()
                     ),
                     "displacement": (
-                        substats["displacement"].astype(float).tolist()
+                        pd.to_numeric(
+                            aligned["displacement"], errors="coerce"
+                        ).astype(float).tolist()
                     ),
                     "median_local_tortuosity": (
-                        substats["median_local_tortuosity"]
-                        .astype(float).tolist()
+                        pd.to_numeric(
+                            aligned["median_local_tortuosity"],
+                            errors="coerce",
+                        ).astype(float).tolist()
                     ),
                     "median_velocity": (
-                        substats["median_velocity"].astype(float).tolist()
+                        pd.to_numeric(
+                            aligned["median_velocity"], errors="coerce"
+                        ).astype(float).tolist()
+                    ),
+                    "fly_id": (
+                        aligned_meta["FlyID"].astype(object)
+                        .where(aligned_meta["FlyID"].notna(), "")
+                        .astype(str).tolist()
+                        if "FlyID" in aligned_meta else [""] * len(group_segments)
+                    ),
+                    "vr": (
+                        aligned_meta["VR"].astype(object)
+                        .where(aligned_meta["VR"].notna(), "")
+                        .astype(str).tolist()
+                        if "VR" in aligned_meta else [""] * len(group_segments)
+                    ),
+                    "source_folder": (
+                        aligned_meta["SourceFolder"].astype(object)
+                        .where(aligned_meta["SourceFolder"].notna(), "")
+                        .astype(str).tolist()
+                        if "SourceFolder" in aligned_meta
+                        else [""] * len(group_segments)
                     ),
                 },
             })
@@ -2619,8 +2683,64 @@ def _custom_region_store_payload(payload):
     }
 
 
-def build_custom_region_diagnostics_figure(payload):
-    """Plot observation-window summaries split by the active panel groups."""
+def _distribution_choice(mode, counts, threshold=200):
+    """Resolve one mark type for an entire multi-panel diagnostic."""
+    requested = str(mode or "auto").lower()
+    if requested in {"swarm", "violin"}:
+        return requested
+    largest = max((int(value) for value in counts), default=0)
+    return "swarm" if largest <= int(threshold) else "violin"
+
+
+def _observation_distribution_values(summary, key, stats_unit="trial"):
+    """Return aligned window observations at trial or animal level."""
+    values = summary.get("segment_values") or {}
+    numeric = np.asarray(values.get(key) or [], dtype=float)
+    seg_ids = np.asarray(values.get("seg_id") or [], dtype=object)
+    support = np.asarray(values.get("n_points") or [], dtype=float)
+    n = min(len(numeric), len(seg_ids), len(support))
+    if not n:
+        return np.array([]), np.array([], dtype=object), np.array([])
+    numeric, seg_ids, support = numeric[:n], seg_ids[:n], support[:n]
+    keep = np.isfinite(numeric)
+    numeric, seg_ids, support = numeric[keep], seg_ids[keep], support[keep]
+    if str(stats_unit or "trial") != "animal" or not len(numeric):
+        return numeric, seg_ids, support
+
+    fly = np.asarray(values.get("fly_id") or [""] * n, dtype=object)[:n][keep]
+    vr = np.asarray(values.get("vr") or [""] * n, dtype=object)[:n][keep]
+    folder = np.asarray(
+        values.get("source_folder") or [""] * n, dtype=object)[:n][keep]
+    animal = np.asarray([
+        f"{f}@{v}" if str(f).strip() else (
+            f"{folder_name}@{v}" if str(folder_name).strip() else str(seg)
+        )
+        for f, v, folder_name, seg in zip(fly, vr, folder, seg_ids)
+    ], dtype=object)
+    pooled = pd.DataFrame({
+        "animal": animal.astype(str),
+        "value": numeric,
+        "support": support,
+    }).groupby("animal", sort=False, observed=True).agg(
+        value=("value", "mean"),
+        support=("support", "sum"),
+    )
+    return (
+        pooled["value"].to_numpy(dtype=float),
+        pooled.index.to_numpy(dtype=object),
+        pooled["support"].to_numpy(dtype=float),
+    )
+
+
+def build_custom_region_diagnostics_figure(
+        payload, distribution_mode="auto", show_violin_points=True,
+        stats_unit="trial"):
+    """Plot six consistent window distributions by the active panel grouping.
+
+    Sample occupancy and entry are independent trial-level proportions (or
+    animal-level means), rather than single group bars. Movement estimates use
+    only the observed sections of each entered `_seg_id`.
+    """
     panels = (payload or {}).get("panels") or []
     region_rows = (payload or {}).get("regions") or []
     if not panels or not region_rows:
@@ -2629,21 +2749,19 @@ def build_custom_region_diagnostics_figure(payload):
             260,
         )
 
-    aggregate_specs = (
-        ("percent", "Samples inside", "% of group samples"),
-        ("trial_percent", "Trials entering", "% of group trials"),
-    )
-    distribution_specs = (
-        ("distance_walked", "Distance walked", "Per observed segment"),
-        ("displacement", "Net displacement", "Per observed segment"),
+    unit_label = "animal mean" if stats_unit == "animal" else "trial"
+    specs = (
+        ("sample_percent", "Samples inside", f"% per {unit_label}"),
+        ("trial_percent", "Trials entering", f"0/100% per {unit_label}"),
+        ("distance_walked", "Distance walked", f"Per {unit_label}"),
+        ("displacement", "Net displacement", f"Per {unit_label}"),
         (
             "median_local_tortuosity",
             "Local tortuosity",
-            "Per observed segment",
+            f"Per {unit_label}",
         ),
-        ("median_velocity", "Velocity", "Per observed segment"),
+        ("median_velocity", "Velocity", f"Per {unit_label}"),
     )
-    specs = aggregate_specs + distribution_specs
     fig = make_subplots(
         rows=2, cols=3,
         subplot_titles=[f"{title}<br><sup>{subtitle}</sup>"
@@ -2657,99 +2775,52 @@ def build_custom_region_diagnostics_figure(payload):
         str(region["id"]): str(region["name"]) for region in region_rows
     }
 
-    # Sample and entering-trial shares are group-level proportions, so grouped
-    # bars remain the honest encoding for the first two panels.
-    for metric_index, (key, title, _subtitle) in enumerate(aggregate_specs):
-        row, col = metric_index // 3 + 1, metric_index % 3 + 1
-        for region_index, region_id in enumerate(region_ids):
-            values, custom = [], []
-            for panel in panels:
-                summary = next((
-                    item for item in panel.get("regions", [])
-                    if str(item.get("id")) == region_id
-                ), {})
-                values.append(summary.get(key))
-                custom.append([
-                    int(summary.get("samples", 0)),
-                    int(summary.get("total_samples", 0)),
-                    int(summary.get("trials", 0)),
-                    int(summary.get("total_trials", 0)),
-                    float(summary.get("total_distance_walked", 0.0)),
-                    float(summary.get("total_displacement", 0.0)),
-                ])
-            fig.add_trace(go.Bar(
-                x=panel_names,
-                y=values,
-                name=region_names[region_id],
-                legendgroup=f"window:{region_id}",
-                showlegend=metric_index == 0,
-                marker=dict(
-                    color=COLORS[region_index % len(COLORS)],
-                    line=dict(color=_rgba(
-                        COLORS[region_index % len(COLORS)], 0.92), width=0.8),
-                ),
-                opacity=0.78,
-                customdata=custom,
-                hovertemplate=(
-                    "<b>%{x} · " + region_names[region_id] + "</b>"
-                    f"<br>{title}: %{{y:.4g}}%"
-                    "<br>samples: %{customdata[0]:,}/%{customdata[1]:,}"
-                    "<br>trials entered: %{customdata[2]:,}/%{customdata[3]:,}"
-                    "<br>total observed distance: %{customdata[4]:.4g}"
-                    "<br>total observed displacement: %{customdata[5]:.4g}"
-                    "<extra></extra>"
-                ),
-            ), row=row, col=col)
-        fig.update_xaxes(tickangle=-22, row=row, col=col)
-        fig.update_yaxes(range=[0, 100], ticksuffix="%",
-                         row=row, col=col)
-
-    # Movement quantities are trial/segment-level estimates. Small groups show
-    # every segment as a deterministic swarm; larger groups switch to a violin.
-    # Both get an identical IQR band and median line, matching Trial Metrics.
     group_count = len(panels)
     region_count = max(1, len(region_ids))
     region_spacing = 0.72 / region_count
     half_width = min(0.28, region_spacing * 0.38)
-    for offset, (key, title, _subtitle) in enumerate(distribution_specs, start=2):
-        row, col = offset // 3 + 1, offset % 3 + 1
+    observations = {}
+    counts = []
+    for metric_index, (key, _title, _subtitle) in enumerate(specs):
         for group_index, panel in enumerate(panels):
             summaries = {
                 str(item.get("id")): item
                 for item in panel.get("regions", [])
             }
             for region_index, region_id in enumerate(region_ids):
-                summary = summaries.get(region_id, {})
-                segment_values = summary.get("segment_values") or {}
-                values = np.asarray(
-                    segment_values.get(key) or [], dtype=float)
-                keep = np.isfinite(values)
-                if not keep.any():
+                values = _observation_distribution_values(
+                    summaries.get(region_id, {}), key, stats_unit)
+                observations[(metric_index, group_index, region_index)] = values
+                counts.append(len(values[0]))
+    mark = _distribution_choice(distribution_mode, counts)
+
+    for metric_index, (key, title, _subtitle) in enumerate(specs):
+        row, col = metric_index // 3 + 1, metric_index % 3 + 1
+        for group_index, panel in enumerate(panels):
+            for region_index, region_id in enumerate(region_ids):
+                values, identities, point_counts = observations[
+                    (metric_index, group_index, region_index)]
+                if not len(values):
                     continue
-                values = values[keep]
-                seg_ids = np.asarray(
-                    segment_values.get("seg_id") or [], dtype=object)[keep]
-                point_counts = np.asarray(
-                    segment_values.get("n_points") or [], dtype=int)[keep]
                 centre = (
                     group_index
                     + (region_index - (region_count - 1) / 2) * region_spacing
                 )
                 color = COLORS[region_index % len(COLORS)]
                 custom = np.column_stack([
-                    seg_ids.astype(str), point_counts,
+                    identities.astype(str), point_counts.astype(int),
                 ]).tolist()
                 hover = (
                     f"<b>{panel_names[group_index]} · "
                     f"{region_names[region_id]}</b>"
                     f"<br>{title}: %{{y:.4g}}"
-                    "<br>segment: %{customdata[0]}"
-                    "<br>observed samples: %{customdata[1]:,}"
+                    f"<br>{unit_label}: %{{customdata[0]}}"
+                    "<br>support samples: %{customdata[1]:,}"
                     "<extra></extra>"
                 )
-                if len(values) <= 200:
+                if mark == "swarm":
                     rng = np.random.default_rng(
-                        2903 + offset * 1009
+                        2903 + metric_index * 1009
                         + group_index * 101 + region_index * 17
                     )
                     jitter = rng.uniform(
@@ -2766,6 +2837,7 @@ def build_custom_region_diagnostics_figure(payload):
                         hovertemplate=hover,
                     ), row=row, col=col)
                 else:
+                    show_points = bool(show_violin_points) and len(values) <= 200
                     fig.add_trace(go.Violin(
                         x=[centre] * len(values),
                         y=values.tolist(),
@@ -2779,7 +2851,10 @@ def build_custom_region_diagnostics_figure(payload):
                         spanmode="hard",
                         box_visible=False,
                         meanline_visible=False,
-                        points=False,
+                        points="all" if show_points else False,
+                        jitter=0.22 if show_points else 0,
+                        pointpos=0,
+                        marker=dict(color=color, size=4, opacity=0.48),
                         width=half_width * 2,
                         line_color=color,
                         fillcolor=color,
@@ -2821,10 +2896,12 @@ def build_custom_region_diagnostics_figure(payload):
             row=row,
             col=col,
         )
+        if metric_index < 2:
+            fig.update_yaxes(range=[-3, 103], ticksuffix="%",
+                             row=row, col=col)
     fig.update_layout(
         template="plotly_white",
         height=680,
-        barmode="group",
         violinmode="overlay",
         margin=dict(l=52, r=28, t=118, b=90),
         legend=dict(
@@ -2832,6 +2909,14 @@ def build_custom_region_diagnostics_figure(payload):
             xanchor="left", x=0,
         ),
         hoverlabel=dict(namelength=-1),
+    )
+    fig.add_annotation(
+        x=0.5, y=-0.16, xref="paper", yref="paper", showarrow=False,
+        text=(
+            f"{mark.title()} selected for all six panels · observations are "
+            f"{unit_label}s · shaded bands are IQR; bold lines are medians."
+        ),
+        font=dict(size=10, color="#667085"),
     )
     return fig
 
@@ -3806,7 +3891,10 @@ def build_direction_field_figure(
             "abundance_metric": bins["metric"],
             "abundance_scale": bins["metric_scale"],
             "abundance_range": [bins["metric_min"], bins["metric_max"]],
-            "spatial_axis_count": bins["nrows"] * ncols,
+            # The last grid cell can be empty when the active grouping has an
+            # odd number of panels.  Region overlays and viewport restoration
+            # must only address subplots that actually contain data.
+            "spatial_axis_count": len(results),
             "marginals": "active heatmap metric",
             "marginal_resolution_multiplier": 4,
             "quadrant_cut": list(bins.get("start_cut", (0.0, 0.0))),
@@ -4496,6 +4584,7 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
 
     # --- panel 2: residence-time paired swarm ---
     res = roi_residence_table(df, rois_by_cfg, reach)
+    rgrp = pd.DataFrame()
     if len(res):
         rgrp = res.groupby(["ConfigFile", "animal"], sort=False, observed=True).agg(
             residence_left=("residence_left", "mean"),
@@ -4584,6 +4673,119 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
                          title_text="config" if row == 4 else None,
                          row=row, col=1)
     fig.update_xaxes(matches="x")
+
+    def _paired_side_tests(source, left_column, right_column):
+        tests = []
+        if source is None or len(source) == 0:
+            return tests
+        for label, sub in source.groupby("label", sort=False, observed=True):
+            left = pd.to_numeric(
+                sub[left_column], errors="coerce").to_numpy(dtype=float)
+            right = pd.to_numeric(
+                sub[right_column], errors="coerce").to_numpy(dtype=float)
+            keep = np.isfinite(left) & np.isfinite(right)
+            left, right = left[keep], right[keep]
+            if len(left) < 2:
+                continue
+            try:
+                p_value = (
+                    1.0 if np.allclose(left, right, equal_nan=True)
+                    else float(scipy_stats.wilcoxon(
+                        left, right, alternative="two-sided").pvalue)
+                )
+            except ValueError:
+                p_value = np.nan
+            tests.append({
+                "left": str(label), "right": "L↔R",
+                "raw_p": p_value,
+            })
+        return tests
+
+    def _unpaired_side_tests(source, value_column, circular=False):
+        tests = []
+        if source is None or len(source) == 0:
+            return tests
+        for label, sub in source.groupby("label", sort=False, observed=True):
+            left = pd.to_numeric(
+                sub.loc[sub["side"] == "left", value_column],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            right = pd.to_numeric(
+                sub.loc[sub["side"] == "right", value_column],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            left, right = (
+                left[np.isfinite(left)], right[np.isfinite(right)])
+            if not len(left) or not len(right):
+                continue
+            try:
+                if circular:
+                    test_frame = pd.DataFrame({
+                        "theta_deg": np.concatenate([left, right]),
+                        "group": (
+                            ["left"] * len(left) + ["right"] * len(right)),
+                    })
+                    p_value, _method = _circular_group_test(test_frame)
+                else:
+                    p_value = float(scipy_stats.mannwhitneyu(
+                        left, right, alternative="two-sided").pvalue)
+            except ValueError:
+                p_value = np.nan
+            tests.append({
+                "left": str(label), "right": "L↔R",
+                "raw_p": p_value,
+            })
+        return tests
+
+    # Heading samples are autocorrelated, so reduce them to one circular mean
+    # per trial/side before comparing left versus right target bearings.
+    ang_trials = pd.DataFrame()
+    if len(ang) and "_seg_id" in ang:
+        angle_rad = np.radians(pd.to_numeric(
+            ang["angle_deg"], errors="coerce").to_numpy(dtype=float))
+        angular = ang[["label", "side", "_seg_id"]].copy()
+        angular["_sin"] = np.sin(angle_rad)
+        angular["_cos"] = np.cos(angle_rad)
+        angular = angular.groupby(
+            ["label", "side", "_seg_id"],
+            sort=False, observed=True,
+        )[["_sin", "_cos"]].mean().reset_index()
+        angular["angle_deg"] = np.degrees(np.arctan2(
+            angular["_sin"].to_numpy(dtype=float),
+            angular["_cos"].to_numpy(dtype=float),
+        ))
+        ang_trials = angular
+
+    panel_tests = [
+        _paired_side_tests(grp, "frac_left", "frac_right"),
+        _paired_side_tests(
+            rgrp, "residence_left", "residence_right"),
+        _unpaired_side_tests(ttt, "t"),
+        _unpaired_side_tests(ang_trials, "angle_deg", circular=True),
+    ]
+    for row, tests in enumerate(panel_tests, start=1):
+        adjusted = _holm_adjust([item["raw_p"] for item in tests])
+        parts = []
+        for item, q_value in zip(tests, adjusted):
+            item["holm_p"] = (
+                float(q_value) if np.isfinite(q_value) else None)
+            item["stars"] = _p_stars(q_value)
+            if item["holm_p"] is not None and item["holm_p"] < 0.05:
+                parts.append(f"{item['left']} {item['stars']}")
+        label = (
+            "L↔R Holm: " + " · ".join(parts[:6])
+            if parts else "L↔R Holm: no q<.05"
+        )
+        xref, yref = _subplot_axis(row)
+        fig.add_annotation(
+            name="td-target-stats",
+            x=0.99, y=0.98,
+            xref=f"{xref} domain", yref=f"{yref} domain",
+            xanchor="right", yanchor="top",
+            showarrow=False, text=label,
+            bgcolor="rgba(255,250,235,0.88)", borderpad=2,
+            font=dict(size=9, color="#7a4f00"),
+        )
     return fig
 
 
@@ -5245,9 +5447,71 @@ def _metric_stat_groups(stats: pd.DataFrame, group_by="config",
     return [(value, stats[text == str(value)]) for value in values]
 
 
+def _metric_stats_for_unit(stats, group_by="config", pool_mode="separate",
+                           stats_unit="trial"):
+    """Pool trial summaries to one mean per animal within the active group."""
+    if (stats is None or len(stats) == 0
+            or str(stats_unit or "trial") != "animal"):
+        return stats
+    work = stats.copy()
+    fly_raw = work.get("fly_id", pd.Series("", index=work.index))
+    vr_raw = work.get("vr", pd.Series("", index=work.index))
+    folder_raw = work.get("source_folder", pd.Series("", index=work.index))
+    fly = fly_raw.astype(object).where(fly_raw.notna(), "").astype(str)
+    vr = vr_raw.astype(object).where(vr_raw.notna(), "").astype(str)
+    folder = (
+        folder_raw.astype(object).where(folder_raw.notna(), "").astype(str)
+    )
+    fallback = work.get(
+        "seg_id", pd.Series(work.index.astype(str), index=work.index)
+    ).astype(str)
+    work["_animal"] = np.where(
+        fly.str.strip().ne(""),
+        fly + "@" + vr,
+        np.where(folder.str.strip().ne(""), folder + "@" + vr, fallback),
+    )
+    columns = {
+        "config": "config",
+        "scene": "scene",
+        "vr": "vr",
+        "flyid": "fly_id",
+        "file": "source_folder",
+    }
+    active = columns.get(group_by, "config")
+    keys = ["_animal"]
+    if pool_mode != "pooled" and group_by != "all" and active in work:
+        keys.insert(0, active)
+    numeric = {
+        column: "mean"
+        for column, _title, _axis in _TRIAL_METRIC_SPECS
+        if column in work
+    }
+    if "peak_velocity" in work:
+        numeric["peak_velocity"] = "mean"
+    if "n_points" in work:
+        numeric["n_points"] = "sum"
+    pooled = work.groupby(
+        keys, sort=False, observed=True, dropna=False).agg(numeric).reset_index()
+    pooled["seg_id"] = pooled["_animal"].astype(str)
+    # Keep all grouping columns available; the active one is already exact and
+    # inactive values are merely hover metadata.
+    for column in ("config", "scene", "vr", "fly_id", "source_folder"):
+        if column in pooled:
+            continue
+        if column == "fly_id":
+            pooled[column] = pooled["_animal"].astype(str)
+        else:
+            pooled[column] = ""
+    if "n_points" not in pooled:
+        pooled["n_points"] = 0
+    return pooled.drop(columns=["_animal"], errors="ignore")
+
+
 def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                                pool_mode="separate",
-                               swarm_max=200) -> go.Figure:
+                               swarm_max=200, distribution_mode="auto",
+                               show_violin_points=True,
+                               stats_unit="trial") -> go.Figure:
     """Compare robust per-trial movement summaries across the active panel axis.
 
     Small groups use a jittered point swarm; larger groups use count-scaled
@@ -5258,6 +5522,8 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
 
     if stats is None or len(stats) == 0:
         return _msg_figure("No per-trial metrics match the active filters.", 430)
+    stats = _metric_stats_for_unit(
+        stats, group_by, pool_mode, stats_unit)
     groups = [(name, group) for name, group in
               _metric_stat_groups(stats, group_by, pool_mode) if len(group)]
     if not groups:
@@ -5269,6 +5535,14 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
         horizontal_spacing=0.09, vertical_spacing=0.17,
     )
     half_width = 0.36
+    group_sizes = []
+    for _raw_name, group in groups:
+        for column, _title, _axis in _TRIAL_METRIC_SPECS:
+            if column in group:
+                values = pd.to_numeric(group[column], errors="coerce")
+                group_sizes.append(int(np.isfinite(
+                    values.to_numpy(dtype=float)).sum()))
+    mark = _distribution_choice(distribution_mode, group_sizes, swarm_max)
     for metric_index, (column, _title, axis_title) in enumerate(_TRIAL_METRIC_SPECS):
         row, col = metric_index // 2 + 1, metric_index % 2 + 1
         ticktext = []
@@ -5297,7 +5571,7 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                 "<br>segment: %{customdata[0]}"
                 "<br>source points: %{customdata[1]:,}<extra></extra>"
             )
-            if len(y) <= int(swarm_max):
+            if mark == "swarm":
                 # Explicit, deterministic jitter avoids opaque box-trace point
                 # positioning and remains stable across rerenders.
                 rng = np.random.default_rng(
@@ -5314,12 +5588,19 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                     customdata=custom, hovertemplate=hover,
                 ), row=row, col=col)
             else:
+                show_points = (
+                    bool(show_violin_points) and len(y) <= int(swarm_max)
+                )
                 fig.add_trace(go.Violin(
                     x=[group_index] * len(y), y=y.tolist(), name=name,
                     legendgroup=f"metric:{raw_name}",
                     scalegroup=f"trial-metric:{column}",
                     showlegend=False, scalemode="count", spanmode="hard",
-                    box_visible=False, meanline_visible=False, points=False,
+                    box_visible=False, meanline_visible=False,
+                    points="all" if show_points else False,
+                    jitter=0.22 if show_points else 0,
+                    pointpos=0,
+                    marker=dict(color=color, size=4, opacity=0.48),
                     width=half_width * 2,
                     line_color=color, fillcolor=color, opacity=0.55,
                     customdata=custom, hovertemplate=hover,
@@ -5375,8 +5656,9 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
     fig.add_annotation(
         x=0.5, y=-0.13, xref="paper", yref="paper", showarrow=False,
         text=(
-            f"Each observation is one visible trial. Groups with ≤{int(swarm_max)} "
-            "trials show jittered points; larger groups show count-scaled violins. "
+            f"Each observation is one visible "
+            f"{'animal mean' if stats_unit == 'animal' else 'trial'}. "
+            f"{mark.title()} is used consistently across all four panels. "
             "Shaded bands are IQR; bold lines are medians."
         ),
         font=dict(size=10, color="#667085"),
@@ -5441,6 +5723,67 @@ def _omnibus_nonparametric(groups, column):
         return np.nan, "constant / insufficient"
 
 
+def _pairwise_nonparametric(groups, column):
+    """Holm-adjusted two-sided Mann–Whitney comparisons for named groups."""
+    prepared = []
+    for name, group in groups:
+        if column not in group:
+            continue
+        values = pd.to_numeric(
+            group[column], errors="coerce").to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values):
+            prepared.append((str(name), values))
+    raw = []
+    for left_index in range(len(prepared)):
+        for right_index in range(left_index + 1, len(prepared)):
+            left_name, left = prepared[left_index]
+            right_name, right = prepared[right_index]
+            try:
+                p_value = float(scipy_stats.mannwhitneyu(
+                    left, right, alternative="two-sided").pvalue)
+            except ValueError:
+                p_value = np.nan
+            raw.append({
+                "left": left_name,
+                "right": right_name,
+                "raw_p": p_value,
+                "n_left": int(len(left)),
+                "n_right": int(len(right)),
+            })
+    adjusted = _holm_adjust([item["raw_p"] for item in raw])
+    for item, q_value in zip(raw, adjusted):
+        item["holm_p"] = float(q_value) if np.isfinite(q_value) else None
+        item["stars"] = _p_stars(q_value)
+    return raw
+
+
+def _pairwise_label(pairs, group_by=None, max_pairs=6):
+    """Compact but explicit significant-pair label for plot annotations."""
+    significant = [
+        item for item in pairs
+        if item.get("holm_p") is not None and item["holm_p"] < 0.05
+    ]
+    if not pairs:
+        return "pairwise n/a"
+    if not significant:
+        return "pairwise Holm: no q<.05"
+    parts = []
+    for item in significant[:max_pairs]:
+        left = (
+            _group_label(group_by, item["left"])
+            if group_by else str(item["left"])
+        )
+        right = (
+            _group_label(group_by, item["right"])
+            if group_by else str(item["right"])
+        )
+        parts.append(f"{left}↔{right} {item['stars']}")
+    if len(significant) > max_pairs:
+        parts.append(f"+{len(significant) - max_pairs} more")
+    return "pairwise Holm: " + " · ".join(parts)
+
+
 def _rayleigh_uniformity_p(angles_deg):
     """Rayleigh uniformity p-value using the standard finite-n expansion."""
     angles = np.radians(np.asarray(angles_deg, dtype=float))
@@ -5495,10 +5838,95 @@ def _circular_group_test(ray):
         return np.nan, "constant / insufficient"
 
 
+def _custom_region_stat_labels(payload, stats_unit="trial"):
+    """Pairwise non-parametric labels for all six window diagnostics."""
+    panels = (payload or {}).get("panels") or []
+    regions = (payload or {}).get("regions") or []
+    if not panels or not regions:
+        return []
+    keys = (
+        "sample_percent", "trial_percent", "distance_walked", "displacement",
+        "median_local_tortuosity", "median_velocity",
+    )
+    region_ids = [str(region.get("id")) for region in regions]
+    region_names = {
+        str(region.get("id")): str(region.get("name")) for region in regions
+    }
+    output = []
+    for key in keys:
+        raw = []
+
+        def add_pairs(named, prefix):
+            for left_index in range(len(named)):
+                for right_index in range(left_index + 1, len(named)):
+                    left_name, left = named[left_index]
+                    right_name, right = named[right_index]
+                    if not len(left) or not len(right):
+                        continue
+                    try:
+                        p_value = float(scipy_stats.mannwhitneyu(
+                            left, right, alternative="two-sided").pvalue)
+                    except ValueError:
+                        p_value = np.nan
+                    raw.append({
+                        "left": f"{prefix}{left_name}",
+                        "right": f"{prefix}{right_name}",
+                        "raw_p": p_value,
+                    })
+
+        # Compare active panel groups separately within each window.
+        for region_id in region_ids:
+            named = []
+            for panel in panels:
+                summary = next((
+                    item for item in panel.get("regions", [])
+                    if str(item.get("id")) == region_id
+                ), {})
+                values, _identities, _support = (
+                    _observation_distribution_values(
+                        summary, key, stats_unit)
+                )
+                named.append((
+                    str(panel.get("name", panel.get("raw", "Group"))),
+                    values,
+                ))
+            add_pairs(named, f"{region_names[region_id]}: ")
+
+        # With multiple windows, also compare windows within each panel group.
+        if len(region_ids) > 1:
+            for panel in panels:
+                summaries = {
+                    str(item.get("id")): item
+                    for item in panel.get("regions", [])
+                }
+                named = []
+                for region_id in region_ids:
+                    values, _identities, _support = (
+                        _observation_distribution_values(
+                            summaries.get(region_id, {}), key, stats_unit)
+                    )
+                    named.append((region_names[region_id], values))
+                add_pairs(
+                    named,
+                    f"{panel.get('name', panel.get('raw', 'Group'))}: ",
+                )
+
+        adjusted = _holm_adjust([item["raw_p"] for item in raw])
+        for item, q_value in zip(raw, adjusted):
+            item["holm_p"] = (
+                float(q_value) if np.isfinite(q_value) else None)
+            item["stars"] = _p_stars(q_value)
+        output.append(_pairwise_label(raw))
+    return output
+
+
 def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
                         pool_mode, polar_moving, polar_walk,
                         polar_angle_source, polar_r_range,
-                        polar_min_point_frac, polar_min_animal_frac):
+                        polar_min_point_frac, polar_min_animal_frac,
+                        stats_unit="trial", custom_region_payload=None):
+    metric_stats = _metric_stats_for_unit(
+        metric_stats, group_by, pool_mode, stats_unit)
     groups = [
         item for item in _metric_stat_groups(
             metric_stats, group_by, pool_mode) if len(item[1])
@@ -5508,11 +5936,21 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
         for column, _title, _axis in _TRIAL_METRIC_SPECS
     ]
     adjusted = _holm_adjust([item[0] for item in raw_metric])
+    metric_pairs = [
+        _pairwise_nonparametric(groups, column)
+        for column, _title, _axis in _TRIAL_METRIC_SPECS
+    ]
     metric_labels = []
-    for (p_value, method), q_value in zip(raw_metric, adjusted):
-        metric_labels.append(
+    for (p_value, method), q_value, pairs in zip(
+            raw_metric, adjusted, metric_pairs):
+        omnibus = (
             f"{method} · Holm p={q_value:.3g} {_p_stars(q_value)}"
-            if np.isfinite(q_value) else f"{method} · n/a")
+            if np.isfinite(q_value) else f"{method} · n/a"
+        )
+        metric_labels.append(
+            omnibus + "<br><sup>"
+            + _pairwise_label(pairs, group_by) + "</sup>"
+        )
 
     polar_ray = rayleigh_by_segment(
         polar_frame, _on(polar_moving), polar_walk, "none",
@@ -5532,9 +5970,51 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
     polar_ray = polar_ray.assign(
         group=polar_ray["_seg_id"].astype(str).map(seg_group))
     polar_p, polar_method = _circular_group_test(polar_ray)
-    polar_label = (
+    polar_omnibus = (
         f"{polar_method} · p={polar_p:.3g} {_p_stars(polar_p)}"
         if np.isfinite(polar_p) else f"{polar_method} · n/a"
+    )
+    polar_pairs_raw = []
+    polar_names = [
+        str(name) for name in pd.unique(polar_ray["group"].dropna())
+    ]
+    for left_index in range(len(polar_names)):
+        for right_index in range(left_index + 1, len(polar_names)):
+            left, right = polar_names[left_index], polar_names[right_index]
+            subset = polar_ray[polar_ray["group"].astype(str).isin([left, right])]
+            p_value, method = _circular_group_test(subset)
+            polar_pairs_raw.append({
+                "left": left, "right": right, "raw_p": p_value,
+                "test": method,
+            })
+    polar_pairs_adjusted = _holm_adjust([
+        item["raw_p"] for item in polar_pairs_raw])
+    for item, q_value in zip(polar_pairs_raw, polar_pairs_adjusted):
+        item["holm_p"] = float(q_value) if np.isfinite(q_value) else None
+        item["stars"] = _p_stars(q_value)
+
+    polar_uniformity = []
+    for name, group in polar_ray.groupby(
+            "group", sort=False, observed=True):
+        p_value = _rayleigh_uniformity_p(group["theta_deg"])
+        polar_uniformity.append({
+            "group": str(name),
+            "rayleigh_p": float(p_value) if np.isfinite(p_value) else None,
+            "stars": _p_stars(p_value),
+            "n": int(len(group)),
+        })
+    directed = [
+        f"{_group_label(group_by, item['group'])} {item['stars']}"
+        for item in polar_uniformity
+        if item["rayleigh_p"] is not None and item["rayleigh_p"] < 0.05
+    ]
+    uniform_label = (
+        "Rayleigh directed: " + " · ".join(directed[:6])
+        if directed else "Rayleigh: no group p<.05"
+    )
+    polar_label = (
+        polar_omnibus + "<br><sup>" + uniform_label + " · "
+        + _pairwise_label(polar_pairs_raw, group_by) + "</sup>"
     )
 
     start_parts = []
@@ -5554,20 +6034,26 @@ def _statistics_payload(metric_stats, polar_frame, raw_frame, group_by,
         f" · min p={min_p:.3g} {_p_stars(min_p)}"
         if start_parts else "Rayleigh uniformity · n/a"
     )
+    region_labels = _custom_region_stat_labels(
+        custom_region_payload, stats_unit)
     return {
         "pending": False,
         "completed": time.time(),
         "metric_labels": metric_labels,
+        "region_labels": region_labels,
         "polar_label": polar_label,
         "start_label": start_label,
         "details": {
             "metrics": [
                 {"metric": spec[0], "test": item[1],
                  "raw_p": item[0],
-                 "holm_p": float(q) if np.isfinite(q) else None}
-                for spec, item, q in zip(
-                    _TRIAL_METRIC_SPECS, raw_metric, adjusted)
+                 "holm_p": float(q) if np.isfinite(q) else None,
+                 "pairwise": pairs}
+                for spec, item, q, pairs in zip(
+                    _TRIAL_METRIC_SPECS, raw_metric, adjusted, metric_pairs)
             ],
+            "polar_uniformity": polar_uniformity,
+            "polar_pairwise": polar_pairs_raw,
             "starting_heading": [
                 {"config": name, "rayleigh_p": p_value, "n": count}
                 for name, p_value, count in start_parts
@@ -6247,6 +6733,54 @@ app.layout = html.Div([
                 "Sampling hides whole SourceFile+Trial+Step segments in the "
                 "mounted plots; 100% shows every trial.",
                 style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
+            ),
+
+            html.Hr(style={"margin": "6px 0"}),
+
+            html.Label(
+                "Distribution marks",
+                title=(
+                    "Auto uses one mark type across every metric: swarm when "
+                    "the largest group has at most 200 observations, otherwise "
+                    "violin. Explicit choices are always honoured."
+                ),
+                style={"fontWeight": "bold", "fontSize": "12px"},
+            ),
+            dcc.RadioItems(
+                id="distribution-mode",
+                options=[
+                    {"label": " Auto", "value": "auto"},
+                    {"label": " Swarm", "value": "swarm"},
+                    {"label": " Violin", "value": "violin"},
+                ],
+                value="auto", inline=True, className="segmented-control",
+                style={"fontSize": "10px"},
+            ),
+            dcc.Checklist(
+                id="distribution-show-points",
+                options=[{
+                    "label": " Show dots on violins when n ≤ 200",
+                    "value": "on",
+                }],
+                value=["on"], style={"fontSize": "10px", "marginTop": "2px"},
+            ),
+            html.Label(
+                "Independent unit",
+                title=(
+                    "Trial treats every SourceFile+Trial+Step segment as one "
+                    "observation. Animal first averages trials within FlyID@VR "
+                    "and the active panel group."
+                ),
+                style={"fontSize": "10px", "marginTop": "3px"},
+            ),
+            dcc.RadioItems(
+                id="stats-unit",
+                options=[
+                    {"label": " Trial", "value": "trial"},
+                    {"label": " Animal", "value": "animal"},
+                ],
+                value="trial", inline=True, className="segmented-control",
+                style={"fontSize": "10px"},
             ),
 
             html.Hr(style={"margin": "6px 0"}),
@@ -7421,19 +7955,16 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
-    function(on, style, renderState, polarState) {
+    function(on) {
       if (window.dash_clientside.clean_layout) {
-        return window.dash_clientside.clean_layout.render(on, style);
+        return window.dash_clientside.clean_layout.render(on);
       }
       return on ? 'Clean layout is loading.' :
-        'Hide spatial grids, axes and legends and use a scale bar.';
+        'Hide spatial axes and Cartesian grids without changing plot data.';
     }
     """,
     Output("btn-minimal-layout", "title"),
     Input("minimal-layout-store", "data"),
-    Input("visual-style-store", "data"),
-    Input("view-render-state", "data"),
-    Input("polar-render-state", "data"),
 )
 
 
@@ -7574,8 +8105,9 @@ app.clientside_callback(
           trajectory, polar, fraction, seed
         );
         var text = (typeof summary === 'string') ? summary.replace(
-          /[\\d,.]+\\/[\\d,.]+ displayed trials/,
-          String(state.selected) + '/' + String(state.total) +
+          /[\\d,.]+[KMB]?\\/[\\d,.]+[KMB]? displayed trials/i,
+          Number(state.selected).toLocaleString() + '/' +
+            Number(state.total).toLocaleString() +
             ' displayed trials'
         ) : window.dash_clientside.no_update;
         return [state, text];
@@ -7734,7 +8266,8 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
 _URL_STR = {"groupby": "group-by", "pool": "pool-mode", "color": "color-by",
             "hscale": "heatmap-scale", "hmetric": "heatmap-metric",
             "hcrange": "heatmap-crange", "pang": "polar-angle-source",
-            "layout": "view-layout", "ractive": "custom-region-active"}
+            "layout": "view-layout", "ractive": "custom-region-active",
+            "dist": "distribution-mode", "sunit": "stats-unit"}
 _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyids",
              "fscn": "filter-scenes", "ffld": "filter-folders", "raw": "raw-columns"}
 
@@ -7797,6 +8330,9 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("custom-region-enabled", "value", allow_duplicate=True),
     Output("custom-regions-store", "data", allow_duplicate=True),
     Output("custom-region-active", "value", allow_duplicate=True),
+    Output("distribution-mode", "value", allow_duplicate=True),
+    Output("distribution-show-points", "value", allow_duplicate=True),
+    Output("stats-unit", "value", allow_duplicate=True),
     Output("minimal-layout-store", "data", allow_duplicate=True),
     Output("url-restored", "data"),
     Input("url", "search"),
@@ -7806,7 +8342,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 58
+    n_out = 61
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -7911,6 +8447,19 @@ def restore_from_url(search, already):
     custom_region_enabled = (
         ["on"] if p["region"][0] == "1" else []
     ) if "region" in p else no_update
+    distribution_mode = (
+        p["dist"][0]
+        if p.get("dist", [""])[0] in ("auto", "swarm", "violin")
+        else no_update
+    )
+    distribution_points = (
+        ["on"] if p["dpts"][0] == "1" else []
+    ) if "dpts" in p else no_update
+    stats_unit = (
+        p["sunit"][0]
+        if p.get("sunit", [""])[0] in ("trial", "animal")
+        else no_update
+    )
     minimal_layout = (
         p["minimal"][0] == "1"
     ) if "minimal" in p else no_update
@@ -8011,6 +8560,7 @@ def restore_from_url(search, already):
         display_percent(), loop_enabled, finite_num("lx"), finite_num("lz"),
         positive_num("lr"), rings, active_ring, match_mode,
         custom_region_enabled, custom_regions, s("ractive"),
+        distribution_mode, distribution_points, stats_unit,
         minimal_layout, True,
     )
 
@@ -8189,6 +8739,9 @@ def tick_progress(n):
     Input("custom-region-enabled", "value"),
     Input("custom-regions-store", "data"),
     Input("custom-region-active", "value"),
+    Input("distribution-mode", "value"),
+    Input("distribution-show-points", "value"),
+    Input("stats-unit", "value"),
     Input("minimal-layout-store", "data"),
     State("viewport-store", "data"),
     State("url-restored", "data"),
@@ -8202,6 +8755,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                loop_enabled, loop_x, loop_z, loop_radius,
                loop_rings, loop_active, loop_match_mode,
                custom_region_enabled, custom_regions, custom_region_active,
+               distribution_mode, distribution_show_points, stats_unit,
                minimal_layout, vp, restored):
     if not restored:
         return no_update
@@ -8230,6 +8784,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     params["anim"] = "1" if (anim and "on" in anim) else "0"
     params["loop"] = "1" if _on(loop_enabled) else "0"
     params["region"] = "1" if _on(custom_region_enabled) else "0"
+    params["dpts"] = "1" if _on(distribution_show_points) else "0"
     params["minimal"] = "1" if minimal_layout else "0"
     if loop_rings:
         params["loops"] = json.dumps(
@@ -8243,6 +8798,10 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             custom_regions, separators=(",", ":"), ensure_ascii=False)
     if custom_region_active:
         params["ractive"] = str(custom_region_active)
+    if distribution_mode in ("auto", "swarm", "violin"):
+        params["dist"] = distribution_mode
+    if stats_unit in ("trial", "animal"):
+        params["sunit"] = stats_unit
     lists = {"fcfg": fcfg, "fvr": fvr, "ffly": ffly, "fscn": fscn, "ffld": ffld, "raw": raw}
     for k, v in lists.items():
         if v:
@@ -9516,6 +10075,9 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     State("flow-max-radius", "value"),
     State("custom-region-enabled", "value"),
     State("custom-regions-store", "data"),
+    State("distribution-mode", "value"),
+    State("distribution-show-points", "value"),
+    State("stats-unit", "value"),
     prevent_initial_call=True,
 )
 def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -9527,7 +10089,8 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
                  roi_trim, roi_entered, polar_moving, polar_walk, polar_angle_source,
                  polar_r_range,
                  polar_min_point_frac, polar_min_animal_frac,
-                 flow_max_radius, custom_region_enabled, custom_regions):
+                 flow_max_radius, custom_region_enabled, custom_regions,
+                 distribution_mode, distribution_show_points, stats_unit):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     raw_hidden = {"display": "none"}
     if not pattern:
@@ -9693,7 +10256,11 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         )
         if region_on else {"enabled": False, "regions": [], "panels": []}
     )
-    region_diag = build_custom_region_diagnostics_figure(region_stats)
+    region_diag = build_custom_region_diagnostics_figure(
+        region_stats, distribution_mode=distribution_mode,
+        show_violin_points=_on(distribution_show_points),
+        stats_unit=stats_unit,
+    )
     region_store = _custom_region_store_payload(region_stats)
     polar_position_frame = (
         rebase_to_origin(df_display) if do_rebase else df_display
@@ -9726,7 +10293,11 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         if region_on else _visible_segment_stats(native_stats, df_view)
     )
     metrics_fig = build_trial_metrics_figure(
-        metric_stats, group_by=group_by, pool_mode=pool_mode)
+        metric_stats, group_by=group_by, pool_mode=pool_mode,
+        distribution_mode=distribution_mode,
+        show_violin_points=_on(distribution_show_points),
+        stats_unit=stats_unit,
+    )
     timings["trial metrics"] = time.perf_counter() - stage_started
     _progress_stage(
         op_id, 7, done=0, total=1,
@@ -9942,6 +10513,9 @@ def update_colour_views(
     Output("polar-render-state", "data", allow_duplicate=True),
     Output("plot-status", "children", allow_duplicate=True),
     Input("custom-region-analysis-interval", "n_intervals"),
+    Input("distribution-mode", "value"),
+    Input("distribution-show-points", "value"),
+    Input("stats-unit", "value"),
     State("view-render-state", "data"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
@@ -9983,14 +10557,20 @@ def update_colour_views(
     prevent_initial_call=True,
 )
 def update_custom_region_analysis(
-        n_intervals, render_state, pattern, vel_thresh, min_disp, trim,
+        n_intervals, distribution_mode, distribution_show_points, stats_unit,
+        render_state, pattern, vel_thresh, min_disp, trim,
         jump_buf, cfg, vrs, fids, scenes, folders, trial_min, trial_max,
         step_min, step_max, vel_selection, disp_selection, group_by, pool_mode,
         color_by, ncols, max_points, render_mode, rebase, roi_show, roi_reach,
         roi_entered, roi_trim, traj_fraction, traj_sample_seed, polar_moving,
         polar_walk, polar_angle_source, polar_r_range, polar_min_point_frac,
         polar_min_animal_frac, enabled, regions):
-    if not n_intervals or not pattern or not render_state:
+    trigger = ctx.triggered_id
+    distribution_only = trigger in {
+        "distribution-mode", "distribution-show-points", "stats-unit",
+    }
+    if ((not n_intervals and not distribution_only)
+            or not pattern or not render_state):
         return (no_update,) * 6
     started = time.perf_counter()
     df_f, _, _ = _filtered_df(
@@ -10020,51 +10600,70 @@ def update_custom_region_analysis(
         )
         if region_on else {"enabled": False, "regions": [], "panels": []}
     )
-    diagnostic = build_custom_region_diagnostics_figure(payload)
-    store_payload = _custom_region_store_payload(payload)
+    diagnostic = build_custom_region_diagnostics_figure(
+        payload, distribution_mode=distribution_mode,
+        show_violin_points=_on(distribution_show_points),
+        stats_unit=stats_unit,
+    )
+    store_payload = (
+        no_update if distribution_only else _custom_region_store_payload(payload)
+    )
     metric_stats = (
         _custom_region_segment_stats(
             df_view, regions, position_frame=position_frame)
         if region_on else _visible_segment_stats(native_stats, df_view)
     )
     metrics_fig = build_trial_metrics_figure(
-        metric_stats, group_by=group_by, pool_mode=pool_mode)
+        metric_stats, group_by=group_by, pool_mode=pool_mode,
+        distribution_mode=distribution_mode,
+        show_violin_points=_on(distribution_show_points),
+        stats_unit=stats_unit,
+    )
 
-    sampled = df_view
-    sampled_positions = rebase_to_origin(sampled) if do_rebase else sampled
-    polar_source = (
-        _custom_region_subset(sampled, regions, sampled_positions)
-        if region_on else sampled
-    )
-    roi_outcomes = (
-        roi_outcome_by_segment(df_view, rois, reach)
-        if color_by == "roi" and rois else None
-    )
-    polar_fig = build_polar_figure(
-        polar_source, group_by, pool_mode, ncols=ncols_value,
-        color_by=color_by or "categorical",
-        moving_only=_on(polar_moving), walk_thresh=polar_walk,
-        max_points=_budget(
-            BUDGET_POLAR, BUDGET_POLAR_SPEED,
-            _render_mode(render_mode), max_points),
-        rois=rois, reach_radius=reach,
-        show_rois=_on(roi_show) and bool(rois) and not do_rebase,
-        roi_outcomes=roi_outcomes, r_range=polar_r_range,
-        min_point_frac=polar_min_point_frac,
-        min_animal_trial_frac=polar_min_animal_frac,
-        angle_source=polar_angle_source,
-    )
+    polar_fig = no_update
+    if not distribution_only:
+        sampled = df_view
+        sampled_positions = rebase_to_origin(sampled) if do_rebase else sampled
+        polar_source = (
+            _custom_region_subset(sampled, regions, sampled_positions)
+            if region_on else sampled
+        )
+        roi_outcomes = (
+            roi_outcome_by_segment(df_view, rois, reach)
+            if color_by == "roi" and rois else None
+        )
+        polar_fig = build_polar_figure(
+            polar_source, group_by, pool_mode, ncols=ncols_value,
+            color_by=color_by or "categorical",
+            moving_only=_on(polar_moving), walk_thresh=polar_walk,
+            max_points=_budget(
+                BUDGET_POLAR, BUDGET_POLAR_SPEED,
+                _render_mode(render_mode), max_points),
+            rois=rois, reach_radius=reach,
+            show_rois=_on(roi_show) and bool(rois) and not do_rebase,
+            roi_outcomes=roi_outcomes, r_range=polar_r_range,
+            min_point_frac=polar_min_point_frac,
+            min_animal_trial_frac=polar_min_animal_frac,
+            angle_source=polar_angle_source,
+        )
     elapsed = time.perf_counter() - started
     state = {
         "completed": time.time(),
-        "operation": "observation windows",
+        "operation": (
+            "distribution style" if distribution_only
+            else "observation windows"
+        ),
         "epoch": int((render_state or {}).get("epoch", 0)),
         "timings": {"observation windows": round(elapsed, 4)},
     }
     return (
         polar_fig, diagnostic, metrics_fig, store_payload, state,
-        "Observation windows updated polar, grouped diagnostics and trial "
-        f"metrics in {elapsed:.2f}s.",
+        (
+            f"Distribution diagnostics updated in {elapsed:.2f}s."
+            if distribution_only else
+            "Observation windows updated polar, grouped diagnostics and trial "
+            f"metrics in {elapsed:.2f}s."
+        ),
     )
 
 
@@ -10127,6 +10726,7 @@ app.clientside_callback(
     State("polar-min-animal-frac", "value"),
     State("custom-region-enabled", "value"),
     State("custom-regions-store", "data"),
+    State("stats-unit", "value"),
     State("rebase-origin", "value"),
     prevent_initial_call=True,
 )
@@ -10137,7 +10737,7 @@ def compute_delayed_statistics(
         pool_mode, roi_reach, roi_entered, roi_trim, traj_fraction,
         traj_sample_seed, polar_moving, polar_walk, polar_angle_source,
         polar_r_range, polar_min_point_frac, polar_min_animal_frac,
-        custom_region_enabled, custom_regions, rebase):
+        custom_region_enabled, custom_regions, stats_unit, rebase):
     if not n_intervals or not pattern or not render_state:
         return no_update
     started = time.perf_counter()
@@ -10156,9 +10756,14 @@ def compute_delayed_statistics(
         df_view, _ = _roi_apply(
             df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
         polar_frame = df_view
+        region_payload = None
         if _on(custom_region_enabled):
             metric_positions = (
                 rebase_to_origin(df_view) if _on(rebase) else df_view
+            )
+            region_payload = _custom_region_stats(
+                df_view, custom_regions, group_by, pool_mode, 2,
+                position_frame=metric_positions,
             )
             metric_stats = _custom_region_segment_stats(
                 df_view, custom_regions, metric_positions)
@@ -10172,7 +10777,9 @@ def compute_delayed_statistics(
         payload = _statistics_payload(
             metric_stats, polar_frame, raw_df, group_by, pool_mode,
             polar_moving, polar_walk, polar_angle_source, polar_r_range,
-            polar_min_point_frac, polar_min_animal_frac)
+            polar_min_point_frac, polar_min_animal_frac,
+            stats_unit=stats_unit,
+            custom_region_payload=region_payload)
         payload["seconds"] = round(time.perf_counter() - started, 4)
         payload["epoch"] = int(render_state.get("epoch", 0))
         return payload
@@ -10222,6 +10829,26 @@ app.clientside_callback(
           });
         });
         apply('trial-metrics-plot',metricAdds);
+        var regionContainer=document.getElementById(
+          'custom-region-diagnostics-plot');
+        var regionGd=regionContainer&&regionContainer.querySelector(
+          '.js-plotly-plot');
+        var regionBase=(regionGd&&regionGd.layout&&
+          regionGd.layout.annotations)||[];
+        var regionAdds=[];
+        (payload.region_labels||[]).forEach(function(label,index){
+          var title=regionBase[index]||{};
+          regionAdds.push({
+            name:'td-stats',xref:'paper',yref:'paper',
+            x:Number(title.x===undefined?0.5:title.x),
+            y:Number(title.y===undefined?1:title.y),
+            xanchor:'center',yanchor:'bottom',yshift:15,
+            showarrow:false,text:label,
+            bgcolor:'rgba(255,250,235,0.88)',borderpad:2,
+            font:{size:8,color:'#7a4f00'}
+          });
+        });
+        apply('custom-region-diagnostics-plot',regionAdds);
         apply('polar-plot',[{
           name:'td-stats',xref:'paper',yref:'paper',x:0.5,y:1.0,
           xanchor:'center',yanchor:'bottom',yshift:38,showarrow:false,

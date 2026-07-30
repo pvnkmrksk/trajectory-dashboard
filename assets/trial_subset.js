@@ -9,7 +9,41 @@
   "use strict";
 
   function clone(value) {
-    return JSON.parse(JSON.stringify(value));
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value, function (_key, item) {
+      return ArrayBuffer.isView(item) ? Array.from(item) : item;
+    }));
+  }
+
+  function sequence(value) {
+    if (Array.isArray(value)) return value;
+    if (ArrayBuffer.isView(value)) return Array.from(value);
+    // Plotly 6 keeps numeric 1-D arrays in Dash figure props as compact
+    // `{dtype,bdata}` objects. Decode those browser-side instead of forcing
+    // the server to expand every trajectory coordinate into JSON numbers.
+    if (value && typeof value === "object" &&
+        typeof value.bdata === "string" && value.dtype) {
+      try {
+        var binary = window.atob(value.bdata);
+        var bytes = new Uint8Array(binary.length);
+        for (var index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        var dtype = String(value.dtype).replace(/[<>=|]/g, "");
+        var constructors = {
+          f8: Float64Array, f4: Float32Array,
+          i4: Int32Array, i2: Int16Array, i1: Int8Array,
+          u4: Uint32Array, u2: Uint16Array, u1: Uint8Array
+        };
+        var Constructor = constructors[dtype];
+        if (Constructor) {
+          return Array.from(new Constructor(bytes.buffer));
+        }
+      } catch (_error) {
+        return null;
+      }
+    }
+    return null;
   }
 
   function hash(text) {
@@ -29,7 +63,7 @@
   function selectedSegments(fig, fraction, seed) {
     var found = {};
     ((fig && fig.data) || []).forEach(function (trace) {
-      (trace.customdata || []).forEach(function (row) {
+      (sequence(trace.customdata) || []).forEach(function (row) {
         var id = segId(row);
         if (id) found[id] = true;
       });
@@ -51,29 +85,25 @@
   }
 
   function filteredTrace(trace, selected) {
-    if (!trace || !Array.isArray(trace.customdata)) return null;
-    var keys = ["x", "y", "r", "theta", "customdata"];
+    var customdata = sequence(trace && trace.customdata);
+    if (!trace || !customdata) return null;
+    var keys = ["x", "y", "r", "theta"];
     var available = keys.filter(function (key) {
-      return Array.isArray(trace[key]);
+      return sequence(trace[key]) !== null;
     });
     if (!available.length) return null;
     var output = {};
-    available.forEach(function (key) { output[key] = []; });
-    var lastWasGap = true;
-    trace.customdata.forEach(function (row, index) {
+    available.forEach(function (key) {
+      output[key] = new Array(sequence(trace[key]).length).fill(null);
+    });
+    customdata.forEach(function (row, index) {
       var id = segId(row);
       var keep = id && selected.ids[id];
       if (keep) {
         available.forEach(function (key) {
-          output[key].push(clone(trace[key][index]));
+          var values = sequence(trace[key]);
+          if (index < values.length) output[key][index] = values[index];
         });
-        lastWasGap = false;
-      } else if (!id && !lastWasGap) {
-        // Preserve one NaN separator after every retained trajectory/ray.
-        available.forEach(function (key) {
-          output[key].push(clone(trace[key][index]));
-        });
-        lastWasGap = true;
       }
     });
     return output;
@@ -82,7 +112,7 @@
   function baseSegmentOrder(trace) {
     var order = [];
     var previous = "";
-    ((trace && trace.customdata) || []).forEach(function (row) {
+    (sequence(trace && trace.customdata) || []).forEach(function (row) {
       var id = segId(row);
       if (id && id !== previous) order.push(id);
       previous = id;
@@ -94,33 +124,25 @@
     var output = clone(frameTrace || {});
     var order = baseSegmentOrder(baseTrace);
     if (!order.length) return output;
-    var x = Array.isArray(frameTrace.x) ? frameTrace.x : [];
-    var y = Array.isArray(frameTrace.y) ? frameTrace.y : [];
+    var x = sequence(frameTrace.x) || [];
+    var y = sequence(frameTrace.y) || [];
     var colors = (
-      frameTrace.marker && Array.isArray(frameTrace.marker.color)
-    ) ? frameTrace.marker.color : null;
-    var nextX = [], nextY = [], nextColors = [];
+      frameTrace.marker && sequence(frameTrace.marker.color)
+    ) || null;
+    var nextX = new Array(x.length).fill(null);
+    var nextY = new Array(y.length).fill(null);
+    var nextColors = colors ? Array.from(colors) : [];
     var segmentIndex = 0;
-    var lastWasGap = true;
     for (var index = 0; index < x.length; index += 1) {
       var gap = x[index] === null || y[index] === null ||
         !Number.isFinite(Number(x[index])) || !Number.isFinite(Number(y[index]));
       var id = order[Math.min(segmentIndex, order.length - 1)];
       var keep = Boolean(selected.ids[id]);
       if (keep && !gap) {
-        nextX.push(x[index]);
-        nextY.push(y[index]);
-        if (colors) nextColors.push(colors[index]);
-        lastWasGap = false;
-      } else if (gap) {
-        if (keep && !lastWasGap) {
-          nextX.push(null);
-          nextY.push(null);
-          if (colors) nextColors.push(null);
-        }
-        lastWasGap = true;
-        segmentIndex += 1;
-      }
+        nextX[index] = x[index];
+        nextY[index] = y[index];
+      } else if (colors && !keep) nextColors[index] = null;
+      if (gap) segmentIndex += 1;
     }
     output.x = nextX;
     output.y = nextY;
@@ -178,15 +200,15 @@
     if (!gd || !window.Plotly || !figure || !figure.data) return;
     var jobs = [];
     figure.data.forEach(function (trace, index) {
-      if (!trace || !Array.isArray(trace.customdata)) return;
+      if (!trace || !sequence(trace.customdata)) return;
       var filtered = selected.all ? {
-        x: trace.x, y: trace.y, r: trace.r, theta: trace.theta,
-        customdata: trace.customdata
+        x: sequence(trace.x), y: sequence(trace.y),
+        r: sequence(trace.r), theta: sequence(trace.theta)
       } : filteredTrace(trace, selected);
       if (!filtered) return;
       var update = {};
-      ["x", "y", "r", "theta", "customdata"].forEach(function (key) {
-        if (Array.isArray(filtered[key])) update[key] = [filtered[key]];
+      ["x", "y", "r", "theta"].forEach(function (key) {
+        if (filtered[key]) update[key] = [filtered[key]];
       });
       jobs.push(window.Plotly.restyle(gd, update, [index]));
     });
@@ -197,7 +219,7 @@
       figure.data.forEach(function (trace) {
         if (!(trace && trace.meta && trace.meta.td_trial_source)) return;
         var subplot = String(trace.subplot || "polar");
-        (trace.customdata || []).forEach(function (row) {
+        (sequence(trace.customdata) || []).forEach(function (row) {
           var idValue = segId(row);
           var uniqueKey = subplot + "|" + idValue;
           if (!idValue || !selected.ids[idValue] || seen[uniqueKey]) return;
@@ -228,11 +250,7 @@
         ));
       });
     }
-    Promise.all(jobs).then(function () {
-      if (window.dash_clientside.clean_layout) {
-        window.dash_clientside.clean_layout.refresh();
-      }
-    });
+    Promise.all(jobs);
   }
 
   function render(trajectoryFigure, polarFigure, fraction, seed) {
@@ -241,7 +259,7 @@
       applyGraph("trajectory-plot", trajectoryFigure, selected);
       // Polar and trajectory customdata share the exact `_seg_id` identity.
       applyGraph("polar-plot", polarFigure, selected);
-    }, 0);
+    }, 35);
     return {
       selected: selected.count,
       total: selected.total,

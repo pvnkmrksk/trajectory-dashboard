@@ -777,14 +777,16 @@ body._dash-loading-callback .status-dot {
 }
 
 /*
- * Publication mode is a persistent presentation state, not a delayed Plotly
- * repaint. Keeping the class on the graph container prevents pan/zoom/react
- * from briefly restoring axes before another relayout callback can hide them.
+ * Publication mode is passive CSS. No Plotly layout mutation means pan/zoom,
+ * linked viewports, image export and editable observation windows retain their
+ * normal interaction state.
  */
 .td-clean-spatial .gridlayer,
 .td-clean-spatial .zerolinelayer,
 .td-clean-spatial .xaxislayer-above,
-.td-clean-spatial .yaxislayer-above {
+.td-clean-spatial .yaxislayer-above,
+.td-clean-spatial .xaxislayer-below,
+.td-clean-spatial .yaxislayer-below {
   display: none !important;
 }
 
@@ -793,9 +795,13 @@ body._dash-loading-callback .status-dot {
   display: none !important;
 }
 
-.td-clean-polar .angular-grid,
-.td-clean-polar .radial-grid,
-.td-clean-polar .angularaxistick,
-.td-clean-polar .radialaxistick {
+.td-clean-mode .legend,
+.td-clean-mode .colorbar {
+  display: none !important;
+}
+
+/* Polar rings and angular ticks deliberately remain as directional context. */
+
+.td-clean-layout #flow-field-legend {
   display: none !important;
 }

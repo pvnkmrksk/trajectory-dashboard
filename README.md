@@ -171,10 +171,10 @@ For a quick preprocessing check on the homing enemy data, run
   Ring edits do not refilter data or call the server.
 - **Observation windows**: add, select, drag, resize and delete rectangular
   regions on Trajectory, Heatmap or Gandiva. Gandiva labels the sample share in
-  each window; polar uses the union of window samples; the Targets section
-  reports samples, entering trials, distance walked, net displacement,
-  tortuosity and velocity. Window edits refresh only polar and this compact
-  diagnostic table.
+  each window; polar and trial metrics use the union of window samples; the
+  diagnostics show per-trial or per-animal distributions of sample occupancy,
+  entry, distance walked, net displacement, tortuosity and velocity. Window
+  edits refresh only those dependent analyses.
 - **Whole-trial display sampling**: instantly hide/show a deterministic random
   1–100% of complete `_seg_id` segments in the mounted browser plots, with a
   button for a fresh sample. The same selected trials feed trajectories, the
@@ -187,12 +187,11 @@ For a quick preprocessing check on the homing enemy data, run
   An optional comparison workspace puts trajectories and polar side-by-side,
   with the heatmap below. Speed is the default and adds a tighter browser
   drawing budget; both modes share the same memory-bounded retained frame.
-- **Clean layout**: one fast, browser-only button makes every Plotly download
-  publication-ready without rebuilding data. Spatial views keep titles and an
-  adaptive scale bar but lose axes/grids/legends; box, violin and other
-  Cartesian diagnostics use a professional left/bottom despined frame; polar
-  grids are removed. Units default to `cm`; `spatial_layout.unit_scale` and
-  `unit_label` describe how one data unit maps to real-world units.
+- **Clean layout**: one passive browser-only button prepares uncluttered Plotly
+  downloads without rebuilding data or touching the viewport. Spatial axes,
+  Cartesian grids/zero-lines, legends and colourbars disappear; polar rings
+  and angular ticks remain for context. The implementation only toggles CSS
+  classes, so pan, zoom and editable shapes keep their native Plotly behavior.
 - **Heatmap**: occupancy density — bin size in **data units**, lin/log with
   plain log labels (`1`, `10`, `100`, `1,000`, never `1e+3`),
   percentile-bounded extent,
@@ -229,13 +228,17 @@ For a quick preprocessing check on the homing enemy data, run
   Median/IQR are drawn as simple line overlays, not violin boxes.
 - **Trial metrics view**: distance walked, net displacement, median smoothed
   velocity, and median local time-windowed path/chord tortuosity across the current
-  panel grouping. Groups with up to 200 visible trials use deterministic
-  jittered swarms; larger groups use count-scaled violins. Both show a
-  full-width shaded IQR with a bold median overlay.
+  panel grouping. Auto uses one encoding across all panels: deterministic
+  swarms when the largest group has at most 200 observations, otherwise
+  count-scaled violins. Explicit Swarm or Violin is always honored, and small
+  violins can retain their dots. The independent unit can be each trial or an
+  animal mean. Both encodings show a full-width shaded IQR with a bold median.
 - **Delayed statistics**: plots render first, then a separate callback adds
-  SciPy non-parametric omnibus tests with Holm-adjusted stars to the four trial
-  metrics, a circular group comparison to polar, and per-config Rayleigh
-  uniformity checks to the starting-angle diagnostic.
+  SciPy non-parametric pairwise tests with Holm-adjusted stars and named pairs
+  to trial metrics, window diagnostics, and left/right target comparisons.
+  Polar adds per-group Rayleigh non-uniformity plus Holm-adjusted pairwise
+  circular comparisons; the starting-angle diagnostic retains its Rayleigh
+  check.
 - **Polar view**: one circular resultant per trial from Unity body orientation
   (`GameObjectRotY`) by default, with movement heading as an alternative. 0° is
   forward/+Z and positive angles turn right/+X. The bold population ray exactly
@@ -295,7 +298,7 @@ shareable URL.
 | Plot order | Drag the values of the active config, scene, VR, fly, or folder grouping. The list follows the active filter selection and moves mounted subplot domains without recomputing them. | Keeps every grouped figure aligned to the comparison order you intend. |
 | Panel columns | Number of columns in the grid. | Wide screens can use 2-4 columns; narrow screens are easier with 1. |
 | Show raw config filenames | Uses exact config filenames instead of readable labels. | Debugs metadata/name mapping when labels look surprising. |
-| Clean layout | Applies title-only spatial axes with scale bars, clean polar axes, and despined statistical axes; the button changes to Full layout for exact restoration. | Produces PNG-ready Plotly figures without recomputing data. |
+| Clean layout | Hides spatial axes, Cartesian grids/zero-lines, legends and colourbars while retaining polar rings; the button changes to Full layout for exact restoration. | Produces PNG-ready Plotly figures with a CSS-only appearance change and no viewport mutation. |
 
 ### Trajectories
 
@@ -306,6 +309,9 @@ shareable URL.
 | Playback animation | Builds animated frames and shows play/pause/scrub controls. | Good for presentations and temporal intuition; off is faster and crisper for analysis. |
 | Displayed trials (%) | Browser-locally shows this fraction of complete `_seg_id` paths in trajectory, loop and polar drawings. | Reduces mounted marks by hiding whole trials without server analysis; 100% is the default and keeps everything. |
 | New random subset | Changes the browser-local sampling seed at the current displayed-trial percentage. | Lets you check that a visual impression is not peculiar to one random subset without rebuilding plots. |
+| Distribution marks | Auto, Swarm, or Violin for every trial/window metric panel together. | Auto uses swarm through 200 observations in the largest group and violin above it; explicit choices are never overridden. |
+| Show dots on violins | Overlays observations on violin groups with at most 200 points. | Preserves individual values when they remain legible. |
+| Independent unit | Treat each `_seg_id` trial as an observation, or first average trials within animal and active group. | Keeps inferential and plotted units aligned. |
 | Point budget | Optional decimation budget. | Larger values preserve detail but increase browser cost; blank uses the app's safe default. |
 
 ### Loop Observer
@@ -332,7 +338,7 @@ available spatial fidelity.
 | Add / delete / selected window | Maintains a small named set of rectangular windows. | Makes side-by-side local comparisons easy while keeping deletion explicit. |
 | X/Z min/max | Exact reproducible bounds; dragging/resizing any dashed box updates these fields. | Supports tactile exploration and precise repeated analyses. |
 | Gandiva labels | Reports each window’s sample percentage per current panel. | Provides immediate spatial prevalence without recomputing local vectors. |
-| Observation-window diagnostics | Reports samples, entered trials, local distance, net displacement, tortuosity and velocity. | Keeps the custom-region readout beside the existing target diagnostics. |
+| Observation-window diagnostics | Plots per-trial/per-animal sample percentage, entry, local distance, net displacement, tortuosity and velocity with the shared Swarm/Violin control. | Makes windows and active groups comparable with the same independent-unit and non-parametric semantics as trial metrics. |
 
 ### Filters
 
@@ -422,7 +428,7 @@ assets/dropzone.js             # folder drag-and-drop
 assets/dashboard.css           # dashboard chrome and sticky section styling
 assets/heatsync.js             # heatmap zoom viewport sync after newPlot
 assets/heatmap_colors.js       # browser-local metric/scale/color-limit restyles
-assets/clean_layout.js         # grid-free spatial mode + adaptive scale bars
+assets/clean_layout.js         # CSS-only publication-mode class toggle
 assets/trial_subset.js         # browser-local whole-segment display sampling
 assets/region_observer.js      # draggable rectangular observation windows
 assets/section_nav.js          # section scroll, including active-tab replay

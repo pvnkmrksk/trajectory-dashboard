@@ -19,7 +19,8 @@
     stats: {},
     style: {},
     painting: false,
-    frame: null
+    frame: null,
+    timer: null
   };
 
   function clone(value) {
@@ -59,6 +60,18 @@
   }
 
   function subplotPairs(gd) {
+    var meta = gd && gd.layout && gd.layout.meta;
+    var spatialCount = Number(meta && meta.spatial_axis_count);
+    if (Number.isFinite(spatialCount) && spatialCount > 0) {
+      var spatialPairs = [];
+      for (var index = 1; index <= Math.floor(spatialCount); index += 1) {
+        spatialPairs.push([
+          "x" + (index === 1 ? "" : index),
+          "y" + (index === 1 ? "" : index)
+        ]);
+      }
+      return spatialPairs;
+    }
     var seen = {};
     var pairs = [];
     ((gd && gd.data) || []).forEach(function (trace) {
@@ -222,6 +235,19 @@
     gd.__regionObserverId = id;
     var pairs = subplotPairs(gd);
     var style = (state.style && state.style.region_observer) || {};
+    var signature = JSON.stringify({
+      enabled: state.enabled,
+      regions: state.regions,
+      active: state.active,
+      stats: state.stats,
+      style: style,
+      pairs: pairs
+    });
+    if (gd.__regionObserverSignature === signature &&
+        gd.__regionObserverDataRef === gd.data) {
+      attach(gd);
+      return;
+    }
     var baseShapes = (gd.layout.shapes || []).filter(function (shape) {
       return String((shape && shape.name) || "").indexOf(PREFIX) !== 0;
     });
@@ -243,6 +269,8 @@
       editrevision: "custom-regions"
     }).then(function () {
       gd.__regionObserverPainting = false;
+      gd.__regionObserverSignature = signature;
+      gd.__regionObserverDataRef = gd.data;
       attach(gd);
     }).catch(function () {
       gd.__regionObserverPainting = false;
@@ -253,6 +281,14 @@
     graphIds.forEach(function (id) { paintGraph(id, 0); });
   }
 
+  function schedulePaint() {
+    if (state.timer) window.clearTimeout(state.timer);
+    state.timer = window.setTimeout(function () {
+      state.timer = null;
+      paintAll();
+    }, 45);
+  }
+
   window.dash_clientside = Object.assign({}, window.dash_clientside, {
     region_observer: {
       render: function (enabled, regions, active, stats, visualStyle) {
@@ -261,8 +297,7 @@
         state.active = String(active || state.regions[0].id);
         state.stats = stats || {};
         state.style = visualStyle || {};
-        window.setTimeout(paintAll, 35);
-        window.setTimeout(paintAll, 180);
+        schedulePaint();
         if (!state.enabled) {
           return "Observation windows off; enable them to subset polar and trial metrics.";
         }

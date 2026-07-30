@@ -99,9 +99,10 @@ Assets (Dash auto-serves `/assets`):
 - `assets/region_observer.js` — editable rectangular window overlays for the
   trajectory, heatmap and Gandiva graphs; shape edits update the compact region
   store, not the master renderer.
-- `assets/clean_layout.js` — one-pass browser-only publication styling:
-  title-only spatial panels with zoom-aware 1/2/5 scale bars, despined
-  statistical panels, clean polar axes, and exact Full-layout restoration.
+- `assets/clean_layout.js` — passive browser-only publication styling. It
+  toggles CSS classes only: spatial axes and Cartesian grids disappear,
+  legends/colorbars are hidden, and polar rings remain for angular context.
+  It never calls Plotly or observes relayout events.
 - `assets/trial_subset.js` — browser-local whole-`_seg_id` visibility sampling
   shared by trajectory, curtain-ring and polar views.
 
@@ -184,9 +185,11 @@ same cache key.
   `_custom_region_subset` and `_custom_region_stats` use vectorised X/Z masks.
   The main renderer applies the union only to polar rows and returns the small
   diagnostics/panel-share payload. Subsequent shape edits call
-  `update_custom_region_analysis`, which rebuilds only polar and the
-  observation-window table; `assets/region_observer.js` repaints rectangles and
-  Gandiva percentage labels without rebuilding direction vectors.
+  `update_custom_region_analysis`, which rebuilds only polar, window-scoped
+  trial metrics, and the observation-window distributions;
+  `assets/region_observer.js` repaints rectangles and Gandiva percentage labels
+  without rebuilding direction vectors. Its subplot list comes from the actual
+  populated panel count, not empty cells in the final grid row.
 - **Colour modes** (`color_by`): `categorical` (default: one muted hue per
   current panel), `none` (neutral translucent gray),
   individual/config/scene/VR/folder/ROI categories, and sequential
@@ -199,11 +202,11 @@ same cache key.
   it). The optional comparison workspace places trajectory and polar sections
   side-by-side, with heatmap and diagnostics full-width below.
   `minimal-layout-store` is presentation-only state: `assets/clean_layout.js`
-  performs one debounced in-place styling pass. Spatial figures lose all axis
-  chrome and gain a 1/2/5 scale bar; Cartesian diagnostics keep labels/ticks but
-  use left/bottom despined axes; polar grids are removed. Legends and trace
-  colourbars are hidden. `spatial_layout.unit_scale` maps one position unit to
-  `unit_label` (default `1 cm`). No dataframe or figure builder runs.
+  synchronously toggles CSS classes. Spatial figures lose their axis chrome;
+  Cartesian diagnostics lose grids/zero-lines; legends and colourbars are
+  hidden; polar rings and angular ticks remain for context. No scale-bar shape,
+  Plotly relayout, dataframe operation, or figure builder runs, so the active
+  viewport and drag interaction remain untouched.
 - **Heatmap**: `build_heatmap_figure` bins X/Z with `np.histogram2d`.
   `bin_size` is in **data units** (blank → `default_bin_size` ≈ 1/20 of the
   95th-pct extent); `bound_pct` clips the extent to a central percentile;
@@ -256,10 +259,13 @@ same cache key.
 - **Trial metrics**: `build_trial_metrics_figure` selects the exact pre-retention
   segment summaries for currently visible `_seg_id` values and groups them by
   the same panel axis. It shows path length, net displacement, median smoothed
-  speed, and the median time-windowed local path/chord ratio. Up to 200 trials per
-  group render as deterministic jittered points; larger groups render as
-  count-scaled violins. Both encodings share a full-width IQR band and median
-  line overlay.
+  speed, and the median time-windowed local path/chord ratio. One mark type is
+  used across the whole diagnostic: Auto chooses a deterministic swarm when the
+  largest group has at most 200 observations and a count-scaled violin
+  otherwise; explicit Swarm/Violin always wins. Optional dots are drawn on
+  violins only at `n <= 200`. Trial is the default independent unit; Animal
+  first averages trials within active group and `FlyID@VR`. Both encodings
+  share a full-width IQR band and median line overlay.
   The starting-heading diagnostic uses 36 fixed sectors with edges
   `[-5°, 5°], [5°, 15°], …`, so cardinal 0° is a bin centre.
 - **Trajectory ROI labels**: corner labels are exclusive first-reached outcome
@@ -312,8 +318,10 @@ same cache key.
   whole-trial percentage persists as `tf=`. Ring movement updates these small
   controls/URL state, but the geometry scan and redraw remain browser-local.
 - Observation windows persist as `region=`, `regions=` and `ractive=`; clean
-  presentation state persists as `minimal=`. Both restore alongside the plot
-  controls without forcing viewport interaction through the server.
+  presentation state persists as `minimal=`. Distribution mode, violin dots,
+  and the trial/animal unit persist as `dist=`, `dpts=`, and `sunit=`.
+  These restore alongside the plot controls without forcing viewport
+  interaction through the server.
 - Peak velocity's robust slider can be overridden by unbounded exact min/max
   inputs; those values persist as `vrmin=`/`vrmax=`. Workspace mode persists as
   `layout=sections|compare`.
@@ -388,7 +396,7 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Displayed-trial fraction / resample | Browser-local `Plotly.restyle` hides complete `_seg_id` paths/rays and updates the visible population ray; analytical spatial/ROI/metric panels retain the complete filtered frame | Server render/reanalysis; row-level random sampling; changes to target/metric denominators |
 | Loop add/delete/select/match, centre/radius or ring drag | Browser-local multi-circle intersection, qualifying-entry split and observer redraw; persist small ring-set state in the URL | Dataframe filtering, master render, heatmap/polar/ROI changes |
 | Observation-window add/delete/select/bounds or box drag | Rebuild polar + custom diagnostics from cached filtered rows; repaint rectangles and Gandiva percentages in the browser | Trajectory, heatmap or Gandiva-vector recomputation; master render |
-| Clean layout | Browser-local relayout, adaptive scale bars and URL state | Figure/data rebuilds or viewport callback traffic |
+| Clean layout | Browser-local CSS class toggle and URL state | Any Plotly call, figure/data rebuild, viewport mutation, or relayout listener |
 | Gandiva maximum radius | Browser-local scaling of existing arrow tips and URL state | Direction recomputation, dataframe filtering or another figure build |
 | Trajectory/heatmap pan/zoom | Immediate clientside peer relayout plus debounced `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
 | Section navigation | Clientside scroll only, including replay of the active tab | Any server render, graph hide/show or Plotly reinitialisation |

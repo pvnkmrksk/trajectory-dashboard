@@ -151,6 +151,11 @@ class DashboardRegressionTests(unittest.TestCase):
             bool(getattr(getattr(trace, "marker", None), "showscale", False))
             for trace in fig.data
         ))
+        sparse_grid = app.build_direction_field_figure(
+            frame, group_by="all", pool_mode="pooled", ncols=2,
+            bin_size=10.0, bound_pct=100.0, angle_source="orientation",
+            metric="count", cmin=0, cmax=10)
+        self.assertEqual(sparse_grid.layout.meta["spatial_axis_count"], 1)
 
     def test_local_direction_strokes_respect_adjustable_cell_radius(self):
         stroke_x, stroke_z = app._flow_arrow_arrays(
@@ -260,6 +265,40 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(median.x1) - float(median.x0), 0.72)
         self.assertAlmostEqual(float(median.y0), 7.5)
         self.assertIn("15-sample path/chord", swarm.layout.yaxis3.title.text)
+        forced_violin = app.build_trial_metrics_figure(
+            stats(8), distribution_mode="violin")
+        forced_swarm = app.build_trial_metrics_figure(
+            stats(201), distribution_mode="swarm")
+        self.assertEqual({trace.type for trace in forced_violin.data}, {"violin"})
+        self.assertEqual({trace.type for trace in forced_swarm.data}, {"scatter"})
+
+    def test_distribution_controls_are_global_and_animal_pooling_is_explicit(self):
+        rows = []
+        for config in ("a.json", "b.json"):
+            for fly in ("1", "2"):
+                for trial in range(3):
+                    rows.append({
+                        "seg_id": f"{config}-{fly}-{trial}",
+                        "n_points": 10,
+                        "distance_walked": trial + (10 if config == "b.json" else 0),
+                        "displacement": trial + 1,
+                        "median_local_tortuosity": 1 + trial / 10,
+                        "median_velocity": 2 + trial,
+                        "config": config,
+                        "vr": "VR1",
+                        "fly_id": fly,
+                        "scene": "scene",
+                        "source_folder": "folder",
+                    })
+        stats = pd.DataFrame(rows)
+        animal = app._metric_stats_for_unit(
+            stats, "config", "separate", "animal")
+        self.assertEqual(len(animal), 4)
+        fig = app.build_trial_metrics_figure(
+            stats, group_by="config", distribution_mode="violin",
+            stats_unit="animal")
+        self.assertEqual({trace.type for trace in fig.data}, {"violin"})
+        self.assertTrue(all(len(trace.y) == 2 for trace in fig.data))
 
     def test_delayed_statistics_payload_covers_all_three_views(self):
         rows = []
@@ -497,6 +536,14 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertNotIn("preload-view", ids)
         self.assertNotIn("preload-interval", ids)
 
+    def test_clean_layout_is_css_only_and_cannot_emit_relayout_events(self):
+        source = Path("assets/clean_layout.js").read_text()
+        self.assertIn('classList.toggle("td-clean-layout"', source)
+        self.assertNotIn("window.Plotly", source)
+        self.assertNotIn('.on("plotly_relayout"', source)
+        self.assertNotIn(".relayout(", source)
+        self.assertNotIn(".restyle(", source)
+
     def test_inline_clientside_callbacks_are_valid_javascript(self):
         node = shutil.which("node")
         if not node:
@@ -538,6 +585,9 @@ class DashboardRegressionTests(unittest.TestCase):
             ],
         )
         self.assertFalse(_component("minimal-layout-store").data)
+        self.assertEqual(_component("distribution-mode").value, "auto")
+        self.assertEqual(_component("distribution-show-points").value, ["on"])
+        self.assertEqual(_component("stats-unit").value, "trial")
         self.assertEqual(len(_component("custom-regions-store").data), 1)
         self.assertIsNotNone(_component("loop-observer-plot"))
         self.assertIsNotNone(_component("custom-region-diagnostics-plot"))
@@ -545,13 +595,13 @@ class DashboardRegressionTests(unittest.TestCase):
         restored = app.restore_from_url(
             "?smin=2&smax=4&hcrange=percentile&frad=0.31"
             "&tf=37&loop=1&lx=-4.5&lz=2&lr=7&minimal=1", False)
-        self.assertEqual(len(restored), 59)
+        self.assertEqual(len(restored), 62)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
         self.assertEqual(restored[44], 0.31)
         self.assertEqual(restored[46:51], (37.0, ["on"], -4.5, 2, 7))
-        self.assertTrue(restored[57])
-        self.assertEqual(len(app.restore_from_url("", True)), 59)
+        self.assertTrue(restored[60])
+        self.assertEqual(len(app.restore_from_url("", True)), 62)
         legacy_color = app.restore_from_url("?color=one", False)
         self.assertEqual(legacy_color[7], "categorical")
         rings = [
@@ -587,6 +637,10 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(region_restore[54], ["on"])
         self.assertEqual(region_restore[55], regions)
         self.assertEqual(region_restore[56], "region-2")
+        distribution_restore = app.restore_from_url(
+            "?dist=violin&dpts=0&sunit=animal", False)
+        self.assertEqual(
+            distribution_restore[57:60], ("violin", [], "animal"))
         value_restore = app.restore_from_url(
             "?hcmin=150&hcmax=200&hcrange=value", False)
         self.assertEqual(value_restore[34], [150.0, 200.0])
@@ -639,6 +693,13 @@ class DashboardRegressionTests(unittest.TestCase):
             payload["panels"][0]["regions"][0]["percent"],
             100 * 4 / len(frame),
         )
+        values = payload["panels"][0]["regions"][0]["segment_values"]
+        self.assertEqual(len(values["sample_percent"]), 2)
+        self.assertTrue(all(0 <= value <= 100
+                            for value in values["sample_percent"]))
+        diagnostic = app.build_custom_region_diagnostics_figure(
+            payload, distribution_mode="violin")
+        self.assertEqual({trace.type for trace in diagnostic.data}, {"violin"})
 
     def test_exact_velocity_bounds_are_unbounded_and_explicit(self):
         self.assertIsNone(getattr(_component("vel-range-min"), "min", None))
