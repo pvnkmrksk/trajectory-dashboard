@@ -954,10 +954,46 @@ def smoothed_velocity(df: pd.DataFrame, window: int = 10, spike_pct: float = 99.
     return sm.reindex(df.index).to_numpy()
 
 
-def compute_tortuosity(df: pd.DataFrame, window: int = 15) -> np.ndarray:
+def _tortuosity_window_samples(
+        df: pd.DataFrame, seconds: float | None = None) -> int:
+    """Convert the configured tortuosity time span to a stable sample window.
+
+    The dashboard colours paths by local curvature, but an individual-frame
+    ratio is mostly tracking noise.  A time-based span also gives comparable
+    smoothing when recordings use different frame rates.
+    """
+    configured = (
+        _visual("trajectory", "tortuosity_window_seconds", 2.0)
+        if seconds is None else seconds
+    )
+    try:
+        span = max(0.5, float(configured))
+    except (TypeError, ValueError):
+        span = 2.0
+    if df is None or len(df) < 2:
+        return 3
+    times = (
+        df["Current Time"].to_numpy()
+        .astype("datetime64[ns]").astype("int64") / 1e9
+    )
+    delta = np.diff(times)
+    seg = df["_seg_id"].to_numpy()
+    valid = delta[(seg[1:] == seg[:-1]) & np.isfinite(delta) & (delta > 0)]
+    dt = float(np.median(valid)) if len(valid) else 1.0
+    # N samples span N-1 intervals.
+    return max(3, int(math.ceil(span / max(dt, 1e-6))) + 1)
+
+
+def compute_tortuosity(
+        df: pd.DataFrame, window: int | None = None) -> np.ndarray:
     """Per-row local tortuosity = (path length over the last `window` steps) /
     (straight-line chord across that window), within each segment. 1 = straight,
-    higher = more winding. Vectorised."""
+    higher = more winding. When ``window`` is omitted, use the configurable
+    time span (2 seconds by default). Vectorised."""
+    window = (
+        _tortuosity_window_samples(df)
+        if window is None else max(3, int(window))
+    )
     x = df["GameObjectPosX"].to_numpy()
     z = df["GameObjectPosZ"].to_numpy()
     seg = df["_seg_id"].to_numpy()
@@ -1000,7 +1036,7 @@ def compute_segment_stats(
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
     vel = smoothed_velocity(df) if vel is None else np.asarray(vel, dtype=float)
-    tort = compute_tortuosity(df, window=15) if tort is None else np.asarray(tort, dtype=float)
+    tort = compute_tortuosity(df) if tort is None else np.asarray(tort, dtype=float)
     seg = df["_seg_id"].to_numpy()
     starts = np.concatenate(([0], np.flatnonzero(seg[1:] != seg[:-1]) + 1))
     ends = np.concatenate((starts[1:], [len(df)]))
@@ -1146,6 +1182,7 @@ _VISUAL_STYLE_DEFAULTS = {
         "opacity": 0.50,
         "gray_color": "#737b85",
         "gray_opacity": 0.25,
+        "tortuosity_window_seconds": 2.0,
         "palette": COLORS,
     },
     "spatial_layout": {
@@ -1372,7 +1409,7 @@ BUDGET_RAW_SPEED = 10_000
 BUDGET_POLAR_SPEED = 12_000
 BUDGET_HEAT_SPEED = 220_000
 BUDGET_ROI_SPEED = 180_000
-PLOT_DEBOUNCE_MS = 750
+PLOT_DEBOUNCE_MS = 120
 _POLAR_RAY_CACHE: dict = {}
 _POLAR_RAY_CACHE_ORDER: list = []
 _POLAR_RAY_CACHE_MAX = 8
@@ -1613,13 +1650,39 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
     ind_color, vr_color, tmin, tmax = _color_maps(df)
     tspan = (tmax - tmin) or 1.0
 
-    # Per-point speed for the "velocity" colour mode (shared scale across subplots)
+    # Per-point sequential metrics share one scale across subplots.
     vel_series, vel_cmax = None, 1.0
     if color_by == "velocity":
         vel_series = pd.Series(smoothed_velocity(df, 10), index=df.index)
         finite = vel_series.to_numpy()
         finite = finite[np.isfinite(finite)]
         vel_cmax = float(np.percentile(finite, 99)) if finite.size else 1.0
+    tort_series, tort_cmax = None, 1.1
+    if color_by == "tortuosity":
+        tort_series = pd.Series(compute_tortuosity(df), index=df.index)
+        finite = tort_series.to_numpy()
+        finite = finite[np.isfinite(finite)]
+        tort_cmax = (
+            max(1.1, float(np.percentile(finite, 99)))
+            if finite.size else 1.1
+        )
+    category_specs = {
+        "config": ("ConfigFile", "config"),
+        "scene": ("SceneName", "scene"),
+        "folder": ("SourceFolder", "file"),
+    }
+    category_maps = {}
+    if color_by in category_specs:
+        column, kind = category_specs[color_by]
+        values = pd.unique(df[column].dropna().astype(str))
+        palette = _visual("trajectory", "palette", COLORS)
+        if not isinstance(palette, list) or not palette:
+            palette = COLORS
+        category_maps[color_by] = {
+            str(value): _category_style(kind, str(value)).get(
+                "color", palette[index % len(palette)])
+            for index, value in enumerate(values)
+        }
     outcome_map = {str(k): str(v) for k, v in (roi_outcomes or {}).items()}
 
     legend_seen, records = set(), []
@@ -1655,17 +1718,23 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
         mc_all = None
         if color_by == "vr":
             ck = vr.astype(str)
+        elif color_by in category_specs:
+            ck = dec[category_specs[color_by][0]].astype(str).to_numpy()
         elif color_by == "trial":
             ck = dec["CurrentTrial"].to_numpy().astype(float).astype(str)
         elif color_by == "local_time":
             ck = np.zeros(len(dec), dtype=int)   # whole subplot = one trace
-            g2 = dec.groupby("_seg_id", sort=False)["Current Time"]
+            g2 = dec.groupby(
+                "_seg_id", sort=False, observed=True)["Current Time"]
             t0, t1 = g2.transform("first"), g2.transform("last")
             dur = (t1 - t0).dt.total_seconds().replace(0, 1.0)
             mc_all = ((dec["Current Time"] - t0).dt.total_seconds() / dur).to_numpy()
         elif color_by == "velocity":
             ck = np.zeros(len(dec), dtype=int)   # whole subplot = one trace
             mc_all = vel_series.loc[dec.index].to_numpy()
+        elif color_by == "tortuosity":
+            ck = np.zeros(len(dec), dtype=int)   # whole subplot = one trace
+            mc_all = tort_series.loc[dec.index].to_numpy()
         elif color_by == "roi":
             ck = (dec["_seg_id"].astype(str).map(outcome_map)
                   .fillna("No ROI").to_numpy(dtype=str))
@@ -1693,6 +1762,17 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
                 rec["label"] = str(entry.get("name", rec["label"]))
                 rec["line_width"] = float(entry.get(
                     "line_width", rec["line_width"]))
+            elif color_by in category_specs:
+                _column, kind = category_specs[color_by]
+                entry = _category_style(kind, str(key))
+                rec["color"] = category_maps[color_by].get(str(key), COLORS[0])
+                rec["label"] = str(entry.get(
+                    "name",
+                    humanise_config(str(key))
+                    if color_by == "config" else str(key),
+                ))
+                rec["line_width"] = float(entry.get(
+                    "line_width", rec["line_width"]))
             elif color_by == "trial":
                 tv = float(key)
                 rec["color"] = _sample_scale((tv - tmin) / tspan)
@@ -1704,6 +1784,10 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
             elif color_by == "velocity":
                 rec["mode"], rec["mc"] = "markers", mc_all[m]
                 rec["colorscale"], rec["cmin"], rec["cmax"] = SEQ_COLORSCALE, 0.0, vel_cmax
+            elif color_by == "tortuosity":
+                rec["mode"], rec["mc"] = "markers", mc_all[m]
+                rec["colorscale"], rec["cmin"], rec["cmax"] = (
+                    SEQ_COLORSCALE, 1.0, tort_cmax)
             elif color_by == "roi":
                 label = str(key)
                 rec["color"] = _ROI_OUTCOME_COLOR.get(label, _ROI_OUTCOME_COLOR["No ROI"])
@@ -1737,7 +1821,7 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
                 rec["line_width"] = float(entry.get(
                     "line_width", rec["line_width"]))
 
-            if color_by in ("individual", "vr", "roi"):
+            if color_by in ("individual", "vr", "roi", *category_specs):
                 if color_by == "individual":
                     rec["legendgroup"] = f"individual:{fidv}@{vrv}"
                 else:
@@ -2065,11 +2149,14 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
 
     # Colourbar for sequential modes (hidden anchor trace, added AFTER the data
     # traces so animation frames update only the data traces)
-    if color_by in ("trial", "local_time", "velocity") and records:
+    if color_by in ("trial", "local_time", "velocity", "tortuosity") and records:
         cmin = records[0]["cmin"] if records[0]["cmin"] is not None else 0.0
         cmax = records[0]["cmax"] if records[0]["cmax"] is not None else 1.0
         title = {"trial": "Trial", "local_time": "Local time",
-                 "velocity": "Speed (units/s)"}[color_by]
+                 "velocity": "Speed (units/s)",
+                 "tortuosity": (
+                     f"Tortuosity ({float(_visual('trajectory', 'tortuosity_window_seconds', 2.0)):g} s)"
+                 )}[color_by]
         fig.add_trace(go.Scattergl(
             x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
             marker=dict(colorscale=SEQ_COLORSCALE, cmin=cmin, cmax=cmax,
@@ -2124,7 +2211,8 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                                                roi_counts if overlay else None,
                                                roi_outcomes if overlay else None))
 
-    show_legend = color_by in ("individual", "vr", "roi")
+    show_legend = color_by in (
+        "individual", "vr", "roi", "config", "scene", "folder")
     legend_labels = [
         trace.name for trace in fig.data
         if bool(getattr(trace, "showlegend", False))
@@ -4502,7 +4590,10 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
 def _ray_cache_key(df, moving_only, walk_thresh, color_by, angle_source):
     return (_frame_cache_token(df), bool(moving_only),
             round(float(walk_thresh or 0), 6), color_by or "none",
-            angle_source or "orientation")
+            angle_source or "orientation",
+            round(float(_visual(
+                "trajectory", "tortuosity_window_seconds", 2.0)), 6)
+            if color_by == "tortuosity" else None)
 
 
 def _cache_ray(key, val):
@@ -4527,8 +4618,9 @@ def rayleigh_by_segment(df, moving_only=False, walk_thresh=None,
     Returns _seg_id, ConfigFile, animal, R (0..1 concentration), theta_deg (mean
     direction), metadata for hover, and an optional per-trial colour value.
     Fully vectorised — no per-segment Python."""
-    cols = ["_seg_id", "ConfigFile", "animal", "VR", "FlyID", "CurrentTrial",
-            "CurrentStep", "SourceFile", "StartTime", "R", "theta_deg", "cval",
+    cols = ["_seg_id", "ConfigFile", "SceneName", "SourceFolder",
+            "animal", "VR", "FlyID", "CurrentTrial", "CurrentStep",
+            "SourceFile", "StartTime", "R", "theta_deg", "cval",
             "n_points", "valid_points", "valid_frac"]
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
@@ -4586,11 +4678,24 @@ def rayleigh_by_segment(df, moving_only=False, walk_thresh=None,
                 valid_points=("valid", "sum"), n_points=("valid", "size")))
     R = np.hypot(agg["ux"].to_numpy(), agg["uz"].to_numpy())
     theta = np.degrees(np.arctan2(agg["ux"].to_numpy(), agg["uz"].to_numpy()))
-    meta = df.groupby("_seg_id", sort=False, observed=True).agg(
-        ConfigFile=("ConfigFile", "first"), VR=("VR", "first"),
-        FlyID=("FlyID", "first"), CurrentTrial=("CurrentTrial", "first"),
-        CurrentStep=("CurrentStep", "first"), SourceFile=("SourceFile", "first"),
-        StartTime=("Current Time", "first"))
+    meta_specs = {
+        "ConfigFile": ("ConfigFile", "first"),
+        "VR": ("VR", "first"),
+        "FlyID": ("FlyID", "first"),
+        "CurrentTrial": ("CurrentTrial", "first"),
+        "CurrentStep": ("CurrentStep", "first"),
+        "SourceFile": ("SourceFile", "first"),
+        "SceneName": ("SceneName", "first"),
+        "SourceFolder": ("SourceFolder", "first"),
+        "StartTime": ("Current Time", "first"),
+    }
+    meta = df.groupby("_seg_id", sort=False, observed=True).agg(**{
+        output: spec for output, spec in meta_specs.items()
+        if spec[0] in df.columns
+    })
+    for output in meta_specs:
+        if output not in meta:
+            meta[output] = ""
     n_points = agg["n_points"].to_numpy(dtype=float)
     valid_points = agg["valid_points"].to_numpy(dtype=float)
     valid_frac = np.divide(valid_points, n_points, out=np.zeros_like(valid_points),
@@ -4811,7 +4916,9 @@ def _polar_seq_values(ray: pd.DataFrame, color_by: str):
         vals = ray["cval"].to_numpy(dtype=float)
         finite = vals[np.isfinite(vals)]
         cmax = float(np.percentile(finite, 99)) if finite.size else 1.0
-        return vals, 1.0, max(1.1, cmax), "Mean tortuosity"
+        seconds = float(_visual(
+            "trajectory", "tortuosity_window_seconds", 2.0))
+        return vals, 1.0, max(1.1, cmax), f"Mean tortuosity ({seconds:g} s)"
     if color_by == "trial":
         vals = pd.to_numeric(ray["CurrentTrial"], errors="coerce").to_numpy(dtype=float)
         finite = vals[np.isfinite(vals)]
@@ -4899,6 +5006,23 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
     if seq_vals is not None:
         ray = ray.assign(_seq_color=seq_vals)
     ind_color, vr_color, _tmin, _tmax = _color_maps(df)
+    category_specs = {
+        "config": ("ConfigFile", "config"),
+        "scene": ("SceneName", "scene"),
+        "folder": ("SourceFolder", "file"),
+    }
+    category_maps = {}
+    if color_by in category_specs:
+        column, kind = category_specs[color_by]
+        palette = _visual("trajectory", "palette", COLORS)
+        if not isinstance(palette, list) or not palette:
+            palette = COLORS
+        category_maps[color_by] = {
+            str(value): _category_style(kind, str(value)).get(
+                "color", palette[index % len(palette)])
+            for index, value in enumerate(
+                pd.unique(df[column].dropna().astype(str)))
+        }
 
     specs = [[{"type": "polar"} for _ in range(ncols)] for _ in range(nrows)]
     vspace = min(0.12, 0.7 / max(nrows, 1))
@@ -4934,13 +5058,16 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
             rr, tt, _cd = _polar_segment_arrays(sub, roi_outcomes)
             fig.add_trace(go.Scatterpolar(
                 r=rr.tolist(), theta=tt.tolist(), mode="lines", showlegend=False,
-                hoverinfo="skip", line=dict(color="rgba(90,96,110,0.32)", width=1)),
+                hoverinfo="skip", customdata=_cd.tolist(),
+                meta={"td_trial_source": True},
+                line=dict(color="rgba(90,96,110,0.32)", width=1)),
                 row=row, col=col)
             base_cd = _polar_custom_base(sub, roi_outcomes)
             fig.add_trace(go.Scatterpolar(
                 r=sub["R"].to_numpy().tolist(),
                 theta=sub["theta_deg"].to_numpy().tolist(),
                 mode="markers", showlegend=False, customdata=base_cd.tolist(),
+                meta={"td_trial_auxiliary": True},
                 hovertemplate=_POLAR_HOVER,
                 marker=dict(size=6, opacity=0.82,
                             color=sub["_seq_color"].to_numpy().tolist(),
@@ -4953,6 +5080,8 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
         else:
             if color_by == "vr":
                 keys = sub["VR"].astype(str).to_numpy()
+            elif color_by in category_specs:
+                keys = sub[category_specs[color_by][0]].astype(str).to_numpy()
             elif color_by == "roi":
                 outcome_map = {str(k): str(v) for k, v in (roi_outcomes or {}).items()}
                 keys = sub["_seg_id"].astype(str).map(outcome_map).fillna("No ROI").to_numpy()
@@ -4968,6 +5097,16 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                     colr = vr_color.get(str(key), COLORS[0])
                     label = str(key)
                     legend_group = f"vr:{label}"
+                elif color_by in category_specs:
+                    _column, kind = category_specs[color_by]
+                    entry = _category_style(kind, str(key))
+                    label = str(entry.get(
+                        "name",
+                        humanise_config(str(key))
+                        if color_by == "config" else str(key),
+                    ))
+                    colr = category_maps[color_by].get(str(key), COLORS[0])
+                    legend_group = f"{color_by}:{key}"
                 elif color_by == "roi":
                     label = str(key)
                     colr = _ROI_OUTCOME_COLOR.get(label, _ROI_OUTCOME_COLOR["No ROI"])
@@ -5008,6 +5147,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                     name=label, legendgroup=legend_group,
                     showlegend=legend_group not in legend_seen,
                     customdata=cd.tolist(), hovertemplate=_POLAR_HOVER,
+                    meta={"td_trial_source": True},
                     opacity=(
                         float(_visual("trajectory", "gray_opacity", 0.36))
                         if color_by in ("none", "gray") else
@@ -5028,6 +5168,7 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
         source_label = "body orientation" if angle_source == "orientation" else "movement heading"
         fig.add_trace(go.Scatterpolar(
             r=[0, Rpop], theta=[thpop, thpop], mode="lines+markers", showlegend=False,
+            meta={"td_population": True},
             hovertemplate=(f"pooled {source_label}<br>R={Rpop:.3f} θ={thpop:.1f}°"
                            f"<br>valid samples={n_heading:,}<extra></extra>"),
             line=dict(color="#0b6b2e", width=3),
@@ -5038,9 +5179,12 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                       radialaxis=dict(range=[0, 1], angle=90, tickangle=90,
                                       tickvals=[0.25, 0.5, 0.75, 1.0]),
                       bgcolor="white")
-    for ann in fig.layout.annotations:
+    for index, ann in enumerate(fig.layout.annotations):
         ann.update(font=dict(size=10), yshift=10)
-    show_legend = color_by in ("individual", "vr", "roi")
+        if index < len(names):
+            ann.update(hovertext=names[index])
+    show_legend = color_by in (
+        "individual", "vr", "roi", "config", "scene", "folder")
     legend_labels = [
         trace.name for trace in fig.data
         if bool(getattr(trace, "showlegend", False))
@@ -6010,8 +6154,9 @@ app.layout = html.Div([
                     "Plot order · Config / Treatment",
                     id="panel-order-summary",
                     title=(
-                        "Drag the values to reorder every subplot and grouped "
-                        "diagnostic for the active panel grouping."
+                        "Drag the values to move mounted trajectory, heatmap, "
+                        "Gandiva, loop and polar subplots for the active panel "
+                        "grouping. No analysis is recomputed."
                     ),
                     style={"fontSize": "10px", "cursor": "pointer"},
                 ),
@@ -6045,12 +6190,25 @@ app.layout = html.Div([
 
             html.Label("Trajectories", style={"fontWeight": "bold", "fontSize": "12px"}),
             html.Label("Colour", title=(
-                           "Use one muted hue per current panel, or draw every "
-                           "trajectory and polar vector in neutral gray."),
+                           "Colour trajectories and polar vectors by the same "
+                           "metadata or metric. Tortuosity uses a 2-second "
+                           "path/chord window by default; edit "
+                           "trajectory.tortuosity_window_seconds in Visual "
+                           "style JSON to change it."),
                        style={"fontSize": "10px"}),
             dcc.Dropdown(id="color-by", options=[
                 {"label": "Categorical · current panels", "value": "categorical"},
                 {"label": "None · neutral gray", "value": "none"},
+                {"label": "Individual (VR + fly)", "value": "individual"},
+                {"label": "Config", "value": "config"},
+                {"label": "Scene", "value": "scene"},
+                {"label": "VR", "value": "vr"},
+                {"label": "Source folder", "value": "folder"},
+                {"label": "ROI outcome", "value": "roi"},
+                {"label": "Trial · sequential", "value": "trial"},
+                {"label": "Local time · sequential", "value": "local_time"},
+                {"label": "Velocity · smoothed", "value": "velocity"},
+                {"label": "Tortuosity · time-smoothed", "value": "tortuosity"},
             ], value="categorical", clearable=False, style={"fontSize": "11px"}),
             html.Label("Render mode",
                        title="Accuracy uses full filtered data for analysis views; Speed decimates plotted data more aggressively.",
@@ -6068,8 +6226,8 @@ app.layout = html.Div([
             html.Label(
                 "Displayed trials (%)",
                 title=(
-                    "Randomly retain this fraction of complete trajectory "
-                    "segments for the trajectory and loop-observer drawings. "
+                    "Browser-locally show this fraction of complete trajectory "
+                    "segments in trajectory, loop-observer and polar drawings. "
                     "Analytical panels still use all filtered trials."
                 ),
                 style={"fontSize": "10px", "marginTop": "5px"},
@@ -6086,8 +6244,8 @@ app.layout = html.Div([
                 className="subtle-action-button",
             ),
             html.Div(
-                "Sampling removes whole SourceFile+Trial+Step segments before "
-                "point decimation; 100% keeps every trial.",
+                "Sampling hides whole SourceFile+Trial+Step segments in the "
+                "mounted plots; 100% shows every trial.",
                 style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
             ),
 
@@ -6149,6 +6307,7 @@ app.layout = html.Div([
             ], style={"display": "flex", "gap": "5px", "marginTop": "3px"}),
             dcc.Slider(
                 id="loop-radius-slider", min=0.5, max=100, step=0.5, value=3,
+                updatemode="mouseup",
                 marks={1: "1", 25: "25", 50: "50", 75: "75", 100: "100"},
                 tooltip={"placement": "bottom", "always_visible": False},
             ),
@@ -6296,7 +6455,7 @@ app.layout = html.Div([
             ),
             dcc.Slider(
                 id="flow-max-radius", min=0.05, max=0.98, step=0.01,
-                value=0.49, updatemode="drag",
+                value=0.49, updatemode="mouseup",
                 marks={0.05: "0.05", 0.49: "0.49", 0.98: "0.98"},
                 tooltip={"placement": "bottom", "always_visible": False},
             ),
@@ -6309,7 +6468,7 @@ app.layout = html.Div([
                           config={"displayModeBar": False, "staticPlot": True},
                           style={"height": "58px", "margin": "0 0 -6px"}),
                 dcc.RangeSlider(id="heatmap-color-range", min=0, max=100,
-                                step=1, value=[0, 99],
+                                step=1, value=[0, 99], updatemode="mouseup",
                                 marks={0: "0", 50: "50", 100: "100"},
                                 tooltip={"placement": "bottom",
                                          "always_visible": False}),
@@ -6354,6 +6513,7 @@ app.layout = html.Div([
                title="Exact radius. Values above the slider maximum are allowed.",
                style={"marginTop": "4px", "alignItems": "center"}),
             dcc.Slider(id="roi-reach-slider", min=0.5, max=100, step=0.5, value=3,
+                       updatemode="mouseup",
                        marks={1: "1", 25: "25", 50: "50", 75: "75", 100: "100"},
                        tooltip={"placement": "bottom", "always_visible": True}),
             dcc.Checklist(id="roi-entered",
@@ -6385,7 +6545,8 @@ app.layout = html.Div([
                       config={"displayModeBar": False, "staticPlot": True},
                       style={"height": "58px", "margin": "0 0 -6px"}),
             dcc.RangeSlider(id="polar-r-range", min=0, max=1, step=0.01,
-                            value=[0, 1], marks={0: "0", 0.5: "0.5", 1: "1"},
+                            value=[0, 1], updatemode="mouseup",
+                            marks={0: "0", 0.5: "0.5", 1: "1"},
                             tooltip={"placement": "bottom", "always_visible": False}),
             html.Label("Min valid point fraction / trial",
                        title="Minimum fraction of samples in a trial that must have a usable heading after moving-only filtering.",
@@ -6396,7 +6557,8 @@ app.layout = html.Div([
                       config={"displayModeBar": False, "staticPlot": True},
                       style={"height": "58px", "margin": "0 0 -6px"}),
             dcc.Slider(id="polar-min-point-frac", min=0, max=1, step=0.05,
-                       value=0, marks={0: "0", 0.5: "0.5", 1: "1"},
+                       value=0, updatemode="mouseup",
+                       marks={0: "0", 0.5: "0.5", 1: "1"},
                        tooltip={"placement": "bottom", "always_visible": False}),
             html.Label("Min good-trial fraction / animal",
                        title="Drop animals unless at least this fraction of their trials pass the polar trial gates.",
@@ -6407,7 +6569,8 @@ app.layout = html.Div([
                       config={"displayModeBar": False, "staticPlot": True},
                       style={"height": "58px", "margin": "0 0 -6px"}),
             dcc.Slider(id="polar-min-animal-frac", min=0, max=1, step=0.05,
-                       value=0, marks={0: "0", 0.5: "0.5", 1: "1"},
+                       value=0, updatemode="mouseup",
+                       marks={0: "0", 0.5: "0.5", 1: "1"},
                        tooltip={"placement": "bottom", "always_visible": False}),
             html.Div([
                 dcc.Checklist(id="polar-moving",
@@ -6435,7 +6598,8 @@ app.layout = html.Div([
                       config={"displayModeBar": False, "staticPlot": True},
                       style={"height": "58px", "margin": "0 0 -6px"}),
             dcc.RangeSlider(id="vel-range", min=0, max=1, step=0.01,
-                            value=[0, 1], marks={0: "0", 1: "1"},
+                            value=[0, 1], updatemode="mouseup",
+                            marks={0: "0", 1: "1"},
                             tooltip={"placement": "bottom", "always_visible": False}),
             html.Details([
                 html.Summary("Exact velocity bounds",
@@ -6459,7 +6623,8 @@ app.layout = html.Div([
                       config={"displayModeBar": False, "staticPlot": True},
                       style={"height": "58px", "margin": "0 0 -6px"}),
             dcc.RangeSlider(id="disp-range", min=0, max=1, step=0.01,
-                            value=[0, 1], marks={0: "0", 1: "1"},
+                            value=[0, 1], updatemode="mouseup",
+                            marks={0: "0", 1: "1"},
                             tooltip={"placement": "bottom", "always_visible": False}),
             html.Button("Update all plots", id="btn-plot", n_clicks=0,
                         title=f"Rebuild all sections now. Changes auto-update after {PLOT_DEBOUNCE_MS / 1000:g}s idle.",
@@ -6478,7 +6643,8 @@ app.layout = html.Div([
                       config={"displayModeBar": False, "staticPlot": True},
                       style={"height": "58px", "margin": "0 0 -6px"}),
             dcc.RangeSlider(id="trial-range", min=0, max=1, step=1,
-                            value=[0, 1], marks={0: "0", 1: "1"},
+                            value=[0, 1], updatemode="mouseup",
+                            marks={0: "0", 1: "1"},
                             tooltip={"placement": "bottom", "always_visible": False}),
             html.Div([
                 html.Div([
@@ -6504,7 +6670,8 @@ app.layout = html.Div([
                       config={"displayModeBar": False, "staticPlot": True},
                       style={"height": "58px", "margin": "0 0 -6px"}),
             dcc.RangeSlider(id="step-range", min=0, max=1, step=1,
-                            value=[0, 1], marks={0: "0", 1: "1"},
+                            value=[0, 1], updatemode="mouseup",
+                            marks={0: "0", 1: "1"},
                             tooltip={"placement": "bottom", "always_visible": False}),
             html.Div([
                 dcc.Input(id="step-min", type="number", value=None,
@@ -7025,6 +7192,7 @@ app.layout = html.Div([
     ),
     dcc.Store(id="custom-region-stats-store", data={}),
     dcc.Store(id="minimal-layout-store", data=False),
+    dcc.Store(id="trial-subset-state", data={}),
     dcc.Store(id="sidebar-collapsed-store", data=False),
     dcc.Store(id="visual-style-store", data=_VISUAL_STYLE_DEFAULTS),
     dcc.Store(id="visual-style-diff-store", data={}),
@@ -7253,7 +7421,7 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
-    function(on, style) {
+    function(on, style, renderState, polarState) {
       if (window.dash_clientside.clean_layout) {
         return window.dash_clientside.clean_layout.render(on, style);
       }
@@ -7264,17 +7432,8 @@ app.clientside_callback(
     Output("btn-minimal-layout", "title"),
     Input("minimal-layout-store", "data"),
     Input("visual-style-store", "data"),
-    Input("trajectory-plot", "figure"),
-    Input("heatmap-figure-store", "data"),
-    Input("flow-figure-store", "data"),
-    Input("polar-plot", "figure"),
-    Input("roi-plot", "figure"),
-    Input("custom-region-diagnostics-plot", "figure"),
-    Input("trial-metrics-plot", "figure"),
-    Input("vel-histogram", "figure"),
-    Input("disp-histogram", "figure"),
-    Input("initial-heading-plot", "figure"),
-    Input("raw-trace-plot", "figure"),
+    Input("view-render-state", "data"),
+    Input("polar-render-state", "data"),
 )
 
 
@@ -7287,7 +7446,9 @@ app.clientside_callback(
 
 
 app.clientside_callback(
-    "function(fig,enabled,rings,active,matchMode,style){"
+    "function(fig,enabled,rings,active,matchMode,style,fraction,seed){"
+    "if(window.TrajectoryTrialSubset){"
+    "fig=window.TrajectoryTrialSubset.filterFigure(fig,fraction,seed);}"
     "if(window.dash_clientside.loop_observer){"
     "return window.dash_clientside.loop_observer.render("
     "fig,enabled,rings,active,matchMode,style);}"
@@ -7299,6 +7460,8 @@ app.clientside_callback(
     Input("loop-active-ring", "value"),
     Input("loop-match-mode", "value"),
     Input("visual-style-store", "data"),
+    Input("traj-trial-fraction", "value"),
+    Input("btn-traj-resample", "n_clicks"),
 )
 
 
@@ -7404,15 +7567,30 @@ app.clientside_callback(
 
 
 app.clientside_callback(
-    "function(n,fraction,clicks,pattern){"
-    "if(!n||!pattern||Number(fraction)>=100)"
-    "return window.dash_clientside.no_update;"
-    "return Number(clicks||0)+1;}",
-    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    """
+    function(trajectory, polar, fraction, seed, summary) {
+      if (window.dash_clientside.trial_subset) {
+        var state = window.dash_clientside.trial_subset.render(
+          trajectory, polar, fraction, seed
+        );
+        var text = (typeof summary === 'string') ? summary.replace(
+          /[\\d,.]+\\/[\\d,.]+ displayed trials/,
+          String(state.selected) + '/' + String(state.total) +
+            ' displayed trials'
+        ) : window.dash_clientside.no_update;
+        return [state, text];
+      }
+      return [window.dash_clientside.no_update,
+              window.dash_clientside.no_update];
+    }
+    """,
+    Output("trial-subset-state", "data"),
+    Output("data-summary", "children", allow_duplicate=True),
+    Input("trajectory-plot", "figure"),
+    Input("polar-plot", "figure"),
+    Input("traj-trial-fraction", "value"),
     Input("btn-traj-resample", "n_clicks"),
-    State("traj-trial-fraction", "value"),
-    State("btn-plot", "n_clicks"),
-    State("store-glob", "data"),
+    State("data-summary", "children"),
     prevent_initial_call=True,
 )
 
@@ -7803,10 +7981,17 @@ def restore_from_url(search, already):
             custom_regions = no_update
     color_value = s("color")
     if color_value is not no_update:
-        color_value = (
-            "none" if str(color_value).lower() in ("none", "gray")
-            else "categorical"
-        )
+        color_value = str(color_value).lower()
+        if color_value == "one":
+            color_value = "categorical"
+        elif color_value == "gray":
+            color_value = "none"
+        elif color_value not in {
+            "categorical", "none", "individual", "config", "scene", "vr",
+            "folder", "roi", "trial", "local_time", "velocity",
+            "tortuosity",
+        }:
+            color_value = "categorical"
     return (
         s("glob"), num("vel"), num("disp"), num("trim"), jump_ms(),
         s("groupby"), s("pool"), color_value, anim, rebase,
@@ -8086,7 +8271,6 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     Input("jump-buffer", "value"),
     Input("group-by", "value"),
     Input("pool-mode", "value"),
-    Input("color-by", "value"),
     Input("render-mode", "value"),
     Input("animate-toggle", "value"),
     Input("heatmap-binsize", "value"),
@@ -8107,7 +8291,6 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     Input("raw-columns", "value"),
     Input("subplot-ncols", "value"),
     Input("plot-points", "value"),
-    Input("traj-trial-fraction", "value"),
     Input("roi-show", "value"),
     Input("roi-reach", "value"),
     Input("roi-entered", "value"),
@@ -8133,7 +8316,6 @@ def arm_auto_replot(*values):
         "filter-configs": "config subset", "filter-vrs": "VR subset",
         "filter-flyids": "animal subset", "filter-scenes": "scene subset",
         "filter-folders": "folder subset",
-        "traj-trial-fraction": "displayed-trial sample",
     }.get(str(trigger), str(trigger).replace("-", " "))
     return (
         {"clicks": int(clicks or 0), "trigger": str(trigger), "ts": time.time()},
@@ -8724,13 +8906,12 @@ def render_panel_order_list(group_by, pool_mode, config_options, vr_options,
 
 
 @app.callback(
-    Output("btn-plot", "n_clicks", allow_duplicate=True),
+    Output("anim-dummy", "children", allow_duplicate=True),
     Input("panel-order-store", "data"),
-    State("btn-plot", "n_clicks"),
-    State("store-glob", "data"),
     prevent_initial_call=True,
 )
-def apply_panel_order(order_data, clicks, pattern):
+def apply_panel_order(order_data):
+    """Persist the browser-local domain order for the next real render."""
     group_by = str((order_data or {}).get("group_by") or "")
     order = (order_data or {}).get("order") or []
     if group_by not in _PANEL_ORDER_CONTROLS or not order:
@@ -8739,7 +8920,7 @@ def apply_panel_order(order_data, clicks, pattern):
     for value in order:
         rank.setdefault(str(value), len(rank))
     _USER_GROUP_ORDERS[group_by] = rank
-    return (clicks or 0) + 1 if pattern else no_update
+    return ""
 
 
 # Auto thresholds: when a box is ticked, fill its field with the computed value
@@ -9436,10 +9617,10 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     )
 
     stage_started = time.perf_counter()
-    # One stable whole-segment sample feeds both trajectory and polar display.
-    # Analytical heat/flow/ROI/metric inputs remain the complete filtered frame.
-    df_display = _sample_trajectory_segments(
-        df_view, traj_fraction, traj_sample_seed)
+    # Keep the complete filtered display frame mounted. The displayed-trial
+    # fraction is applied browser-side by `_seg_id`, so changing it never
+    # rebuilds analytical sections or Plotly figures.
+    df_display = df_view
     df_plot = rebase_to_origin(df_display) if do_rebase else df_display
     df_spatial = rebase_to_origin(df_view) if do_rebase else df_view
     bound_pct = float(hm_bound) if hm_bound not in (None, "") else 98.0
@@ -9565,7 +9746,10 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
     n_frames = len(traj_fig.frames)
     n_traces = int(df_view["_seg_id"].nunique()) if len(df_view) else 0
     n_displayed_traces = (
-        int(df_traj_sample["_seg_id"].nunique()) if len(df_traj_sample) else 0)
+        max(1, int(math.ceil(
+            _trial_display_fraction(traj_fraction) * n_traces)))
+        if n_traces else 0
+    )
     n_segs_before = df_sub["_seg_id"].nunique()
     bt = time.perf_counter() - started
     timings["total"] = bt
@@ -9603,6 +9787,151 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
             region_diag, region_store, polar_fig,
             metrics_fig, raw_fig, raw_style, summary, exclusion,
             render_state, f"Ready — all sections updated in {bt:.2f}s.")
+
+
+@app.callback(
+    Output("trajectory-plot", "figure", allow_duplicate=True),
+    Output("polar-plot", "figure", allow_duplicate=True),
+    Output("plot-status", "children", allow_duplicate=True),
+    Output("data-summary", "children", allow_duplicate=True),
+    Input("color-by", "value"),
+    State("view-render-state", "data"),
+    State("store-glob", "data"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("trial-min", "value"),
+    State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
+    State("vel-range-effective", "data"),
+    State("disp-range", "value"),
+    State("group-by", "value"),
+    State("pool-mode", "value"),
+    State("subplot-ncols", "value"),
+    State("plot-points", "value"),
+    State("render-mode", "value"),
+    State("animate-toggle", "value"),
+    State("rebase-origin", "value"),
+    State("heatmap-bound", "value"),
+    State("viewport-store", "data"),
+    State("roi-show", "value"),
+    State("roi-reach", "value"),
+    State("roi-entered", "value"),
+    State("roi-trim", "value"),
+    State("polar-moving", "value"),
+    State("polar-walk", "value"),
+    State("polar-angle-source", "value"),
+    State("polar-r-range", "value"),
+    State("polar-min-point-frac", "value"),
+    State("polar-min-animal-frac", "value"),
+    State("custom-region-enabled", "value"),
+    State("custom-regions-store", "data"),
+    State("data-summary", "children"),
+    prevent_initial_call=True,
+)
+def update_colour_views(
+        color_by, render_state, pattern, vel_thresh, min_disp, trim, jump_buf,
+        cfg, vrs, fids, scenes, folders, trial_min, trial_max, step_min,
+        step_max, vel_selection, disp_selection, group_by, pool_mode, ncols,
+        max_points, render_mode, animate, rebase, hm_bound, viewport, roi_show,
+        roi_reach, roi_entered, roi_trim, polar_moving, polar_walk,
+        polar_angle_source, polar_r_range, polar_min_point_frac,
+        polar_min_animal_frac, custom_region_enabled, custom_regions,
+        current_summary):
+    """Recolour only the two views whose marks encode ``color-by``."""
+    if not pattern or not render_state:
+        return no_update, no_update, no_update, no_update
+    started = time.perf_counter()
+    df_f, _, _ = _filtered_df(
+        pattern, vel_thresh, min_disp, trim, jump_buf,
+        cfg, vrs, fids, scenes, folders, trial_min, trial_max,
+        step_min, step_max, vel_selection, disp_selection)
+    if df_f is None or len(df_f) == 0:
+        message = _msg_figure("No trajectories match the active filters.")
+        return (
+            message, message, "Colour update skipped — no matching rows.",
+            no_update,
+        )
+
+    _, _, metas = _load_data(pattern)
+    rois = rois_by_config(metas)
+    reach = float(roi_reach or 3.0)
+    want_rois = _on(roi_show) and bool(rois)
+    df_view, table = _roi_apply(
+        df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
+    ncols_value = max(1, int(ncols or 2))
+    do_rebase = _on(rebase)
+    do_animate = _on(animate)
+    mode = _render_mode(render_mode)
+    draw_frame = rebase_to_origin(df_view) if do_rebase else df_view
+    bound_pct = float(hm_bound) if hm_bound not in (None, "") else 98.0
+    shared_fit = (
+        _robust_range(draw_frame, bound_pct)
+        if bound_pct < 100 else _shared_range(draw_frame)
+    )
+    budget = _budget(
+        BUDGET_SVG if do_animate else BUDGET_GL,
+        BUDGET_SVG_SPEED if do_animate else BUDGET_GL_SPEED,
+        mode, max_points,
+    )
+    draw_sample = (
+        _decimate_frame(draw_frame, budget) if mode == "speed" else draw_frame)
+    outcomes = (
+        roi_outcome_by_segment(df_view, rois, reach)
+        if (color_by == "roi" or want_rois) and rois else None
+    )
+    trajectory = build_trajectory_figure(
+        draw_sample, group_by, pool_mode, ncols=ncols_value,
+        color_by=color_by or "categorical", animate=do_animate,
+        max_points=len(draw_sample) if mode == "speed" else max_points,
+        rois=rois, reach_radius=reach,
+        show_rois=want_rois and not do_rebase, roi_counts=table,
+        roi_outcomes=outcomes, view_range=shared_fit,
+    )
+    _apply_viewport(trajectory, viewport, draw_sample)
+
+    polar_positions = (
+        rebase_to_origin(df_view) if do_rebase else df_view)
+    polar_source = (
+        _custom_region_subset(
+            df_view, custom_regions, position_frame=polar_positions)
+        if _on(custom_region_enabled) else df_view
+    )
+    polar, _quality = build_polar_figure(
+        polar_source, group_by, pool_mode, ncols=ncols_value,
+        color_by=color_by or "categorical",
+        moving_only=_on(polar_moving), walk_thresh=polar_walk,
+        max_points=_budget(
+            BUDGET_POLAR, BUDGET_POLAR_SPEED, mode, max_points),
+        rois=rois, reach_radius=reach,
+        show_rois=want_rois and not do_rebase,
+        roi_outcomes=outcomes, r_range=polar_r_range,
+        min_point_frac=polar_min_point_frac,
+        min_animal_trial_frac=polar_min_animal_frac,
+        return_summary=True, angle_source=polar_angle_source,
+    )
+    elapsed = time.perf_counter() - started
+    updated_summary = (
+        re.sub(
+            r"colour: [^|]+",
+            f"colour: {color_by} ",
+            current_summary,
+        )
+        if isinstance(current_summary, str) else no_update
+    )
+    return (
+        trajectory,
+        polar,
+        f"Ready — trajectory and polar recoloured by {color_by} in {elapsed:.2f}s.",
+        updated_summary,
+    )
 
 
 @app.callback(
@@ -9701,8 +10030,7 @@ def update_custom_region_analysis(
     metrics_fig = build_trial_metrics_figure(
         metric_stats, group_by=group_by, pool_mode=pool_mode)
 
-    sampled = _sample_trajectory_segments(
-        df_view, traj_fraction, traj_sample_seed)
+    sampled = df_view
     sampled_positions = rebase_to_origin(sampled) if do_rebase else sampled
     polar_source = (
         _custom_region_subset(sampled, regions, sampled_positions)
@@ -9827,8 +10155,7 @@ def compute_delayed_statistics(
         reach = float(roi_reach or 3.0)
         df_view, _ = _roi_apply(
             df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
-        polar_frame = _sample_trajectory_segments(
-            df_view, traj_fraction, traj_sample_seed)
+        polar_frame = df_view
         if _on(custom_region_enabled):
             metric_positions = (
                 rebase_to_origin(df_view) if _on(rebase) else df_view
@@ -10089,8 +10416,7 @@ def update_polar_only(render_state, polar_moving, polar_walk, polar_angle_source
     rois = rois_by_config(metas)
     reach = float(roi_reach) if roi_reach else 3.0
     df_view, _ = _roi_apply(df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
-    df_polar = _sample_trajectory_segments(
-        df_view, traj_fraction, traj_sample_seed)
+    df_polar = df_view
     if _on(custom_region_enabled):
         polar_positions = (
             rebase_to_origin(df_polar) if _on(rebase) else df_polar
@@ -10243,6 +10569,7 @@ app.clientside_callback(
     "toImageButtonOptions:{format:'png',scale:3},edits:{shapePosition:true}});"
     "hg.__hmfp=fp;hg.__hmPainted=true;"
     "if(window.__attachHeatSync){window.__attachHeatSync(hg,true);}}catch(e){}"
+    "if(window.dash_clientside.clean_layout){window.dash_clientside.clean_layout.refresh();}"
     "try{hc.style.opacity='1';}catch(e){}"
     "setTimeout(function(){window.__hmSuppress=false;},250);"
     "}else{try{"
@@ -10265,7 +10592,7 @@ app.clientside_callback(
     "if(v&&window.__restyleHeatmap){"
     "window.__restyleHeatmap(hg,v,metric,scale,colorRange,rangeMode,colorData);"
     "}}catch(e){}"
-    "if(window.dash_clientside.clean_layout){window.dash_clientside.clean_layout.refresh();}}"
+    "}"
     "},90);return '';}",
     Output("anim-dummy", "children", allow_duplicate=True),
     Input("heatmap-figure-store", "data"),

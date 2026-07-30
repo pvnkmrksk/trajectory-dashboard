@@ -531,7 +531,11 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(color_control.value, "categorical")
         self.assertEqual(
             [option["value"] for option in color_control.options],
-            ["categorical", "none"],
+            [
+                "categorical", "none", "individual", "config", "scene", "vr",
+                "folder", "roi", "trial", "local_time", "velocity",
+                "tortuosity",
+            ],
         )
         self.assertFalse(_component("minimal-layout-store").data)
         self.assertEqual(len(_component("custom-regions-store").data), 1)

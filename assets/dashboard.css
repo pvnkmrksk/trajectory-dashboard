@@ -775,3 +775,27 @@ body._dash-loading-callback .status-dot {
   border-color: var(--td-border) !important;
   border-radius: 5px !important;
 }
+
+/*
+ * Publication mode is a persistent presentation state, not a delayed Plotly
+ * repaint. Keeping the class on the graph container prevents pan/zoom/react
+ * from briefly restoring axes before another relayout callback can hide them.
+ */
+.td-clean-spatial .gridlayer,
+.td-clean-spatial .zerolinelayer,
+.td-clean-spatial .xaxislayer-above,
+.td-clean-spatial .yaxislayer-above {
+  display: none !important;
+}
+
+.td-clean-cartesian .gridlayer,
+.td-clean-cartesian .zerolinelayer {
+  display: none !important;
+}
+
+.td-clean-polar .angular-grid,
+.td-clean-polar .radial-grid,
+.td-clean-polar .angularaxistick,
+.td-clean-polar .radialaxistick {
+  display: none !important;
+}

@@ -88,7 +88,8 @@ Assets (Dash auto-serves `/assets`):
 - `assets/plot_wheel_guard.js` — prevents page/panel scroll while the pointer is
   over Plotly's central wheel-zoom plane; margins still scroll normally.
 - `assets/config_order.js` — drag-to-reorder the visible values of the active
-  config/scene/VR/fly/folder panel axis via `panel-order-store`.
+  config/scene/VR/fly/folder panel axis by swapping mounted Plotly domains,
+  then persisting the order via `panel-order-store`.
 - `assets/shared_legend.js` — shares categorical layer visibility between the
   trajectory and polar figures and reports counts for the currently visible
   layers.
@@ -101,6 +102,8 @@ Assets (Dash auto-serves `/assets`):
 - `assets/clean_layout.js` — one-pass browser-only publication styling:
   title-only spatial panels with zoom-aware 1/2/5 scale bars, despined
   statistical panels, clean polar axes, and exact Full-layout restoration.
+- `assets/trial_subset.js` — browser-local whole-`_seg_id` visibility sampling
+  shared by trajectory, curtain-ring and polar views.
 
 ---
 
@@ -184,10 +187,11 @@ same cache key.
   `update_custom_region_analysis`, which rebuilds only polar and the
   observation-window table; `assets/region_observer.js` repaints rectangles and
   Gandiva percentage labels without rebuilding direction vectors.
-- **Colour modes** (`color_by`): the UI intentionally exposes only
-  `categorical` (default: one muted hue per current panel) and `none` (neutral
-  translucent gray). Older URL values are restored as `categorical` so obsolete
-  modes cannot leave the dropdown in an invalid hidden state.
+- **Colour modes** (`color_by`): `categorical` (default: one muted hue per
+  current panel), `none` (neutral translucent gray),
+  individual/config/scene/VR/folder/ROI categories, and sequential
+  trial/local-time/velocity/tortuosity modes. Tortuosity uses the configurable
+  time span in `trajectory.tortuosity_window_seconds`.
 - **Layout**: 2-col grid, `SUBPLOT_PX=480` per subplot → the figure is its
   natural full height and the panel scrolls (no squishing). Subplot vertical
   spacing is deliberately tight so Plotly drag rectangles are easy to hit. 1:1
@@ -252,7 +256,7 @@ same cache key.
 - **Trial metrics**: `build_trial_metrics_figure` selects the exact pre-retention
   segment summaries for currently visible `_seg_id` values and groups them by
   the same panel axis. It shows path length, net displacement, median smoothed
-  speed, and the median 15-sample local path/chord ratio. Up to 200 trials per
+  speed, and the median time-windowed local path/chord ratio. Up to 200 trials per
   group render as deterministic jittered points; larger groups render as
   count-scaled violins. Both encodings share a full-width IQR band and median
   line overlay.
@@ -376,10 +380,12 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 |---|---|---|
 | Load / dropped folder | Load/cache data, options and metadata; reset range controls on a changed source; render once after that barrier | Stale prior-dataset ranges; URL from pan/zoom |
 | Update all plots (`btn-plot`) | Build every mounted section from one filtered state | Competing per-section builders; direct heatmap `dcc.Graph.figure` |
+| Colour mode | Rebuild only trajectory and polar marks from the cached filtered frame | Heatmap/Gandiva/ROI/diagnostic/metric rebuilds |
+| Plot order | Browser-local Cartesian/polar domain swap; persist rank for the next real render | Figure reconstruction, rebinning or analysis |
 | Heatmap bin/bound or data filter | Debounced all-section update; heatmap store + variants are built exactly | Concurrent heatmap sidebar aggregation |
 | Heatmap metric/scale/color range mode/value | Clientside heatmap `Plotly.restyle` from current binning variants; rebuild the local direction field from the cached filtered frame so abundance matches | Dataframe refiltering, heatmap rebinning or master-section rebuild |
 | ROI entered/trim | Debounced atomic update of all affected sections | A second ROI/trajectory refresh callback |
-| Displayed-trial fraction / resample | Rebuild trajectory and polar drawings from one whole-`_seg_id` sample; analytical spatial/ROI/metric panels retain the complete filtered frame | Row-level random sampling; changes to target/metric denominators |
+| Displayed-trial fraction / resample | Browser-local `Plotly.restyle` hides complete `_seg_id` paths/rays and updates the visible population ray; analytical spatial/ROI/metric panels retain the complete filtered frame | Server render/reanalysis; row-level random sampling; changes to target/metric denominators |
 | Loop add/delete/select/match, centre/radius or ring drag | Browser-local multi-circle intersection, qualifying-entry split and observer redraw; persist small ring-set state in the URL | Dataframe filtering, master render, heatmap/polar/ROI changes |
 | Observation-window add/delete/select/bounds or box drag | Rebuild polar + custom diagnostics from cached filtered rows; repaint rectangles and Gandiva percentages in the browser | Trajectory, heatmap or Gandiva-vector recomputation; master render |
 | Clean layout | Browser-local relayout, adaptive scale bars and URL state | Figure/data rebuilds or viewport callback traffic |

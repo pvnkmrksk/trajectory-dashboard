@@ -22,7 +22,8 @@
     on: false,
     style: {},
     timer: null,
-    frames: {}
+    frames: {},
+    force: false
   };
 
   function clone(value) {
@@ -33,6 +34,21 @@
   function graphDiv(id) {
     var container = document.getElementById(id);
     return container && container.querySelector(".js-plotly-plot");
+  }
+
+  function presentationClass(id, on) {
+    var container = document.getElementById(id);
+    if (!container || !container.classList) return;
+    container.classList.toggle("td-clean-mode", Boolean(on));
+    container.classList.toggle(
+      "td-clean-spatial", Boolean(on) && SPATIAL_IDS.indexOf(id) >= 0
+    );
+    container.classList.toggle(
+      "td-clean-polar", Boolean(on) && POLAR_IDS.indexOf(id) >= 0
+    );
+    container.classList.toggle(
+      "td-clean-cartesian", Boolean(on) && CARTESIAN_IDS.indexOf(id) >= 0
+    );
   }
 
   function axisName(prefix, index) {
@@ -249,6 +265,30 @@
     update.annotations = annotations;
   }
 
+  function scaleBarUpdate(gd) {
+    if (!state.on || !gd || !gd.layout || !window.Plotly) {
+      return Promise.resolve(false);
+    }
+    var shapes = (gd.layout.shapes || []).filter(function (shape) {
+      return !shape || shape.name !== SCALE_NAME;
+    });
+    var annotations = (gd.layout.annotations || []).filter(function (annotation) {
+      return !annotation || annotation.name !== SCALE_NAME;
+    });
+    scaleObjects(gd, spatialIndices(gd), shapes, annotations);
+    gd.__tdCleanPainting = true;
+    return window.Plotly.relayout(gd, {
+      shapes: shapes,
+      annotations: annotations
+    }).then(function () {
+      gd.__tdCleanPainting = false;
+      return true;
+    }).catch(function () {
+      gd.__tdCleanPainting = false;
+      return false;
+    });
+  }
+
   function cartesianUpdate(gd, update) {
     axisKeys(gd.layout).forEach(function (name) {
       update[name + ".showgrid"] = false;
@@ -327,7 +367,9 @@
       if (!changedRange) return;
       if (state.frames[id]) window.cancelAnimationFrame(state.frames[id]);
       state.frames[id] = window.requestAnimationFrame(function () {
-        paint(id);
+        // Pan/zoom only changes scale-bar geometry. Reapplying every axis
+        // property here caused a visible full→clean flash during interaction.
+        scaleBarUpdate(gd);
         state.frames[id] = null;
       });
     };
@@ -337,9 +379,15 @@
   function paint(id) {
     var gd = graphDiv(id);
     if (!gd || !gd.layout || !window.Plotly) return Promise.resolve(false);
+    presentationClass(id, state.on);
     var wasActive = Boolean(gd.__tdCleanActive);
-    if (state.on && (freshFigure(gd) || !gd.__tdCleanActive)) {
+    var fresh = freshFigure(gd);
+    if (state.on && (fresh || !gd.__tdCleanActive)) {
       gd.__tdCleanBase = snapshot(gd);
+    }
+    if (state.on && wasActive && !fresh && !state.force) {
+      if (SPATIAL_IDS.indexOf(id) >= 0) return scaleBarUpdate(gd);
+      return Promise.resolve(true);
     }
     var update = {};
     if (state.on) {
@@ -387,7 +435,10 @@
     if (!found && attempt < 10) {
       window.setTimeout(function () { paintAll(attempt + 1); }, 45);
     }
-    return Promise.all(jobs);
+    return Promise.all(jobs).then(function (result) {
+      state.force = false;
+      return result;
+    });
   }
 
   function schedule(delay) {
@@ -403,6 +454,13 @@
       render: function (on, visualStyle) {
         state.on = Boolean(on);
         state.style = visualStyle || {};
+        ALL_IDS.forEach(function (id) {
+          presentationClass(id, state.on);
+        });
+        // This entry point is called only for an explicit mode/style change or
+        // a completed structural render, never for pan/zoom. Force one complete
+        // presentation pass even if Plotly reused its data-array identity.
+        state.force = true;
         schedule(35);
         return state.on ?
           "Switch to the full interactive axes, grids and legends." :
