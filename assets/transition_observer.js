@@ -94,11 +94,28 @@
     return displays[metric] || displays.fraction || displays.count || null;
   }
 
+  function boundedDisplay(state, display) {
+    var out = clone(display);
+    if (!out || state.metric !== "count") return out;
+    var lower = Number(state.countMin);
+    var upper = Number(state.countMax);
+    if (Number.isFinite(lower)) out.zmin = Math.max(0, lower);
+    if (Number.isFinite(upper)) out.zmax = Math.max(0, upper);
+    if (!(Number(out.zmax) > Number(out.zmin))) {
+      out.zmax = Math.max(
+        Number(display.zmax || 1), Number(out.zmin || 0) + 1
+      );
+    }
+    return out;
+  }
+
   function selection(state) {
     var selected = outcomeVariant(state.bundle, state.outcome);
     return {
       outcome: selected,
-      display: displayVariant(selected, state.metric)
+      display: boundedDisplay(
+        state, displayVariant(selected, state.metric)
+      )
     };
   }
 
@@ -315,6 +332,23 @@
     return out;
   }
 
+  function setHeatmapFocus(state, focused) {
+    var gd = graphDiv(state.heatId);
+    if (!gd || !window.Plotly) return Promise.resolve();
+    var indices = [];
+    (gd.data || []).forEach(function (trace, index) {
+      if (String((trace && trace.type) || "").toLowerCase() === "heatmap") {
+        indices.push(index);
+      }
+    });
+    state.heatmapFocused = Boolean(focused);
+    if (!indices.length) return Promise.resolve();
+    return Promise.resolve(window.Plotly.restyle(gd, {
+      opacity: focused ? 0.08 : 1,
+      showscale: focused ? false : true
+    }, indices));
+  }
+
   function clearOverlay(state, message) {
     var gd = graphDiv(state.heatId);
     state.selectedPoint = null;
@@ -329,6 +363,8 @@
       return window.Plotly.relayout(gd, {
         shapes: withoutSelectionShape(gd.layout && gd.layout.shapes)
       });
+    }).then(function () {
+      return setHeatmapFocus(state, false);
     }).then(function () {
       if (message) setStatus(state, message);
     });
@@ -457,6 +493,8 @@
           [shape])
       });
     }).then(function () {
+      return setHeatmapFocus(state, true);
+    }).then(function () {
       setStatus(
         state,
         exactSuccess.toLocaleString() + "/" +
@@ -573,7 +611,10 @@
       outcome: "crossed",
       metric: "fraction",
       enabled: false,
-      selectedPoint: null
+      selectedPoint: null,
+      heatmapFocused: false,
+      countMin: null,
+      countMax: null
     };
     return states[key];
   }
@@ -585,6 +626,8 @@
       state.bundle = options.bundle || {};
       state.outcome = options.outcome === "ended" ? "ended" : "crossed";
       state.metric = options.metric === "count" ? "count" : "fraction";
+      state.countMin = options.countMin;
+      state.countMax = options.countMax;
       state.enabled = Array.isArray(options.enabled) &&
         options.enabled.indexOf("on") >= 0;
       mount(state, false);
@@ -606,6 +649,8 @@
       state.bundle = options.bundle || {};
       state.outcome = options.outcome === "ended" ? "ended" : "crossed";
       state.metric = options.metric === "count" ? "count" : "fraction";
+      state.countMin = options.countMin;
+      state.countMax = options.countMax;
       state.enabled = true;
       state.signature = String(state.bundle.signature || "");
       states[key] = state;
@@ -617,6 +662,11 @@
         },
         setMetric: function (metric) {
           state.metric = metric === "count" ? "count" : "fraction";
+          mount(state, true);
+        },
+        setCountRange: function (lower, upper) {
+          state.countMin = lower;
+          state.countMax = upper;
           mount(state, true);
         }
       };

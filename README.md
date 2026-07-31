@@ -175,9 +175,11 @@ For a quick preprocessing check on the homing enemy data, run
 - **Observation windows**: add, select, drag, resize and delete rectangular
   regions on Trajectory, Heatmap or Gandiva. Gandiva labels the sample share in
   each window; polar and trial metrics use the union of window samples; the
-  diagnostics show per-trial or per-animal distributions of sample occupancy,
-  entry, distance walked, net displacement, tortuosity and velocity. Window
-  edits refresh only those dependent analyses.
+  diagnostics show tracked-time percentage, paired per-animal trial-entry
+  counts, distance walked, net displacement, tortuosity and velocity. Trial
+  mode contributes one point per trial; animal mode pools the correct
+  numerator/denominator before contributing one point per animal. Window edits
+  refresh only those dependent analyses.
 - **Whole-trial display sampling**: instantly hide/show a deterministic random
   1–100% of complete `_seg_id` segments in the mounted browser plots, with a
   button for a fresh sample. The same selected trials feed trajectories, the
@@ -215,7 +217,9 @@ For a quick preprocessing check on the homing enemy data, run
   than implying zero probability. Both outcomes are calculated together, so
   their switch is immediate. Click a cell to reveal only its successful
   displayed trajectories, split into muted pre-entry and saturated future
-  paths, with exact numerator/denominator counts on hover.
+  paths, while the underlying grid fades into the background. A blank-cell
+  click clears the paths and restores the grid. Raw-count colour limits are
+  independently editable without repeating the transition calculation.
 - **Gandiva plot**: a quiver/heatmap hybrid named for Arjuna's divine bow on the same selectable
   spatial grid. Each cell is a circular summary of its samples: stroke angle and
   hue show mean direction, stroke length and colour saturation show resultant
@@ -323,7 +327,7 @@ more concurrent source files.
 | Panel columns | Number of columns in the grid. | Wide screens can use 2-4 columns; narrow screens are easier with 1. |
 | Show raw config filenames | Uses exact config filenames instead of readable labels. | Debugs metadata/name mapping when labels look surprising. |
 | Clean layout | Hides spatial axes, Cartesian grids/zero-lines, legends and colourbars while retaining polar rings; the button changes to Full layout for exact restoration. | Produces PNG-ready Plotly figures with a CSS-only appearance change and no viewport mutation. |
-| Scale-bar conversion / unit | Multiplies data units for the clean-layout scale label and sets its text (default `1`, `cm`). | Keeps the same geometry usable for centimetres, metres, or experiment-specific calibration. |
+| Scale-bar conversion / unit | Multiplies data units for the clean-layout scale label and for distance/displacement/velocity diagnostic axes, then sets their unit text (default `1`, `cm`). | Keeps the same geometry and movement metrics usable for centimetres, metres, or experiment-specific calibration. |
 
 ### Trajectories
 
@@ -363,7 +367,7 @@ available spatial fidelity.
 | Add / delete / selected window | Maintains a small named set of rectangular windows. | Makes side-by-side local comparisons easy while keeping deletion explicit. |
 | X/Z min/max | Exact reproducible bounds; dragging/resizing any dashed box updates these fields. | Supports tactile exploration and precise repeated analyses. |
 | Gandiva labels | Reports each window’s sample percentage per current panel. | Provides immediate spatial prevalence without recomputing local vectors. |
-| Observation-window diagnostics | Plots per-trial/per-animal sample percentage, entry, local distance, net displacement, tortuosity and velocity with the shared Swarm/Violin control. | Makes windows and active groups comparable with the same independent-unit and non-parametric semantics as trial metrics. |
+| Observation-window diagnostics | Plots percentage of tracked time, paired per-animal counts of trials entering, local distance, net displacement, tortuosity and velocity with the shared Swarm/Violin control. | Time percentages pool duration denominators correctly, entry pairs share each animal's trial effort, and movement panels use one trial/animal observation as selected. |
 
 ### Filters
 
@@ -396,9 +400,10 @@ available spatial fidelity.
 | Enable transition probability | Calculates a separate conditional-probability grid for each active config/scene/VR/fly/folder panel. | Keeps the ordinary occupancy heatmap unchanged and avoids doing the extra trial-level calculation when it is not needed. |
 | Crossed later / Ended opposite | Defines success after a trial first enters a cell: any later sample reaches the opposite half, or the trial's final retained sample lies there. | “Crossed” captures temporary excursions; “Ended” is the stricter destination interpretation. Both reuse the same calculation. |
 | Colour | Fraction (%) or Successful trials (n). | Fraction exposes transition propensity; count exposes how much successful-trial support is behind the colour and avoids exaggerating sparse cells. Switching is a browser-local restyle. |
+| Count colour min / max | Optional exact colour limits for Successful trials (n); blank keeps automatic limits. | Stops a few high-support cells from flattening useful count structure. Limits are applied browser-locally and are preserved in URLs/HTML exports. |
 | Horizontal split Z | Blank uses the modal segment-start row; an exact number overrides it and becomes a true bin boundary, with transition rows placed at whole grid-size increments on either side. | Makes `0` an exact arena-midline boundary instead of merely moving a line across an independently anchored grid. |
 | Minimum entering trials | Blanks cells whose unique-trial denominator is smaller than this value. | Prevents a one-of-one cell from visually looking as reliable as a densely sampled one. |
-| Click a cell | Overlays successful currently displayed paths faintly on that same subplot, with past/future split at first entry; clicking a blank cell clears them. | Combines the heatmap overview with curtain-ring-style trajectory diagnosis without a server request or a second graph. |
+| Click a cell | Fades the heatmap and overlays successful currently displayed paths on that same subplot, with past/future split at first entry; clicking a blank cell clears them and restores the heatmap. | Combines the heatmap overview with a focused curtain-ring-style trajectory diagnosis without a server request or a second graph. |
 
 Each `_seg_id` contributes at most once to a cell denominator even when it
 leaves and revisits that cell. Because the split is itself an edge, every

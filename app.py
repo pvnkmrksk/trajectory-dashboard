@@ -2285,6 +2285,31 @@ def _median_dt(df) -> float:
     return float(np.median(dt)) if len(dt) else 1.0
 
 
+def _sample_time_weights(df) -> np.ndarray:
+    """Duration represented by each sorted sample without crossing trials."""
+    if df is None or len(df) == 0:
+        return np.zeros(0, dtype=float)
+    fallback = _median_dt(df) if "Current Time" in df else 1.0
+    fallback = fallback if np.isfinite(fallback) and fallback > 0 else 1.0
+    if "Current Time" not in df or "_seg_id" not in df:
+        return np.full(len(df), fallback, dtype=float)
+    times = (
+        df["Current Time"].to_numpy().astype("datetime64[ns]")
+        .astype("int64") / 1e9
+    )
+    seg = df["_seg_id"].astype(str).to_numpy()
+    duration = np.full(len(df), fallback, dtype=float)
+    if len(df) > 1:
+        forward = np.diff(times)
+        valid = (
+            (seg[1:] == seg[:-1])
+            & np.isfinite(forward)
+            & (forward > 0)
+        )
+        duration[:-1] = np.where(valid, forward, fallback)
+    return duration
+
+
 def _fmt_metric(v: float, metric: str) -> str:
     """Human-readable tick label for a metric value."""
     if metric == "percent":
@@ -2526,6 +2551,11 @@ def _custom_region_stats(frame, regions, group_by="config",
         pd.Series(1, index=seg)
         .groupby(level=0, sort=False).sum().reindex(segment_order)
     )
+    sample_seconds = _sample_time_weights(frame)
+    total_seconds_by_segment = (
+        pd.Series(sample_seconds, index=seg)
+        .groupby(level=0, sort=False).sum().reindex(segment_order)
+    )
     first_by_segment = (
         frame.drop_duplicates("_seg_id", keep="first")
         .assign(_seg_text=lambda value: value["_seg_id"].astype(str))
@@ -2535,6 +2565,8 @@ def _custom_region_stats(frame, regions, group_by="config",
     region_rows = []
     per_region_stats = {}
     per_region_sample_percent = {}
+    per_region_inside_seconds = {}
+    per_region_time_percent = {}
 
     for region, mask in zip(clean, masks):
         stats = _custom_region_segment_stats(
@@ -2550,6 +2582,16 @@ def _custom_region_stats(frame, regions, group_by="config",
         per_region_sample_percent[region["id"]] = (
             100.0 * inside_by_segment
             / total_samples_by_segment.clip(lower=1)
+        )
+        inside_seconds = (
+            pd.Series(sample_seconds * mask.astype(float), index=seg)
+            .groupby(level=0, sort=False).sum().reindex(
+                segment_order, fill_value=0.0)
+        )
+        per_region_inside_seconds[region["id"]] = inside_seconds
+        per_region_time_percent[region["id"]] = (
+            100.0 * inside_seconds
+            / total_seconds_by_segment.clip(lower=np.finfo(float).eps)
         )
         sample_count = int(mask.sum())
         entered = int(len(stats))
@@ -2596,6 +2638,18 @@ def _custom_region_stats(frame, regions, group_by="config",
                 per_region_sample_percent[region["id"]]
                 .reindex(group_segments).fillna(0.0)
             )
+            inside_seconds = (
+                per_region_inside_seconds[region["id"]]
+                .reindex(group_segments).fillna(0.0)
+            )
+            time_percent = (
+                per_region_time_percent[region["id"]]
+                .reindex(group_segments).fillna(0.0)
+            )
+            total_seconds = (
+                total_seconds_by_segment
+                .reindex(group_segments).fillna(0.0)
+            )
             count = int((mask & group_membership).sum())
             entered = int(len(substats))
             summaries.append({
@@ -2640,6 +2694,12 @@ def _custom_region_stats(frame, regions, group_by="config",
                         .fillna(0).astype(int).tolist()
                     ),
                     "sample_percent": sample_percent.astype(float).tolist(),
+                    "inside_seconds": inside_seconds.astype(float).tolist(),
+                    "total_seconds": total_seconds.astype(float).tolist(),
+                    "time_percent": time_percent.astype(float).tolist(),
+                    "entered": (
+                        sample_percent.to_numpy(dtype=float) > 0
+                    ).astype(int).tolist(),
                     "trial_percent": (
                         100.0 * (sample_percent.to_numpy(dtype=float) > 0)
                     ).tolist(),
@@ -2726,28 +2786,75 @@ def _distribution_choice(mode, counts, threshold=200):
 def _observation_distribution_values(summary, key, stats_unit="trial"):
     """Return aligned window observations at trial or animal level."""
     values = summary.get("segment_values") or {}
-    numeric = np.asarray(values.get(key) or [], dtype=float)
     seg_ids = np.asarray(values.get("seg_id") or [], dtype=object)
     support = np.asarray(values.get("n_points") or [], dtype=float)
+    requested_key = str(key)
+    source_key = "entered" if requested_key == "trial_count" else requested_key
+    numeric = np.asarray(values.get(source_key) or [], dtype=float)
     n = min(len(numeric), len(seg_ids), len(support))
     if not n:
         return np.array([]), np.array([], dtype=object), np.array([])
     numeric, seg_ids, support = numeric[:n], seg_ids[:n], support[:n]
-    keep = np.isfinite(numeric)
-    numeric, seg_ids, support = numeric[keep], seg_ids[keep], support[keep]
-    if str(stats_unit or "trial") != "animal" or not len(numeric):
-        return numeric, seg_ids, support
 
-    fly = np.asarray(values.get("fly_id") or [""] * n, dtype=object)[:n][keep]
-    vr = np.asarray(values.get("vr") or [""] * n, dtype=object)[:n][keep]
+    fly = np.asarray(values.get("fly_id") or [""] * n, dtype=object)[:n]
+    vr = np.asarray(values.get("vr") or [""] * n, dtype=object)[:n]
     folder = np.asarray(
-        values.get("source_folder") or [""] * n, dtype=object)[:n][keep]
+        values.get("source_folder") or [""] * n, dtype=object)[:n]
     animal = np.asarray([
         f"{f}@{v}" if str(f).strip() else (
             f"{folder_name}@{v}" if str(folder_name).strip() else str(seg)
         )
         for f, v, folder_name, seg in zip(fly, vr, folder, seg_ids)
     ], dtype=object)
+
+    # Entry is an animal-level count by definition: each animal contributes one
+    # paired count per window, irrespective of the display unit used elsewhere.
+    if requested_key == "trial_count":
+        entered = np.where(np.isfinite(numeric), numeric, 0.0)
+        pooled = pd.DataFrame({
+            "animal": animal.astype(str),
+            "value": entered,
+            "trials": np.ones(n, dtype=float),
+        }).groupby("animal", sort=False, observed=True).agg(
+            value=("value", "sum"),
+            support=("trials", "sum"),
+        )
+        return (
+            pooled["value"].to_numpy(dtype=float),
+            pooled.index.to_numpy(dtype=object),
+            pooled["support"].to_numpy(dtype=float),
+        )
+
+    # Percent tracked time must pool numerators and denominators. Averaging trial
+    # percentages would give short trials the same weight as long trials.
+    if requested_key == "time_percent":
+        inside = np.asarray(values.get("inside_seconds") or [], dtype=float)[:n]
+        total = np.asarray(values.get("total_seconds") or [], dtype=float)[:n]
+        if str(stats_unit or "trial") != "animal":
+            keep = np.isfinite(numeric) & np.isfinite(total) & (total > 0)
+            return numeric[keep], seg_ids[keep], total[keep]
+        pooled = pd.DataFrame({
+            "animal": animal.astype(str),
+            "inside": np.where(np.isfinite(inside), inside, 0.0),
+            "total": np.where(np.isfinite(total), total, 0.0),
+        }).groupby("animal", sort=False, observed=True).sum()
+        valid = pooled["total"].to_numpy(dtype=float) > 0
+        ratio = (
+            100.0 * pooled["inside"].to_numpy(dtype=float)[valid]
+            / pooled["total"].to_numpy(dtype=float)[valid]
+        )
+        return (
+            ratio,
+            pooled.index.to_numpy(dtype=object)[valid],
+            pooled["total"].to_numpy(dtype=float)[valid],
+        )
+
+    keep = np.isfinite(numeric)
+    numeric, seg_ids, support = numeric[keep], seg_ids[keep], support[keep]
+    animal = animal[keep]
+    if str(stats_unit or "trial") != "animal" or not len(numeric):
+        return numeric, seg_ids, support
+
     pooled = pd.DataFrame({
         "animal": animal.astype(str),
         "value": numeric,
@@ -2765,12 +2872,13 @@ def _observation_distribution_values(summary, key, stats_unit="trial"):
 
 def build_custom_region_diagnostics_figure(
         payload, distribution_mode="auto", show_violin_points=True,
-        stats_unit="trial"):
+        stats_unit="trial", spatial_unit_scale=1.0,
+        spatial_unit_label="cm"):
     """Plot six consistent window distributions by the active panel grouping.
 
-    Sample occupancy and entry are independent trial-level proportions (or
-    animal-level means), rather than single group bars. Movement estimates use
-    only the observed sections of each entered `_seg_id`.
+    Time occupancy pools tracked seconds with the correct trial/animal
+    denominator. Entry is a paired per-animal trial count. Movement estimates
+    use only the observed sections of each entered `_seg_id`.
     """
     panels = (payload or {}).get("panels") or []
     region_rows = (payload or {}).get("regions") or []
@@ -2780,18 +2888,34 @@ def build_custom_region_diagnostics_figure(
             260,
         )
 
-    unit_label = "animal mean" if stats_unit == "animal" else "trial"
+    try:
+        distance_scale = float(spatial_unit_scale)
+    except (TypeError, ValueError):
+        distance_scale = 1.0
+    if not np.isfinite(distance_scale) or distance_scale <= 0:
+        distance_scale = 1.0
+    distance_unit = str(spatial_unit_label or "cm").strip() or "cm"
+    unit_label = "animal" if stats_unit == "animal" else "trial"
     specs = (
-        ("sample_percent", "Samples inside", f"% per {unit_label}"),
-        ("trial_percent", "Trials entering", f"0/100% per {unit_label}"),
-        ("distance_walked", "Distance walked", f"Per {unit_label}"),
-        ("displacement", "Net displacement", f"Per {unit_label}"),
+        ("time_percent", "Time inside", f"% tracked time per {unit_label}"),
+        ("trial_count", "Trials entering", "count per animal"),
+        (
+            "distance_walked", "Distance walked",
+            f"{distance_unit} per {unit_label}",
+        ),
+        (
+            "displacement", "Net displacement",
+            f"{distance_unit} per {unit_label}",
+        ),
         (
             "median_local_tortuosity",
             "Local tortuosity",
-            f"Per {unit_label}",
+            f"ratio per {unit_label}",
         ),
-        ("median_velocity", "Velocity", f"Per {unit_label}"),
+        (
+            "median_velocity", "Velocity",
+            f"{distance_unit}/s per {unit_label}",
+        ),
     )
     fig = make_subplots(
         rows=2, cols=3,
@@ -2821,6 +2945,12 @@ def build_custom_region_diagnostics_figure(
             for region_index, region_id in enumerate(region_ids):
                 values = _observation_distribution_values(
                     summaries.get(region_id, {}), key, stats_unit)
+                if key in {"distance_walked", "displacement", "median_velocity"}:
+                    values = (
+                        values[0] * distance_scale,
+                        values[1],
+                        values[2],
+                    )
                 observations[(metric_index, group_index, region_index)] = values
                 counts.append(len(values[0]))
     mark = _distribution_choice(distribution_mode, counts)
@@ -2828,6 +2958,47 @@ def build_custom_region_diagnostics_figure(
     for metric_index, (key, title, _subtitle) in enumerate(specs):
         row, col = metric_index // 3 + 1, metric_index % 3 + 1
         for group_index, panel in enumerate(panels):
+            # Connect the same trial/animal across windows. Entry counts always
+            # use animals, so R/S comparisons share the animal's trial effort.
+            if region_count > 1:
+                paired = {}
+                centres = []
+                for region_index, _region_id in enumerate(region_ids):
+                    centres.append(
+                        group_index
+                        + (region_index - (region_count - 1) / 2)
+                        * region_spacing
+                    )
+                    region_values, identities, _support = observations[
+                        (metric_index, group_index, region_index)
+                    ]
+                    for identity, value in zip(identities, region_values):
+                        paired.setdefault(str(identity), {})[
+                            region_index] = float(value)
+                pair_x, pair_y = [], []
+                for identity_values in paired.values():
+                    present = [
+                        index for index in range(region_count)
+                        if index in identity_values
+                        and np.isfinite(identity_values[index])
+                    ]
+                    if len(present) < 2:
+                        continue
+                    pair_x.extend([centres[index] for index in present] + [None])
+                    pair_y.extend([
+                        identity_values[index] for index in present
+                    ] + [None])
+                if pair_x:
+                    fig.add_trace(go.Scatter(
+                        x=pair_x, y=pair_y, mode="lines",
+                        line=dict(color="rgba(71,84,103,0.20)", width=0.8),
+                        hoverinfo="skip", showlegend=False,
+                        meta={
+                            "td_group_value": str(
+                                panel.get("raw", panel_names[group_index])),
+                            "td_region_pairing": True,
+                        },
+                    ), row=row, col=col)
             for region_index, region_id in enumerate(region_ids):
                 values, identities, point_counts = observations[
                     (metric_index, group_index, region_index)]
@@ -2838,17 +3009,41 @@ def build_custom_region_diagnostics_figure(
                     + (region_index - (region_count - 1) / 2) * region_spacing
                 )
                 color = COLORS[region_index % len(COLORS)]
+                inside_time = (
+                    values * point_counts / 100.0
+                    if key == "time_percent"
+                    else np.full(len(values), np.nan)
+                )
                 custom = np.column_stack([
-                    identities.astype(str), point_counts.astype(int),
+                    identities.astype(str), point_counts, inside_time,
                 ]).tolist()
+                support_label = (
+                    "tracked seconds" if key == "time_percent"
+                    else "available trials" if key == "trial_count"
+                    else "samples inside"
+                )
+                identity_label = (
+                    "animal" if key == "trial_count" else unit_label
+                )
                 hover = (
                     f"<b>{panel_names[group_index]} · "
                     f"{region_names[region_id]}</b>"
                     f"<br>{title}: %{{y:.4g}}"
-                    f"<br>{unit_label}: %{{customdata[0]}}"
-                    "<br>support samples: %{customdata[1]:,}"
-                    "<extra></extra>"
+                    f"<br>{identity_label}: %{{customdata[0]}}"
                 )
+                if key == "time_percent":
+                    hover += (
+                        "<br>time inside: %{customdata[2]:.4g}s / "
+                        "%{customdata[1]:.4g}s tracked"
+                    )
+                elif key == "trial_count":
+                    hover += (
+                        "<br>entered: %{y:.0f} / "
+                        "%{customdata[1]:.0f} available trials"
+                    )
+                else:
+                    hover += f"<br>{support_label}: %{{customdata[1]:.4g}}"
+                hover += "<extra></extra>"
                 if mark == "swarm":
                     rng = np.random.default_rng(
                         2903 + metric_index * 1009
@@ -2945,9 +3140,18 @@ def build_custom_region_diagnostics_figure(
             row=row,
             col=col,
         )
-        if metric_index < 2:
+        if key == "time_percent":
             fig.update_yaxes(range=[-3, 103], ticksuffix="%",
                              row=row, col=col)
+        elif key == "trial_count":
+            fig.update_yaxes(rangemode="tozero", row=row, col=col)
+        elif key in {"distance_walked", "displacement"}:
+            fig.update_yaxes(
+                title_text=distance_unit, rangemode="tozero", row=row, col=col)
+        elif key == "median_velocity":
+            fig.update_yaxes(
+                title_text=f"{distance_unit}/s", rangemode="tozero",
+                row=row, col=col)
     fig.update_layout(
         template="plotly_white",
         height=680,
@@ -2971,7 +3175,9 @@ def build_custom_region_diagnostics_figure(
         x=0.5, y=-0.16, xref="paper", yref="paper", showarrow=False,
         text=(
             f"{mark.title()} selected for all six panels · observations are "
-            f"{unit_label}s · shaded bands are IQR; bold lines are medians."
+            f"{unit_label}s (entry counts are animals) · faint lines pair the "
+            "same unit across windows · shaded bands are IQR; bold lines are "
+            "medians."
         ),
         font=dict(size=10, color="#667085"),
     )
@@ -6177,7 +6383,9 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                                pool_mode="separate",
                                swarm_max=200, distribution_mode="auto",
                                show_violin_points=True,
-                               stats_unit="trial") -> go.Figure:
+                               stats_unit="trial",
+                               spatial_unit_scale=1.0,
+                               spatial_unit_label="cm") -> go.Figure:
     """Compare robust per-trial movement summaries across the active panel axis.
 
     Small groups use a jittered point swarm; larger groups use count-scaled
@@ -6195,9 +6403,29 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
     if not groups:
         return _msg_figure("No per-trial metrics match the active filters.", 430)
 
+    try:
+        distance_scale = float(spatial_unit_scale)
+    except (TypeError, ValueError):
+        distance_scale = 1.0
+    if not np.isfinite(distance_scale) or distance_scale <= 0:
+        distance_scale = 1.0
+    distance_unit = str(spatial_unit_label or "cm").strip() or "cm"
+    independent_unit = "animal" if stats_unit == "animal" else "trial"
+    axis_titles = {
+        "distance_walked": f"Path length ({distance_unit})",
+        "displacement": f"Start-to-end distance ({distance_unit})",
+        "median_local_tortuosity": (
+            "Median 15-sample path/chord ratio (1 = locally straight)"
+        ),
+        "median_velocity": f"Smoothed speed ({distance_unit}/s)",
+    }
+    subplot_titles = [
+        title.replace("/ trial", f"/ {independent_unit}")
+        for _column, title, _axis in _TRIAL_METRIC_SPECS
+    ]
     fig = make_subplots(
         rows=2, cols=2,
-        subplot_titles=[spec[1] for spec in _TRIAL_METRIC_SPECS],
+        subplot_titles=subplot_titles,
         horizontal_spacing=0.09, vertical_spacing=0.17,
     )
     half_width = 0.36
@@ -6209,7 +6437,9 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                 group_sizes.append(int(np.isfinite(
                     values.to_numpy(dtype=float)).sum()))
     mark = _distribution_choice(distribution_mode, group_sizes, swarm_max)
-    for metric_index, (column, _title, axis_title) in enumerate(_TRIAL_METRIC_SPECS):
+    for metric_index, (column, _title, _axis_title) in enumerate(
+            _TRIAL_METRIC_SPECS):
+        axis_title = axis_titles[column]
         row, col = metric_index // 2 + 1, metric_index % 2 + 1
         ticktext = []
         for group_index, (raw_name, group) in enumerate(groups):
@@ -6224,6 +6454,9 @@ def build_trial_metrics_figure(stats: pd.DataFrame | None, group_by="config",
                 continue
             sub = group.loc[keep]
             y = values.loc[keep].to_numpy(dtype=float)
+            if column in {
+                    "distance_walked", "displacement", "median_velocity"}:
+                y = y * distance_scale
             x_name = f"{name}<br>n={len(y):,}"
             ticktext.append(x_name)
             custom = np.column_stack([
@@ -6596,7 +6829,7 @@ def _custom_region_stat_labels(payload, stats_unit="trial"):
     if not panels or not regions:
         return []
     keys = (
-        "sample_percent", "trial_percent", "distance_walked", "displacement",
+        "time_percent", "trial_count", "distance_walked", "displacement",
         "median_local_tortuosity", "median_velocity",
     )
     region_ids = [str(region.get("id")) for region in regions]
@@ -6678,7 +6911,7 @@ def _custom_region_stat_marks(payload, stats_unit="trial"):
     if not panels or not regions:
         return []
     keys = (
-        "sample_percent", "trial_percent", "distance_walked", "displacement",
+        "time_percent", "trial_count", "distance_walked", "displacement",
         "median_local_tortuosity", "median_velocity",
     )
     output = []
@@ -8087,6 +8320,38 @@ app.layout = html.Div([
                     ),
                 ], style={"flex": "1"}),
             ], style={"display": "flex", "gap": "6px", "marginTop": "3px"}),
+            html.Div([
+                html.Div([
+                    html.Label(
+                        "Count colour min",
+                        title=(
+                            "Only affects Successful trials (n). Leave blank "
+                            "to start the colour scale at zero."
+                        ),
+                        style={"fontSize": "10px"},
+                    ),
+                    dcc.Input(
+                        id="transition-count-min", type="number", value=None,
+                        min=0, step="any", debounce=True, placeholder="auto",
+                        className="td-plain-number", style=_INPUT_STYLE,
+                    ),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label(
+                        "Count colour max",
+                        title=(
+                            "Only affects Successful trials (n). Lower this "
+                            "ceiling when a few high-count bins hide structure."
+                        ),
+                        style={"fontSize": "10px"},
+                    ),
+                    dcc.Input(
+                        id="transition-count-max", type="number", value=None,
+                        min=0, step="any", debounce=True, placeholder="auto",
+                        className="td-plain-number", style=_INPUT_STYLE,
+                    ),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "6px", "marginTop": "3px"}),
             html.Div(
                 "Each trial counts once per cell. Click a visible cell to "
                 "overlay successful paths faintly on that panel; click a blank "
@@ -9111,12 +9376,15 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
-    function(bundle, outcome, metric, enabled, trajectory, fraction, seed) {
+    function(bundle, outcome, metric, countMin, countMax, enabled,
+             trajectory, fraction, seed) {
       if (window.TransitionProbabilityObserver) {
         return window.TransitionProbabilityObserver.renderDashboard({
           bundle: bundle || {},
           outcome: outcome || 'crossed',
           metric: metric || 'fraction',
+          countMin: countMin,
+          countMax: countMax,
           enabled: enabled,
           trajectoryFigure: trajectory || {},
           fraction: fraction,
@@ -9130,6 +9398,8 @@ app.clientside_callback(
     Input("transition-data-store", "data"),
     Input("transition-outcome", "value"),
     Input("transition-metric", "value"),
+    Input("transition-count-min", "value"),
+    Input("transition-count-max", "value"),
     Input("transition-enabled", "value"),
     Input("trajectory-plot", "figure"),
     Input("traj-trial-fraction", "value"),
@@ -9426,7 +9696,9 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
             "pmin": "polar-min-point-frac", "amin": "polar-min-animal-frac",
             "uscale": "spatial-unit-scale",
             "tsplit": "transition-split-z",
-            "trnmin": "transition-min-trials"}
+            "trnmin": "transition-min-trials",
+            "tcmin": "transition-count-min",
+            "tcmax": "transition-count-max"}
 _URL_STR = {"groupby": "group-by", "pool": "pool-mode", "color": "color-by",
             "hscale": "heatmap-scale", "hmetric": "heatmap-metric",
             "hcrange": "heatmap-crange", "pang": "polar-angle-source",
@@ -9505,6 +9777,8 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("transition-enabled", "value", allow_duplicate=True),
     Output("transition-outcome", "value", allow_duplicate=True),
     Output("transition-metric", "value", allow_duplicate=True),
+    Output("transition-count-min", "value", allow_duplicate=True),
+    Output("transition-count-max", "value", allow_duplicate=True),
     Output("transition-split-z", "value", allow_duplicate=True),
     Output("transition-min-trials", "value", allow_duplicate=True),
     Output("minimal-layout-store", "data", allow_duplicate=True),
@@ -9516,7 +9790,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 68
+    n_out = 70
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -9752,6 +10026,7 @@ def restore_from_url(search, already):
         distribution_mode, distribution_points, stats_unit,
         positive_num("uscale"), s("ulabel"),
         transition_enabled, transition_outcome, transition_metric,
+        finite_num("tcmin"), finite_num("tcmax"),
         finite_num("tsplit"),
         positive_num("trnmin"),
         minimal_layout, True,
@@ -9946,6 +10221,8 @@ def tick_progress(n):
     Input("transition-enabled", "value"),
     Input("transition-outcome", "value"),
     Input("transition-metric", "value"),
+    Input("transition-count-min", "value"),
+    Input("transition-count-max", "value"),
     Input("transition-split-z", "value"),
     Input("transition-min-trials", "value"),
     Input("minimal-layout-store", "data"),
@@ -9964,6 +10241,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                distribution_mode, distribution_show_points, stats_unit,
                spatial_unit_scale, spatial_unit_label,
                transition_enabled, transition_outcome, transition_metric,
+               transition_count_min, transition_count_max,
                transition_split_z, transition_min_trials,
                minimal_layout, vp, restored):
     if not restored:
@@ -9978,6 +10256,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             "reach": reach, "frad": flow_max_radius,
             "tf": traj_fraction, "lx": loop_x, "lz": loop_z,
             "lr": loop_radius, "uscale": spatial_unit_scale,
+            "tcmin": transition_count_min, "tcmax": transition_count_max,
             "tsplit": transition_split_z,
             "trnmin": transition_min_trials}
     for k, v in nums.items():
@@ -11359,6 +11638,8 @@ def _apply_viewport_to_current_range(fig, viewport, max_span_mult=2.0):
     State("distribution-mode", "value"),
     State("distribution-show-points", "value"),
     State("stats-unit", "value"),
+    State("spatial-unit-scale", "value"),
+    State("spatial-unit-label", "value"),
     prevent_initial_call=True,
 )
 def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
@@ -11371,7 +11652,8 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
                  polar_r_range,
                  polar_min_point_frac, polar_min_animal_frac,
                  flow_max_radius, custom_region_enabled, custom_regions,
-                 distribution_mode, distribution_show_points, stats_unit):
+                 distribution_mode, distribution_show_points, stats_unit,
+                 spatial_unit_scale, spatial_unit_label):
     empty = go.Figure().update_layout(height=400, template="plotly_white")
     raw_hidden = {"display": "none"}
     if not pattern:
@@ -11543,6 +11825,8 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         region_stats, distribution_mode=distribution_mode,
         show_violin_points=_on(distribution_show_points),
         stats_unit=stats_unit,
+        spatial_unit_scale=spatial_unit_scale,
+        spatial_unit_label=spatial_unit_label,
     )
     region_store = _custom_region_store_payload(region_stats)
     polar_position_frame = (
@@ -11581,6 +11865,8 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
         distribution_mode=distribution_mode,
         show_violin_points=_on(distribution_show_points),
         stats_unit=stats_unit,
+        spatial_unit_scale=spatial_unit_scale,
+        spatial_unit_label=spatial_unit_label,
     )
     timings["trial metrics"] = time.perf_counter() - stage_started
     _progress_stage(
@@ -11927,6 +12213,8 @@ def update_colour_views(
     Input("distribution-mode", "value"),
     Input("distribution-show-points", "value"),
     Input("stats-unit", "value"),
+    Input("spatial-unit-scale", "value"),
+    Input("spatial-unit-label", "value"),
     State("view-render-state", "data"),
     State("store-glob", "data"),
     State("vel-threshold", "value"),
@@ -11969,6 +12257,7 @@ def update_colour_views(
 )
 def update_custom_region_analysis(
         n_intervals, distribution_mode, distribution_show_points, stats_unit,
+        spatial_unit_scale, spatial_unit_label,
         render_state, pattern, vel_thresh, min_disp, trim,
         jump_buf, cfg, vrs, fids, scenes, folders, trial_min, trial_max,
         step_min, step_max, vel_selection, disp_selection, group_by, pool_mode,
@@ -11977,10 +12266,15 @@ def update_custom_region_analysis(
         polar_walk, polar_angle_source, polar_r_range, polar_min_point_frac,
         polar_min_animal_frac, enabled, regions):
     trigger = ctx.triggered_id
-    distribution_only = trigger in {
-        "distribution-mode", "distribution-show-points", "stats-unit",
+    figure_only = trigger in {
+        "distribution-mode", "distribution-show-points",
+        "spatial-unit-scale", "spatial-unit-label",
     }
-    if ((not n_intervals and not distribution_only)
+    payload_unchanged = trigger in {
+        "distribution-mode", "distribution-show-points", "stats-unit",
+        "spatial-unit-scale", "spatial-unit-label",
+    }
+    if ((not n_intervals and not payload_unchanged)
             or not pattern or not render_state):
         return (no_update,) * 6
     started = time.perf_counter()
@@ -12015,9 +12309,11 @@ def update_custom_region_analysis(
         payload, distribution_mode=distribution_mode,
         show_violin_points=_on(distribution_show_points),
         stats_unit=stats_unit,
+        spatial_unit_scale=spatial_unit_scale,
+        spatial_unit_label=spatial_unit_label,
     )
     store_payload = (
-        no_update if distribution_only else _custom_region_store_payload(payload)
+        no_update if payload_unchanged else _custom_region_store_payload(payload)
     )
     metric_stats = (
         _custom_region_segment_stats(
@@ -12029,10 +12325,12 @@ def update_custom_region_analysis(
         distribution_mode=distribution_mode,
         show_violin_points=_on(distribution_show_points),
         stats_unit=stats_unit,
+        spatial_unit_scale=spatial_unit_scale,
+        spatial_unit_label=spatial_unit_label,
     )
 
     polar_fig = no_update
-    if not distribution_only:
+    if not figure_only:
         sampled = df_view
         sampled_positions = rebase_to_origin(sampled) if do_rebase else sampled
         polar_source = (
@@ -12062,7 +12360,7 @@ def update_custom_region_analysis(
     state = {
         "completed": time.time(),
         "operation": (
-            "distribution style" if distribution_only
+            "figure format" if figure_only
             else "observation windows"
         ),
         "epoch": int((render_state or {}).get("epoch", 0)),
@@ -12072,7 +12370,7 @@ def update_custom_region_analysis(
         polar_fig, diagnostic, metrics_fig, store_payload, state,
         (
             f"Distribution diagnostics updated in {elapsed:.2f}s."
-            if distribution_only else
+            if figure_only else
             "Observation windows updated polar, grouped diagnostics and trial "
             f"metrics in {elapsed:.2f}s."
         ),
@@ -13137,7 +13435,8 @@ def _export_loop_observer_html(
 
 
 def _export_transition_observer_html(
-        bundle, outcome="crossed", display_metric="fraction") -> str:
+        bundle, outcome="crossed", display_metric="fraction",
+        count_min=None, count_max=None) -> str:
     """Embed the transition grid and browser-local clicked-bin drill-down."""
     if not isinstance(bundle, dict) or not bundle.get("figure"):
         return "<p>Transition probability was not enabled for this export.</p>"
@@ -13148,14 +13447,38 @@ def _export_transition_observer_html(
     figure = go.Figure(bundle["figure"])
     active = bundle.get("variants", {}).get(selected, {})
     display = active.get("displays", {}).get(selected_metric, {})
+    try:
+        count_min_value = float(count_min)
+    except (TypeError, ValueError):
+        count_min_value = None
+    try:
+        count_max_value = float(count_max)
+    except (TypeError, ValueError):
+        count_max_value = None
+    if count_min_value is not None and not np.isfinite(count_min_value):
+        count_min_value = None
+    if count_max_value is not None and not np.isfinite(count_max_value):
+        count_max_value = None
+    active_zmin = display.get("zmin")
+    active_zmax = display.get("zmax")
+    if selected_metric == "count":
+        if count_min_value is not None:
+            active_zmin = max(0.0, count_min_value)
+        if count_max_value is not None:
+            active_zmax = max(0.0, count_max_value)
+        if not float(active_zmax or 0) > float(active_zmin or 0):
+            active_zmax = max(
+                float(display.get("zmax") or 1),
+                float(active_zmin or 0) + 1,
+            )
     for index, trace in enumerate(figure.data):
         if str(getattr(trace, "type", "")).lower() != "heatmap":
             continue
         if index < len(display.get("z", [])):
             trace.z = display["z"][index]
             trace.customdata = active["customdata"][index]
-            trace.zmin = display.get("zmin")
-            trace.zmax = display.get("zmax")
+            trace.zmin = active_zmin
+            trace.zmax = active_zmax
             trace.colorbar = display.get("colorbar")
             trace.hovertemplate = display.get("hovertemplate")
     heat_html = figure.to_html(
@@ -13171,6 +13494,8 @@ def _export_transition_observer_html(
         Path(__file__).with_name("assets") / "transition_observer.js"
     ).read_text(encoding="utf-8")
     encoded = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
+    count_min_text = "" if count_min_value is None else f"{count_min_value:g}"
+    count_max_text = "" if count_max_value is None else f"{count_max_value:g}"
     return f"""
 <div class="transition-export">
   <div class="transition-export-controls">
@@ -13186,6 +13511,14 @@ def _export_transition_observer_html(
         <option value="count">Successful trials (n)</option>
       </select>
     </label>
+    <label>Count min
+      <input id="export-transition-count-min" type="number" min="0" step="any"
+        value="{count_min_text}" placeholder="auto">
+    </label>
+    <label>Count max
+      <input id="export-transition-count-max" type="number" min="0" step="any"
+        value="{count_max_text}" placeholder="auto">
+    </label>
     <span id="export-transition-status">{bundle.get("message", "")}</span>
   </div>
   <div class="transition-export-note">Each cell conditions on unique trials
@@ -13195,10 +13528,12 @@ def _export_transition_observer_html(
 </div>
 <script>{module}</script>
 <script>
-(function (bundle, initialOutcome, initialMetric) {{
+(function (bundle, initialOutcome, initialMetric, initialMin, initialMax) {{
   "use strict";
   var selector = document.getElementById("export-transition-outcome");
   var metricSelector = document.getElementById("export-transition-metric");
+  var countMin = document.getElementById("export-transition-count-min");
+  var countMax = document.getElementById("export-transition-count-max");
   selector.value = initialOutcome;
   metricSelector.value = initialMetric;
   var controller = window.TransitionProbabilityObserver.attachExport({{
@@ -13207,7 +13542,9 @@ def _export_transition_observer_html(
     statusId: "export-transition-status",
     bundle: bundle,
     outcome: initialOutcome,
-    metric: initialMetric
+    metric: initialMetric,
+    countMin: initialMin,
+    countMax: initialMax
   }});
   selector.addEventListener("change", function () {{
     controller.setOutcome(selector.value);
@@ -13215,7 +13552,13 @@ def _export_transition_observer_html(
   metricSelector.addEventListener("change", function () {{
     controller.setMetric(metricSelector.value);
   }});
-}})({encoded}, {json.dumps(selected)}, {json.dumps(selected_metric)});
+  function updateCountRange() {{
+    controller.setCountRange(countMin.value, countMax.value);
+  }}
+  countMin.addEventListener("change", updateCountRange);
+  countMax.addEventListener("change", updateCountRange);
+}})({encoded}, {json.dumps(selected)}, {json.dumps(selected_metric)},
+    {json.dumps(count_min_value)}, {json.dumps(count_max_value)});
 </script>
 """
 
@@ -13228,7 +13571,9 @@ def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
                          loop_match_mode="any", visual_style=None,
                          transition_bundle=None,
                          transition_outcome="crossed",
-                         transition_metric="fraction"):
+                         transition_metric="fraction",
+                         transition_count_min=None,
+                         transition_count_max=None):
     """Build one offline-capable report with a single embedded plotly.js."""
     cfgd = dict(scrollZoom=True, displaylogo=False)
     traj_h = traj.to_html(
@@ -13239,7 +13584,8 @@ def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
         rings=loop_rings, active=loop_active, match_mode=loop_match_mode,
         visual_style=visual_style)
     transition_h = _export_transition_observer_html(
-        transition_bundle, transition_outcome, transition_metric)
+        transition_bundle, transition_outcome, transition_metric,
+        transition_count_min, transition_count_max)
     heat_h = heat.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     flow_h = flow.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     roi_h = roi.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
@@ -13339,6 +13685,8 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
     State("transition-enabled", "value"),
     State("transition-outcome", "value"),
     State("transition-metric", "value"),
+    State("transition-count-min", "value"),
+    State("transition-count-max", "value"),
     State("transition-split-z", "value"),
     State("transition-min-trials", "value"),
     State("filter-configs", "value"),
@@ -13380,6 +13728,8 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
     State("stats-unit", "value"),
     State("distribution-mode", "value"),
     State("distribution-show-points", "value"),
+    State("spatial-unit-scale", "value"),
+    State("spatial-unit-label", "value"),
     State("viewport-store", "data"),
     State("data-summary", "children"),
     State("url", "search"),
@@ -13389,6 +13739,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 color_by, animate, hm_binsize, hm_scale, hm_bound, hm_metric,
                 hm_cmin, hm_cmax, hm_crange,
                 transition_enabled, transition_outcome, transition_metric,
+                transition_count_min, transition_count_max,
                 transition_split_z, transition_min_trials,
                 cfg, vrs, fids, scenes, folders,
                 trial_min, trial_max, step_min, step_max,
@@ -13400,6 +13751,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 polar_moving, polar_walk, polar_angle_source,
                 vel_selection, disp_selection, flow_max_radius,
                 stats_unit, distribution_mode, distribution_show_points,
+                spatial_unit_scale, spatial_unit_label,
                 viewport, summary, url_search):
     if not pattern:
         LOGGER.warning("export.rejected reason=missing_source")
@@ -13514,6 +13866,8 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         distribution_mode=distribution_mode,
         show_violin_points=_on(distribution_show_points),
         stats_unit=stats_unit,
+        spatial_unit_scale=spatial_unit_scale,
+        spatial_unit_label=spatial_unit_label,
     )
     token = _DATA_TOKEN_BY_PATTERN.get(_pattern_key(pattern))
     native_velocity = _VELOCITY_CACHE.get(token)
@@ -13558,6 +13912,8 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         transition_bundle=transition_bundle,
         transition_outcome=transition_outcome,
         transition_metric=transition_metric,
+        transition_count_min=transition_count_min,
+        transition_count_max=transition_count_max,
     )
 
     ts = time.strftime("%Y%m%d_%H%M%S")

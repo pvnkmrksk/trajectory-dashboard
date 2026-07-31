@@ -59,6 +59,26 @@ def _polar_frame():
 
 
 class DashboardRegressionTests(unittest.TestCase):
+    def test_server_callback_signatures_match_registered_dependencies(self):
+        for output, metadata in app.app.callback_map.items():
+            callback = metadata.get("callback")
+            if callback is None:
+                continue
+            function = getattr(callback, "__wrapped__", callback)
+            signature = inspect.signature(function)
+            if any(
+                    parameter.kind in {
+                        inspect.Parameter.VAR_POSITIONAL,
+                        inspect.Parameter.VAR_KEYWORD,
+                    }
+                    for parameter in signature.parameters.values()):
+                continue
+            expected = len(metadata["inputs"]) + len(metadata["state"])
+            self.assertEqual(
+                len(signature.parameters), expected,
+                f"callback dependency arity mismatch for {output}",
+            )
+
     def test_speed_is_the_default_render_mode(self):
         self.assertEqual(app._render_mode(None), "speed")
         self.assertEqual(app._render_mode("speed"), "speed")
@@ -121,6 +141,32 @@ class DashboardRegressionTests(unittest.TestCase):
             animals, equal_units=True)
         self.assertEqual(support, 2)
         self.assertAlmostEqual(rbar, 0.0, places=10)
+
+    def test_animal_polar_draws_one_radial_vector_per_animal(self):
+        trial = app.build_polar_figure(
+            _polar_frame(), group_by="all", pool_mode="pooled",
+            color_by="none", stats_unit="trial")
+        animal = app.build_polar_figure(
+            _polar_frame(), group_by="all", pool_mode="pooled",
+            color_by="none", stats_unit="animal")
+
+        def independent_vectors(figure):
+            traces = [
+                trace for trace in figure.data
+                if isinstance(getattr(trace, "meta", None), dict)
+                and trace.meta.get("td_trial_source")
+            ]
+            return sum(
+                int(np.isfinite(np.asarray(trace.r, dtype=float)).sum() / 2)
+                for trace in traces
+            )
+
+        self.assertEqual(independent_vectors(trial), 2)
+        self.assertEqual(independent_vectors(animal), 1)
+        self.assertIn(
+            "1/1 animals shown",
+            " ".join(annotation.text for annotation in animal.layout.annotations),
+        )
 
     def test_local_direction_field_encodes_cell_strength_and_abundance(self):
         frame = _polar_frame().iloc[:2].copy()
@@ -610,6 +656,9 @@ class DashboardRegressionTests(unittest.TestCase):
         )
         self.assertNotIn("transition-outcome", transition_inputs)
         self.assertNotIn("transition-metric", transition_inputs)
+        update_url = app.app.callback_map["url.search"]
+        update_ids = [item["id"] for item in update_url["inputs"]]
+        self.assertEqual(len(update_ids), len(set(update_ids)))
 
     def test_sections_follow_analysis_then_diagnostics_order(self):
         ids = [getattr(node, "id", None) for node in _components(app.app.layout)]
@@ -734,6 +783,8 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("transition-enabled").value, [])
         self.assertEqual(_component("transition-outcome").value, "crossed")
         self.assertEqual(_component("transition-metric").value, "fraction")
+        self.assertIsNone(_component("transition-count-min").value)
+        self.assertIsNone(_component("transition-count-max").value)
         self.assertIsNone(_component("transition-split-z").value)
         self.assertEqual(_component("transition-min-trials").value, 3)
         self.assertIsNotNone(_component("disp-range-min"))
@@ -746,9 +797,9 @@ class DashboardRegressionTests(unittest.TestCase):
             "?smin=2&smax=4&hcrange=percentile&frad=0.31"
             "&tf=37&loop=1&lx=-4.5&lz=2&lr=7"
             "&uscale=0.1&ulabel=mm&trans=1&tmode=ended"
-            "&tmetric=count&tsplit=-2.5&trnmin=7"
+            "&tmetric=count&tcmin=2&tcmax=18&tsplit=-2.5&trnmin=7"
             "&view=transition&minimal=1", False)
-        self.assertEqual(len(restored), 69)
+        self.assertEqual(len(restored), 71)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
         self.assertEqual(restored[44], 0.31)
@@ -756,9 +807,11 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(restored[60:62], (0.1, "mm"))
         self.assertEqual(restored[41], "transition")
         self.assertEqual(
-            restored[62:67], (["on"], "ended", "count", -2.5, 7))
-        self.assertTrue(restored[67])
-        self.assertEqual(len(app.restore_from_url("", True)), 69)
+            restored[62:69],
+            (["on"], "ended", "count", 2, 18, -2.5, 7),
+        )
+        self.assertTrue(restored[69])
+        self.assertEqual(len(app.restore_from_url("", True)), 71)
         legacy_color = app.restore_from_url("?color=one", False)
         self.assertEqual(legacy_color[7], "categorical")
         rings = [
@@ -857,6 +910,58 @@ class DashboardRegressionTests(unittest.TestCase):
         diagnostic = app.build_custom_region_diagnostics_figure(
             payload, distribution_mode="violin")
         self.assertEqual({trace.type for trace in diagnostic.data}, {"violin"})
+
+    def test_observation_time_pooling_and_entry_counts_use_animal_denominators(self):
+        summary = {
+            "segment_values": {
+                "seg_id": ["a1", "a2", "b1"],
+                "n_points": [10, 30, 5],
+                "fly_id": ["a", "a", "b"],
+                "vr": ["VR1", "VR1", "VR1"],
+                "source_folder": ["folder"] * 3,
+                "inside_seconds": [1.0, 3.0, 2.0],
+                "total_seconds": [10.0, 30.0, 5.0],
+                "time_percent": [10.0, 10.0, 40.0],
+                "entered": [1, 0, 1],
+            },
+        }
+        time_values, time_ids, time_denominators = (
+            app._observation_distribution_values(
+                summary, "time_percent", "animal")
+        )
+        self.assertEqual(time_ids.tolist(), ["a@VR1", "b@VR1"])
+        np.testing.assert_allclose(time_values, [10.0, 40.0])
+        np.testing.assert_allclose(time_denominators, [40.0, 5.0])
+
+        entries, animal_ids, trial_effort = (
+            app._observation_distribution_values(
+                summary, "trial_count", "trial")
+        )
+        self.assertEqual(animal_ids.tolist(), ["a@VR1", "b@VR1"])
+        np.testing.assert_allclose(entries, [1.0, 1.0])
+        np.testing.assert_allclose(trial_effort, [2.0, 1.0])
+
+    def test_metric_axes_and_values_follow_spatial_unit_configuration(self):
+        stats = pd.DataFrame({
+            "seg_id": ["s1"],
+            "n_points": [10],
+            "distance_walked": [20.0],
+            "displacement": [5.0],
+            "median_local_tortuosity": [1.2],
+            "median_velocity": [4.0],
+            "config": ["cfg.json"],
+            "vr": ["VR1"],
+            "fly_id": ["1"],
+            "scene": ["scene"],
+            "source_folder": ["folder"],
+        })
+        figure = app.build_trial_metrics_figure(
+            stats, spatial_unit_scale=0.1, spatial_unit_label="m")
+        self.assertAlmostEqual(float(figure.data[0].y[0]), 2.0)
+        self.assertAlmostEqual(float(figure.data[1].y[0]), 0.5)
+        self.assertAlmostEqual(float(figure.data[3].y[0]), 0.4)
+        self.assertEqual(figure.layout.yaxis.title.text, "Path length (m)")
+        self.assertEqual(figure.layout.yaxis4.title.text, "Smoothed speed (m/s)")
 
     def test_exact_velocity_bounds_are_unbounded_and_explicit(self):
         self.assertIsNone(getattr(_component("vel-range-min"), "min", None))
