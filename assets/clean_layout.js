@@ -10,7 +10,8 @@
   "use strict";
 
   var SPATIAL_IDS = [
-    "trajectory-plot", "loop-observer-plot", "heatmap-plot", "flow-plot"
+    "trajectory-plot", "loop-observer-plot", "heatmap-plot",
+    "transition-plot", "transition-observer-plot", "flow-plot"
   ];
   var POLAR_IDS = ["polar-plot", "initial-heading-plot"];
   var CARTESIAN_IDS = [

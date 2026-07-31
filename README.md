@@ -207,6 +207,15 @@ For a quick preprocessing check on the homing enemy data, run
   in each subplot's top corners. Heatmap and trajectory start from the same
   central-98% square extent, and pan/zoom propagate immediately in both
   directions without a server render.
+- **Transition probability**: an optional heatmap-grid observer conditions each
+  cell on the unique trials that ever entered it, then colours it by the
+  percentage that later crossed the horizontal split or ended on its opposite
+  side. The automatic split is the modal starting-Z bin edge; it can also be
+  entered exactly. Cells below a configurable trial count stay blank rather
+  than implying zero probability. Both outcomes are calculated together, so
+  their switch is immediate. Click a cell to reveal only its successful
+  displayed trajectories, split into muted pre-entry and saturated future
+  paths, with exact numerator/denominator counts on hover.
 - **Gandiva plot**: a quiver/heatmap hybrid named for Arjuna's divine bow on the same selectable
   spatial grid. Each cell is a circular summary of its samples: stroke angle and
   hue show mean direction, stroke length and colour saturation show resultant
@@ -380,6 +389,22 @@ available spatial fidelity.
 | cmin / cmax | Expand “Explicit colour limits” to enter exact limits. Blank auto-scales. | Fix limits across views when comparing treatments or exporting without crowding the normal controls. |
 | Color range as value or percentile | Interpret color limits literally or as data percentiles. Percentile is the default at 0–99 and its slider/histogram axis is 0–100. Range changes restyle only `zmin`/`zmax` and the colorbar in the browser. | Percentiles are convenient when the absolute range changes by dataset; changing them does not refilter rows or rebuild unrelated plots. |
 
+### Transition Probability
+
+| Control | Meaning | Rationale |
+|---|---|---|
+| Enable transition probability | Calculates a separate conditional-probability grid for each active config/scene/VR/fly/folder panel. | Keeps the ordinary occupancy heatmap unchanged and avoids doing the extra trial-level calculation when it is not needed. |
+| Crossed later / Ended opposite | Defines success after a trial first enters a cell: any later sample reaches the opposite half, or the trial's final retained sample lies there. | “Crossed” captures temporary excursions; “Ended” is the stricter destination interpretation. Both reuse the same calculation. |
+| Horizontal split Z | Blank uses the modal segment-start row, snapped to a heatmap edge; an exact number overrides it. | Gives a reproducible two-side definition while making the common arena midline automatic. |
+| Minimum entering trials | Blanks cells whose unique-trial denominator is smaller than this value. | Prevents a one-of-one cell from visually looking as reliable as a densely sampled one. |
+| Click a cell | Shows successful currently displayed paths that entered that bin, with past/future split at first entry. | Combines the heatmap overview with curtain-ring-style trajectory diagnosis without a server request. |
+
+Each `_seg_id` contributes at most once to a cell denominator even when it
+leaves and revisits that cell. A heatmap row crossed by a manually entered split
+is intentionally blank because it does not belong unambiguously to either
+half. The exact transition percentage uses the complete filtered trial frame;
+the clicked path count follows the current browser-side displayed-trial subset.
+
 ### ROI / Targets
 
 | Control | Meaning | Rationale |
@@ -416,7 +441,7 @@ available spatial fidelity.
 | Diagnostics section | Native velocity/displacement histograms, a toggleable 36-bin starting-heading null distribution per treatment, and optional raw time-series columns. The raw trace panel stays hidden until columns are selected. | Preserves the original dataset baseline while filters change and exposes unexpected directional bias at segment starts. |
 | Trial metrics section | Per-trial path length, displacement, median smoothed speed, and median time-windowed local tortuosity grouped by the selected panel axis. | Makes treatment/scene/animal differences visible without reducing tortuosity to unstable whole-trial distance divided by displacement. |
 | Raw trace columns | Numeric columns to plot over time. Defaults to none. | Avoids needless GameObject position time-series overhead unless you explicitly need it. |
-| Export HTML | Writes an offline dashboard snapshot including trajectories, heatmap, Gandiva, polar, target diagnostics, trial metrics, native velocity/displacement and starting-heading diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
+| Export HTML | Writes an offline dashboard snapshot including trajectories, the clickable transition observer when enabled, heatmap, Gandiva, polar, target diagnostics, trial metrics, native velocity/displacement and starting-heading diagnostics, and selected raw traces. The first figure embeds Plotly once; later figures reuse it. | Useful for sharing a fixed analysis state without a running Dash server or internet connection. |
 | Header activity status | Reports the current load, filter/render, debounce, or export state plus retained points; hover exposes per-stage timings. | Makes slow work and failures visible, while the terminal retains full errors and tracebacks. |
 
 The dashboard's resident normalized frame defaults to 2,000,000 rows. Set
@@ -444,6 +469,7 @@ assets/dropzone.js             # folder drag-and-drop
 assets/dashboard.css           # dashboard chrome and sticky section styling
 assets/heatsync.js             # heatmap zoom viewport sync after newPlot
 assets/heatmap_colors.js       # browser-local metric/scale/color-limit restyles
+assets/transition_observer.js  # local outcome switch + clicked-cell trajectories
 assets/clean_layout.js         # CSS-only publication-mode class toggle
 assets/trial_subset.js         # browser-local whole-segment display sampling
 assets/region_observer.js      # draggable rectangular observation windows

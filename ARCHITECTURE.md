@@ -75,7 +75,7 @@ Plotly.
 | 395-670 | **ROI tables/masks + CSV loader bridge** | `roi_reached_table`, `time_to_target_table`, `heading_target_angle_table`, `_roi_masks`, `_roi_apply`, `load_csv_fast`. |
 | 763-947 | **Filtering bridge / stats** | Compatibility wrappers; canonical implementations live in `trajectory_dashboard.filters`. |
 | 948-3410 | **Plotting** | `_prepare_merged_groups`, `build_trajectory_figure`, heatmap builders + variants, explicit-bin histograms, raw trace, ROI panels, circular/polar statistics, and grouped trial metrics. |
-| 3141-3980 | **Dash app, caches + layout** | `app`, data/filter/ROI/polar caches, sidebar controls, and seven continuously mounted scroll sections. |
+| 3141-3980 | **Dash app, caches + layout** | `app`, data/filter/ROI/polar/transition caches, sidebar controls, and eight continuously mounted scroll sections. |
 | 3981-end | **Callbacks + clientside interaction** | URL/load state, the atomic all-section renderer, viewport sync, LUT, export, playback and guards. |
 
 Assets (Dash auto-serves `/assets`):
@@ -96,6 +96,9 @@ Assets (Dash auto-serves `/assets`):
 - `assets/loop_observer.js` — browser-local circle/polyline intersection and
   first-entry path splitting for the movable curtain-ring trajectory observer.
   The same module is inlined into offline exports.
+- `assets/transition_observer.js` — browser-local crossed/ended variant restyle,
+  clicked-bin segment/rectangle intersection, and first-entry path splitting
+  for the transition observer. The same module is inlined into offline exports.
 - `assets/region_observer.js` — editable rectangular window overlays for the
   trajectory, heatmap and Gandiva graphs; shape edits update the compact region
   store, not the master renderer.
@@ -126,8 +129,9 @@ glob / dropped folder
                velocity-jump (time-buffered), min-displacement, trim
                └─ _roi_apply(...)                    cached masks in _ROI_MASK_CACHE
                   ├─ analytical build_* figures → dcc.Graph / figure stores
+                  ├─ optional transition bundle → _TRANSITION_CACHE
                   └─ _sample_trajectory_segments(...) (drawing only)
-                     └─ trajectory figure → browser-local loop observer
+                     └─ trajectory figure → browser-local loop/transition observers
 ```
 
 **Everything downstream assumes the load-time time-sort** and uses
@@ -188,6 +192,24 @@ same cache key.
   i.e. the moment every ring has been satisfied.
   Matching therefore has the spatial fidelity of the active rendered point
   budget; Accuracy or a larger point budget is appropriate for tiny rings.
+- **Transition observer**: `build_transition_probability_bundle` uses the same
+  X/Z extent, square bin size and active grouping as the occupancy heatmap.
+  `_transition_group_probabilities` vectorises unique
+  `(_seg_id, cell)` first entries, future suffix extrema and final Z, so repeat
+  visits never inflate the denominator. It computes both `crossed` (a later
+  sample reaches the opposite horizontal half) and `ended` (the retained final
+  sample is in that half) in one pass. Automatic split Z comes from the modal
+  segment-start row and is snapped to a bin edge; a row straddling a manual
+  split is ambiguous and blank. Cells with fewer than the requested unique
+  entering trials are also blank. `update_transition_probability` owns a small
+  dedicated cache and is disabled by default; it is triggered only by a
+  completed render, enable/split/minimum changes, not by the master renderer.
+  `assets/transition_observer.js` swaps precomputed outcome matrices with
+  `Plotly.restyle`. On click it uses the mounted trajectory source, active panel
+  metadata and segment/rectangle intersection to emit merged WebGL paths:
+  muted before first cell entry and saturated afterward. Thus heatmap
+  numerator/denominator values are exact for the full filtered frame, while the
+  diagnostic path count honestly follows the current displayed-trial sample.
 - **Observation windows**: `_normalise_custom_regions`,
   `_custom_region_subset` and `_custom_region_stats` use vectorised X/Z masks.
   The main renderer applies the union only to polar rows and returns the small
@@ -331,6 +353,9 @@ same cache key.
 - The loop state persists as `loop=`, `lx=`, `lz=`, and `lr=`. The displayed
   whole-trial percentage persists as `tf=`. Ring movement updates these small
   controls/URL state, but the geometry scan and redraw remain browser-local.
+- Transition state persists as `trans=`, `tmode=`, `tsplit=` and `trnmin=`.
+  The outcome switch and cell selection are browser-local; enabling the panel or
+  changing its split/support threshold only refreshes its dedicated bundle.
 - Observation windows persist as `region=`, `regions=` and `ractive=`; clean
   presentation state persists as `minimal=`. Distribution mode, violin dots,
   and the trial/animal unit persist as `dist=`, `dpts=`, and `sunit=`.
@@ -386,9 +411,10 @@ same cache key.
   to the previous stage, mirroring the actual filter pipeline.
 - `export_html` rebuilds figures server-side and emits one self-contained file.
   Plotly is embedded once (no CDN dependency). It includes trajectories,
-  an interactive curtain-ring observer, heatmap, local direction field, polar,
-  target diagnostics, trial metrics, native velocity/displacement and
-  starting-heading diagnostics, and selected raw traces.
+  an interactive curtain-ring observer, an enabled clickable transition grid,
+  heatmap, local direction field, polar, target diagnostics, trial metrics,
+  native velocity/displacement and starting-heading diagnostics, and selected
+  raw traces.
 - The header `status-dock` mirrors load/filter/render/export state and uses
   Dash's body loading class for immediate Working/Ready feedback. Its hover text
   exposes the latest stage timings. Python logging records load, cache, polar,
@@ -410,6 +436,8 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | ROI entered/trim | Debounced atomic update of all affected sections | A second ROI/trajectory refresh callback |
 | Displayed-trial fraction / resample | Browser-local `Plotly.restyle` hides complete `_seg_id` paths/rays and updates the visible population ray; analytical spatial/ROI/metric panels retain the complete filtered frame | Server render/reanalysis; row-level random sampling; changes to target/metric denominators |
 | Loop add/delete/select/match, centre/radius or ring drag | Browser-local multi-circle intersection, qualifying-entry split and observer redraw; persist small ring-set state in the URL | Dataframe filtering, master render, heatmap/polar/ROI changes |
+| Transition enable, split or minimum support | Dedicated cached transition-bundle callback after a completed render | Master render, occupancy/Gandiva/polar/ROI rebuilds |
+| Transition crossed/ended switch or cell click | Browser-local heatmap restyle or mounted-path intersection/filter | Dataframe filtering, server callback, master render |
 | Observation-window add/delete/select/bounds or box drag | Rebuild polar + custom diagnostics from cached filtered rows; repaint rectangles and Gandiva percentages in the browser | Trajectory, heatmap or Gandiva-vector recomputation; master render |
 | Clean layout | Browser-local CSS class toggle and URL state | Any Plotly call, figure/data rebuild, viewport mutation, or relayout listener |
 | Gandiva maximum radius | Browser-local scaling of existing arrow tips and URL state | Direction recomputation, dataframe filtering or another figure build |

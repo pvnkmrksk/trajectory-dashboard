@@ -2,6 +2,7 @@
   var LABEL_TO_VIEW = {
     trajectories: 'traj',
     heatmap: 'heat',
+    transitions: 'transition',
     'flow field': 'flow',
     targets: 'roi',
     polar: 'polar',

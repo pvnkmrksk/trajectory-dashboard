@@ -45,6 +45,7 @@
     var ids = {
       traj: 'trajectory-plot',
       heat: 'heatmap-plot',
+      transition: 'transition-plot',
       flow: 'flow-plot'
     };
     var id = ids[source];
@@ -63,7 +64,7 @@
       if (out.yaxis) update['yaxis.range'] = out.yaxis.slice();
     }
     if (!Object.keys(update).length) return;
-    ['traj', 'heat', 'flow'].forEach(function (peerSource) {
+    ['traj', 'heat', 'transition', 'flow'].forEach(function (peerSource) {
       if (peerSource === source) return;
       var peer = graphFor(peerSource);
       if (!peer) return;

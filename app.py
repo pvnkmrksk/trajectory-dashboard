@@ -1230,6 +1230,21 @@ _VISUAL_STYLE_DEFAULTS = {
         "name": "Occupancy heatmap",
         "colorscale": "Viridis",
     },
+    "transition": {
+        "name": "Transition probability",
+        "colorscale": [
+            [0.00, "#f5f3f8"],
+            [0.20, "#ddd5e8"],
+            [0.45, "#b7a8ce"],
+            [0.70, "#806ca8"],
+            [1.00, "#49356f"],
+        ],
+        "split_line": "rgba(57,45,76,0.82)",
+        "selected_fill": "rgba(198,151,45,0.12)",
+        "selected_line": "#b87917",
+        "before_color": "#89919d",
+        "future_color": "#5e4a82",
+    },
     "series": {
         "individual": {},
     },
@@ -1414,6 +1429,9 @@ PLOT_DEBOUNCE_MS = 120
 _POLAR_RAY_CACHE: dict = {}
 _POLAR_RAY_CACHE_ORDER: list = []
 _POLAR_RAY_CACHE_MAX = 8
+_TRANSITION_CACHE: dict = {}
+_TRANSITION_CACHE_ORDER: list = []
+_TRANSITION_CACHE_MAX = 4
 
 # Per-subplot pixel height. With a 2-col layout each subplot is ~half the main
 # width, so ~480px tall keeps each box roughly square; the page scrolls when
@@ -1750,6 +1768,7 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
             rec = dict(row=row, col=col, segids=segids[m], x=x[m], y=y[m],
                        dpos=dpos[m], dlen=dlen[m], customdata=custom_all[m],
                        mc=None, mode="lines",
+                       group_value=str(gname),
                        color=COLORS[0], label="", legendgroup=None,
                        line_width=float(_visual(
                            "trajectory", "line_width", 1.2)),
@@ -1837,6 +1856,7 @@ def _prepare_merged_groups(df, group_by, pool_mode, ncols, color_by, budget,
 def _add_traj_trace(fig, td, TraceType, hover=True):
     common = dict(name=td["label"], legendgroup=td["legendgroup"],
                   showlegend=td["showlegend"],
+                  meta={"td_group_value": str(td.get("group_value", ""))},
                   opacity=float(td.get(
                       "opacity", _visual("trajectory", "opacity", 0.58))))
     if td.get("customdata") is not None:
@@ -2144,6 +2164,7 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                     showlegend=rec["showlegend"], legendgroup=rec["legendgroup"],
                     label=rec["label"], line_width=rec.get("line_width"),
                     opacity=rec.get("opacity"),
+                    group_value=rec.get("group_value", ""),
                     customdata=rec.get("customdata_joined"))
 
     # Base traces (full extent)
@@ -2234,6 +2255,11 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
                     font_size=10, itemclick="toggle", itemdoubleclick="toggleothers"),
         margin=dict(l=50, r=35, t=legend_top, b=40),
         template="plotly_white", dragmode="pan",
+        meta={
+            "panel_order_values": [str(name) for name in group_names],
+            "panel_order_labels": titles,
+            "spatial_axis_count": len(group_names),
+        },
     )
     return fig
 
@@ -3280,6 +3306,327 @@ def build_heatmap_figure(df, group_by="config", pool_mode="separate", ncols=2,
     var = _heatmap_variant(bins, log_scale=log_scale, metric=metric, cmin=cmin,
                            cmax=cmax, crange_mode=crange_mode)
     return _assemble_heatmap(bins, var, ncols, df)
+
+
+# ---------------------------------------------------------------------------
+# Conditional half-transition probability
+# ---------------------------------------------------------------------------
+
+TRANSITION_OUTCOMES = {
+    "crossed": "crossed the opposite half after first cell entry",
+    "ended": "ended in the opposite half after first cell entry",
+}
+
+
+def _transition_default_split(
+        df: pd.DataFrame, yedges: np.ndarray) -> tuple[float, str]:
+    """Choose a reproducible start-centred horizontal split.
+
+    The modal segment-start row is used rather than a frame-weighted centre.
+    Snapping the automatic value to a grid edge keeps every heatmap cell wholly
+    on one side; an explicitly entered split remains exact and may therefore
+    create one deliberately blank, ambiguous row.
+    """
+    starts = df.drop_duplicates("_seg_id", keep="first")
+    values = pd.to_numeric(
+        starts["GameObjectPosZ"], errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        target = 0.0
+    else:
+        counts, _ = np.histogram(values, bins=yedges)
+        index = int(np.argmax(counts)) if len(counts) else 0
+        target = float(np.median(
+            values[(values >= yedges[index]) & (values <= yedges[index + 1])]
+        )) if len(counts) and counts[index] else float(np.median(values))
+    edge_index = int(np.argmin(np.abs(yedges - target)))
+    return float(yedges[edge_index]), "automatic modal-start grid edge"
+
+
+def _transition_group_probabilities(
+        frame: pd.DataFrame, xedges: np.ndarray, yedges: np.ndarray,
+        split_z: float) -> dict[str, np.ndarray]:
+    """Count unique trial transitions from each spatial cell.
+
+    Each ``(_seg_id, cell)`` contributes once, at its first cell entry. The
+    future suffix minimum/maximum and final Z are computed with vectorised
+    groupby transforms, so repeated visits never inflate the denominator.
+    """
+    nx, nz = len(xedges) - 1, len(yedges) - 1
+    size = nx * nz
+    empty = np.zeros(size, dtype=np.int64)
+    if frame is None or len(frame) == 0 or size <= 0:
+        return {
+            "entrants": empty.reshape(nz, nx),
+            "crossed": empty.reshape(nz, nx),
+            "ended": empty.reshape(nz, nx),
+            "side": empty.reshape(nz, nx),
+        }
+
+    x = pd.to_numeric(
+        frame["GameObjectPosX"], errors="coerce").to_numpy(dtype=float)
+    z = pd.to_numeric(
+        frame["GameObjectPosZ"], errors="coerce").to_numpy(dtype=float)
+    seg = frame["_seg_id"].astype(str).to_numpy()
+    ix = np.searchsorted(xedges, x, side="right") - 1
+    iz = np.searchsorted(yedges, z, side="right") - 1
+    # Match numpy.histogram2d: its final edge belongs to the final bin.
+    ix[x == xedges[-1]] = nx - 1
+    iz[z == yedges[-1]] = nz - 1
+    good = (
+        np.isfinite(x) & np.isfinite(z)
+        & (ix >= 0) & (ix < nx) & (iz >= 0) & (iz < nz)
+    )
+    if not np.any(good):
+        return {
+            "entrants": empty.reshape(nz, nx),
+            "crossed": empty.reshape(nz, nx),
+            "ended": empty.reshape(nz, nx),
+            "side": empty.reshape(nz, nx),
+        }
+
+    positions = np.flatnonzero(good)
+    flat = (iz[good] * nx + ix[good]).astype(np.int64, copy=False)
+    pairs = pd.DataFrame({
+        "_seg_id": seg[good],
+        "cell": flat,
+        "position": positions,
+    })
+    first = pairs.loc[
+        ~pairs.duplicated(["_seg_id", "cell"], keep="first")]
+    entry_cell = first["cell"].to_numpy(dtype=np.int64)
+    entry_position = first["position"].to_numpy(dtype=np.int64)
+
+    seg_series = pd.Series(seg, copy=False)
+    z_series = pd.Series(z, copy=False)
+    reversed_seg = seg_series.iloc[::-1].reset_index(drop=True)
+    reversed_z = z_series.iloc[::-1].reset_index(drop=True)
+    future_min = (
+        reversed_z.groupby(reversed_seg, sort=False, observed=True)
+        .cummin().to_numpy(dtype=float)[::-1]
+    )
+    future_max = (
+        reversed_z.groupby(reversed_seg, sort=False, observed=True)
+        .cummax().to_numpy(dtype=float)[::-1]
+    )
+    final_z = (
+        z_series.groupby(seg_series, sort=False, observed=True)
+        .transform("last").to_numpy(dtype=float)
+    )
+
+    entry_iz = entry_cell // nx
+    lower = yedges[entry_iz + 1] <= split_z
+    upper = yedges[entry_iz] >= split_z
+    unambiguous = lower | upper
+    entry_cell = entry_cell[unambiguous]
+    entry_position = entry_position[unambiguous]
+    lower = lower[unambiguous]
+    upper = upper[unambiguous]
+
+    crossed_success = (
+        (lower & (future_max[entry_position] > split_z))
+        | (upper & (future_min[entry_position] < split_z))
+    )
+    ended_success = (
+        (lower & (final_z[entry_position] > split_z))
+        | (upper & (final_z[entry_position] < split_z))
+    )
+    entrants = np.bincount(entry_cell, minlength=size).astype(np.int64)
+    crossed = np.bincount(
+        entry_cell, weights=crossed_success.astype(np.int64),
+        minlength=size).round().astype(np.int64)
+    ended = np.bincount(
+        entry_cell, weights=ended_success.astype(np.int64),
+        minlength=size).round().astype(np.int64)
+
+    side = np.zeros((nz, nx), dtype=np.int8)
+    side[yedges[1:] <= split_z, :] = -1
+    side[yedges[:-1] >= split_z, :] = 1
+    return {
+        "entrants": entrants.reshape(nz, nx),
+        "crossed": crossed.reshape(nz, nx),
+        "ended": ended.reshape(nz, nx),
+        "side": side,
+    }
+
+
+def _transition_variant(results, outcome: str, min_trials: int) -> dict:
+    """Materialise one selected transition definition from shared counts."""
+    outcome = outcome if outcome in TRANSITION_OUTCOMES else "crossed"
+    z_values, custom_values = [], []
+    total_entrants = total_successes = informative_cells = 0
+    for result in results:
+        entrants = result["entrants"].astype(np.int64, copy=False)
+        successes = result[outcome].astype(np.int64, copy=False)
+        side = result["side"]
+        probability = np.divide(
+            100.0 * successes,
+            entrants,
+            out=np.full(entrants.shape, np.nan, dtype=float),
+            where=entrants > 0,
+        )
+        informative = (entrants >= min_trials) & (side != 0)
+        probability[~informative] = np.nan
+        stayed = entrants - successes
+        custom = np.stack([successes, entrants, stayed], axis=-1)
+        z_values.append(probability.tolist())
+        custom_values.append(custom.tolist())
+        total_entrants += int(entrants.sum())
+        total_successes += int(successes.sum())
+        informative_cells += int(np.count_nonzero(informative))
+    return {
+        "z": z_values,
+        "customdata": custom_values,
+        "hovertemplate": (
+            "x=%{x:.2f} z=%{y:.2f}<br>"
+            "<b>%{z:.1f}% transitioned</b><br>"
+            "%{customdata[0]:,.0f}/%{customdata[1]:,.0f} entering trials<br>"
+            "%{customdata[2]:,.0f} did not transition"
+            f"<br>{TRANSITION_OUTCOMES[outcome]}<extra></extra>"
+        ),
+        "total_entrants": total_entrants,
+        "total_successes": total_successes,
+        "informative_cells": informative_cells,
+    }
+
+
+def build_transition_probability_bundle(
+        df, group_by="config", pool_mode="separate", ncols=2,
+        bin_size=20.0, bound_pct=98.0, split_z=None, min_trials=3,
+        outcome="crossed"):
+    """Build both transition definitions on the occupancy heatmap grid."""
+    if df is None or len(df) == 0:
+        return {
+            "enabled": True,
+            "figure": _msg_figure(
+                "No trajectories match the active transition filters."
+            ).to_plotly_json(),
+            "variants": {},
+            "message": "No trajectories match the active transition filters.",
+        }
+    groups = _group_frames(df, group_by, pool_mode, ncols)
+    group_names = list(groups.keys())
+    nrows = max(1, (len(group_names) + ncols - 1) // ncols)
+    xedges, yedges, rng = _heatmap_edges(
+        df, bin_size=bin_size, bound_pct=bound_pct)
+    if split_z in (None, ""):
+        split_value, split_source = _transition_default_split(df, yedges)
+    else:
+        split_value = float(split_z)
+        if not np.isfinite(split_value):
+            split_value, split_source = _transition_default_split(df, yedges)
+        else:
+            split_source = "manual"
+    min_count = max(1, int(min_trials or 1))
+    results = [
+        _transition_group_probabilities(
+            groups[name], xedges, yedges, split_value)
+        for name in group_names
+    ]
+    variants = {
+        key: _transition_variant(results, key, min_count)
+        for key in TRANSITION_OUTCOMES
+    }
+    selected = outcome if outcome in variants else "crossed"
+    active = variants[selected]
+    xc = (0.5 * (xedges[:-1] + xedges[1:])).tolist()
+    yc = (0.5 * (yedges[:-1] + yedges[1:])).tolist()
+    fig = make_subplots(
+        rows=nrows, cols=ncols,
+        subplot_titles=[_group_label(group_by, name) for name in group_names],
+        horizontal_spacing=0.05, vertical_spacing=_subplot_spacing(nrows))
+    for index, name in enumerate(group_names):
+        fig.add_trace(go.Heatmap(
+            x=xc, y=yc,
+            z=active["z"][index],
+            customdata=active["customdata"][index],
+            meta={"td_group_value": str(name)},
+            colorscale=_visual(
+                "transition", "colorscale",
+                _VISUAL_STYLE_DEFAULTS["transition"]["colorscale"]),
+            zmin=0, zmax=100, connectgaps=False,
+            showscale=(index == 0),
+            colorbar=dict(
+                title="opposite-half<br>transition (%)",
+                thickness=12, len=0.5,
+                tickvals=[0, 25, 50, 75, 100],
+                ticktext=["0", "25", "50", "75", "100"],
+            ),
+            hovertemplate=active["hovertemplate"],
+        ), row=index // ncols + 1, col=index % ncols + 1)
+    _apply_axis_sync(
+        fig, nrows, ncols, df, uirev="transition_view", rng=rng)
+    split_line = _visual(
+        "transition", "split_line", "rgba(57,45,76,0.82)")
+    for index in range(len(group_names)):
+        xref, yref = _subplot_axis(index + 1)
+        fig.add_shape(
+            type="line", x0=float(xedges[0]), x1=float(xedges[-1]),
+            y0=split_value, y1=split_value, xref=xref, yref=yref,
+            name="transition-half-split",
+            line=dict(color=split_line, width=1.8, dash="dash"),
+            layer="above",
+        )
+    labels = [_group_label(group_by, name) for name in group_names]
+    for index, annotation in enumerate(fig.layout.annotations):
+        if index < len(group_names):
+            annotation.update(
+                hovertext=str(group_names[index]), font=dict(size=12))
+    fig.update_layout(
+        height=60 + nrows * _subplot_px(nrows, ncols),
+        margin=dict(l=50, r=80, t=58, b=40),
+        template="plotly_white", dragmode="pan", showlegend=False,
+        meta={
+            "panel_order_values": [str(name) for name in group_names],
+            "panel_order_labels": labels,
+            "spatial_axis_count": len(group_names),
+            "transition_split_z": split_value,
+            "transition_split_source": split_source,
+            "transition_min_trials": min_count,
+            "transition_xedges": xedges.tolist(),
+            "transition_yedges": yedges.tolist(),
+        },
+    )
+    message = (
+        f"Transition grid ready · split Z={split_value:g} ({split_source}) · "
+        f"at least {min_count} entering trial"
+        f"{'s' if min_count != 1 else ''} per visible cell."
+    )
+    signature = "|".join([
+        repr(_frame_cache_token(df)),
+        str(group_by), str(pool_mode), str(ncols),
+        (
+            f"x:{float(xedges[0]):.10g}:{float(xedges[-1]):.10g}:"
+            f"{len(xedges)}"
+        ),
+        (
+            f"z:{float(yedges[0]):.10g}:{float(yedges[-1]):.10g}:"
+            f"{len(yedges)}"
+        ),
+        f"{split_value:.10g}", str(min_count),
+        ",".join(str(name) for name in group_names),
+        json.dumps(
+            _VISUAL_STYLE.get(
+                "transition", _VISUAL_STYLE_DEFAULTS["transition"]),
+            sort_keys=True, separators=(",", ":")),
+    ])
+    return {
+        "enabled": True,
+        "figure": fig.to_plotly_json(),
+        "variants": variants,
+        "outcome": selected,
+        "split_z": split_value,
+        "split_source": split_source,
+        "min_trials": min_count,
+        "xedges": xedges.tolist(),
+        "yedges": yedges.tolist(),
+        "groups": [str(name) for name in group_names],
+        "style": copy.deepcopy(
+            _VISUAL_STYLE.get(
+                "transition", _VISUAL_STYLE_DEFAULTS["transition"])),
+        "message": message,
+        "signature": signature,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -6773,7 +7120,9 @@ def _files_signature(files):
 
 def _invalidate_render_state():
     for name in ("_FILTER_CACHE", "_FILTER_CACHE_ORDER", "_ROI_MASK_CACHE",
-                 "_POLAR_RAY_CACHE", "_POLAR_RAY_CACHE_ORDER", "_VELOCITY_CACHE"):
+                 "_POLAR_RAY_CACHE", "_POLAR_RAY_CACHE_ORDER",
+                 "_TRANSITION_CACHE", "_TRANSITION_CACHE_ORDER",
+                 "_VELOCITY_CACHE"):
         obj = globals().get(name)
         if hasattr(obj, "clear"):
             obj.clear()
@@ -7548,6 +7897,89 @@ app.layout = html.Div([
 
             html.Hr(style={"margin": "6px 0"}),
 
+            html.Label(
+                "Transition observer",
+                title=(
+                    "For every shared spatial bin, condition on unique trials "
+                    "that entered it and estimate how many later reached the "
+                    "opposite side of a horizontal Z split."
+                ),
+                style={"fontWeight": "bold", "fontSize": "12px"},
+            ),
+            dcc.Checklist(
+                id="transition-enabled",
+                options=[{
+                    "label": " Calculate transition probability",
+                    "value": "on",
+                }],
+                value=[], style={"fontSize": "11px"},
+            ),
+            dcc.RadioItems(
+                id="transition-outcome",
+                options=[
+                    {
+                        "label": " Crossed opposite half",
+                        "value": "crossed",
+                        "title": (
+                            "Success when a trial reaches the opposite half at "
+                            "any later sample after first entering the cell."
+                        ),
+                    },
+                    {
+                        "label": " Ended opposite half",
+                        "value": "ended",
+                        "title": (
+                            "Stricter success: the final trial sample must lie "
+                            "in the opposite half."
+                        ),
+                    },
+                ],
+                value="crossed", className="segmented-control",
+                style={"fontSize": "10px", "marginTop": "3px"},
+            ),
+            html.Div([
+                html.Div([
+                    html.Label(
+                        "Horizontal split Z",
+                        title=(
+                            "Blank uses the grid edge nearest the modal trial "
+                            "start. A manual line through a cell makes that "
+                            "ambiguous cell row blank."
+                        ),
+                        style={"fontSize": "10px"},
+                    ),
+                    dcc.Input(
+                        id="transition-split-z", type="number", value=None,
+                        step="any", debounce=True, placeholder="auto",
+                        className="td-plain-number", style=_INPUT_STYLE,
+                    ),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Label(
+                        "Min entering trials",
+                        title=(
+                            "Hide low-support cells below this unique-trial "
+                            "denominator. Hidden cells are not treated as zero."
+                        ),
+                        style={"fontSize": "10px"},
+                    ),
+                    dcc.Input(
+                        id="transition-min-trials", type="number", value=3,
+                        min=1, step=1, debounce=True,
+                        className="td-plain-number", style=_INPUT_STYLE,
+                    ),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "6px", "marginTop": "3px"}),
+            html.Div(
+                "Each trial counts once per cell. Click a visible cell to show "
+                "the successful paths, split into muted pre-entry and saturated "
+                "future sections. Survival on the same half is 100% minus the "
+                "crossed probability.",
+                style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
+            ),
+
+            html.Hr(style={"margin": "6px 0"}),
+
             html.Label("Targets", style={"fontWeight": "bold", "fontSize": "12px"}),
             dcc.Checklist(id="roi-show",
                           options=[{"label": " Show target ROIs + reached counts",
@@ -7932,6 +8364,8 @@ app.layout = html.Div([
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Heatmap", value="heat",
                         className="view-tab", selected_className="view-tab-selected"),
+                dcc.Tab(label="Transitions", value="transition",
+                        className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Gandiva", value="flow",
                         className="view-tab", selected_className="view-tab-selected"),
                 dcc.Tab(label="Polar", value="polar",
@@ -8021,6 +8455,56 @@ app.layout = html.Div([
                                        "transition": "opacity .2s",
                                        "pointerEvents": "none"})],
                     id="view-heat", className="plot-section", style={**_PANEL_STYLE}),
+
+                # --- Conditional transition probability + clicked paths ---
+                html.Div([
+                    html.Div([
+                        html.H4(
+                            "Transition probability",
+                            title=(
+                                "For each cell, the denominator is unique trials "
+                                "that entered it. Colour is the fraction that "
+                                "subsequently crossed or ended across the "
+                                "horizontal split."
+                            ),
+                        ),
+                        html.Span(
+                            "Heatmap × curtain ring · click a bin to inspect paths",
+                            className="plot-section-kicker",
+                        ),
+                        html.Span(
+                            "Enable the transition calculation in the sidebar.",
+                            id="transition-status",
+                            className="stats-status-chip",
+                        ),
+                    ], className="plot-section-heading"),
+                    dcc.Graph(
+                        id="transition-plot",
+                        figure=_msg_figure(
+                            "Enable transition probability in the sidebar."),
+                        config=GRAPH_CONFIG,
+                        style={"width": "100%"},
+                    ),
+                    html.Div([
+                        html.Div([
+                            html.Strong("Clicked-bin trajectories"),
+                            html.Span(
+                                "Click a coloured cell above. Muted paths precede "
+                                "first entry; saturated paths show the successful "
+                                "future.",
+                                className="loop-observer-note",
+                            ),
+                        ], className="loop-observer-heading"),
+                        dcc.Graph(
+                            id="transition-observer-plot",
+                            figure=_msg_figure(
+                                "Click a transition cell to inspect its trials."),
+                            config=GRAPH_CONFIG,
+                            style={"width": "100%"},
+                        ),
+                    ], className="transition-observer-wrap"),
+                ], id="view-transition", className="plot-section",
+                   style={**_PANEL_STYLE}),
 
                 # --- Gandiva local direction field ---
                 html.Div(
@@ -8229,6 +8713,7 @@ app.layout = html.Div([
     dcc.Store(id="viewport-store"),
     dcc.Store(id="heatmap-figure-store"),
     dcc.Store(id="flow-figure-store"),
+    dcc.Store(id="transition-data-store"),
     dcc.Store(id="heatmap-variants"),
     dcc.Store(id="heatmap-color-distributions"),
     dcc.Store(id="heatmap-color-values"),
@@ -8526,6 +9011,32 @@ app.clientside_callback(
 
 
 app.clientside_callback(
+    """
+    function(bundle, outcome, enabled, trajectory, fraction, seed) {
+      if (window.TransitionProbabilityObserver) {
+        return window.TransitionProbabilityObserver.renderDashboard({
+          bundle: bundle || {},
+          outcome: outcome || 'crossed',
+          enabled: enabled,
+          trajectoryFigure: trajectory || {},
+          fraction: fraction,
+          seed: seed
+        });
+      }
+      return 'Loading transition observer…';
+    }
+    """,
+    Output("transition-status", "children"),
+    Input("transition-data-store", "data"),
+    Input("transition-outcome", "value"),
+    Input("transition-enabled", "value"),
+    Input("trajectory-plot", "figure"),
+    Input("traj-trial-fraction", "value"),
+    Input("btn-traj-resample", "n_clicks"),
+)
+
+
+app.clientside_callback(
     "function(fig,enabled,rings,active,matchMode,style,fraction,seed){"
     "if(window.TrajectoryTrialSubset){"
     "fig=window.TrajectoryTrialSubset.filterFigure(fig,fraction,seed);}"
@@ -8812,13 +9323,16 @@ _URL_NUM = {"vel": "vel-threshold", "disp": "min-disp", "trim": "trim-samples",
             "vrmin": "vel-range", "vrmax": "vel-range",
             "drmin": "disp-range", "drmax": "disp-range",
             "pmin": "polar-min-point-frac", "amin": "polar-min-animal-frac",
-            "uscale": "spatial-unit-scale"}
+            "uscale": "spatial-unit-scale",
+            "tsplit": "transition-split-z",
+            "trnmin": "transition-min-trials"}
 _URL_STR = {"groupby": "group-by", "pool": "pool-mode", "color": "color-by",
             "hscale": "heatmap-scale", "hmetric": "heatmap-metric",
             "hcrange": "heatmap-crange", "pang": "polar-angle-source",
             "layout": "view-layout", "ractive": "custom-region-active",
             "dist": "distribution-mode", "sunit": "stats-unit",
-            "ulabel": "spatial-unit-label"}
+            "ulabel": "spatial-unit-label",
+            "tmode": "transition-outcome"}
 _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyids",
              "fscn": "filter-scenes", "ffld": "filter-folders", "raw": "raw-columns"}
 
@@ -8886,6 +9400,10 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("stats-unit", "value", allow_duplicate=True),
     Output("spatial-unit-scale", "value", allow_duplicate=True),
     Output("spatial-unit-label", "value", allow_duplicate=True),
+    Output("transition-enabled", "value", allow_duplicate=True),
+    Output("transition-outcome", "value", allow_duplicate=True),
+    Output("transition-split-z", "value", allow_duplicate=True),
+    Output("transition-min-trials", "value", allow_duplicate=True),
     Output("minimal-layout-store", "data", allow_duplicate=True),
     Output("url-restored", "data"),
     Input("url", "search"),
@@ -8895,7 +9413,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 63
+    n_out = 67
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -9013,6 +9531,14 @@ def restore_from_url(search, already):
         if p.get("sunit", [""])[0] in ("trial", "animal")
         else no_update
     )
+    transition_enabled = (
+        ["on"] if p["trans"][0] == "1" else []
+    ) if "trans" in p else no_update
+    transition_outcome = (
+        p["tmode"][0]
+        if p.get("tmode", [""])[0] in TRANSITION_OUTCOMES
+        else no_update
+    )
     minimal_layout = (
         p["minimal"][0] == "1"
     ) if "minimal" in p else no_update
@@ -9020,7 +9546,9 @@ def restore_from_url(search, already):
     view = (
         p["view"][0]
         if p.get("view", [""])[0]
-        in ("traj", "heat", "flow", "roi", "polar", "metrics", "diag")
+        in (
+            "traj", "heat", "transition", "flow",
+            "roi", "polar", "metrics", "diag")
         else no_update
     )
     mode = p["mode"][0] if p.get("mode", [""])[0] in ("accuracy", "speed") else no_update
@@ -9115,6 +9643,8 @@ def restore_from_url(search, already):
         custom_region_enabled, custom_regions, s("ractive"),
         distribution_mode, distribution_points, stats_unit,
         positive_num("uscale"), s("ulabel"),
+        transition_enabled, transition_outcome, finite_num("tsplit"),
+        positive_num("trnmin"),
         minimal_layout, True,
     )
 
@@ -9304,6 +9834,10 @@ def tick_progress(n):
     Input("stats-unit", "value"),
     Input("spatial-unit-scale", "value"),
     Input("spatial-unit-label", "value"),
+    Input("transition-enabled", "value"),
+    Input("transition-outcome", "value"),
+    Input("transition-split-z", "value"),
+    Input("transition-min-trials", "value"),
     Input("minimal-layout-store", "data"),
     State("viewport-store", "data"),
     State("url-restored", "data"),
@@ -9319,6 +9853,8 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                custom_region_enabled, custom_regions, custom_region_active,
                distribution_mode, distribution_show_points, stats_unit,
                spatial_unit_scale, spatial_unit_label,
+               transition_enabled, transition_outcome, transition_split_z,
+               transition_min_trials,
                minimal_layout, vp, restored):
     if not restored:
         return no_update
@@ -9331,7 +9867,9 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             "smin": smin, "smax": smax, "pmin": pmin, "amin": amin,
             "reach": reach, "frad": flow_max_radius,
             "tf": traj_fraction, "lx": loop_x, "lz": loop_z,
-            "lr": loop_radius, "uscale": spatial_unit_scale}
+            "lr": loop_radius, "uscale": spatial_unit_scale,
+            "tsplit": transition_split_z,
+            "trnmin": transition_min_trials}
     for k, v in nums.items():
         if v is not None and v != "":
             if k == "trim" and float(v or 0) <= 0:
@@ -9343,12 +9881,15 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
             "view": view, "layout": view_layout}
     if spatial_unit_label:
         strs["ulabel"] = spatial_unit_label
+    if transition_outcome in TRANSITION_OUTCOMES:
+        strs["tmode"] = transition_outcome
     for k, v in strs.items():
         if v:
             params[k] = v
     params["anim"] = "1" if (anim and "on" in anim) else "0"
     params["loop"] = "1" if _on(loop_enabled) else "0"
     params["region"] = "1" if _on(custom_region_enabled) else "0"
+    params["trans"] = "1" if _on(transition_enabled) else "0"
     params["dpts"] = "1" if _on(distribution_show_points) else "0"
     params["minimal"] = "1" if minimal_layout else "0"
     if loop_rings:
@@ -10992,6 +11533,131 @@ def update_plots(n, generation, pattern, vel_thresh, min_disp, trim, jump_buf,
 
 
 @app.callback(
+    Output("transition-data-store", "data"),
+    Input("view-render-state", "data"),
+    Input("transition-enabled", "value"),
+    Input("transition-split-z", "value"),
+    Input("transition-min-trials", "value"),
+    State("store-glob", "data"),
+    State("vel-threshold", "value"),
+    State("min-disp", "value"),
+    State("trim-samples", "value"),
+    State("jump-buffer", "value"),
+    State("filter-configs", "value"),
+    State("filter-vrs", "value"),
+    State("filter-flyids", "value"),
+    State("filter-scenes", "value"),
+    State("filter-folders", "value"),
+    State("trial-min", "value"),
+    State("trial-max", "value"),
+    State("step-min", "value"),
+    State("step-max", "value"),
+    State("vel-range-effective", "data"),
+    State("disp-range", "value"),
+    State("group-by", "value"),
+    State("pool-mode", "value"),
+    State("subplot-ncols", "value"),
+    State("heatmap-binsize", "value"),
+    State("heatmap-bound", "value"),
+    State("rebase-origin", "value"),
+    State("roi-reach", "value"),
+    State("roi-entered", "value"),
+    State("roi-trim", "value"),
+    State("viewport-store", "data"),
+    prevent_initial_call=True,
+)
+def update_transition_probability(
+        render_state, enabled, split_z, min_trials, pattern,
+        vel_thresh, min_disp, trim, jump_buf, cfg, vrs, fids, scenes,
+        folders, trial_min, trial_max, step_min, step_max, vel_selection,
+        disp_selection, group_by, pool_mode, ncols, hm_binsize, hm_bound,
+        rebase, roi_reach, roi_entered, roi_trim, viewport):
+    """Build only the optional transition grid; never arm the master renderer."""
+    if not _on(enabled):
+        return {
+            "enabled": False,
+            "message": (
+                "Transition observer off. Enable it in Spatial fields to "
+                "calculate conditional trial probabilities."
+            ),
+        }
+    if not pattern or not render_state or not render_state.get("completed"):
+        return {
+            "enabled": True,
+            "message": "Load and render data before calculating transitions.",
+        }
+    started = time.perf_counter()
+    try:
+        df_f, _df_sub, _stats = _filtered_df(
+            pattern, vel_thresh, min_disp, trim, jump_buf,
+            cfg, vrs, fids, scenes, folders, trial_min, trial_max,
+            step_min, step_max, vel_selection, disp_selection)
+        if df_f is None or len(df_f) == 0:
+            return {
+                "enabled": True,
+                "message": "No filtered trials are available for transitions.",
+            }
+        reach = float(roi_reach or 3.0)
+        df_view, _table = _roi_apply(
+            df_f, pattern, reach, _on(roi_entered), _on(roi_trim))
+        df_spatial = rebase_to_origin(df_view) if _on(rebase) else df_view
+        ncols_value = max(1, int(ncols or 2))
+        bound_pct = (
+            float(hm_bound) if hm_bound not in (None, "") else 98.0)
+        minimum = max(1, int(min_trials or 1))
+        split_key = (
+            None if split_z in (None, "") else round(float(split_z), 10))
+        cache_key = (
+            _frame_cache_token(df_spatial), str(group_by or "config"),
+            str(pool_mode or "separate"), ncols_value,
+            None if hm_binsize in (None, "") else round(float(hm_binsize), 10),
+            round(bound_pct, 8), split_key, minimum,
+            json.dumps(
+                _VISUAL_STYLE.get("transition", {}),
+                sort_keys=True, separators=(",", ":")),
+        )
+        bundle = _TRANSITION_CACHE.get(cache_key)
+        if bundle is None:
+            bundle = build_transition_probability_bundle(
+                df_spatial, group_by=group_by, pool_mode=pool_mode,
+                ncols=ncols_value, bin_size=hm_binsize,
+                bound_pct=bound_pct, split_z=split_z,
+                min_trials=minimum, outcome="crossed")
+            _TRANSITION_CACHE[cache_key] = bundle
+            _TRANSITION_CACHE_ORDER.append(cache_key)
+            while len(_TRANSITION_CACHE_ORDER) > _TRANSITION_CACHE_MAX:
+                old = _TRANSITION_CACHE_ORDER.pop(0)
+                _TRANSITION_CACHE.pop(old, None)
+        else:
+            try:
+                _TRANSITION_CACHE_ORDER.remove(cache_key)
+            except ValueError:
+                pass
+            _TRANSITION_CACHE_ORDER.append(cache_key)
+        figure = go.Figure(bundle.get("figure") or {})
+        _apply_viewport_to_current_range(
+            figure, viewport, max_span_mult=1.5)
+        output = dict(bundle)
+        output["figure"] = figure.to_plotly_json()
+        output["seconds"] = round(time.perf_counter() - started, 4)
+        output["message"] = (
+            f"{bundle.get('message', 'Transition grid ready')} "
+            f"Built in {output['seconds']:.2f}s."
+        )
+        return output
+    except Exception as exc:
+        LOGGER.exception("transition.failed")
+        return {
+            "enabled": True,
+            "message": (
+                f"Transition calculation failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "error": True,
+        }
+
+
+@app.callback(
     Output("trajectory-plot", "figure", allow_duplicate=True),
     Output("polar-plot", "figure", allow_duplicate=True),
     Output("plot-status", "children", allow_duplicate=True),
@@ -12357,12 +13023,79 @@ def _export_loop_observer_html(
     return controls + boot
 
 
+def _export_transition_observer_html(bundle, outcome="crossed") -> str:
+    """Embed the transition grid and browser-local clicked-bin drill-down."""
+    if not isinstance(bundle, dict) or not bundle.get("figure"):
+        return "<p>Transition probability was not enabled for this export.</p>"
+    selected = outcome if outcome in TRANSITION_OUTCOMES else "crossed"
+    figure = go.Figure(bundle["figure"])
+    active = bundle.get("variants", {}).get(selected, {})
+    for index, trace in enumerate(figure.data):
+        if str(getattr(trace, "type", "")).lower() != "heatmap":
+            continue
+        if index < len(active.get("z", [])):
+            trace.z = active["z"][index]
+            trace.customdata = active["customdata"][index]
+            trace.hovertemplate = active.get("hovertemplate")
+    heat_html = figure.to_html(
+        full_html=False, include_plotlyjs=False,
+        config=dict(scrollZoom=True, displaylogo=False),
+        div_id="export-transition-plot",
+    )
+    settings = {
+        key: value for key, value in bundle.items()
+        if key != "figure"
+    }
+    module = (
+        Path(__file__).with_name("assets") / "transition_observer.js"
+    ).read_text(encoding="utf-8")
+    encoded = json.dumps(settings, separators=(",", ":"), ensure_ascii=False)
+    return f"""
+<div class="transition-export">
+  <div class="transition-export-controls">
+    <label>Outcome
+      <select id="export-transition-outcome">
+        <option value="crossed">Crossed opposite half</option>
+        <option value="ended">Ended opposite half</option>
+      </select>
+    </label>
+    <span id="export-transition-status">{bundle.get("message", "")}</span>
+  </div>
+  <div class="transition-export-note">Each cell conditions on unique trials
+    that entered it. Click a coloured cell to show successful paths below.</div>
+  {heat_html}
+  <div id="export-transition-observer"></div>
+</div>
+<script>{module}</script>
+<script>
+(function (bundle, initialOutcome) {{
+  "use strict";
+  var selector = document.getElementById("export-transition-outcome");
+  selector.value = initialOutcome;
+  var controller = window.TransitionProbabilityObserver.attachExport({{
+    heatId: "export-transition-plot",
+    observerId: "export-transition-observer",
+    sourceId: "export-trajectory-plot",
+    statusId: "export-transition-status",
+    bundle: bundle,
+    outcome: initialOutcome
+  }});
+  selector.addEventListener("change", function () {{
+    controller.setOutcome(selector.value);
+  }});
+}})({encoded}, {json.dumps(selected)});
+</script>
+"""
+
+
 def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
                          initial_heading, raw,
                          *, include_raw, summary, share_state,
                          loop_enabled=False, loop_x=0, loop_z=0, loop_radius=3,
                          loop_rings=None, loop_active=None,
-                         loop_match_mode="any", visual_style=None):
+                         loop_match_mode="any", visual_style=None,
+                         transition_bundle=None,
+                         transition_outcome="crossed"):
     """Build one offline-capable report with a single embedded plotly.js."""
     cfgd = dict(scrollZoom=True, displaylogo=False)
     traj_h = traj.to_html(
@@ -12372,6 +13105,8 @@ def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
         loop_enabled, loop_x, loop_z, loop_radius,
         rings=loop_rings, active=loop_active, match_mode=loop_match_mode,
         visual_style=visual_style)
+    transition_h = _export_transition_observer_html(
+        transition_bundle, transition_outcome)
     heat_h = heat.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     flow_h = flow.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     roi_h = roi.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
@@ -12399,6 +13134,12 @@ font-size:11px;color:#473a18}}
 .loop-export-controls input[type=number]{{width:72px}}
 .loop-export-controls span{{margin-left:auto;color:#6b5d32}}
 .loop-export-note{{font-size:10px;color:#75683f;margin:5px 0}}
+.transition-export{{border:1px solid rgba(94,74,130,.22);border-radius:7px;
+padding:8px;margin:8px 0 14px;background:linear-gradient(180deg,#f8f5fb,#fff 80px)}}
+.transition-export-controls{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+font-size:11px;color:#493b67}}
+.transition-export-controls span{{margin-left:auto;color:#5e4a82}}
+.transition-export-note{{font-size:10px;color:#756b85;margin:5px 0}}
 .flowlegend>span{{font-size:9px;font-weight:650;color:#475467;text-transform:uppercase}}
 .flowwheel{{position:relative;width:64px;height:64px;font-size:8px;font-weight:700;color:#667085}}
 .flowwheel i{{position:absolute;inset:8px;border-radius:50%;
@@ -12423,6 +13164,7 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
 <h3>Trajectories</h3>{traj_h}
 <h3>Loop observer</h3>{loop_h}
 <h3>Heatmap</h3>{heat_h}
+<h3>Transition probability</h3>{transition_h}
 <h3>Gandiva plot</h3>
 <div class="flowlegend"><span>Mean direction</span>
 <div class="flowwheel" aria-label="Circular direction colour legend">
@@ -12461,6 +13203,10 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
     State("heatmap-cmin", "value"),
     State("heatmap-cmax", "value"),
     State("heatmap-crange", "value"),
+    State("transition-enabled", "value"),
+    State("transition-outcome", "value"),
+    State("transition-split-z", "value"),
+    State("transition-min-trials", "value"),
     State("filter-configs", "value"),
     State("filter-vrs", "value"),
     State("filter-flyids", "value"),
@@ -12507,7 +13253,9 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
 )
 def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool_mode,
                 color_by, animate, hm_binsize, hm_scale, hm_bound, hm_metric,
-                hm_cmin, hm_cmax, hm_crange, cfg, vrs, fids, scenes, folders,
+                hm_cmin, hm_cmax, hm_crange,
+                transition_enabled, transition_outcome, transition_split_z,
+                transition_min_trials, cfg, vrs, fids, scenes, folders,
                 trial_min, trial_max, step_min, step_max,
                 raw_cols, ncols, max_points, traj_fraction, traj_sample_seed,
                 loop_enabled, loop_x, loop_z, loop_radius,
@@ -12591,6 +13339,16 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                                 cmin=hm_cmin, cmax=hm_cmax, crange_mode=hm_crange,
                                 rois=rois if want_rois and not do_rebase else None,
                                 reach_radius=reach)
+    transition_bundle = (
+        build_transition_probability_bundle(
+            df_plot, group_by, pool_mode, ncols=ncols_val,
+            bin_size=hm_binsize, bound_pct=bound_pct,
+            split_z=transition_split_z,
+            min_trials=transition_min_trials,
+            outcome=transition_outcome,
+        )
+        if _on(transition_enabled) else None
+    )
     flow = build_direction_field_figure(
         df_plot, group_by, pool_mode, ncols=ncols_val,
         bin_size=hm_binsize, bound_pct=bound_pct,
@@ -12641,6 +13399,12 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
             if viewport.get("yaxis"):
                 f.update_yaxes(range=viewport["yaxis"])
         _apply_viewport_to_current_range(flow, viewport, max_span_mult=1.5)
+        if transition_bundle:
+            transition_figure = go.Figure(transition_bundle["figure"])
+            _apply_viewport_to_current_range(
+                transition_figure, viewport, max_span_mult=1.5)
+            transition_bundle = dict(transition_bundle)
+            transition_bundle["figure"] = transition_figure.to_plotly_json()
 
     _progress_stage(
         op_id, 2, done=0, total=1,
@@ -12655,6 +13419,8 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         loop_radius=loop_radius, loop_rings=loop_rings,
         loop_active=loop_active, loop_match_mode=loop_match_mode,
         visual_style=_VISUAL_STYLE,
+        transition_bundle=transition_bundle,
+        transition_outcome=transition_outcome,
     )
 
     ts = time.strftime("%Y%m%d_%H%M%S")

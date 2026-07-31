@@ -7,7 +7,7 @@
 
   var GRAPH_IDS = [
     "trajectory-plot", "loop-observer-plot", "heatmap-plot",
-    "flow-plot", "polar-plot", "initial-heading-plot",
+    "transition-plot", "flow-plot", "polar-plot", "initial-heading-plot",
     "roi-plot", "custom-region-diagnostics-plot", "trial-metrics-plot"
   ];
   var activeOrder = null;

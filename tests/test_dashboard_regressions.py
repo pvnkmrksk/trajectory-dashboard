@@ -188,6 +188,57 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertTrue(np.isnan(stroke_x[2]))
         self.assertTrue(np.isnan(stroke_z[2]))
 
+    def test_transition_cells_count_each_trial_once_and_distinguish_outcomes(self):
+        rows = []
+        paths = {
+            # Crosses the split, then returns to the original half.
+            "returns": [-2.0, -1.5, 1.0, -1.0],
+            # Crosses and ends in the opposite half.
+            "ends": [-2.0, -1.5, 1.0, 2.0],
+            # Revisits the source cell but never crosses.
+            "stays": [-2.0, -1.5, -2.0, -1.5],
+        }
+        for segment, values in paths.items():
+            for z in values:
+                rows.append({
+                    "_seg_id": segment,
+                    "GameObjectPosX": 0.25,
+                    "GameObjectPosZ": z,
+                })
+        frame = pd.DataFrame(rows)
+        result = app._transition_group_probabilities(
+            frame,
+            np.array([-1.0, 0.0, 1.0]),
+            np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]),
+            split_z=0.0,
+        )
+        # Cell X=[0,1], Z=[-2,-1]: all three trials entered it, despite
+        # repeated samples/revisits. Two ever crossed; only one ended across.
+        self.assertEqual(int(result["entrants"][1, 1]), 3)
+        self.assertEqual(int(result["crossed"][1, 1]), 2)
+        self.assertEqual(int(result["ended"][1, 1]), 1)
+        crossed = app._transition_variant([result], "crossed", min_trials=1)
+        ended = app._transition_variant([result], "ended", min_trials=1)
+        self.assertAlmostEqual(crossed["z"][0][1][1], 200 / 3)
+        self.assertAlmostEqual(ended["z"][0][1][1], 100 / 3)
+
+    def test_transition_bundle_has_two_local_variants_and_plain_heatmap_lists(self):
+        bundle = app.build_transition_probability_bundle(
+            _polar_frame(), group_by="all", pool_mode="pooled", ncols=1,
+            bin_size=1.0, bound_pct=100, split_z=0.5, min_trials=1)
+        self.assertTrue(bundle["enabled"])
+        self.assertEqual(set(bundle["variants"]), {"crossed", "ended"})
+        self.assertEqual(bundle["split_z"], 0.5)
+        figure = bundle["figure"]
+        self.assertIsInstance(figure["data"][0]["z"], list)
+        self.assertIsInstance(figure["data"][0]["customdata"], list)
+        self.assertEqual(
+            figure["layout"]["meta"]["panel_order_values"], ["All Data"])
+        narrower = app.build_transition_probability_bundle(
+            _polar_frame(), group_by="all", pool_mode="pooled", ncols=1,
+            bin_size=1.0, bound_pct=80, split_z=0.5, min_trials=1)
+        self.assertNotEqual(bundle["signature"], narrower["signature"])
+
     def test_local_direction_field_movement_heading_uses_segment_safe_diffs(self):
         frame = _polar_frame().copy()
         bins = app._direction_field_bins(
@@ -496,6 +547,8 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_large_callback_signatures_match_registered_inputs_and_states(self):
         checks = (
             ("trajectory-plot.figure", app.update_plots),
+            ("transition-data-store.data",
+             app.update_transition_probability),
             ("polar-r-hist.figure", app.update_polar_only),
             ("download-html.data", app.export_html),
         )
@@ -511,12 +564,40 @@ class DashboardRegressionTests(unittest.TestCase):
                 output_fragment,
             )
 
+    def test_transition_controls_do_not_arm_or_enter_the_master_renderer(self):
+        master = next(
+            meta for output, meta in app.app.callback_map.items()
+            if output.startswith("..trajectory-plot.figure...")
+        )
+        master_inputs = {item["id"] for item in master["inputs"]}
+        auto = next(
+            meta for output, meta in app.app.callback_map.items()
+            if output.startswith("..auto-replot-state.data...")
+        )
+        auto_inputs = {item["id"] for item in auto["inputs"]}
+        transition = app.app.callback_map["transition-data-store.data"]
+        transition_inputs = {item["id"] for item in transition["inputs"]}
+
+        for control in (
+                "transition-enabled", "transition-outcome",
+                "transition-split-z", "transition-min-trials"):
+            self.assertNotIn(control, master_inputs)
+            self.assertNotIn(control, auto_inputs)
+        self.assertEqual(
+            transition_inputs,
+            {
+                "view-render-state", "transition-enabled",
+                "transition-split-z", "transition-min-trials",
+            },
+        )
+        self.assertNotIn("transition-outcome", transition_inputs)
+
     def test_sections_follow_analysis_then_diagnostics_order(self):
         ids = [getattr(node, "id", None) for node in _components(app.app.layout)]
         self.assertIn("flow-field-legend", ids)
         positions = [ids.index(component_id) for component_id in (
-            "view-traj", "view-heat", "view-flow", "view-polar", "view-roi",
-            "view-metrics", "view-diag")]
+            "view-traj", "view-heat", "view-transition", "view-flow",
+            "view-polar", "view-roi", "view-metrics", "view-diag")]
         self.assertEqual(positions, sorted(positions))
 
     def test_polar_controls_use_the_polar_only_callback(self):
@@ -631,6 +712,10 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("stats-unit").value, "trial")
         self.assertEqual(_component("spatial-unit-scale").value, 1)
         self.assertEqual(_component("spatial-unit-label").value, "cm")
+        self.assertEqual(_component("transition-enabled").value, [])
+        self.assertEqual(_component("transition-outcome").value, "crossed")
+        self.assertIsNone(_component("transition-split-z").value)
+        self.assertEqual(_component("transition-min-trials").value, 3)
         self.assertIsNotNone(_component("disp-range-min"))
         self.assertIsNotNone(_component("disp-range-max"))
         self.assertEqual(len(_component("custom-regions-store").data), 1)
@@ -640,15 +725,19 @@ class DashboardRegressionTests(unittest.TestCase):
         restored = app.restore_from_url(
             "?smin=2&smax=4&hcrange=percentile&frad=0.31"
             "&tf=37&loop=1&lx=-4.5&lz=2&lr=7"
-            "&uscale=0.1&ulabel=mm&minimal=1", False)
-        self.assertEqual(len(restored), 64)
+            "&uscale=0.1&ulabel=mm&trans=1&tmode=ended"
+            "&tsplit=-2.5&trnmin=7&view=transition&minimal=1", False)
+        self.assertEqual(len(restored), 68)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
         self.assertEqual(restored[44], 0.31)
         self.assertEqual(restored[46:51], (37.0, ["on"], -4.5, 2, 7))
         self.assertEqual(restored[60:62], (0.1, "mm"))
-        self.assertTrue(restored[62])
-        self.assertEqual(len(app.restore_from_url("", True)), 64)
+        self.assertEqual(restored[41], "transition")
+        self.assertEqual(
+            restored[62:66], (["on"], "ended", -2.5, 7))
+        self.assertTrue(restored[66])
+        self.assertEqual(len(app.restore_from_url("", True)), 68)
         legacy_color = app.restore_from_url("?color=one", False)
         self.assertEqual(legacy_color[7], "categorical")
         rings = [
@@ -966,13 +1055,18 @@ class DashboardRegressionTests(unittest.TestCase):
 
     def test_export_is_offline_capable_and_contains_every_section(self):
         fig = app.go.Figure(app.go.Scatter(x=[0, 1], y=[0, 1]))
+        transition = app.build_transition_probability_bundle(
+            _polar_frame(), group_by="all", pool_mode="pooled", ncols=1,
+            bin_size=1, bound_pct=100, split_z=0.5, min_trials=1)
         document = app._compose_export_html(
             fig, fig, fig, fig, fig, fig, fig, fig, fig, fig,
             include_raw=False, summary="test summary", share_state="?mode=speed",
+            transition_bundle=transition,
         )
         self.assertNotIn('src="https://cdn.plot.ly', document)
         self.assertIn("plotly.js", document)
         self.assertIn("TrajectoryLoopObserver", document)
+        self.assertIn("TransitionProbabilityObserver", document)
         self.assertIn('id="export-loop-radius"', document)
         node = shutil.which("node")
         if node:
@@ -989,7 +1083,8 @@ class DashboardRegressionTests(unittest.TestCase):
                     capture_output=True, check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
-        for heading in ("Trajectories", "Loop observer", "Heatmap", "Gandiva plot",
+        for heading in ("Trajectories", "Loop observer", "Heatmap",
+                        "Transition probability", "Gandiva plot",
                         "Target diagnostics", "Polar",
                         "Trial metrics",
                         "Diagnostics: raw starting-heading null distribution",
