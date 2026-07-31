@@ -3316,6 +3316,10 @@ TRANSITION_OUTCOMES = {
     "crossed": "crossed the opposite half after first cell entry",
     "ended": "ended in the opposite half after first cell entry",
 }
+TRANSITION_METRICS = {
+    "fraction": "fraction of entering trials",
+    "count": "number of successful trials",
+}
 
 
 def _transition_default_split(
@@ -3323,9 +3327,9 @@ def _transition_default_split(
     """Choose a reproducible start-centred horizontal split.
 
     The modal segment-start row is used rather than a frame-weighted centre.
-    Snapping the automatic value to a grid edge keeps every heatmap cell wholly
-    on one side; an explicitly entered split remains exact and may therefore
-    create one deliberately blank, ambiguous row.
+    Its median start position becomes the exact boundary; transition-only bin
+    edges are then rebuilt outward from it, so the automatic line can never
+    straddle an arbitrarily offset pre-existing row.
     """
     starts = df.drop_duplicates("_seg_id", keep="first")
     values = pd.to_numeric(
@@ -3339,8 +3343,51 @@ def _transition_default_split(
         target = float(np.median(
             values[(values >= yedges[index]) & (values <= yedges[index + 1])]
         )) if len(counts) and counts[index] else float(np.median(values))
-    edge_index = int(np.argmin(np.abs(yedges - target)))
-    return float(yedges[edge_index]), "automatic modal-start grid edge"
+    return float(target), "automatic modal-start boundary"
+
+
+def _transition_edges(
+        df: pd.DataFrame, bin_size, bound_pct, split_z=None,
+) -> tuple[np.ndarray, np.ndarray, tuple, float, str]:
+    """Return transition grid edges with ``split_z`` as a true Z-bin edge.
+
+    The occupancy heatmap keeps its existing extent-anchored lattice. The
+    transition grid instead uses ``split + k * bin_size`` so an explicit zero
+    is exactly the boundary between the rows immediately below and above zero.
+    """
+    xedges, base_yedges, rng = _heatmap_edges(
+        df, bin_size=bin_size, bound_pct=bound_pct)
+    if split_z in (None, ""):
+        split_value, split_source = _transition_default_split(
+            df, base_yedges)
+    else:
+        try:
+            split_value = float(split_z)
+        except (TypeError, ValueError):
+            split_value = np.nan
+        if np.isfinite(split_value):
+            split_source = "manual grid boundary"
+        else:
+            split_value, split_source = _transition_default_split(
+                df, base_yedges)
+
+    bs = float(xedges[1] - xedges[0])
+    rz = rng[1]
+    lower_index = int(math.floor(
+        (float(rz[0]) - split_value) / bs))
+    upper_index = int(math.ceil(
+        (float(rz[1]) - split_value) / bs))
+    if upper_index <= lower_index:
+        upper_index = lower_index + 1
+    yedges = (
+        split_value
+        + np.arange(lower_index, upper_index + 1, dtype=float) * bs
+    )
+    # Remove floating-point drift at the boundary itself.
+    zero_index = -lower_index
+    if 0 <= zero_index < len(yedges):
+        yedges[zero_index] = split_value
+    return xedges, yedges, rng, split_value, split_source
 
 
 def _transition_group_probabilities(
@@ -3453,8 +3500,9 @@ def _transition_group_probabilities(
 def _transition_variant(results, outcome: str, min_trials: int) -> dict:
     """Materialise one selected transition definition from shared counts."""
     outcome = outcome if outcome in TRANSITION_OUTCOMES else "crossed"
-    z_values, custom_values = [], []
+    probability_values, count_values, custom_values = [], [], []
     total_entrants = total_successes = informative_cells = 0
+    maximum_successes = 0
     for result in results:
         entrants = result["entrants"].astype(np.int64, copy=False)
         successes = result[outcome].astype(np.int64, copy=False)
@@ -3467,23 +3515,75 @@ def _transition_variant(results, outcome: str, min_trials: int) -> dict:
         )
         informative = (entrants >= min_trials) & (side != 0)
         probability[~informative] = np.nan
+        success_count = successes.astype(float)
+        success_count[~informative] = np.nan
         stayed = entrants - successes
-        custom = np.stack([successes, entrants, stayed], axis=-1)
-        z_values.append(probability.tolist())
+        raw_probability = np.divide(
+            100.0 * successes,
+            entrants,
+            out=np.zeros(entrants.shape, dtype=float),
+            where=entrants > 0,
+        )
+        custom = np.stack(
+            [successes, entrants, stayed, raw_probability], axis=-1)
+        probability_values.append(probability.tolist())
+        count_values.append(success_count.tolist())
         custom_values.append(custom.tolist())
         total_entrants += int(entrants.sum())
         total_successes += int(successes.sum())
         informative_cells += int(np.count_nonzero(informative))
+        if np.any(informative):
+            maximum_successes = max(
+                maximum_successes,
+                int(successes[informative].max(initial=0)),
+            )
     return {
-        "z": z_values,
         "customdata": custom_values,
-        "hovertemplate": (
-            "x=%{x:.2f} z=%{y:.2f}<br>"
-            "<b>%{z:.1f}% transitioned</b><br>"
-            "%{customdata[0]:,.0f}/%{customdata[1]:,.0f} entering trials<br>"
-            "%{customdata[2]:,.0f} did not transition"
-            f"<br>{TRANSITION_OUTCOMES[outcome]}<extra></extra>"
-        ),
+        "displays": {
+            "fraction": {
+                "z": probability_values,
+                "zmin": 0,
+                "zmax": 100,
+                "colorbar": {
+                    "title": {
+                        "text": "opposite-half<br>transition (%)",
+                    },
+                    "thickness": 12,
+                    "len": 0.5,
+                    "tickvals": [0, 25, 50, 75, 100],
+                    "ticktext": ["0", "25", "50", "75", "100"],
+                },
+                "hovertemplate": (
+                    "x=%{x:.2f} z=%{y:.2f}<br>"
+                    "<b>%{z:.1f}% transitioned</b><br>"
+                    "%{customdata[0]:,.0f}/%{customdata[1]:,.0f} "
+                    "entering trials<br>"
+                    "%{customdata[2]:,.0f} did not transition"
+                    f"<br>{TRANSITION_OUTCOMES[outcome]}<extra></extra>"
+                ),
+            },
+            "count": {
+                "z": count_values,
+                "zmin": 0,
+                "zmax": max(1, maximum_successes),
+                "colorbar": {
+                    "title": {
+                        "text": "successful<br>trials (n)",
+                    },
+                    "thickness": 12,
+                    "len": 0.5,
+                },
+                "hovertemplate": (
+                    "x=%{x:.2f} z=%{y:.2f}<br>"
+                    "<b>%{z:,.0f} successful trials</b><br>"
+                    "%{customdata[0]:,.0f}/%{customdata[1]:,.0f} "
+                    "entering trials "
+                    "(%{customdata[3]:.1f}%)<br>"
+                    "%{customdata[2]:,.0f} did not transition"
+                    f"<br>{TRANSITION_OUTCOMES[outcome]}<extra></extra>"
+                ),
+            },
+        },
         "total_entrants": total_entrants,
         "total_successes": total_successes,
         "informative_cells": informative_cells,
@@ -3493,7 +3593,7 @@ def _transition_variant(results, outcome: str, min_trials: int) -> dict:
 def build_transition_probability_bundle(
         df, group_by="config", pool_mode="separate", ncols=2,
         bin_size=20.0, bound_pct=98.0, split_z=None, min_trials=3,
-        outcome="crossed"):
+        outcome="crossed", display_metric="fraction"):
     """Build both transition definitions on the occupancy heatmap grid."""
     if df is None or len(df) == 0:
         return {
@@ -3507,16 +3607,8 @@ def build_transition_probability_bundle(
     groups = _group_frames(df, group_by, pool_mode, ncols)
     group_names = list(groups.keys())
     nrows = max(1, (len(group_names) + ncols - 1) // ncols)
-    xedges, yedges, rng = _heatmap_edges(
-        df, bin_size=bin_size, bound_pct=bound_pct)
-    if split_z in (None, ""):
-        split_value, split_source = _transition_default_split(df, yedges)
-    else:
-        split_value = float(split_z)
-        if not np.isfinite(split_value):
-            split_value, split_source = _transition_default_split(df, yedges)
-        else:
-            split_source = "manual"
+    xedges, yedges, rng, split_value, split_source = _transition_edges(
+        df, bin_size=bin_size, bound_pct=bound_pct, split_z=split_z)
     min_count = max(1, int(min_trials or 1))
     results = [
         _transition_group_probabilities(
@@ -3529,6 +3621,10 @@ def build_transition_probability_bundle(
     }
     selected = outcome if outcome in variants else "crossed"
     active = variants[selected]
+    selected_metric = (
+        display_metric
+        if display_metric in TRANSITION_METRICS else "fraction")
+    active_display = active["displays"][selected_metric]
     xc = (0.5 * (xedges[:-1] + xedges[1:])).tolist()
     yc = (0.5 * (yedges[:-1] + yedges[1:])).tolist()
     fig = make_subplots(
@@ -3538,21 +3634,18 @@ def build_transition_probability_bundle(
     for index, name in enumerate(group_names):
         fig.add_trace(go.Heatmap(
             x=xc, y=yc,
-            z=active["z"][index],
+            z=active_display["z"][index],
             customdata=active["customdata"][index],
             meta={"td_group_value": str(name)},
             colorscale=_visual(
                 "transition", "colorscale",
                 _VISUAL_STYLE_DEFAULTS["transition"]["colorscale"]),
-            zmin=0, zmax=100, connectgaps=False,
+            zmin=active_display["zmin"],
+            zmax=active_display["zmax"],
+            connectgaps=False,
             showscale=(index == 0),
-            colorbar=dict(
-                title="opposite-half<br>transition (%)",
-                thickness=12, len=0.5,
-                tickvals=[0, 25, 50, 75, 100],
-                ticktext=["0", "25", "50", "75", "100"],
-            ),
-            hovertemplate=active["hovertemplate"],
+            colorbar=active_display["colorbar"],
+            hovertemplate=active_display["hovertemplate"],
         ), row=index // ncols + 1, col=index % ncols + 1)
     _apply_axis_sync(
         fig, nrows, ncols, df, uirev="transition_view", rng=rng)
@@ -3615,6 +3708,7 @@ def build_transition_probability_bundle(
         "figure": fig.to_plotly_json(),
         "variants": variants,
         "outcome": selected,
+        "display_metric": selected_metric,
         "split_z": split_value,
         "split_source": split_source,
         "min_trials": min_count,
@@ -7937,14 +8031,37 @@ app.layout = html.Div([
                 value="crossed", className="segmented-control",
                 style={"fontSize": "10px", "marginTop": "3px"},
             ),
+            dcc.RadioItems(
+                id="transition-metric",
+                options=[
+                    {
+                        "label": " Fraction (%)",
+                        "value": "fraction",
+                        "title": (
+                            "Colour each cell by successful trials divided by "
+                            "all unique trials that entered it."
+                        ),
+                    },
+                    {
+                        "label": " Successful trials (n)",
+                        "value": "count",
+                        "title": (
+                            "Colour each cell by the absolute number of "
+                            "entering trials that crossed or ended opposite."
+                        ),
+                    },
+                ],
+                value="fraction", className="segmented-control",
+                style={"fontSize": "10px", "marginTop": "3px"},
+            ),
             html.Div([
                 html.Div([
                     html.Label(
                         "Horizontal split Z",
                         title=(
-                            "Blank uses the grid edge nearest the modal trial "
-                            "start. A manual line through a cell makes that "
-                            "ambiguous cell row blank."
+                            "Blank uses the modal trial start. An exact value "
+                            "becomes a true grid boundary; all Z-bin edges are "
+                            "that value plus whole grid-size increments."
                         ),
                         style={"fontSize": "10px"},
                     ),
@@ -7971,10 +8088,10 @@ app.layout = html.Div([
                 ], style={"flex": "1"}),
             ], style={"display": "flex", "gap": "6px", "marginTop": "3px"}),
             html.Div(
-                "Each trial counts once per cell. Click a visible cell to show "
-                "the successful paths, split into muted pre-entry and saturated "
-                "future sections. Survival on the same half is 100% minus the "
-                "crossed probability.",
+                "Each trial counts once per cell. Click a visible cell to "
+                "overlay successful paths faintly on that panel; click a blank "
+                "cell to clear them. Survival on the same half is 100% minus "
+                "the crossed probability.",
                 style={"fontSize": "9px", "color": "#888", "marginTop": "2px"},
             ),
 
@@ -8485,24 +8602,6 @@ app.layout = html.Div([
                         config=GRAPH_CONFIG,
                         style={"width": "100%"},
                     ),
-                    html.Div([
-                        html.Div([
-                            html.Strong("Clicked-bin trajectories"),
-                            html.Span(
-                                "Click a coloured cell above. Muted paths precede "
-                                "first entry; saturated paths show the successful "
-                                "future.",
-                                className="loop-observer-note",
-                            ),
-                        ], className="loop-observer-heading"),
-                        dcc.Graph(
-                            id="transition-observer-plot",
-                            figure=_msg_figure(
-                                "Click a transition cell to inspect its trials."),
-                            config=GRAPH_CONFIG,
-                            style={"width": "100%"},
-                        ),
-                    ], className="transition-observer-wrap"),
                 ], id="view-transition", className="plot-section",
                    style={**_PANEL_STYLE}),
 
@@ -9012,11 +9111,12 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
-    function(bundle, outcome, enabled, trajectory, fraction, seed) {
+    function(bundle, outcome, metric, enabled, trajectory, fraction, seed) {
       if (window.TransitionProbabilityObserver) {
         return window.TransitionProbabilityObserver.renderDashboard({
           bundle: bundle || {},
           outcome: outcome || 'crossed',
+          metric: metric || 'fraction',
           enabled: enabled,
           trajectoryFigure: trajectory || {},
           fraction: fraction,
@@ -9029,6 +9129,7 @@ app.clientside_callback(
     Output("transition-status", "children"),
     Input("transition-data-store", "data"),
     Input("transition-outcome", "value"),
+    Input("transition-metric", "value"),
     Input("transition-enabled", "value"),
     Input("trajectory-plot", "figure"),
     Input("traj-trial-fraction", "value"),
@@ -9332,7 +9433,8 @@ _URL_STR = {"groupby": "group-by", "pool": "pool-mode", "color": "color-by",
             "layout": "view-layout", "ractive": "custom-region-active",
             "dist": "distribution-mode", "sunit": "stats-unit",
             "ulabel": "spatial-unit-label",
-            "tmode": "transition-outcome"}
+            "tmode": "transition-outcome",
+            "tmetric": "transition-metric"}
 _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyids",
              "fscn": "filter-scenes", "ffld": "filter-folders", "raw": "raw-columns"}
 
@@ -9402,6 +9504,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("spatial-unit-label", "value", allow_duplicate=True),
     Output("transition-enabled", "value", allow_duplicate=True),
     Output("transition-outcome", "value", allow_duplicate=True),
+    Output("transition-metric", "value", allow_duplicate=True),
     Output("transition-split-z", "value", allow_duplicate=True),
     Output("transition-min-trials", "value", allow_duplicate=True),
     Output("minimal-layout-store", "data", allow_duplicate=True),
@@ -9413,7 +9516,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 67
+    n_out = 68
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -9539,6 +9642,11 @@ def restore_from_url(search, already):
         if p.get("tmode", [""])[0] in TRANSITION_OUTCOMES
         else no_update
     )
+    transition_metric = (
+        p["tmetric"][0]
+        if p.get("tmetric", [""])[0] in TRANSITION_METRICS
+        else no_update
+    )
     minimal_layout = (
         p["minimal"][0] == "1"
     ) if "minimal" in p else no_update
@@ -9643,7 +9751,8 @@ def restore_from_url(search, already):
         custom_region_enabled, custom_regions, s("ractive"),
         distribution_mode, distribution_points, stats_unit,
         positive_num("uscale"), s("ulabel"),
-        transition_enabled, transition_outcome, finite_num("tsplit"),
+        transition_enabled, transition_outcome, transition_metric,
+        finite_num("tsplit"),
         positive_num("trnmin"),
         minimal_layout, True,
     )
@@ -9836,6 +9945,7 @@ def tick_progress(n):
     Input("spatial-unit-label", "value"),
     Input("transition-enabled", "value"),
     Input("transition-outcome", "value"),
+    Input("transition-metric", "value"),
     Input("transition-split-z", "value"),
     Input("transition-min-trials", "value"),
     Input("minimal-layout-store", "data"),
@@ -9853,8 +9963,8 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                custom_region_enabled, custom_regions, custom_region_active,
                distribution_mode, distribution_show_points, stats_unit,
                spatial_unit_scale, spatial_unit_label,
-               transition_enabled, transition_outcome, transition_split_z,
-               transition_min_trials,
+               transition_enabled, transition_outcome, transition_metric,
+               transition_split_z, transition_min_trials,
                minimal_layout, vp, restored):
     if not restored:
         return no_update
@@ -9883,6 +9993,8 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
         strs["ulabel"] = spatial_unit_label
     if transition_outcome in TRANSITION_OUTCOMES:
         strs["tmode"] = transition_outcome
+    if transition_metric in TRANSITION_METRICS:
+        strs["tmetric"] = transition_metric
     for k, v in strs.items():
         if v:
             params[k] = v
@@ -12130,6 +12242,7 @@ app.clientside_callback(
         var container=document.getElementById(graphId);
         var gd=container&&container.querySelector('.js-plotly-plot');
         if (!gd||!window.Plotly||!gd.layout) return;
+        var subtitleMarker='<br><sup><b>';
         var byGroup={};
         (marks||[]).forEach(function(mark){
           byGroup[String(mark.group||'')]=mark;
@@ -12141,15 +12254,15 @@ app.clientside_callback(
           var mark=byGroup[group];
           if(!mark)return;
           if(!gd.__tdStatsTitleBase[group] ||
-             String(ann.text||'').indexOf('<br><sup>Rayleigh ')<0){
+             String(ann.text||'').indexOf(subtitleMarker)<0){
             gd.__tdStatsTitleBase[group]=String(ann.text||'');
           }
           var base=gd.__tdStatsTitleBase[group];
-          var text=prefix==='polar'
-            ? ('Rayleigh '+String(mark.rayleigh_stars||'n/a')+
-               ' · group '+String(mark.letters||''))
-            : ('Rayleigh '+String(mark.rayleigh_stars||'n/a'));
-          ann.text=base+'<br><sup>'+text+'</sup>';
+          var text=String(mark.rayleigh_stars||'n/a');
+          if(prefix==='polar' && mark.letters){
+            text+=' · '+String(mark.letters);
+          }
+          ann.text=base+subtitleMarker+text+'</b></sup>';
           ann.hovertext=group;
           ann.hoverlabel={namelength:-1};
           ann.captureevents=true;
@@ -12197,9 +12310,9 @@ app.clientside_callback(
       },30);
       var elapsed=Number(payload.seconds||0).toFixed(2)+' s';
       return [
-        'Rayleigh + circular pairwise labels ready · '+elapsed,
+        'circular significance labels ready · '+elapsed,
         'non-parametric compact-letter labels ready · '+elapsed,
-        'initial-angle Rayleigh labels ready · '+elapsed
+        'initial-angle significance labels ready · '+elapsed
       ];
     }
     """,
@@ -13023,20 +13136,28 @@ def _export_loop_observer_html(
     return controls + boot
 
 
-def _export_transition_observer_html(bundle, outcome="crossed") -> str:
+def _export_transition_observer_html(
+        bundle, outcome="crossed", display_metric="fraction") -> str:
     """Embed the transition grid and browser-local clicked-bin drill-down."""
     if not isinstance(bundle, dict) or not bundle.get("figure"):
         return "<p>Transition probability was not enabled for this export.</p>"
     selected = outcome if outcome in TRANSITION_OUTCOMES else "crossed"
+    selected_metric = (
+        display_metric
+        if display_metric in TRANSITION_METRICS else "fraction")
     figure = go.Figure(bundle["figure"])
     active = bundle.get("variants", {}).get(selected, {})
+    display = active.get("displays", {}).get(selected_metric, {})
     for index, trace in enumerate(figure.data):
         if str(getattr(trace, "type", "")).lower() != "heatmap":
             continue
-        if index < len(active.get("z", [])):
-            trace.z = active["z"][index]
+        if index < len(display.get("z", [])):
+            trace.z = display["z"][index]
             trace.customdata = active["customdata"][index]
-            trace.hovertemplate = active.get("hovertemplate")
+            trace.zmin = display.get("zmin")
+            trace.zmax = display.get("zmax")
+            trace.colorbar = display.get("colorbar")
+            trace.hovertemplate = display.get("hovertemplate")
     heat_html = figure.to_html(
         full_html=False, include_plotlyjs=False,
         config=dict(scrollZoom=True, displaylogo=False),
@@ -13059,31 +13180,42 @@ def _export_transition_observer_html(bundle, outcome="crossed") -> str:
         <option value="ended">Ended opposite half</option>
       </select>
     </label>
+    <label>Colour
+      <select id="export-transition-metric">
+        <option value="fraction">Fraction (%)</option>
+        <option value="count">Successful trials (n)</option>
+      </select>
+    </label>
     <span id="export-transition-status">{bundle.get("message", "")}</span>
   </div>
   <div class="transition-export-note">Each cell conditions on unique trials
-    that entered it. Click a coloured cell to show successful paths below.</div>
+    that entered it. Click a coloured cell to overlay successful paths; click
+    a blank cell to clear them.</div>
   {heat_html}
-  <div id="export-transition-observer"></div>
 </div>
 <script>{module}</script>
 <script>
-(function (bundle, initialOutcome) {{
+(function (bundle, initialOutcome, initialMetric) {{
   "use strict";
   var selector = document.getElementById("export-transition-outcome");
+  var metricSelector = document.getElementById("export-transition-metric");
   selector.value = initialOutcome;
+  metricSelector.value = initialMetric;
   var controller = window.TransitionProbabilityObserver.attachExport({{
     heatId: "export-transition-plot",
-    observerId: "export-transition-observer",
     sourceId: "export-trajectory-plot",
     statusId: "export-transition-status",
     bundle: bundle,
-    outcome: initialOutcome
+    outcome: initialOutcome,
+    metric: initialMetric
   }});
   selector.addEventListener("change", function () {{
     controller.setOutcome(selector.value);
   }});
-}})({encoded}, {json.dumps(selected)});
+  metricSelector.addEventListener("change", function () {{
+    controller.setMetric(metricSelector.value);
+  }});
+}})({encoded}, {json.dumps(selected)}, {json.dumps(selected_metric)});
 </script>
 """
 
@@ -13095,7 +13227,8 @@ def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
                          loop_rings=None, loop_active=None,
                          loop_match_mode="any", visual_style=None,
                          transition_bundle=None,
-                         transition_outcome="crossed"):
+                         transition_outcome="crossed",
+                         transition_metric="fraction"):
     """Build one offline-capable report with a single embedded plotly.js."""
     cfgd = dict(scrollZoom=True, displaylogo=False)
     traj_h = traj.to_html(
@@ -13106,7 +13239,7 @@ def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
         rings=loop_rings, active=loop_active, match_mode=loop_match_mode,
         visual_style=visual_style)
     transition_h = _export_transition_observer_html(
-        transition_bundle, transition_outcome)
+        transition_bundle, transition_outcome, transition_metric)
     heat_h = heat.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     flow_h = flow.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
     roi_h = roi.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
@@ -13205,6 +13338,7 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
     State("heatmap-crange", "value"),
     State("transition-enabled", "value"),
     State("transition-outcome", "value"),
+    State("transition-metric", "value"),
     State("transition-split-z", "value"),
     State("transition-min-trials", "value"),
     State("filter-configs", "value"),
@@ -13254,8 +13388,9 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
 def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool_mode,
                 color_by, animate, hm_binsize, hm_scale, hm_bound, hm_metric,
                 hm_cmin, hm_cmax, hm_crange,
-                transition_enabled, transition_outcome, transition_split_z,
-                transition_min_trials, cfg, vrs, fids, scenes, folders,
+                transition_enabled, transition_outcome, transition_metric,
+                transition_split_z, transition_min_trials,
+                cfg, vrs, fids, scenes, folders,
                 trial_min, trial_max, step_min, step_max,
                 raw_cols, ncols, max_points, traj_fraction, traj_sample_seed,
                 loop_enabled, loop_x, loop_z, loop_radius,
@@ -13346,6 +13481,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
             split_z=transition_split_z,
             min_trials=transition_min_trials,
             outcome=transition_outcome,
+            display_metric=transition_metric,
         )
         if _on(transition_enabled) else None
     )
@@ -13421,6 +13557,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
         visual_style=_VISUAL_STYLE,
         transition_bundle=transition_bundle,
         transition_outcome=transition_outcome,
+        transition_metric=transition_metric,
     )
 
     ts = time.strftime("%Y%m%d_%H%M%S")

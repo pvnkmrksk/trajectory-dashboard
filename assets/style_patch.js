@@ -13,7 +13,6 @@
     "loop-observer-plot",
     "heatmap-plot",
     "transition-plot",
-    "transition-observer-plot",
     "flow-plot",
     "polar-plot",
     "roi-plot",

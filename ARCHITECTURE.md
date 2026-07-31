@@ -199,15 +199,18 @@ same cache key.
   visits never inflate the denominator. It computes both `crossed` (a later
   sample reaches the opposite horizontal half) and `ended` (the retained final
   sample is in that half) in one pass. Automatic split Z comes from the modal
-  segment-start row and is snapped to a bin edge; a row straddling a manual
-  split is ambiguous and blank. Cells with fewer than the requested unique
-  entering trials are also blank. `update_transition_probability` owns a small
+  segment-start row. `_transition_edges` then rebuilds only the transition
+  Z-lattice as `split + k × bin_size`, making an explicit `0` (or any manual
+  value) an exact row boundary. Cells with fewer than the requested unique
+  entering trials are blank. `update_transition_probability` owns a small
   dedicated cache and is disabled by default; it is triggered only by a
   completed render, enable/split/minimum changes, not by the master renderer.
-  `assets/transition_observer.js` swaps precomputed outcome matrices with
-  `Plotly.restyle`. On click it uses the mounted trajectory source, active panel
-  metadata and segment/rectangle intersection to emit merged WebGL paths:
-  muted before first cell entry and saturated afterward. Thus heatmap
+  `assets/transition_observer.js` swaps precomputed outcome and
+  fraction/success-count matrices with `Plotly.restyle`. On click it uses the
+  mounted trajectory source, active panel metadata and segment/rectangle
+  intersection to add merged WebGL paths directly over the selected heatmap
+  subplot: muted before first cell entry and saturated afterward. A blank-cell
+  click clears the selection. Thus heatmap
   numerator/denominator values are exact for the full filtered frame, while the
   diagnostic path count honestly follows the current displayed-trial sample.
 - **Observation windows**: `_normalise_custom_regions`,
@@ -353,7 +356,8 @@ same cache key.
 - The loop state persists as `loop=`, `lx=`, `lz=`, and `lr=`. The displayed
   whole-trial percentage persists as `tf=`. Ring movement updates these small
   controls/URL state, but the geometry scan and redraw remain browser-local.
-- Transition state persists as `trans=`, `tmode=`, `tsplit=` and `trnmin=`.
+- Transition state persists as `trans=`, `tmode=`, `tmetric=`, `tsplit=` and
+  `trnmin=`.
   The outcome switch and cell selection are browser-local; enabling the panel or
   changing its split/support threshold only refreshes its dedicated bundle.
 - Observation windows persist as `region=`, `regions=` and `ractive=`; clean

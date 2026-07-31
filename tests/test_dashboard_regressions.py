@@ -219,16 +219,33 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(int(result["ended"][1, 1]), 1)
         crossed = app._transition_variant([result], "crossed", min_trials=1)
         ended = app._transition_variant([result], "ended", min_trials=1)
-        self.assertAlmostEqual(crossed["z"][0][1][1], 200 / 3)
-        self.assertAlmostEqual(ended["z"][0][1][1], 100 / 3)
+        self.assertAlmostEqual(
+            crossed["displays"]["fraction"]["z"][0][1][1], 200 / 3)
+        self.assertAlmostEqual(
+            ended["displays"]["fraction"]["z"][0][1][1], 100 / 3)
+        self.assertEqual(
+            crossed["displays"]["count"]["z"][0][1][1], 2)
+        self.assertEqual(
+            ended["displays"]["count"]["z"][0][1][1], 1)
 
-    def test_transition_bundle_has_two_local_variants_and_plain_heatmap_lists(self):
+    def test_transition_bundle_anchors_manual_split_and_has_local_displays(self):
         bundle = app.build_transition_probability_bundle(
             _polar_frame(), group_by="all", pool_mode="pooled", ncols=1,
-            bin_size=1.0, bound_pct=100, split_z=0.5, min_trials=1)
+            bin_size=1.0, bound_pct=100, split_z=0.0, min_trials=1)
         self.assertTrue(bundle["enabled"])
         self.assertEqual(set(bundle["variants"]), {"crossed", "ended"})
-        self.assertEqual(bundle["split_z"], 0.5)
+        self.assertEqual(bundle["split_z"], 0.0)
+        self.assertEqual(bundle["split_source"], "manual grid boundary")
+        yedges = np.asarray(bundle["yedges"])
+        split_index = int(np.flatnonzero(yedges == 0.0)[0])
+        self.assertAlmostEqual(yedges[split_index - 1], -1.0)
+        self.assertAlmostEqual(yedges[split_index + 1], 1.0)
+        self.assertTrue(np.allclose(np.diff(yedges), 1.0))
+        for outcome in ("crossed", "ended"):
+            self.assertEqual(
+                set(bundle["variants"][outcome]["displays"]),
+                {"fraction", "count"},
+            )
         figure = bundle["figure"]
         self.assertIsInstance(figure["data"][0]["z"], list)
         self.assertIsInstance(figure["data"][0]["customdata"], list)
@@ -236,7 +253,7 @@ class DashboardRegressionTests(unittest.TestCase):
             figure["layout"]["meta"]["panel_order_values"], ["All Data"])
         narrower = app.build_transition_probability_bundle(
             _polar_frame(), group_by="all", pool_mode="pooled", ncols=1,
-            bin_size=1.0, bound_pct=80, split_z=0.5, min_trials=1)
+            bin_size=1.0, bound_pct=80, split_z=0.0, min_trials=1)
         self.assertNotEqual(bundle["signature"], narrower["signature"])
 
     def test_local_direction_field_movement_heading_uses_segment_safe_diffs(self):
@@ -580,7 +597,8 @@ class DashboardRegressionTests(unittest.TestCase):
 
         for control in (
                 "transition-enabled", "transition-outcome",
-                "transition-split-z", "transition-min-trials"):
+                "transition-metric", "transition-split-z",
+                "transition-min-trials"):
             self.assertNotIn(control, master_inputs)
             self.assertNotIn(control, auto_inputs)
         self.assertEqual(
@@ -591,6 +609,7 @@ class DashboardRegressionTests(unittest.TestCase):
             },
         )
         self.assertNotIn("transition-outcome", transition_inputs)
+        self.assertNotIn("transition-metric", transition_inputs)
 
     def test_sections_follow_analysis_then_diagnostics_order(self):
         ids = [getattr(node, "id", None) for node in _components(app.app.layout)]
@@ -714,6 +733,7 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("spatial-unit-label").value, "cm")
         self.assertEqual(_component("transition-enabled").value, [])
         self.assertEqual(_component("transition-outcome").value, "crossed")
+        self.assertEqual(_component("transition-metric").value, "fraction")
         self.assertIsNone(_component("transition-split-z").value)
         self.assertEqual(_component("transition-min-trials").value, 3)
         self.assertIsNotNone(_component("disp-range-min"))
@@ -726,8 +746,9 @@ class DashboardRegressionTests(unittest.TestCase):
             "?smin=2&smax=4&hcrange=percentile&frad=0.31"
             "&tf=37&loop=1&lx=-4.5&lz=2&lr=7"
             "&uscale=0.1&ulabel=mm&trans=1&tmode=ended"
-            "&tsplit=-2.5&trnmin=7&view=transition&minimal=1", False)
-        self.assertEqual(len(restored), 68)
+            "&tmetric=count&tsplit=-2.5&trnmin=7"
+            "&view=transition&minimal=1", False)
+        self.assertEqual(len(restored), 69)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
         self.assertEqual(restored[44], 0.31)
@@ -735,9 +756,9 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(restored[60:62], (0.1, "mm"))
         self.assertEqual(restored[41], "transition")
         self.assertEqual(
-            restored[62:66], (["on"], "ended", -2.5, 7))
-        self.assertTrue(restored[66])
-        self.assertEqual(len(app.restore_from_url("", True)), 68)
+            restored[62:67], (["on"], "ended", "count", -2.5, 7))
+        self.assertTrue(restored[67])
+        self.assertEqual(len(app.restore_from_url("", True)), 69)
         legacy_color = app.restore_from_url("?color=one", False)
         self.assertEqual(legacy_color[7], "categorical")
         rings = [
@@ -1062,12 +1083,15 @@ class DashboardRegressionTests(unittest.TestCase):
             fig, fig, fig, fig, fig, fig, fig, fig, fig, fig,
             include_raw=False, summary="test summary", share_state="?mode=speed",
             transition_bundle=transition,
+            transition_metric="count",
         )
         self.assertNotIn('src="https://cdn.plot.ly', document)
         self.assertIn("plotly.js", document)
         self.assertIn("TrajectoryLoopObserver", document)
         self.assertIn("TransitionProbabilityObserver", document)
         self.assertIn('id="export-loop-radius"', document)
+        self.assertIn('id="export-transition-metric"', document)
+        self.assertNotIn('id="export-transition-observer"', document)
         node = shutil.which("node")
         if node:
             loop_scripts = [

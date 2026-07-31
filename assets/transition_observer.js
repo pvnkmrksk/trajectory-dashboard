@@ -1,8 +1,8 @@
 /*
- * Conditional half-transition heatmap + clicked-bin trajectory observer.
+ * Conditional half-transition heatmap + clicked-bin trajectory overlay.
  *
- * The server computes exact unique-trial cell denominators and both outcome
- * variants. Outcome switching and clicked-bin path selection remain entirely
+ * The server computes exact unique-trial denominators and both outcome/display
+ * variants. Outcome/metric switching and clicked-bin overlays remain entirely
  * browser-local, including in the self-contained HTML export.
  */
 (function () {
@@ -21,6 +21,18 @@
       return host;
     }
     return host.querySelector(".js-plotly-plot");
+  }
+
+  function setGraphHeight(state, figure) {
+    var host = document.getElementById(state.heatId);
+    if (!host) return;
+    var height = Number(
+      figure && figure.layout && figure.layout.height
+    );
+    if (!Number.isFinite(height) || height < 240) height = 360;
+    host.style.height = Math.round(height) + "px";
+    var gd = graphDiv(state.heatId);
+    if (gd && gd !== host) gd.style.height = "100%";
   }
 
   function sequence(value) {
@@ -72,49 +84,90 @@
     };
   }
 
-  function variant(bundle, outcome) {
+  function outcomeVariant(bundle, outcome) {
     var variants = (bundle && bundle.variants) || {};
     return variants[outcome] || variants.crossed || variants.ended || null;
   }
 
-  function applyVariantToFigure(figure, selected) {
-    if (!selected) return figure;
-    (figure.data || []).forEach(function (trace, index) {
+  function displayVariant(selected, metric) {
+    var displays = (selected && selected.displays) || {};
+    return displays[metric] || displays.fraction || displays.count || null;
+  }
+
+  function selection(state) {
+    var selected = outcomeVariant(state.bundle, state.outcome);
+    return {
+      outcome: selected,
+      display: displayVariant(selected, state.metric)
+    };
+  }
+
+  function applyVariantToFigure(figure, state) {
+    var selected = selection(state);
+    if (!selected.outcome || !selected.display) return figure;
+    var heatIndex = 0;
+    (figure.data || []).forEach(function (trace) {
       if (String((trace && trace.type) || "").toLowerCase() !== "heatmap") {
         return;
       }
-      trace.z = selected.z[index] || [];
-      trace.customdata = selected.customdata[index] || [];
-      trace.hovertemplate = selected.hovertemplate;
+      trace.z = selected.display.z[heatIndex] || [];
+      trace.customdata = selected.outcome.customdata[heatIndex] || [];
+      trace.zmin = selected.display.zmin;
+      trace.zmax = selected.display.zmax;
+      trace.colorbar = clone(selected.display.colorbar);
+      trace.hovertemplate = selected.display.hovertemplate;
+      heatIndex += 1;
     });
     return figure;
   }
 
   function restyleVariant(state) {
-    var selected = variant(state.bundle, state.outcome);
+    var selected = selection(state);
     var gd = graphDiv(state.heatId);
-    if (!selected || !gd || !window.Plotly) return Promise.resolve();
+    if (!selected.outcome || !selected.display ||
+        !gd || !window.Plotly) return Promise.resolve();
     var indices = [];
     var z = [];
     var customdata = [];
+    var zmin = [];
+    var zmax = [];
+    var colorbar = [];
     var hovertemplate = [];
+    var heatIndex = 0;
     (gd.data || []).forEach(function (trace, index) {
       if (String((trace && trace.type) || "").toLowerCase() !== "heatmap") {
         return;
       }
       indices.push(index);
-      z.push(selected.z[index] || []);
-      customdata.push(selected.customdata[index] || []);
-      hovertemplate.push(selected.hovertemplate);
+      z.push(selected.display.z[heatIndex] || []);
+      customdata.push(selected.outcome.customdata[heatIndex] || []);
+      zmin.push(selected.display.zmin);
+      zmax.push(selected.display.zmax);
+      colorbar.push(clone(selected.display.colorbar));
+      hovertemplate.push(selected.display.hovertemplate);
+      heatIndex += 1;
     });
     if (!indices.length) return Promise.resolve();
     return Promise.resolve(window.Plotly.restyle(gd, {
-      z: z, customdata: customdata, hovertemplate: hovertemplate
+      z: z,
+      customdata: customdata,
+      zmin: zmin,
+      zmax: zmax,
+      colorbar: colorbar,
+      hovertemplate: hovertemplate
     }, indices));
   }
 
+  function traceMeta(trace) {
+    return ((trace || {}).meta || {});
+  }
+
   function traceGroup(trace) {
-    return String((((trace || {}).meta || {}).td_group_value) || "");
+    return String(traceMeta(trace).td_group_value || "");
+  }
+
+  function isOverlayTrace(trace) {
+    return Boolean(traceMeta(trace).td_transition_overlay);
   }
 
   function pointSegmentId(row) {
@@ -158,8 +211,7 @@
       y >= bounds.z0 && y <= bounds.z1;
   }
 
-  // Liang–Barsky line clipping: returns the first point where a segment enters
-  // the clicked rectangle, or null when it misses.
+  // Liang–Barsky line clipping: first entry of a segment into the cell.
   function segmentRectangleEntry(x0, y0, x1, y1, bounds) {
     var dx = x1 - x0;
     var dy = y1 - y0;
@@ -234,12 +286,10 @@
     var yedges = (bundle && bundle.yedges) || [];
     var indices = point.pointNumber || point.pointIndex || [];
     var xIndex = Math.max(0, Math.min(
-      xedges.length - 2,
-      Number(indices[1])
+      xedges.length - 2, Number(indices[1])
     ));
     var yIndex = Math.max(0, Math.min(
-      yedges.length - 2,
-      Number(indices[0])
+      yedges.length - 2, Number(indices[0])
     ));
     if (!Number.isFinite(xIndex) || !Number.isFinite(yIndex) ||
         xedges.length < 2 || yedges.length < 2) {
@@ -251,20 +301,65 @@
     };
   }
 
-  function renderObserver(state, point) {
-    if (!point) return;
+  function withoutSelectionShape(shapes) {
+    return (shapes || []).filter(function (shape) {
+      return String((shape || {}).name || "") !== "transition-selected-bin";
+    });
+  }
+
+  function overlayIndices(gd) {
+    var out = [];
+    (gd && gd.data || []).forEach(function (trace, index) {
+      if (isOverlayTrace(trace)) out.push(index);
+    });
+    return out;
+  }
+
+  function clearOverlay(state, message) {
+    var gd = graphDiv(state.heatId);
+    state.selectedPoint = null;
+    if (!gd || !window.Plotly) {
+      if (message) setStatus(state, message);
+      return Promise.resolve();
+    }
+    var removals = overlayIndices(gd);
+    var deleteJob = removals.length ?
+      window.Plotly.deleteTraces(gd, removals) : Promise.resolve();
+    return Promise.resolve(deleteJob).then(function () {
+      return window.Plotly.relayout(gd, {
+        shapes: withoutSelectionShape(gd.layout && gd.layout.shapes)
+      });
+    }).then(function () {
+      if (message) setStatus(state, message);
+    });
+  }
+
+  function renderOverlay(state, point) {
+    if (!point) return Promise.resolve();
     var bundle = state.bundle || {};
     var bounds = edgeBounds(bundle, point);
     var custom = point.customdata;
     var trace = point.data || point.fullData || {};
     var group = traceGroup(trace);
     var split = Number(bundle.split_z);
-    if (!bounds || !Array.isArray(custom) || !Number.isFinite(split)) return;
+    var exactEntrants = Array.isArray(custom) ? Number(custom[1] || 0) : 0;
+    if (!bounds || !Array.isArray(custom) || !Number.isFinite(split) ||
+        point.z === null || point.z === undefined ||
+        !Number.isFinite(Number(point.z)) ||
+        exactEntrants < Number(bundle.min_trials || 1)) {
+      return clearOverlay(
+        state,
+        "Selection cleared · click a coloured transition cell to overlay paths."
+      );
+    }
     var side = bounds.z1 <= split ? -1 : (bounds.z0 >= split ? 1 : 0);
     if (!side) {
-      setStatus(state, "This cell straddles the split and has no defined side.");
-      return;
+      return clearOverlay(
+        state,
+        "Selection cleared · that cell does not belong to one side of the split."
+      );
     }
+
     var beforeX = [];
     var beforeY = [];
     var futureX = [];
@@ -299,113 +394,79 @@
     var futureColor = style.future_color || "#5e4a82";
     var selectedLine = style.selected_line || "#b87917";
     var selectedFill = style.selected_fill || "rgba(198,151,45,0.12)";
-    var data = [
+    var xaxis = String(trace.xaxis || "x");
+    var yaxis = String(trace.yaxis || "y");
+    var meta = {
+      td_transition_overlay: true,
+      td_group_value: group
+    };
+    var overlay = [
       {
         type: "scattergl", mode: "lines",
-        x: beforeX, y: beforeY,
-        line: {color: beforeColor, width: 1.1},
-        opacity: 0.28, showlegend: false,
-        hoverinfo: "skip", name: "Before cell entry"
+        x: beforeX, y: beforeY, xaxis: xaxis, yaxis: yaxis,
+        line: {color: beforeColor, width: 0.9},
+        opacity: 0.14, showlegend: false,
+        hoverinfo: "skip", name: "Before cell entry", meta: meta
       },
       {
         type: "scattergl", mode: "lines",
-        x: futureX, y: futureY,
-        line: {color: futureColor, width: 1.55},
-        opacity: 0.78, showlegend: false,
-        hoverinfo: "skip", name: "Successful future"
+        x: futureX, y: futureY, xaxis: xaxis, yaxis: yaxis,
+        line: {color: futureColor, width: 1.35},
+        opacity: 0.48, showlegend: false,
+        hoverinfo: "skip", name: "Successful future", meta: meta
       },
       {
         type: "scatter", mode: "markers",
-        x: entryX, y: entryY, customdata: entryIds,
+        x: entryX, y: entryY, xaxis: xaxis, yaxis: yaxis,
+        customdata: entryIds, meta: meta,
         marker: {
-          size: 7, color: "#fff7d1",
-          line: {color: selectedLine, width: 1.4}
+          size: 5, color: "#fff7d1", opacity: 0.72,
+          line: {color: selectedLine, width: 1}
         },
         showlegend: false, name: "First cell entry",
         hovertemplate: "segment=%{customdata}<br>" +
           "first bin entry x=%{x:.2f} z=%{y:.2f}<extra></extra>"
       }
     ];
-    var xRange = point.xaxis && point.xaxis.range ?
-      Array.from(point.xaxis.range) : [
-        Number(bundle.xedges[0]),
-        Number(bundle.xedges[bundle.xedges.length - 1])
-      ];
-    var yRange = point.yaxis && point.yaxis.range ?
-      Array.from(point.yaxis.range) : [
-        Number(bundle.yedges[0]),
-        Number(bundle.yedges[bundle.yedges.length - 1])
-      ];
+    var shape = {
+      name: "transition-selected-bin",
+      type: "rect", xref: xaxis, yref: yaxis,
+      x0: bounds.x0, x1: bounds.x1,
+      y0: bounds.z0, y1: bounds.z1,
+      fillcolor: selectedFill,
+      line: {color: selectedLine, width: 1.7},
+      layer: "above"
+    };
     var exactSuccess = Number(custom[0] || 0);
-    var exactEntrants = Number(custom[1] || 0);
     var probability = exactEntrants ?
       100 * exactSuccess / exactEntrants : 0;
     var definition = state.outcome === "ended" ?
       "ended opposite" : "crossed opposite";
-    var layout = {
-      height: 510,
-      template: "plotly_white",
-      margin: {l: 52, r: 28, t: 58, b: 42},
-      dragmode: "pan",
-      showlegend: false,
-      uirevision: "transition-cell:" + group + ":" +
-        bounds.x0 + ":" + bounds.z0 + ":" + state.outcome,
-      xaxis: {range: xRange, title: "X"},
-      yaxis: {
-        range: yRange, title: "Z",
-        scaleanchor: "x", scaleratio: 1
-      },
-      shapes: [
-        {
-          type: "rect",
-          x0: bounds.x0, x1: bounds.x1,
-          y0: bounds.z0, y1: bounds.z1,
-          fillcolor: selectedFill,
-          line: {color: selectedLine, width: 2},
-          layer: "above"
-        },
-        {
-          type: "line",
-          x0: xRange[0], x1: xRange[1],
-          y0: split, y1: split,
-          line: {
-            color: style.split_line || "rgba(57,45,76,0.82)",
-            width: 1.6, dash: "dash"
-          }
-        }
-      ],
-      annotations: [{
-        x: 0, y: 1.08, xref: "paper", yref: "paper",
-        xanchor: "left", showarrow: false,
-        text: "<b>" + group + "</b> · " +
-          exactSuccess.toLocaleString() + "/" +
-          exactEntrants.toLocaleString() + " trials " + definition +
-          " (" + probability.toFixed(1) + "%)",
-        font: {size: 12, color: "#3f315d"}
-      }],
-      meta: {spatial_axis_count: 1}
-    };
-    var observer = graphDiv(state.observerId);
-    if (!observer || !window.Plotly) return;
-    var config = {
-      scrollZoom: true, displayModeBar: true, displaylogo: false,
-      responsive: true
-    };
-    var promise = state.observerPainted ?
-      window.Plotly.react(observer, data, layout, config) :
-      window.Plotly.newPlot(observer, data, layout, config);
-    Promise.resolve(promise).then(function () {
-      state.observerPainted = true;
-    });
+    var gd = graphDiv(state.heatId);
+    if (!gd || !window.Plotly) return Promise.resolve();
     state.selectedPoint = point;
-    setStatus(
-      state,
-      exactSuccess.toLocaleString() + "/" +
-      exactEntrants.toLocaleString() + " exact entering trials " +
-      definition + " (" + probability.toFixed(1) + "%); " +
-      successful.toLocaleString() +
-      " currently displayed path" + (successful === 1 ? "" : "s") + "."
-    );
+
+    var removals = overlayIndices(gd);
+    var deleteJob = removals.length ?
+      window.Plotly.deleteTraces(gd, removals) : Promise.resolve();
+    return Promise.resolve(deleteJob).then(function () {
+      return window.Plotly.addTraces(gd, overlay);
+    }).then(function () {
+      return window.Plotly.relayout(gd, {
+        shapes: withoutSelectionShape(gd.layout && gd.layout.shapes).concat(
+          [shape])
+      });
+    }).then(function () {
+      setStatus(
+        state,
+        exactSuccess.toLocaleString() + "/" +
+        exactEntrants.toLocaleString() + " exact entering trials " +
+        definition + " (" + probability.toFixed(1) + "%); " +
+        successful.toLocaleString() +
+        " currently displayed path" + (successful === 1 ? "" : "s") +
+        " overlaid."
+      );
+    });
   }
 
   function refreshSelectedPoint(state) {
@@ -417,7 +478,8 @@
     var row = Number(indices[0]);
     var column = Number(indices[1]);
     var trace = (gd.data || [])[curve];
-    if (!trace || !Number.isFinite(row) || !Number.isFinite(column)) {
+    if (!trace || isOverlayTrace(trace) ||
+        !Number.isFinite(row) || !Number.isFinite(column)) {
       return point;
     }
     var custom = sequence(trace.customdata) || [];
@@ -438,7 +500,8 @@
     }
     state.clickHandler = function (event) {
       var point = event && event.points && event.points[0];
-      if (point) renderObserver(state, point);
+      if (!point || isOverlayTrace(point.data || point.fullData)) return;
+      renderOverlay(state, point);
     };
     gd.on("plotly_click", state.clickHandler);
   }
@@ -449,20 +512,25 @@
     var gd = graphDiv(state.heatId);
     if (!gd || !window.Plotly) return;
     if (!enabled || !bundle.enabled || (!bundle.figure && !reuseMounted)) {
+      state.selectedPoint = null;
       var empty = blankFigure(
         bundle.message || "Enable transition probability in the sidebar.");
+      setGraphHeight(state, empty);
       window.Plotly.react(gd, empty.data, empty.layout, {
         displayModeBar: false, responsive: true
       });
       return;
     }
-    var selected = variant(bundle, state.outcome);
-    if (!selected) return;
+    var selected = selection(state);
+    if (!selected.outcome || !selected.display) return;
     var signature = String(bundle.signature || "");
     var structuralChange = !reuseMounted && state.signature !== signature;
+    var priorPoint = structuralChange ? null : state.selectedPoint;
+    if (structuralChange) state.selectedPoint = null;
     var promise;
     if (structuralChange) {
-      var figure = applyVariantToFigure(clone(bundle.figure), selected);
+      var figure = applyVariantToFigure(clone(bundle.figure), state);
+      setGraphHeight(state, figure);
       promise = window.Plotly.newPlot(
         gd, figure.data || [], figure.layout || {}, {
           scrollZoom: true, displayModeBar: true,
@@ -488,8 +556,9 @@
           window.dash_clientside.panel_order.reapply) {
         window.dash_clientside.panel_order.reapply();
       }
-      if (state.selectedPoint) {
-        renderObserver(state, refreshSelectedPoint(state));
+      if (priorPoint) {
+        state.selectedPoint = priorPoint;
+        renderOverlay(state, refreshSelectedPoint(state));
       }
     });
   }
@@ -498,14 +567,13 @@
     var key = "dashboard";
     states[key] = states[key] || {
       heatId: "transition-plot",
-      observerId: "transition-observer-plot",
       sourceId: "trajectory-plot",
       statusId: "transition-status",
       signature: null,
       outcome: "crossed",
+      metric: "fraction",
       enabled: false,
-      selectedPoint: null,
-      observerPainted: false
+      selectedPoint: null
     };
     return states[key];
   }
@@ -516,11 +584,9 @@
       var state = dashboardState();
       state.bundle = options.bundle || {};
       state.outcome = options.outcome === "ended" ? "ended" : "crossed";
+      state.metric = options.metric === "count" ? "count" : "fraction";
       state.enabled = Array.isArray(options.enabled) &&
         options.enabled.indexOf("on") >= 0;
-      state.trajectoryFigure = options.trajectoryFigure || {};
-      state.fraction = options.fraction;
-      state.seed = options.seed;
       mount(state, false);
       return state.bundle.message || (
         state.enabled ? "Calculating transition probability…" :
@@ -532,14 +598,14 @@
       options = options || {};
       var key = "export:" + String(options.heatId || "");
       var state = states[key] || {
-        signature: null, selectedPoint: null, observerPainted: false
+        signature: null, selectedPoint: null
       };
       state.heatId = options.heatId;
-      state.observerId = options.observerId;
       state.sourceId = options.sourceId;
       state.statusId = options.statusId;
       state.bundle = options.bundle || {};
       state.outcome = options.outcome === "ended" ? "ended" : "crossed";
+      state.metric = options.metric === "count" ? "count" : "fraction";
       state.enabled = true;
       state.signature = String(state.bundle.signature || "");
       states[key] = state;
@@ -547,12 +613,11 @@
       return {
         setOutcome: function (outcome) {
           state.outcome = outcome === "ended" ? "ended" : "crossed";
-          state.selectedPoint = null;
           mount(state, true);
-          setStatus(
-            state,
-            state.bundle.message || "Click a transition cell to inspect paths."
-          );
+        },
+        setMetric: function (metric) {
+          state.metric = metric === "count" ? "count" : "fraction";
+          mount(state, true);
         }
       };
     }

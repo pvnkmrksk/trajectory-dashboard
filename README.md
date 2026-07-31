@@ -395,15 +395,16 @@ available spatial fidelity.
 |---|---|---|
 | Enable transition probability | Calculates a separate conditional-probability grid for each active config/scene/VR/fly/folder panel. | Keeps the ordinary occupancy heatmap unchanged and avoids doing the extra trial-level calculation when it is not needed. |
 | Crossed later / Ended opposite | Defines success after a trial first enters a cell: any later sample reaches the opposite half, or the trial's final retained sample lies there. | “Crossed” captures temporary excursions; “Ended” is the stricter destination interpretation. Both reuse the same calculation. |
-| Horizontal split Z | Blank uses the modal segment-start row, snapped to a heatmap edge; an exact number overrides it. | Gives a reproducible two-side definition while making the common arena midline automatic. |
+| Colour | Fraction (%) or Successful trials (n). | Fraction exposes transition propensity; count exposes how much successful-trial support is behind the colour and avoids exaggerating sparse cells. Switching is a browser-local restyle. |
+| Horizontal split Z | Blank uses the modal segment-start row; an exact number overrides it and becomes a true bin boundary, with transition rows placed at whole grid-size increments on either side. | Makes `0` an exact arena-midline boundary instead of merely moving a line across an independently anchored grid. |
 | Minimum entering trials | Blanks cells whose unique-trial denominator is smaller than this value. | Prevents a one-of-one cell from visually looking as reliable as a densely sampled one. |
-| Click a cell | Shows successful currently displayed paths that entered that bin, with past/future split at first entry. | Combines the heatmap overview with curtain-ring-style trajectory diagnosis without a server request. |
+| Click a cell | Overlays successful currently displayed paths faintly on that same subplot, with past/future split at first entry; clicking a blank cell clears them. | Combines the heatmap overview with curtain-ring-style trajectory diagnosis without a server request or a second graph. |
 
 Each `_seg_id` contributes at most once to a cell denominator even when it
-leaves and revisits that cell. A heatmap row crossed by a manually entered split
-is intentionally blank because it does not belong unambiguously to either
-half. The exact transition percentage uses the complete filtered trial frame;
-the clicked path count follows the current browser-side displayed-trial subset.
+leaves and revisits that cell. Because the split is itself an edge, every
+transition row belongs unambiguously to one half. Exact transition percentages
+and successful counts use the complete filtered trial frame; the overlaid path
+count follows the current browser-side displayed-trial subset.
 
 ### ROI / Targets
 

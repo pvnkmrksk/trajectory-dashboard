@@ -576,20 +576,6 @@ body._dash-loading-callback .status-dot {
   background: #fffdf7;
 }
 
-.transition-observer-wrap {
-  margin: 8px;
-  overflow: hidden;
-  border: 1px solid rgba(94, 74, 130, 0.22);
-  border-radius: 7px;
-  background:
-    linear-gradient(180deg, rgba(247, 244, 251, 0.9), #fff 72px);
-}
-
-.transition-observer-wrap .loop-observer-heading {
-  border-bottom-color: rgba(94, 74, 130, 0.16);
-  color: #493b67;
-}
-
 .loop-observer-heading {
   min-height: 38px;
   box-sizing: border-box;
