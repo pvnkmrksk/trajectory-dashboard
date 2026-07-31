@@ -1,4 +1,8 @@
-# Trajectory Dashboard
+# Dari Deepa
+
+*Dari Deepa* is Kannada wordplay for a light or lamp along a path: an
+interactive dashboard for illuminating movement trajectories, their local
+direction, spatial occupancy, target visits, and transitions.
 
 An interactive web dashboard (Dash + Plotly) for exploring VR insect-trajectory
 experiments. Point it at a folder of CSVs — or drag the folder onto the page —
@@ -367,7 +371,14 @@ available spatial fidelity.
 | Add / delete / selected window | Maintains a small named set of rectangular windows. | Makes side-by-side local comparisons easy while keeping deletion explicit. |
 | X/Z min/max | Exact reproducible bounds; dragging/resizing any dashed box updates these fields. | Supports tactile exploration and precise repeated analyses. |
 | Gandiva labels | Reports each window’s sample percentage per current panel. | Provides immediate spatial prevalence without recomputing local vectors. |
-| Observation-window diagnostics | Plots percentage of tracked time, paired per-animal counts of trials entering, local distance, net displacement, tortuosity and velocity with the shared Swarm/Violin control. | Time percentages pool duration denominators correctly, entry pairs share each animal's trial effort, and movement panels use one trial/animal observation as selected. |
+| Observation-window diagnostics | Plots percentage of tracked time, paired per-animal counts of trials entering, local distance, net displacement, tortuosity and velocity with the shared Swarm/Violin control. Geometry and Gandiva percentages follow a drag immediately; polar, metrics and inference update once after 7 seconds without another edit. | Time percentages pool duration denominators correctly without launching the expensive analysis repeatedly while a window is being positioned. |
+| Connect paired regions | Shows or hides the within-subject lines that join adjacent region pairs (1↔2, 3↔4, …), without rebuilding a figure. | Keeps pairing visible when useful and removes the “tower” of lines when it obscures the distributions. |
+
+Observation-window inference is deliberately local: each adjacent region pair is
+compared only within the same active config/scene/VR/fly/folder panel. It does
+not make cross-panel region comparisons. Target diagnostics likewise compare
+the two target sides within a panel; ordinary trial metrics retain their
+cross-panel comparisons.
 
 ### Filters
 
@@ -400,7 +411,7 @@ available spatial fidelity.
 | Enable transition probability | Calculates a separate conditional-probability grid for each active config/scene/VR/fly/folder panel. | Keeps the ordinary occupancy heatmap unchanged and avoids doing the extra trial-level calculation when it is not needed. |
 | Crossed later / Ended opposite | Defines success after a trial first enters a cell: any later sample reaches the opposite half, or the trial's final retained sample lies there. | “Crossed” captures temporary excursions; “Ended” is the stricter destination interpretation. Both reuse the same calculation. |
 | Colour | Fraction (%) or Successful trials (n). | Fraction exposes transition propensity; count exposes how much successful-trial support is behind the colour and avoids exaggerating sparse cells. Switching is a browser-local restyle. |
-| Count colour min / max | Optional exact colour limits for Successful trials (n); blank keeps automatic limits. | Stops a few high-support cells from flattening useful count structure. Limits are applied browser-locally and are preserved in URLs/HTML exports. |
+| Count colour min / max | Optional exact colour limits for Successful trials (n); blank keeps automatic limits. | Stops a few high-support cells from flattening useful count structure. Limits alter only mounted `zmin`/`zmax` in the browser and are preserved in URLs/HTML exports. |
 | Horizontal split Z | Blank uses the modal segment-start row; an exact number overrides it and becomes a true bin boundary, with transition rows placed at whole grid-size increments on either side. | Makes `0` an exact arena-midline boundary instead of merely moving a line across an independently anchored grid. |
 | Minimum entering trials | Blanks cells whose unique-trial denominator is smaller than this value. | Prevents a one-of-one cell from visually looking as reliable as a densely sampled one. |
 | Click a cell | Fades the heatmap and overlays successful currently displayed paths on that same subplot, with past/future split at first entry; clicking a blank cell clears them and restores the heatmap. | Combines the heatmap overview with a focused curtain-ring-style trajectory diagnosis without a server request or a second graph. |
@@ -409,7 +420,11 @@ Each `_seg_id` contributes at most once to a cell denominator even when it
 leaves and revisits that cell. Because the split is itself an edge, every
 transition row belongs unambiguously to one half. Exact transition percentages
 and successful counts use the complete filtered trial frame; the overlaid path
-count follows the current browser-side displayed-trial subset.
+count follows the current browser-side displayed-trial subset. Crossed/ended and
+fraction/count matrices are built together and retained in one bundle, so
+switching among them is local. Gandiva-style top/right marginals show the same
+selected metric: denominator-weighted transition fraction or summed successful
+trials.
 
 ### ROI / Targets
 

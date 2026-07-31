@@ -2259,6 +2259,18 @@ def build_trajectory_figure(df, group_by="config", pool_mode="separate",
             "panel_order_values": [str(name) for name in group_names],
             "panel_order_labels": titles,
             "spatial_axis_count": len(group_names),
+            "trial_subset_signature": "|".join([
+                "trajectory",
+                repr(_frame_cache_token(df)),
+                str(group_by), str(pool_mode), str(color_by),
+                str(bool(animate)), str(max_points),
+                repr(view_range),
+                json.dumps(
+                    _VISUAL_STYLE.get(
+                        "trajectory", _VISUAL_STYLE_DEFAULTS["trajectory"]),
+                    sort_keys=True, separators=(",", ":"),
+                ),
+            ]),
         },
     )
     return fig
@@ -2958,8 +2970,9 @@ def build_custom_region_diagnostics_figure(
     for metric_index, (key, title, _subtitle) in enumerate(specs):
         row, col = metric_index // 3 + 1, metric_index % 3 + 1
         for group_index, panel in enumerate(panels):
-            # Connect the same trial/animal across windows. Entry counts always
-            # use animals, so R/S comparisons share the animal's trial effort.
+            # Connect the same trial/animal only inside explicit adjacent
+            # window pairs (1↔2, 3↔4, ...). Entry counts always use animals,
+            # so each pair shares the animal's trial effort.
             if region_count > 1:
                 paired = {}
                 centres = []
@@ -2977,17 +2990,22 @@ def build_custom_region_diagnostics_figure(
                             region_index] = float(value)
                 pair_x, pair_y = [], []
                 for identity_values in paired.values():
-                    present = [
-                        index for index in range(region_count)
-                        if index in identity_values
-                        and np.isfinite(identity_values[index])
-                    ]
-                    if len(present) < 2:
-                        continue
-                    pair_x.extend([centres[index] for index in present] + [None])
-                    pair_y.extend([
-                        identity_values[index] for index in present
-                    ] + [None])
+                    for left_index in range(0, region_count - 1, 2):
+                        right_index = left_index + 1
+                        if not (
+                                left_index in identity_values
+                                and right_index in identity_values
+                                and np.isfinite(identity_values[left_index])
+                                and np.isfinite(identity_values[right_index])):
+                            continue
+                        pair_x.extend([
+                            centres[left_index], centres[right_index], None,
+                        ])
+                        pair_y.extend([
+                            identity_values[left_index],
+                            identity_values[right_index],
+                            None,
+                        ])
                 if pair_x:
                     fig.add_trace(go.Scatter(
                         x=pair_x, y=pair_y, mode="lines",
@@ -2997,6 +3015,7 @@ def build_custom_region_diagnostics_figure(
                             "td_group_value": str(
                                 panel.get("raw", panel_names[group_index])),
                             "td_region_pairing": True,
+                            "td_pairing": True,
                         },
                     ), row=row, col=col)
             for region_index, region_id in enumerate(region_ids):
@@ -3707,6 +3726,8 @@ def _transition_variant(results, outcome: str, min_trials: int) -> dict:
     """Materialise one selected transition definition from shared counts."""
     outcome = outcome if outcome in TRANSITION_OUTCOMES else "crossed"
     probability_values, count_values, custom_values = [], [], []
+    fraction_x_marginals, fraction_z_marginals = [], []
+    count_x_marginals, count_z_marginals = [], []
     total_entrants = total_successes = informative_cells = 0
     maximum_successes = 0
     for result in results:
@@ -3735,6 +3756,28 @@ def _transition_variant(results, outcome: str, min_trials: int) -> dict:
         probability_values.append(probability.tolist())
         count_values.append(success_count.tolist())
         custom_values.append(custom.tolist())
+        visible_entrants = np.where(informative, entrants, 0)
+        visible_successes = np.where(informative, successes, 0)
+        x_entrants = visible_entrants.sum(axis=0)
+        z_entrants = visible_entrants.sum(axis=1)
+        x_successes = visible_successes.sum(axis=0)
+        z_successes = visible_successes.sum(axis=1)
+        fraction_x_marginals.append(np.divide(
+            100.0 * x_successes,
+            x_entrants,
+            out=np.full(x_entrants.shape, np.nan, dtype=float),
+            where=x_entrants > 0,
+        ).tolist())
+        fraction_z_marginals.append(np.divide(
+            100.0 * z_successes,
+            z_entrants,
+            out=np.full(z_entrants.shape, np.nan, dtype=float),
+            where=z_entrants > 0,
+        ).tolist())
+        count_x_marginals.append(
+            x_successes.astype(float, copy=False).tolist())
+        count_z_marginals.append(
+            z_successes.astype(float, copy=False).tolist())
         total_entrants += int(entrants.sum())
         total_successes += int(successes.sum())
         informative_cells += int(np.count_nonzero(informative))
@@ -3748,6 +3791,8 @@ def _transition_variant(results, outcome: str, min_trials: int) -> dict:
         "displays": {
             "fraction": {
                 "z": probability_values,
+                "x_marginal": fraction_x_marginals,
+                "z_marginal": fraction_z_marginals,
                 "zmin": 0,
                 "zmax": 100,
                 "colorbar": {
@@ -3767,9 +3812,19 @@ def _transition_variant(results, outcome: str, min_trials: int) -> dict:
                     "%{customdata[2]:,.0f} did not transition"
                     f"<br>{TRANSITION_OUTCOMES[outcome]}<extra></extra>"
                 ),
+                "x_marginal_hovertemplate": (
+                    "X=%{x:.2f}<br><b>%{y:.1f}% transitioned</b>"
+                    "<extra>X marginal</extra>"
+                ),
+                "z_marginal_hovertemplate": (
+                    "Z=%{y:.2f}<br><b>%{x:.1f}% transitioned</b>"
+                    "<extra>Z marginal</extra>"
+                ),
             },
             "count": {
                 "z": count_values,
+                "x_marginal": count_x_marginals,
+                "z_marginal": count_z_marginals,
                 "zmin": 0,
                 "zmax": max(1, maximum_successes),
                 "colorbar": {
@@ -3788,12 +3843,95 @@ def _transition_variant(results, outcome: str, min_trials: int) -> dict:
                     "%{customdata[2]:,.0f} did not transition"
                     f"<br>{TRANSITION_OUTCOMES[outcome]}<extra></extra>"
                 ),
+                "x_marginal_hovertemplate": (
+                    "X=%{x:.2f}<br><b>%{y:,.0f} successful trials</b>"
+                    "<extra>X marginal</extra>"
+                ),
+                "z_marginal_hovertemplate": (
+                    "Z=%{y:.2f}<br><b>%{x:,.0f} successful trials</b>"
+                    "<extra>Z marginal</extra>"
+                ),
             },
         },
         "total_entrants": total_entrants,
         "total_successes": total_successes,
         "informative_cells": informative_cells,
     }
+
+
+def _add_transition_marginals(fig, display, group_names, xc, yc,
+                              nrows, ncols):
+    """Attach compact top/right conditional-transition marginals per panel."""
+    total_main_axes = nrows * ncols
+    main_fraction = 0.82
+    gap_fraction = 0.025
+    line_color = _visual(
+        "gandiva", "marginal_line", "rgba(183,126,28,0.92)")
+    fill_color = _visual(
+        "gandiva", "marginal_fill", "rgba(218,164,55,0.20)")
+    for index, raw_name in enumerate(group_names):
+        main_x_ref, main_y_ref = _subplot_axis(index + 1)
+        main_x_key = _layout_axis_key(main_x_ref)
+        main_y_key = _layout_axis_key(main_y_ref)
+        xdomain = list(getattr(fig.layout, main_x_key).domain)
+        ydomain = list(getattr(fig.layout, main_y_key).domain)
+        xspan = xdomain[1] - xdomain[0]
+        yspan = ydomain[1] - ydomain[0]
+        x_main_end = xdomain[0] + main_fraction * xspan
+        y_main_end = ydomain[0] + main_fraction * yspan
+        x_margin_start = xdomain[0] + (main_fraction + gap_fraction) * xspan
+        y_margin_start = ydomain[0] + (main_fraction + gap_fraction) * yspan
+        getattr(fig.layout, main_x_key).domain = [xdomain[0], x_main_end]
+        getattr(fig.layout, main_y_key).domain = [ydomain[0], y_main_end]
+
+        top_number = total_main_axes + index * 2 + 1
+        side_number = top_number + 1
+        top_x_ref, top_y_ref = f"x{top_number}", f"y{top_number}"
+        side_x_ref, side_y_ref = f"x{side_number}", f"y{side_number}"
+        fig.update_layout(**{
+            _layout_axis_key(top_x_ref): dict(
+                domain=[xdomain[0], x_main_end], anchor=top_y_ref,
+                matches=main_x_ref, showticklabels=False, showgrid=False,
+                zeroline=False, ticks="",
+            ),
+            _layout_axis_key(top_y_ref): dict(
+                domain=[y_margin_start, ydomain[1]], anchor=top_x_ref,
+                rangemode="tozero", showticklabels=False, showgrid=False,
+                zeroline=False, fixedrange=True, ticks="",
+            ),
+            _layout_axis_key(side_x_ref): dict(
+                domain=[x_margin_start, xdomain[1]], anchor=side_y_ref,
+                rangemode="tozero", showticklabels=False, showgrid=False,
+                zeroline=False, fixedrange=True, ticks="",
+            ),
+            _layout_axis_key(side_y_ref): dict(
+                domain=[ydomain[0], y_main_end], anchor=side_x_ref,
+                matches=main_y_ref, showticklabels=False, showgrid=False,
+                zeroline=False, ticks="",
+            ),
+        })
+        meta = {
+            "td_group_value": str(raw_name),
+            "td_transition_panel_index": index,
+        }
+        fig.add_trace(go.Scatter(
+            x=xc, y=display["x_marginal"][index],
+            xaxis=top_x_ref, yaxis=top_y_ref,
+            mode="lines", fill="tozeroy", showlegend=False,
+            line=dict(color=line_color, width=1.5), fillcolor=fill_color,
+            name="X transition marginal",
+            meta={**meta, "td_transition_marginal": "x"},
+            hovertemplate=display["x_marginal_hovertemplate"],
+        ))
+        fig.add_trace(go.Scatter(
+            x=display["z_marginal"][index], y=yc,
+            xaxis=side_x_ref, yaxis=side_y_ref,
+            mode="lines", fill="tozerox", showlegend=False,
+            line=dict(color=line_color, width=1.5), fillcolor=fill_color,
+            name="Z transition marginal",
+            meta={**meta, "td_transition_marginal": "z"},
+            hovertemplate=display["z_marginal_hovertemplate"],
+        ))
 
 
 def build_transition_probability_bundle(
@@ -3855,6 +3993,8 @@ def build_transition_probability_bundle(
         ), row=index // ncols + 1, col=index % ncols + 1)
     _apply_axis_sync(
         fig, nrows, ncols, df, uirev="transition_view", rng=rng)
+    _add_transition_marginals(
+        fig, active_display, group_names, xc, yc, nrows, ncols)
     split_line = _visual(
         "transition", "split_line", "rgba(57,45,76,0.82)")
     for index in range(len(group_names)):
@@ -3884,6 +4024,7 @@ def build_transition_probability_bundle(
             "transition_min_trials": min_count,
             "transition_xedges": xedges.tolist(),
             "transition_yedges": yedges.tolist(),
+            "transition_marginals": True,
         },
     )
     message = (
@@ -5249,7 +5390,8 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
     lx, rx, ly, ry, px, py = _paired_arrays(grp, "frac_left", "frac_right")
     fig.add_trace(go.Scatter(x=px.tolist(), y=py.tolist(), mode="lines",
         line=dict(color="rgba(120,120,120,0.35)", width=1),
-        hoverinfo="skip", showlegend=False), row=1, col=1)
+        hoverinfo="skip", showlegend=False,
+        meta={"td_pairing": True}), row=1, col=1)
     left_cd = grp[["animal", "reach_left", "trials"]].to_numpy()
     right_cd = grp[["animal", "reach_right", "trials"]].to_numpy()
     fig.add_trace(go.Scatter(x=lx.tolist(), y=ly.tolist(), mode="markers", name="Left",
@@ -5285,7 +5427,8 @@ def build_roi_swarm_figure(df, rois_by_cfg, reach, table=None):
                 rgrp, "residence_left", "residence_right")
             fig.add_trace(go.Scatter(x=rpx.tolist(), y=rpy.tolist(), mode="lines",
                 line=dict(color="rgba(120,120,120,0.28)", width=1),
-                hoverinfo="skip", showlegend=False), row=2, col=1)
+                hoverinfo="skip", showlegend=False,
+                meta={"td_pairing": True}), row=2, col=1)
             rleft_cd = rgrp[["animal", "trials"]].to_numpy()
             rright_cd = rgrp[["animal", "trials"]].to_numpy()
             fig.add_trace(go.Scatter(x=rlx.tolist(), y=rly.tolist(), mode="markers",
@@ -6270,6 +6413,17 @@ def build_polar_figure(df, group_by="config", pool_mode="separate", ncols=2,
                           "panel_order_labels": [
                               _group_label(group_by, name) for name in names
                           ],
+                          "trial_subset_signature": "|".join([
+                              "polar",
+                              repr(_frame_cache_token(df)),
+                              str(group_by), str(pool_mode), str(color_by),
+                              str(bool(moving_only)), str(walk_thresh),
+                              str(angle_source), repr(_polar_r_range(r_range)),
+                              str(min_point_frac),
+                              str(min_animal_trial_frac),
+                              "animal" if animal_mode else "trial",
+                              str(max_points),
+                          ]),
                       },
                       legend=dict(
                           orientation="h", yanchor="bottom", y=1.02,
@@ -6822,90 +6976,119 @@ def _circular_group_test(ray):
         return np.nan, "constant / insufficient"
 
 
-def _custom_region_stat_labels(payload, stats_unit="trial"):
-    """Pairwise non-parametric labels for all six window diagnostics."""
+def _paired_custom_region_tests(payload, key, stats_unit="trial"):
+    """Paired adjacent-window tests within each active panel only.
+
+    Observation windows are interpreted as explicit pairs (1↔2, 3↔4, ...).
+    The same trial or animal is aligned across the two windows before a
+    Wilcoxon signed-rank test. There are deliberately no cross-panel or
+    cross-pair comparisons here.
+    """
     panels = (payload or {}).get("panels") or []
     regions = (payload or {}).get("regions") or []
-    if not panels or not regions:
+    if not panels or len(regions) < 2:
         return []
+    tests = []
+    for group_index, panel in enumerate(panels):
+        summaries = {
+            str(item.get("id")): item
+            for item in panel.get("regions", [])
+        }
+        for left_index in range(0, len(regions) - 1, 2):
+            right_index = left_index + 1
+            left_region, right_region = regions[left_index], regions[right_index]
+            left_id = str(left_region.get("id"))
+            right_id = str(right_region.get("id"))
+            left_values, left_units, _left_support = (
+                _observation_distribution_values(
+                    summaries.get(left_id, {}), key, stats_unit)
+            )
+            right_values, right_units, _right_support = (
+                _observation_distribution_values(
+                    summaries.get(right_id, {}), key, stats_unit)
+            )
+            left_map = {
+                str(identity): float(value)
+                for identity, value in zip(left_units, left_values)
+                if np.isfinite(value)
+            }
+            right_map = {
+                str(identity): float(value)
+                for identity, value in zip(right_units, right_values)
+                if np.isfinite(value)
+            }
+            common = [
+                identity for identity in left_map if identity in right_map
+            ]
+            left = np.asarray(
+                [left_map[identity] for identity in common], dtype=float)
+            right = np.asarray(
+                [right_map[identity] for identity in common], dtype=float)
+            if len(common) < 2:
+                p_value = np.nan
+            else:
+                try:
+                    p_value = (
+                        1.0 if np.allclose(left, right, equal_nan=True)
+                        else float(scipy_stats.wilcoxon(
+                            left, right, alternative="two-sided").pvalue)
+                    )
+                except ValueError:
+                    p_value = np.nan
+            raw_group = str(
+                panel.get("raw", panel.get("name", "Group")))
+            tests.append({
+                "group": raw_group,
+                "group_label": str(
+                    panel.get("name", panel.get("raw", "Group"))),
+                "group_index": group_index,
+                "left": left_id,
+                "right": right_id,
+                "left_name": str(left_region.get("name", left_id)),
+                "right_name": str(right_region.get("name", right_id)),
+                "left_index": left_index,
+                "right_index": right_index,
+                "raw_p": p_value,
+                "n": int(len(common)),
+            })
+    adjusted = _holm_adjust([item["raw_p"] for item in tests])
+    for item, q_value in zip(tests, adjusted):
+        item["holm_p"] = float(q_value) if np.isfinite(q_value) else None
+        item["stars"] = _p_stars(q_value)
+    return tests
+
+
+def _custom_region_stat_labels(payload, stats_unit="trial"):
+    """Within-panel paired-window labels for all six diagnostics."""
     keys = (
         "time_percent", "trial_count", "distance_walked", "displacement",
         "median_local_tortuosity", "median_velocity",
     )
-    region_ids = [str(region.get("id")) for region in regions]
-    region_names = {
-        str(region.get("id")): str(region.get("name")) for region in regions
-    }
     output = []
     for key in keys:
-        raw = []
-
-        def add_pairs(named, prefix):
-            for left_index in range(len(named)):
-                for right_index in range(left_index + 1, len(named)):
-                    left_name, left = named[left_index]
-                    right_name, right = named[right_index]
-                    if not len(left) or not len(right):
-                        continue
-                    try:
-                        p_value = float(scipy_stats.mannwhitneyu(
-                            left, right, alternative="two-sided").pvalue)
-                    except ValueError:
-                        p_value = np.nan
-                    raw.append({
-                        "left": f"{prefix}{left_name}",
-                        "right": f"{prefix}{right_name}",
-                        "raw_p": p_value,
-                    })
-
-        # Compare active panel groups separately within each window.
-        for region_id in region_ids:
-            named = []
-            for panel in panels:
-                summary = next((
-                    item for item in panel.get("regions", [])
-                    if str(item.get("id")) == region_id
-                ), {})
-                values, _identities, _support = (
-                    _observation_distribution_values(
-                        summary, key, stats_unit)
-                )
-                named.append((
-                    str(panel.get("name", panel.get("raw", "Group"))),
-                    values,
-                ))
-            add_pairs(named, f"{region_names[region_id]}: ")
-
-        # With multiple windows, also compare windows within each panel group.
-        if len(region_ids) > 1:
-            for panel in panels:
-                summaries = {
-                    str(item.get("id")): item
-                    for item in panel.get("regions", [])
-                }
-                named = []
-                for region_id in region_ids:
-                    values, _identities, _support = (
-                        _observation_distribution_values(
-                            summaries.get(region_id, {}), key, stats_unit)
-                    )
-                    named.append((region_names[region_id], values))
-                add_pairs(
-                    named,
-                    f"{panel.get('name', panel.get('raw', 'Group'))}: ",
-                )
-
-        adjusted = _holm_adjust([item["raw_p"] for item in raw])
-        for item, q_value in zip(raw, adjusted):
-            item["holm_p"] = (
-                float(q_value) if np.isfinite(q_value) else None)
-            item["stars"] = _p_stars(q_value)
-        output.append(_pairwise_label(raw))
+        tests = _paired_custom_region_tests(payload, key, stats_unit)
+        if not tests:
+            output.append("paired windows n/a")
+            continue
+        significant = [
+            item for item in tests
+            if item["holm_p"] is not None and item["holm_p"] < 0.05
+        ]
+        if not significant:
+            output.append("paired windows · no Holm q<.05")
+            continue
+        output.append(
+            "paired windows · " + " · ".join(
+                f"{item['group_label']}: "
+                f"{item['left_name']}↔{item['right_name']} {item['stars']}"
+                for item in significant[:6]
+            )
+        )
     return output
 
 
 def _custom_region_stat_marks(payload, stats_unit="trial"):
-    """Compact-letter marks above every grouped observation distribution."""
+    """Local letters above paired windows; never compare across panels."""
     panels = (payload or {}).get("panels") or []
     regions = (payload or {}).get("regions") or []
     if not panels or not regions:
@@ -6935,7 +7118,6 @@ def _custom_region_stat_marks(payload, stats_unit="trial"):
                 region_name = str(region.get("name", region_id))
                 category = f"{raw_group}\x1f{region_id}"
                 prepared.append({
-                    "category": category,
                     "group": raw_group,
                     "group_index": group_index,
                     "region": region_id,
@@ -6943,46 +7125,20 @@ def _custom_region_stat_marks(payload, stats_unit="trial"):
                     "region_index": region_index,
                     "values": values,
                 })
-        raw_pairs = []
-        for left_index in range(len(prepared)):
-            for right_index in range(left_index + 1, len(prepared)):
-                left = prepared[left_index]
-                right = prepared[right_index]
-                if not len(left["values"]) or not len(right["values"]):
-                    continue
-                try:
-                    p_value = float(scipy_stats.mannwhitneyu(
-                        left["values"], right["values"],
-                        alternative="two-sided",
-                    ).pvalue)
-                except ValueError:
-                    p_value = np.nan
-                raw_pairs.append({
-                    "left": left["category"],
-                    "right": right["category"],
-                    "raw_p": p_value,
-                    "n_left": int(len(left["values"])),
-                    "n_right": int(len(right["values"])),
-                })
-        adjusted = _holm_adjust([item["raw_p"] for item in raw_pairs])
-        for pair, q_value in zip(raw_pairs, adjusted):
-            pair["holm_p"] = (
-                float(q_value) if np.isfinite(q_value) else None)
-            pair["stars"] = _p_stars(q_value)
-        categories = [item["category"] for item in prepared]
-        letters = _compact_letter_display(categories, raw_pairs)
+        tests = _paired_custom_region_tests(payload, key, stats_unit)
+        test_by_mark = {}
+        for test in tests:
+            test_by_mark[(test["group"], test["left"])] = (test, "left")
+            test_by_mark[(test["group"], test["right"])] = (test, "right")
         marks = []
         for item in prepared:
             if not len(item["values"]):
                 continue
-            relevant = [
-                pair for pair in raw_pairs
-                if item["category"] in (pair["left"], pair["right"])
-            ]
-            significant = sum(
-                pair.get("holm_p") is not None
-                and pair["holm_p"] < 0.05
-                for pair in relevant
+            paired = test_by_mark.get((item["group"], item["region"]))
+            test, side = paired if paired else (None, None)
+            significant = bool(
+                test and test.get("holm_p") is not None
+                and test["holm_p"] < 0.05
             )
             marks.append({
                 "metric_index": metric_index,
@@ -6991,9 +7147,21 @@ def _custom_region_stat_marks(payload, stats_unit="trial"):
                 "region": item["region"],
                 "region_name": item["region_name"],
                 "region_index": item["region_index"],
-                "letters": letters.get(item["category"], ""),
+                "letters": (
+                    "A" if not significant or side == "left" else "B"
+                ),
                 "n": int(len(item["values"])),
                 "significant_pairs": int(significant),
+                "hover": (
+                    (
+                        f"{test['left_name']} versus {test['right_name']}"
+                        f"<br>paired Wilcoxon · Holm q="
+                        f"{test['holm_p']:.3g} {test['stars']}"
+                        f"<br>matched n={test['n']:,}"
+                    )
+                    if test and test.get("holm_p") is not None else
+                    "paired comparison unavailable"
+                ),
             })
         output.append(marks)
     return output
@@ -7202,7 +7370,7 @@ app = Dash(
     update_title="Working…",
     on_error=_dash_error_handler,
 )
-app.title = "Trajectory Dashboard"
+app.title = "Dari Deepa"
 
 _load_config_lut()      # restore any saved / hand-edited config names
 
@@ -7722,7 +7890,12 @@ app.layout = html.Div([
 
     # Header
     html.Div([
-        html.H3("Trajectory Dashboard",
+        html.H3(
+                "Dari Deepa",
+                title=(
+                    "Kannada: a lamp for the path — illuminating trajectories "
+                    "so their routes and transitions can be understood."
+                ),
                 style={"margin": "0", "fontSize": "17px", "whiteSpace": "nowrap"}),
         # Compact live status belongs beside the title, where it remains visible
         # regardless of sidebar/main scroll position. Hover exposes stage timing.
@@ -7974,6 +8147,18 @@ app.layout = html.Div([
                 ],
                 value="trial", inline=True, className="segmented-control",
                 style={"fontSize": "10px"},
+            ),
+            dcc.Checklist(
+                id="observation-paired-lines",
+                options=[{
+                    "label": " Connect matching units across paired regions",
+                    "value": "on",
+                    "title": (
+                        "Show a line between the same trial or animal in the "
+                        "two compared observation windows or target sides."
+                    ),
+                }],
+                value=["on"], style={"fontSize": "10px", "marginTop": "2px"},
             ),
 
             html.Hr(style={"margin": "6px 0"}),
@@ -9100,6 +9285,8 @@ app.layout = html.Div([
         }],
     ),
     dcc.Store(id="custom-region-stats-store", data={}),
+    dcc.Store(id="custom-region-analysis-request", data={}),
+    dcc.Store(id="custom-region-debounce-state", data={}),
     dcc.Store(id="minimal-layout-store", data=False),
     dcc.Store(id="trial-subset-state", data={}),
     dcc.Store(id="sidebar-collapsed-store", data=False),
@@ -9116,8 +9303,6 @@ app.layout = html.Div([
     dcc.Interval(id="auto-replot-interval", interval=PLOT_DEBOUNCE_MS,
                  max_intervals=-1, disabled=True),
     dcc.Interval(id="stats-delay-interval", interval=650,
-                 max_intervals=1, disabled=True),
-    dcc.Interval(id="custom-region-analysis-interval", interval=4500,
                  max_intervals=1, disabled=True),
 ], className="td-app",
    style={"fontFamily": "system-ui, -apple-system, sans-serif", "margin": "0"})
@@ -9296,14 +9481,77 @@ app.clientside_callback(
 app.clientside_callback(
     """
     function(enabled, regions) {
-      return [false, 0];
+      var active = Array.isArray(enabled) && enabled.indexOf('on') >= 0;
+      if (window.__tdRegionAnalysisTimer) {
+        window.clearTimeout(window.__tdRegionAnalysisTimer);
+        window.__tdRegionAnalysisTimer = null;
+      }
+      var signature = JSON.stringify(regions || []);
+      if (!active) {
+        window.setTimeout(function() {
+          if (window.dash_clientside && window.dash_clientside.set_props) {
+            window.dash_clientside.set_props(
+              'custom-region-analysis-request',
+              {data:{
+                signature:signature,
+                requested:Date.now(),
+                reason:'disabled'
+              }}
+            );
+          }
+        }, 0);
+        return {pending:false, signature:signature, updated:Date.now()};
+      }
+      window.__tdRegionAnalysisTimer = window.setTimeout(function() {
+        window.__tdRegionAnalysisTimer = null;
+        if (window.dash_clientside && window.dash_clientside.set_props) {
+          window.dash_clientside.set_props(
+            'custom-region-analysis-request',
+            {data:{
+              signature:signature,
+              requested:Date.now(),
+              reason:'geometry-idle'
+            }}
+          );
+        }
+      }, 7000);
+      return {
+        pending:true, signature:signature, requested:Date.now(),
+        delay_ms:7000
+      };
     }
     """,
-    Output("custom-region-analysis-interval", "disabled"),
-    Output("custom-region-analysis-interval", "n_intervals"),
+    Output("custom-region-debounce-state", "data"),
     Input("custom-region-enabled", "value"),
     Input("custom-regions-store", "data"),
     prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(value, regionFigure, targetFigure) {
+      var visible = Array.isArray(value) && value.indexOf('on') >= 0;
+      ['custom-region-diagnostics-plot', 'roi-plot'].forEach(function(id) {
+        var host = document.getElementById(id);
+        var gd = host && host.querySelector('.js-plotly-plot');
+        if (!gd || !window.Plotly) return;
+        var indices = [];
+        (gd.data || []).forEach(function(trace, index) {
+          if (trace && trace.meta && trace.meta.td_pairing) indices.push(index);
+        });
+        if (indices.length) {
+          window.Plotly.restyle(gd, {visible: visible}, indices);
+        }
+      });
+      return visible ? 'paired lines on' : 'paired lines off';
+    }
+    """,
+    Output("anim-dummy", "children", allow_duplicate=True),
+    Input("observation-paired-lines", "value"),
+    Input("custom-region-diagnostics-plot", "figure"),
+    Input("roi-plot", "figure"),
+    prevent_initial_call="initial_duplicate",
 )
 
 
@@ -9376,8 +9624,7 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
-    function(bundle, outcome, metric, countMin, countMax, enabled,
-             trajectory, fraction, seed) {
+    function(bundle, outcome, metric, enabled, countMin, countMax) {
       if (window.TransitionProbabilityObserver) {
         return window.TransitionProbabilityObserver.renderDashboard({
           bundle: bundle || {},
@@ -9385,10 +9632,7 @@ app.clientside_callback(
           metric: metric || 'fraction',
           countMin: countMin,
           countMax: countMax,
-          enabled: enabled,
-          trajectoryFigure: trajectory || {},
-          fraction: fraction,
-          seed: seed
+          enabled: enabled
         });
       }
       return 'Loading transition observer…';
@@ -9398,12 +9642,27 @@ app.clientside_callback(
     Input("transition-data-store", "data"),
     Input("transition-outcome", "value"),
     Input("transition-metric", "value"),
+    Input("transition-enabled", "value"),
+    State("transition-count-min", "value"),
+    State("transition-count-max", "value"),
+)
+
+
+app.clientside_callback(
+    """
+    function(countMin, countMax) {
+      if (window.TransitionProbabilityObserver) {
+        return window.TransitionProbabilityObserver.setDashboardCountRange(
+          countMin, countMax
+        );
+      }
+      return window.dash_clientside.no_update;
+    }
+    """,
+    Output("anim-dummy", "children", allow_duplicate=True),
     Input("transition-count-min", "value"),
     Input("transition-count-max", "value"),
-    Input("transition-enabled", "value"),
-    Input("trajectory-plot", "figure"),
-    Input("traj-trial-fraction", "value"),
-    Input("btn-traj-resample", "n_clicks"),
+    prevent_initial_call=True,
 )
 
 
@@ -9772,6 +10031,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
     Output("distribution-mode", "value", allow_duplicate=True),
     Output("distribution-show-points", "value", allow_duplicate=True),
     Output("stats-unit", "value", allow_duplicate=True),
+    Output("observation-paired-lines", "value", allow_duplicate=True),
     Output("spatial-unit-scale", "value", allow_duplicate=True),
     Output("spatial-unit-label", "value", allow_duplicate=True),
     Output("transition-enabled", "value", allow_duplicate=True),
@@ -9790,7 +10050,7 @@ _URL_LIST = {"fcfg": "filter-configs", "fvr": "filter-vrs", "ffly": "filter-flyi
 def restore_from_url(search, already):
     # All outputs except the final url-restored flag. The guarded early-return
     # appends that flag below, so this count must remain one below total arity.
-    n_out = 70
+    n_out = 71
     # Restore exactly once (the first time the URL is seen). Later URL writes
     # come from update_url echoing current state — ignore them to avoid a loop.
     if already:
@@ -9908,6 +10168,9 @@ def restore_from_url(search, already):
         if p.get("sunit", [""])[0] in ("trial", "animal")
         else no_update
     )
+    paired_lines = (
+        ["on"] if p["pairs"][0] == "1" else []
+    ) if "pairs" in p else no_update
     transition_enabled = (
         ["on"] if p["trans"][0] == "1" else []
     ) if "trans" in p else no_update
@@ -10023,7 +10286,7 @@ def restore_from_url(search, already):
         display_percent(), loop_enabled, finite_num("lx"), finite_num("lz"),
         positive_num("lr"), rings, active_ring, match_mode,
         custom_region_enabled, custom_regions, s("ractive"),
-        distribution_mode, distribution_points, stats_unit,
+        distribution_mode, distribution_points, stats_unit, paired_lines,
         positive_num("uscale"), s("ulabel"),
         transition_enabled, transition_outcome, transition_metric,
         finite_num("tcmin"), finite_num("tcmax"),
@@ -10216,6 +10479,7 @@ def tick_progress(n):
     Input("distribution-mode", "value"),
     Input("distribution-show-points", "value"),
     Input("stats-unit", "value"),
+    Input("observation-paired-lines", "value"),
     Input("spatial-unit-scale", "value"),
     Input("spatial-unit-label", "value"),
     Input("transition-enabled", "value"),
@@ -10239,6 +10503,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
                loop_rings, loop_active, loop_match_mode,
                custom_region_enabled, custom_regions, custom_region_active,
                distribution_mode, distribution_show_points, stats_unit,
+               observation_paired_lines,
                spatial_unit_scale, spatial_unit_label,
                transition_enabled, transition_outcome, transition_metric,
                transition_count_min, transition_count_max,
@@ -10282,6 +10547,7 @@ def update_url(n, g, vel, disp, trim, jb, gb, pm, color, anim,
     params["region"] = "1" if _on(custom_region_enabled) else "0"
     params["trans"] = "1" if _on(transition_enabled) else "0"
     params["dpts"] = "1" if _on(distribution_show_points) else "0"
+    params["pairs"] = "1" if _on(observation_paired_lines) else "0"
     params["minimal"] = "1" if minimal_layout else "0"
     if loop_rings:
         params["loops"] = json.dumps(
@@ -12209,7 +12475,7 @@ def update_colour_views(
     Output("custom-region-stats-store", "data", allow_duplicate=True),
     Output("polar-render-state", "data", allow_duplicate=True),
     Output("plot-status", "children", allow_duplicate=True),
-    Input("custom-region-analysis-interval", "n_intervals"),
+    Input("custom-region-analysis-request", "data"),
     Input("distribution-mode", "value"),
     Input("distribution-show-points", "value"),
     Input("stats-unit", "value"),
@@ -12256,7 +12522,7 @@ def update_colour_views(
     prevent_initial_call=True,
 )
 def update_custom_region_analysis(
-        n_intervals, distribution_mode, distribution_show_points, stats_unit,
+        analysis_request, distribution_mode, distribution_show_points, stats_unit,
         spatial_unit_scale, spatial_unit_label,
         render_state, pattern, vel_thresh, min_disp, trim,
         jump_buf, cfg, vrs, fids, scenes, folders, trial_min, trial_max,
@@ -12274,7 +12540,7 @@ def update_custom_region_analysis(
         "distribution-mode", "distribution-show-points", "stats-unit",
         "spatial-unit-scale", "spatial-unit-label",
     }
-    if ((not n_intervals and not payload_unchanged)
+    if ((not analysis_request and not payload_unchanged)
             or not pattern or not render_state):
         return (no_update,) * 6
     started = time.perf_counter()
@@ -13598,7 +13864,7 @@ def _compose_export_html(traj, heat, flow, roi, polar, metrics, vel, disp,
     raw_h = (raw.to_html(full_html=False, include_plotlyjs=False, config=cfgd)
              if include_raw else "<p>No raw trace columns selected.</p>")
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Trajectory Export</title>
+<html><head><meta charset="utf-8"><title>Dari Deepa Export</title>
 <style>body{{font-family:system-ui,sans-serif;margin:18px;color:#222}}
 h2{{margin:0 0 6px}} h3{{margin:18px 0 4px;font-size:14px;color:#555}}
 .info{{background:#e9ecef;padding:8px;border-radius:4px;font-size:13px;margin:6px 0}}
@@ -13637,7 +13903,7 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
 .credit{{font-size:12px;margin-top:22px;color:#667085}}
 .credit a{{color:#2563eb;text-decoration:none;font-weight:650}}</style>
 </head><body>
-<h2>Trajectory Export</h2>
+<h2>Dari Deepa</h2>
 <div class="info">{summary or ''}</div>
 <div class="share">State: <code>{share_state or ''}</code></div>
 <h3>Trajectories</h3>{traj_h}
@@ -13728,6 +13994,7 @@ conic-gradient(from 0deg,#ed5f5f,#eded5f,#5fed5f,#5feded,#5f5fed,#ed5fed,#ed5f5f
     State("stats-unit", "value"),
     State("distribution-mode", "value"),
     State("distribution-show-points", "value"),
+    State("observation-paired-lines", "value"),
     State("spatial-unit-scale", "value"),
     State("spatial-unit-label", "value"),
     State("viewport-store", "data"),
@@ -13751,6 +14018,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
                 polar_moving, polar_walk, polar_angle_source,
                 vel_selection, disp_selection, flow_max_radius,
                 stats_unit, distribution_mode, distribution_show_points,
+                observation_paired_lines,
                 spatial_unit_scale, spatial_unit_label,
                 viewport, summary, url_search):
     if not pattern:
@@ -13859,6 +14127,11 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
     roi_fig = (build_roi_swarm_figure(df_view, rois, reach, table=table)
                if want_rois and table is not None
                else _msg_figure("No target diagnostics are available for this selection."))
+    if not _on(observation_paired_lines):
+        for trace in roi_fig.data:
+            meta = getattr(trace, "meta", None)
+            if isinstance(meta, dict) and meta.get("td_pairing"):
+                trace.visible = False
     metrics_fig = build_trial_metrics_figure(
         _visible_segment_stats(native_stats, df_view),
         group_by=group_by,
@@ -13917,7 +14190,7 @@ def export_html(n, pattern, vel_thresh, min_disp, trim, jump_buf, group_by, pool
     )
 
     ts = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"trajectory_export_{ts}.html"
+    filename = f"dari_deepa_export_{ts}.html"
     LOGGER.info(
         "export.done filename=%s bytes=%d rows=%d seconds=%.3f",
         filename, len(content.encode("utf-8")), len(df_view),
@@ -13985,7 +14258,7 @@ app.clientside_callback(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Trajectory Dashboard",
+        description="Dari Deepa — interactive trajectory analysis",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

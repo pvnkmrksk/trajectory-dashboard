@@ -308,7 +308,7 @@
           (state.regions.length === 1 ? "" : "s") +
           " · drag or resize any dashed box · " +
           samples.toLocaleString() + " window-memberships · analytics refresh " +
-          "4.5 s after editing stops";
+          "7 s after editing stops";
       }
     }
   });

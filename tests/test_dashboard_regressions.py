@@ -295,6 +295,21 @@ class DashboardRegressionTests(unittest.TestCase):
         figure = bundle["figure"]
         self.assertIsInstance(figure["data"][0]["z"], list)
         self.assertIsInstance(figure["data"][0]["customdata"], list)
+        marginal_traces = [
+            trace for trace in figure["data"]
+            if (trace.get("meta") or {}).get("td_transition_marginal")
+        ]
+        self.assertEqual(len(marginal_traces), 2)
+        self.assertEqual(
+            {trace["meta"]["td_transition_marginal"]
+             for trace in marginal_traces},
+            {"x", "z"},
+        )
+        self.assertTrue(figure["layout"]["meta"]["transition_marginals"])
+        for selected_outcome in bundle["variants"].values():
+            for display in selected_outcome["displays"].values():
+                self.assertEqual(len(display["x_marginal"]), 1)
+                self.assertEqual(len(display["z_marginal"]), 1)
         self.assertEqual(
             figure["layout"]["meta"]["panel_order_values"], ["All Data"])
         narrower = app.build_transition_probability_bundle(
@@ -660,6 +675,20 @@ class DashboardRegressionTests(unittest.TestCase):
         update_ids = [item["id"] for item in update_url["inputs"]]
         self.assertEqual(len(update_ids), len(set(update_ids)))
 
+    def test_region_geometry_arms_idle_request_not_analysis_directly(self):
+        region = next(
+            meta for _output, meta in app.app.callback_map.items()
+            if any(
+                item["id"] == "custom-region-analysis-request"
+                for item in meta["inputs"]
+            )
+        )
+        region_inputs = {item["id"] for item in region["inputs"]}
+        self.assertIn("custom-region-analysis-request", region_inputs)
+        self.assertNotIn("custom-regions-store", region_inputs)
+        self.assertNotIn("custom-region-analysis-interval", region_inputs)
+        self.assertIsNotNone(_component("custom-region-debounce-state"))
+
     def test_sections_follow_analysis_then_diagnostics_order(self):
         ids = [getattr(node, "id", None) for node in _components(app.app.layout)]
         self.assertIn("flow-field-legend", ids)
@@ -733,6 +762,101 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertIn("var baseFigures = {}", source)
         self.assertIn("sourceFigure(", source)
         self.assertIn("finiteCoordinateCount", source)
+        self.assertNotIn("finite >= cached.finite", source)
+        self.assertIn("renderVersion", source)
+        self.assertIn("coordinateGroups", source)
+
+    def test_observation_statistics_only_compare_paired_regions_within_panel(self):
+        def summary(values):
+            return {
+                "segment_values": {
+                    "seg_id": ["u1", "u2", "u3"],
+                    "n_points": [10, 10, 10],
+                    "distance_walked": values,
+                    "fly_id": ["f1", "f2", "f3"],
+                    "vr": ["VR1", "VR1", "VR1"],
+                    "source_folder": ["folder"] * 3,
+                },
+            }
+
+        payload = {
+            "regions": [
+                {"id": "r1", "name": "Region 1"},
+                {"id": "r2", "name": "Region 2"},
+            ],
+            "panels": [
+                {
+                    "raw": "a", "name": "Panel A",
+                    "regions": [
+                        {"id": "r1", **summary([1, 2, 3])},
+                        {"id": "r2", **summary([3, 4, 5])},
+                    ],
+                },
+                {
+                    "raw": "b", "name": "Panel B",
+                    "regions": [
+                        {"id": "r1", **summary([10, 11, 12])},
+                        {"id": "r2", **summary([8, 9, 10])},
+                    ],
+                },
+            ],
+        }
+        comparisons = app._paired_custom_region_tests(
+            payload, "distance_walked", "trial")
+        self.assertEqual(len(comparisons), 2)
+        self.assertEqual({item["group"] for item in comparisons}, {"a", "b"})
+        self.assertTrue(all(
+            (item["left"], item["right"]) == ("r1", "r2")
+            for item in comparisons
+        ))
+        self.assertTrue(all(item["n"] == 3 for item in comparisons))
+
+    def test_observation_pairing_lines_never_bridge_separate_region_pairs(self):
+        def summary(values):
+            return {
+                "segment_values": {
+                    "seg_id": ["u1", "u2"],
+                    "n_points": [10, 10],
+                    "distance_walked": values,
+                    "fly_id": ["f1", "f2"],
+                    "vr": ["VR1", "VR1"],
+                    "source_folder": ["folder", "folder"],
+                },
+            }
+
+        regions = [
+            {"id": f"r{index}", "name": f"Region {index}"}
+            for index in range(1, 5)
+        ]
+        payload = {
+            "regions": regions,
+            "panels": [{
+                "raw": "a", "name": "Panel A",
+                "regions": [
+                    {"id": region["id"], **summary([index, index + 1])}
+                    for index, region in enumerate(regions, start=1)
+                ],
+            }],
+        }
+        figure = app.build_custom_region_diagnostics_figure(
+            payload, distribution_mode="swarm")
+        pairing = [
+            trace for trace in figure.data
+            if isinstance(trace.meta, dict) and trace.meta.get("td_pairing")
+        ]
+        self.assertEqual(len(pairing), 1)
+        runs, current = [], []
+        for value in pairing[0].x:
+            if value is None:
+                if current:
+                    runs.append(current)
+                    current = []
+            else:
+                current.append(value)
+        if current:
+            runs.append(current)
+        self.assertEqual(len(runs), 4)
+        self.assertTrue(all(len(run) == 2 for run in runs))
 
     def test_inline_clientside_callbacks_are_valid_javascript(self):
         node = shutil.which("node")
@@ -778,6 +902,7 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(_component("distribution-mode").value, "auto")
         self.assertEqual(_component("distribution-show-points").value, ["on"])
         self.assertEqual(_component("stats-unit").value, "trial")
+        self.assertEqual(_component("observation-paired-lines").value, ["on"])
         self.assertEqual(_component("spatial-unit-scale").value, 1)
         self.assertEqual(_component("spatial-unit-label").value, "cm")
         self.assertEqual(_component("transition-enabled").value, [])
@@ -798,20 +923,20 @@ class DashboardRegressionTests(unittest.TestCase):
             "&tf=37&loop=1&lx=-4.5&lz=2&lr=7"
             "&uscale=0.1&ulabel=mm&trans=1&tmode=ended"
             "&tmetric=count&tcmin=2&tcmax=18&tsplit=-2.5&trnmin=7"
-            "&view=transition&minimal=1", False)
-        self.assertEqual(len(restored), 71)
+            "&view=transition&minimal=1&pairs=0", False)
+        self.assertEqual(len(restored), 72)
         self.assertEqual(restored[24:26], (2, 4))
         self.assertEqual(restored[36], [2.0, 4.0])
         self.assertEqual(restored[44], 0.31)
         self.assertEqual(restored[46:51], (37.0, ["on"], -4.5, 2, 7))
-        self.assertEqual(restored[60:62], (0.1, "mm"))
+        self.assertEqual(restored[60:63], ([], 0.1, "mm"))
         self.assertEqual(restored[41], "transition")
         self.assertEqual(
-            restored[62:69],
+            restored[63:70],
             (["on"], "ended", "count", 2, 18, -2.5, 7),
         )
-        self.assertTrue(restored[69])
-        self.assertEqual(len(app.restore_from_url("", True)), 71)
+        self.assertTrue(restored[70])
+        self.assertEqual(len(app.restore_from_url("", True)), 72)
         legacy_color = app.restore_from_url("?color=one", False)
         self.assertEqual(legacy_color[7], "categorical")
         rings = [

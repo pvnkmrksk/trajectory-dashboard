@@ -124,6 +124,21 @@
     if (!selected.outcome || !selected.display) return figure;
     var heatIndex = 0;
     (figure.data || []).forEach(function (trace) {
+      var meta = traceMeta(trace);
+      var marginal = String(meta.td_transition_marginal || "");
+      var panelIndex = Number(meta.td_transition_panel_index);
+      if (marginal && Number.isFinite(panelIndex)) {
+        if (marginal === "x") {
+          trace.y = selected.display.x_marginal[panelIndex] || [];
+          trace.hovertemplate =
+            selected.display.x_marginal_hovertemplate;
+        } else if (marginal === "z") {
+          trace.x = selected.display.z_marginal[panelIndex] || [];
+          trace.hovertemplate =
+            selected.display.z_marginal_hovertemplate;
+        }
+        return;
+      }
       if (String((trace && trace.type) || "").toLowerCase() !== "heatmap") {
         return;
       }
@@ -151,7 +166,33 @@
     var colorbar = [];
     var hovertemplate = [];
     var heatIndex = 0;
+    var jobs = [];
+    var xMarginalIndices = [];
+    var xMarginalValues = [];
+    var xMarginalHover = [];
+    var zMarginalIndices = [];
+    var zMarginalValues = [];
+    var zMarginalHover = [];
     (gd.data || []).forEach(function (trace, index) {
+      var meta = traceMeta(trace);
+      var marginal = String(meta.td_transition_marginal || "");
+      var panelIndex = Number(meta.td_transition_panel_index);
+      if (marginal && Number.isFinite(panelIndex)) {
+        if (marginal === "x") {
+          xMarginalIndices.push(index);
+          xMarginalValues.push(
+            selected.display.x_marginal[panelIndex] || []);
+          xMarginalHover.push(
+            selected.display.x_marginal_hovertemplate);
+        } else if (marginal === "z") {
+          zMarginalIndices.push(index);
+          zMarginalValues.push(
+            selected.display.z_marginal[panelIndex] || []);
+          zMarginalHover.push(
+            selected.display.z_marginal_hovertemplate);
+        }
+        return;
+      }
       if (String((trace && trace.type) || "").toLowerCase() !== "heatmap") {
         return;
       }
@@ -164,15 +205,49 @@
       hovertemplate.push(selected.display.hovertemplate);
       heatIndex += 1;
     });
+    if (xMarginalIndices.length) {
+      jobs.push(window.Plotly.restyle(gd, {
+        y: xMarginalValues, hovertemplate: xMarginalHover
+      }, xMarginalIndices));
+    }
+    if (zMarginalIndices.length) {
+      jobs.push(window.Plotly.restyle(gd, {
+        x: zMarginalValues, hovertemplate: zMarginalHover
+      }, zMarginalIndices));
+    }
+    if (indices.length) {
+      jobs.push(window.Plotly.restyle(gd, {
+        z: z,
+        customdata: customdata,
+        zmin: zmin,
+        zmax: zmax,
+        colorbar: colorbar,
+        hovertemplate: hovertemplate
+      }, indices));
+    }
+    return Promise.all(jobs);
+  }
+
+  function restyleCountRange(state) {
+    var selected = selection(state);
+    var gd = graphDiv(state.heatId);
+    if (state.metric !== "count" || !selected.display ||
+        !gd || !window.Plotly) return Promise.resolve();
+    var indices = [];
+    var zmin = [];
+    var zmax = [];
+    (gd.data || []).forEach(function (trace, index) {
+      if (String((trace && trace.type) || "").toLowerCase() !== "heatmap") {
+        return;
+      }
+      indices.push(index);
+      zmin.push(selected.display.zmin);
+      zmax.push(selected.display.zmax);
+    });
     if (!indices.length) return Promise.resolve();
-    return Promise.resolve(window.Plotly.restyle(gd, {
-      z: z,
-      customdata: customdata,
-      zmin: zmin,
-      zmax: zmax,
-      colorbar: colorbar,
-      hovertemplate: hovertemplate
-    }, indices));
+    return Promise.resolve(window.Plotly.restyle(
+      gd, {zmin: zmin, zmax: zmax}, indices
+    ));
   }
 
   function traceMeta(trace) {
@@ -544,13 +619,14 @@
     gd.on("plotly_click", state.clickHandler);
   }
 
-  function mount(state, reuseMounted) {
+  function mount(state, reuseMounted, refreshOverlay) {
     var bundle = state.bundle || {};
     var enabled = state.enabled;
     var gd = graphDiv(state.heatId);
     if (!gd || !window.Plotly) return;
     if (!enabled || !bundle.enabled || (!bundle.figure && !reuseMounted)) {
       state.selectedPoint = null;
+      state.signature = null;
       var empty = blankFigure(
         bundle.message || "Enable transition probability in the sidebar.");
       setGraphHeight(state, empty);
@@ -594,9 +670,11 @@
           window.dash_clientside.panel_order.reapply) {
         window.dash_clientside.panel_order.reapply();
       }
-      if (priorPoint) {
+      if (priorPoint && refreshOverlay) {
         state.selectedPoint = priorPoint;
         renderOverlay(state, refreshSelectedPoint(state));
+      } else if (priorPoint) {
+        state.selectedPoint = priorPoint;
       }
     });
   }
@@ -623,6 +701,7 @@
     renderDashboard: function (options) {
       options = options || {};
       var state = dashboardState();
+      var priorOutcome = state.outcome;
       state.bundle = options.bundle || {};
       state.outcome = options.outcome === "ended" ? "ended" : "crossed";
       state.metric = options.metric === "count" ? "count" : "fraction";
@@ -630,11 +709,21 @@
       state.countMax = options.countMax;
       state.enabled = Array.isArray(options.enabled) &&
         options.enabled.indexOf("on") >= 0;
-      mount(state, false);
+      mount(state, false, priorOutcome !== state.outcome);
       return state.bundle.message || (
         state.enabled ? "Calculating transition probability…" :
           "Transition observer off."
       );
+    },
+
+    setDashboardCountRange: function (lower, upper) {
+      var state = dashboardState();
+      state.countMin = lower;
+      state.countMax = upper;
+      restyleCountRange(state);
+      return state.metric === "count" ?
+        "Count colour limits updated locally." :
+        "Count colour limits saved; switch to Successful trials (n) to view.";
     },
 
     attachExport: function (options) {
@@ -654,20 +743,20 @@
       state.enabled = true;
       state.signature = String(state.bundle.signature || "");
       states[key] = state;
-      mount(state, true);
+      mount(state, true, false);
       return {
         setOutcome: function (outcome) {
           state.outcome = outcome === "ended" ? "ended" : "crossed";
-          mount(state, true);
+          mount(state, true, true);
         },
         setMetric: function (metric) {
           state.metric = metric === "count" ? "count" : "fraction";
-          mount(state, true);
+          mount(state, true, false);
         },
         setCountRange: function (lower, upper) {
           state.countMin = lower;
           state.countMax = upper;
-          mount(state, true);
+          restyleCountRange(state);
         }
       };
     }

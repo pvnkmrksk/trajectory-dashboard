@@ -9,6 +9,11 @@
   "use strict";
 
   var baseFigures = {};
+  var filteredTraceCache = new WeakMap();
+  var segmentInventoryCache = new WeakMap();
+  var renderTimer = null;
+  var renderVersion = 0;
+  var applyQueue = Promise.resolve();
 
   function clone(value) {
     if (value === undefined) return undefined;
@@ -63,6 +68,10 @@
   }
 
   function figureSignature(fig) {
+    var meta = (fig && fig.layout && fig.layout.meta) || {};
+    if (meta.trial_subset_signature) {
+      return String(meta.trial_subset_signature);
+    }
     var ids = {};
     var points = 0;
     ((fig && fig.data) || []).forEach(function (trace) {
@@ -73,7 +82,6 @@
         if (id) ids[id] = true;
       });
     });
-    var meta = (fig && fig.layout && fig.layout.meta) || {};
     return [
       ((fig && fig.data) || []).length,
       points,
@@ -99,10 +107,14 @@
 
   function sourceFigure(id, figure) {
     var signature = figureSignature(figure);
-    var finite = finiteCoordinateCount(figure);
     var cached = baseFigures[id];
-    if (!cached || cached.signature !== signature ||
-        finite >= cached.finite) {
+    if (cached && cached.signature === signature) return cached.figure;
+    // A mounted Plotly restyle can flow its masked arrays back through the
+    // Dash figure prop. Never promote that reduced figure to the new source
+    // merely because it has the same structural signature. A real server
+    // render supplies a new explicit signature in layout.meta.
+    if (!cached || cached.signature !== signature) {
+      var finite = finiteCoordinateCount(figure);
       cached = {
         signature: signature,
         finite: finite,
@@ -113,7 +125,9 @@
     return cached.figure;
   }
 
-  function selectedSegments(fig, fraction, seed) {
+  function segmentInventory(fig) {
+    var cached = segmentInventoryCache.get(fig);
+    if (cached) return cached;
     var found = {};
     ((fig && fig.data) || []).forEach(function (trace) {
       (sequence(trace.customdata) || []).forEach(function (row) {
@@ -121,20 +135,39 @@
         if (id) found[id] = true;
       });
     });
-    var ids = Object.keys(found);
+    cached = {found: found, ids: Object.keys(found), rankedBySeed: {}};
+    segmentInventoryCache.set(fig, cached);
+    return cached;
+  }
+
+  function selectedSegments(fig, fraction, seed) {
+    var inventory = segmentInventory(fig);
+    var found = inventory.found;
+    var ids = inventory.ids;
     var pct = Math.max(1, Math.min(100, Number(fraction || 100)));
     if (pct >= 100 || ids.length <= 1) {
-      return {all: true, ids: found, count: ids.length, total: ids.length};
+      return {
+        all: true, ids: found, count: ids.length, total: ids.length,
+        key: "all"
+      };
     }
-    ids.sort(function (left, right) {
-      var difference = hash(String(seed || 0) + "|" + left) -
-        hash(String(seed || 0) + "|" + right);
-      return difference || left.localeCompare(right);
-    });
+    var seedKey = String(seed || 0);
+    var ranked = inventory.rankedBySeed[seedKey];
+    if (!ranked) {
+      ranked = ids.slice().sort(function (left, right) {
+        var difference = hash(seedKey + "|" + left) -
+          hash(seedKey + "|" + right);
+        return difference || left.localeCompare(right);
+      });
+      inventory.rankedBySeed[seedKey] = ranked;
+    }
     var count = Math.max(1, Math.ceil(ids.length * pct / 100));
     var kept = {};
-    ids.slice(0, count).forEach(function (id) { kept[id] = true; });
-    return {all: false, ids: kept, count: count, total: ids.length};
+    ranked.slice(0, count).forEach(function (id) { kept[id] = true; });
+    return {
+      all: false, ids: kept, count: count, total: ids.length,
+      key: seedKey + "|" + String(count) + "|" + String(ids.length)
+    };
   }
 
   function filteredTrace(trace, selected) {
@@ -145,20 +178,25 @@
       return sequence(trace[key]) !== null;
     });
     if (!available.length) return null;
+    var cached = filteredTraceCache.get(trace);
+    if (cached && cached.key === selected.key) return cached.output;
     var output = {};
+    var valuesByKey = {};
     available.forEach(function (key) {
-      output[key] = new Array(sequence(trace[key]).length).fill(null);
+      valuesByKey[key] = sequence(trace[key]);
+      output[key] = new Array(valuesByKey[key].length).fill(null);
     });
     customdata.forEach(function (row, index) {
       var id = segId(row);
       var keep = id && selected.ids[id];
       if (keep) {
         available.forEach(function (key) {
-          var values = sequence(trace[key]);
+          var values = valuesByKey[key];
           if (index < values.length) output[key][index] = values[index];
         });
       }
     });
+    filteredTraceCache.set(trace, {key: selected.key, output: output});
     return output;
   }
 
@@ -229,11 +267,18 @@
   }
 
   function filterFigure(fig, fraction, seed) {
-    var source = clone(sourceFigure("trajectory-plot", fig));
-    var selected = selectedSegments(source, fraction, seed);
-    if (selected.all) return source;
-    source.data = (source.data || []).map(function (trace) {
-      var filtered = filteredTrace(trace, selected);
+    var sourceBase = sourceFigure("trajectory-plot", fig);
+    var selected = selectedSegments(sourceBase, fraction, seed);
+    if (selected.all) return sourceBase;
+    // The observer only reads this figure. Shallow-copy the traces whose
+    // coordinate arrays are replaced instead of cloning the complete payload.
+    var source = Object.assign({}, sourceBase, {
+      data: (sourceBase.data || []).map(function (trace) {
+        return Object.assign({}, trace);
+      })
+    });
+    source.data = (source.data || []).map(function (trace, index) {
+      var filtered = filteredTrace(sourceBase.data[index], selected);
       if (!filtered) return trace;
       Object.keys(filtered).forEach(function (key) {
         trace[key] = filtered[key];
@@ -252,6 +297,7 @@
     var gd = graphDiv(id);
     if (!gd || !window.Plotly || !figure || !figure.data) return;
     var jobs = [];
+    var coordinateGroups = {};
     figure.data.forEach(function (trace, index) {
       if (!trace || !sequence(trace.customdata)) return;
       var filtered = selected.all ? {
@@ -261,9 +307,26 @@
       if (!filtered) return;
       var update = {};
       ["x", "y", "r", "theta"].forEach(function (key) {
-        if (filtered[key]) update[key] = [filtered[key]];
+        if (filtered[key]) update[key] = filtered[key];
       });
-      jobs.push(window.Plotly.restyle(gd, update, [index]));
+      var keys = Object.keys(update).sort();
+      if (!keys.length) return;
+      var signature = keys.join("|");
+      var group = coordinateGroups[signature] || {
+        keys: keys, indices: [], updates: {}
+      };
+      keys.forEach(function (key) {
+        group.updates[key] = group.updates[key] || [];
+        group.updates[key].push(update[key]);
+      });
+      group.indices.push(index);
+      coordinateGroups[signature] = group;
+    });
+    Object.keys(coordinateGroups).forEach(function (signature) {
+      var group = coordinateGroups[signature];
+      jobs.push(window.Plotly.restyle(
+        gd, group.updates, group.indices
+      ));
     });
     if (id === "trajectory-plot") replaceFrames(gd, figure, selected);
     if (id === "polar-plot") {
@@ -306,7 +369,7 @@
         ));
       });
     }
-    Promise.all(jobs);
+    return Promise.all(jobs);
   }
 
   function render(trajectoryFigure, polarFigure, fraction, seed) {
@@ -322,12 +385,22 @@
     ) === "animal";
     var polarSelected = polarAnimalMode ?
       selectedSegments(polarSource, fraction, seed) : selected;
-    window.setTimeout(function () {
-      applyGraph("trajectory-plot", trajectorySource, selected);
-      // Trial-mode polar and trajectory customdata share `_seg_id`. Animal
-      // mode deliberately samples its independent animal vectors instead.
-      applyGraph("polar-plot", polarSource, polarSelected);
-    }, 35);
+    renderVersion += 1;
+    var version = renderVersion;
+    if (renderTimer) window.clearTimeout(renderTimer);
+    renderTimer = window.setTimeout(function () {
+      renderTimer = null;
+      if (version !== renderVersion) return;
+      applyQueue = applyQueue.catch(function () {}).then(function () {
+        if (version !== renderVersion) return null;
+        // Trial-mode polar and trajectory customdata share `_seg_id`. Animal
+        // mode deliberately samples its independent animal vectors instead.
+        return Promise.all([
+          applyGraph("trajectory-plot", trajectorySource, selected),
+          applyGraph("polar-plot", polarSource, polarSelected)
+        ]);
+      });
+    }, 20);
     return {
       selected: selected.count,
       total: selected.total,

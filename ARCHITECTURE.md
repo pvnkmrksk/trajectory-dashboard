@@ -1,4 +1,4 @@
-# Architecture & context — Trajectory Dashboard
+# Architecture & context — Dari Deepa
 
 > One-stop context for a developer or coding agent. The dashboard shell and
 > Plotly figure builders live in `app.py`; reusable Dash-free loading, filtering,
@@ -206,8 +206,11 @@ same cache key.
   dedicated cache and is disabled by default; it is triggered only by a
   completed render, enable/split/minimum changes, not by the master renderer.
   `assets/transition_observer.js` swaps precomputed outcome and
-  fraction/success-count matrices with `Plotly.restyle`. On click it uses the
-  mounted trajectory source, active panel metadata and segment/rectangle
+  fraction/success-count matrices, plus denominator-weighted or summed
+  top/right marginals, with `Plotly.restyle`. Exact successful-count colour
+  bounds restyle only `zmin`/`zmax`; none of these view controls rebuild the
+  transition calculation. On click it uses the mounted trajectory source,
+  active panel metadata and segment/rectangle
   intersection to add merged WebGL paths directly over the selected heatmap
   subplot: muted before first cell entry and saturated afterward. A blank-cell
   click clears the selection. Thus heatmap
@@ -217,11 +220,14 @@ same cache key.
   `_custom_region_subset` and `_custom_region_stats` use vectorised X/Z masks.
   The main renderer applies the union only to polar rows and returns the small
   diagnostics/panel-share payload. Subsequent shape edits call
-  `update_custom_region_analysis`, which rebuilds only polar, window-scoped
-  trial metrics, and the observation-window distributions;
+  `update_custom_region_analysis` only after seven seconds of geometry idle,
+  which rebuilds polar, window-scoped trial metrics, and the observation-window
+  distributions once after placement;
   `assets/region_observer.js` repaints rectangles and Gandiva percentage labels
-  without rebuilding direction vectors. Its subplot list comes from the actual
-  populated panel count, not empty cells in the final grid row.
+  immediately without rebuilding direction vectors. Paired inference is limited
+  to adjacent region pairs inside each active panel, and its pairing-line traces
+  are toggled browser-side. Its subplot list comes from the actual populated
+  panel count, not empty cells in the final grid row.
 - **Colour modes** (`color_by`): `categorical` (default: one muted hue per
   current panel), `none` (neutral translucent gray),
   individual/config/scene/VR/folder/ROI categories, and sequential

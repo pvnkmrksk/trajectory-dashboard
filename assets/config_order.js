@@ -162,8 +162,11 @@
     var raw = titles.map(function (ann) { return String(ann.hovertext); });
     var count = raw.length;
     var isPolar = Boolean(gd.layout && gd.layout.polar);
-    var isFlow = id === "flow-plot";
-    var mainCount = isFlow ?
+    var hasMarginals = id === "flow-plot" || (
+      id === "transition-plot" &&
+      Boolean((gd.layout.meta || {}).transition_marginals)
+    );
+    var mainCount = hasMarginals ?
       Math.max(count, Number((gd.layout.meta || {}).spatial_axis_count || 0)) :
       count;
     var slots = [];
@@ -177,7 +180,7 @@
         slot.polar = clone(polar.domain || {});
         panels[name] = {polar: index + 1};
       } else {
-        axisIndices = isFlow ?
+        axisIndices = hasMarginals ?
           [
             index + 1,
             mainCount + index * 2 + 1,
