@@ -8,6 +8,15 @@
 > `trajectory_dashboard/` as source of truth unless explicitly asked to sync the
 > copy.
 
+> **Browser-native rebuild on `codex/browser-native-dashboard`.**
+> `native_app.py` is a second, Plotly-free application that reuses the package
+> analysis model, sends one typed binary table to a Web Worker, and renders with
+> WebGL2/Canvas. Its design, benchmarks, and honest parity matrix live in
+> [NATIVE_ARCHITECTURE.md](NATIVE_ARCHITECTURE.md); scientific versus legacy-
+> framework requirements live in
+> [NATIVE_REBUILD_REQUIREMENTS.md](NATIVE_REBUILD_REQUIREMENTS.md). The Dash app
+> remains the reference for the compatibility rows in that matrix.
+
 ---
 
 ## 1. What it is

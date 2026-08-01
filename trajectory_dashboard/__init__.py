@@ -30,6 +30,7 @@ from .io import (
     load_dataset,
     load_folder_metadata,
 )
+from .roi import roi_xz, rois_by_config, rois_from_config
 
 __all__ = [
     "FilterResult",
@@ -48,6 +49,9 @@ __all__ = [
     "load_csv_fast",
     "load_dataset",
     "load_folder_metadata",
+    "roi_xz",
+    "rois_by_config",
+    "rois_from_config",
     "smoothed_velocity",
     "subset_frame",
     "velocity_all",

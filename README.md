@@ -4,10 +4,37 @@
 interactive dashboard for illuminating movement trajectories, their local
 direction, spatial occupancy, target visits, and transitions.
 
-An interactive web dashboard (Dash + Plotly) for exploring VR insect-trajectory
-experiments. Point it at a folder of CSVs — or drag the folder onto the page —
-and it pools, filters, animates, and density-maps 2-D trajectories, fast, on
-millions of rows.
+An interactive web dashboard for exploring VR insect-trajectory experiments.
+The new browser-native entry point keeps the proven Python preprocessing but
+renders with purpose-built WebGL2 and Canvas components: no Dash callbacks,
+Plotly figures, or repeated figure JSON are involved after the initial load.
+The original Dash + Plotly application remains available for side-by-side
+parity checks while advanced workflows finish migrating.
+
+## Browser-native dashboard
+
+Run the rebuilt UI locally:
+
+```bash
+uv run python native_app.py --glob "/path/to/Data/**/*_VR*.csv"
+```
+
+Open `http://127.0.0.1:8060/`. You can also start without `--glob` and enter a
+file, folder, or recursive glob in the header.
+
+The browser receives one compact typed-column payload, transfers ownership to a
+Web Worker, and then keeps filtering, grouping, binning, playback, displayed-
+trial sampling, and circular summaries off the main thread. Trajectories use
+one WebGL draw call; occupancy, local direction, polar, ROI, heading-time,
+metrics, and diagnostics use dependency-free Canvas renderers. Pan and zoom are
+shared locally between all spatial views. Raw numeric channels load only when
+requested.
+
+The behavioral contract and the distinction between scientific requirements
+and old framework artifacts are in
+[`NATIVE_REBUILD_REQUIREMENTS.md`](NATIVE_REBUILD_REQUIREMENTS.md).
+Implementation details, measured SubScale timings, and the parity matrix are in
+[`NATIVE_ARCHITECTURE.md`](NATIVE_ARCHITECTURE.md).
 
 > **New here / an AI agent?** Read **[ARCHITECTURE.md](ARCHITECTURE.md)** — it has
 > the data model, file map, callback graph, the non-obvious rendering gotchas,
@@ -50,7 +77,7 @@ uv pip install -r requirements.txt
 
 Known-good local runtime is Python 3.10; `uv python install` fetches it if needed.
 
-Run the dashboard:
+Run the legacy parity dashboard:
 
 ```bash
 uv run python app.py
@@ -504,9 +531,14 @@ alone. Velocity is in **position units/second**, not cm/s (values are large).
 ```
 app.py                         # Dash shell, layout, caches, Plotly figures
 dashboard_callbacks.py         # callback registration and update orchestration
+native_app.py                   # Plotly-free local entry point
+native_dashboard/dataset.py    # bounded loader + typed binary column contract
+native_dashboard/server.py     # small Flask API/static shell
+native_dashboard/static/       # worker, WebGL/Canvas renderers, native UI
 trajectory_dashboard/io.py     # CSV discovery, config/metadata loading
 trajectory_dashboard/filters.py # velocity, segment stats, vectorized filters
 trajectory_dashboard/grouping.py # subset filters and group splitting
+trajectory_dashboard/roi.py    # Dash-free Unity target geometry
 trajectory_dashboard/ui_contract.py # control scopes + adaptive panel sizing
 assets/dropzone.js             # folder drag-and-drop
 assets/dashboard.css           # dashboard chrome and sticky section styling
