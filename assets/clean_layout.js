@@ -16,7 +16,7 @@
   var POLAR_IDS = ["polar-plot", "initial-heading-plot"];
   var CARTESIAN_IDS = [
     "roi-plot", "custom-region-diagnostics-plot", "trial-metrics-plot",
-    "vel-histogram", "disp-histogram", "raw-trace-plot"
+    "heading-time-plot", "vel-histogram", "disp-histogram", "raw-trace-plot"
   ];
   var ALL_IDS = SPATIAL_IDS.concat(POLAR_IDS, CARTESIAN_IDS);
   var enabled = false;

@@ -6,6 +6,7 @@
     'flow field': 'flow',
     targets: 'roi',
     polar: 'polar',
+    'heading time': 'heading',
     diagnostics: 'diag'
   };
 
@@ -16,8 +17,13 @@
     window.requestAnimationFrame(function () {
       var tabs = scroller.querySelector('.view-tabs-wrap');
       var offset = (tabs && tabs.offsetHeight || 0) + 4;
+      var scrollerTop = scroller.getBoundingClientRect().top;
+      var targetTop = target.getBoundingClientRect().top;
       scroller.scrollTo({
-        top: Math.max(0, target.offsetTop - offset),
+        // offsetTop is relative to the nearest positioned ancestor, which is
+        // not main-scroll once plots are mounted.  Convert the live viewport
+        // delta back into the scroller's coordinate space instead.
+        top: Math.max(0, scroller.scrollTop + targetTop - scrollerTop - offset),
         behavior: behavior || 'smooth'
       });
     });

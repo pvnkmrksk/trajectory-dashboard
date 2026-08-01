@@ -64,6 +64,7 @@ class FilterSpec:
     step_range: tuple[float | None, float | None] | None = None
     velocity_range: tuple[float, float] | None = None
     displacement_range: tuple[float, float] | None = None
+    distance_walked_range: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -171,11 +172,18 @@ def filter_frame(
     if stats is not None and len(stats):
         visible_ids = pd.Index(subset["_seg_id"].astype(str).unique())
         subset_stats = stats[stats["seg_id"].astype(str).isin(visible_ids)].copy()
-    has_range = bool(spec.displacement_range or spec.velocity_range)
+    has_range = bool(
+        spec.displacement_range or spec.distance_walked_range
+        or spec.velocity_range)
     if spec.displacement_range:
         subset_stats = subset_stats if subset_stats is not None else compute_segment_stats(subset)
         lo, hi = spec.displacement_range
         subset = filter_by_stat_range(subset, subset_stats, "displacement", lo, hi)
+    if spec.distance_walked_range:
+        subset_stats = subset_stats if subset_stats is not None else compute_segment_stats(subset)
+        lo, hi = spec.distance_walked_range
+        subset = filter_by_stat_range(
+            subset, subset_stats, "distance_walked", lo, hi)
     if spec.velocity_range:
         subset_stats = subset_stats if subset_stats is not None else compute_segment_stats(subset)
         lo, hi = spec.velocity_range

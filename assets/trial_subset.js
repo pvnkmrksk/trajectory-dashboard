@@ -372,12 +372,15 @@
     return Promise.all(jobs);
   }
 
-  function render(trajectoryFigure, polarFigure, fraction, seed) {
+  function render(trajectoryFigure, polarFigure, headingFigure, fraction, seed) {
     var trajectorySource = sourceFigure(
       "trajectory-plot", trajectoryFigure || {data: [], layout: {}}
     );
     var polarSource = sourceFigure(
       "polar-plot", polarFigure || {data: [], layout: {}}
+    );
+    var headingSource = sourceFigure(
+      "heading-time-plot", headingFigure || {data: [], layout: {}}
     );
     var selected = selectedSegments(trajectorySource, fraction, seed);
     var polarAnimalMode = String(
@@ -385,6 +388,9 @@
     ) === "animal";
     var polarSelected = polarAnimalMode ?
       selectedSegments(polarSource, fraction, seed) : selected;
+    var headingTrialMode = String(
+      ((headingSource.layout || {}).meta || {}).heading_time_mode || "trial"
+    ) === "trial";
     renderVersion += 1;
     var version = renderVersion;
     if (renderTimer) window.clearTimeout(renderTimer);
@@ -397,7 +403,9 @@
         // mode deliberately samples its independent animal vectors instead.
         return Promise.all([
           applyGraph("trajectory-plot", trajectorySource, selected),
-          applyGraph("polar-plot", polarSource, polarSelected)
+          applyGraph("polar-plot", polarSource, polarSelected),
+          headingTrialMode ?
+            applyGraph("heading-time-plot", headingSource, selected) : null
         ]);
       });
     }, 20);

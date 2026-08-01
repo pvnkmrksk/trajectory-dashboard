@@ -7,7 +7,8 @@
 
   var GRAPH_IDS = [
     "trajectory-plot", "loop-observer-plot", "heatmap-plot",
-    "transition-plot", "flow-plot", "polar-plot", "initial-heading-plot",
+    "transition-plot", "flow-plot", "polar-plot", "heading-time-plot",
+    "initial-heading-plot",
     "roi-plot", "custom-region-diagnostics-plot", "trial-metrics-plot"
   ];
   var activeOrder = null;
@@ -271,7 +272,6 @@
   }
 
   function publish(list) {
-    if (!window.dash_clientside || !window.dash_clientside.set_props) return;
     var first = list.querySelector('li[data-order-group]');
     if (!first) return;
     var payload = {
@@ -279,8 +279,19 @@
       order: values(list),
       ts: Date.now()
     };
+    // Reorder mounted Plotly domains immediately.  Persist only after the user
+    // has left the order alone: sending the store on every drop used to make
+    // Dash rebuild this very list and race the next drag gesture.
     apply(payload);
-    window.dash_clientside.set_props('panel-order-store', {data: payload});
+    if (list.__orderSaveTimer) window.clearTimeout(list.__orderSaveTimer);
+    list.__orderSaveTimer = window.setTimeout(function () {
+      if (!window.dash_clientside || !window.dash_clientside.set_props) return;
+      list.classList.add('is-saving');
+      window.dash_clientside.set_props('panel-order-store', {data: payload});
+      window.setTimeout(function () {
+        list.classList.remove('is-saving');
+      }, 750);
+    }, 7000);
   }
 
   function after(list, y) {
@@ -306,6 +317,10 @@
       var li = e.target && e.target.closest &&
         e.target.closest('li[data-order-value]');
       if (!li) return;
+      if (list.__orderSaveTimer) {
+        window.clearTimeout(list.__orderSaveTimer);
+        list.__orderSaveTimer = null;
+      }
       li.classList.add('dragging');
       li.style.opacity = '0.45';
       if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';

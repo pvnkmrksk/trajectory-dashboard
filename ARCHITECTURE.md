@@ -1,8 +1,9 @@
 # Architecture & context — Dari Deepa
 
 > One-stop context for a developer or coding agent. The dashboard shell and
-> Plotly figure builders live in `app.py`; reusable Dash-free loading, filtering,
-> and grouping live under `trajectory_dashboard/`. A sibling `Plotting/dashboard.py`
+> Plotly figure builders live in `app.py`; callback registration lives in
+> `dashboard_callbacks.py`; reusable Dash-free loading, filtering, grouping and
+> UI policy live under `trajectory_dashboard/`. A sibling `Plotting/dashboard.py`
 > exists but currently lags this repo; treat this repo's `app.py` plus
 > `trajectory_dashboard/` as source of truth unless explicitly asked to sync the
 > copy.
@@ -70,13 +71,12 @@ Plotly.
 
 | Lines (~) | Section | Key functions |
 |---|---|---|
-| package | **Reusable pipeline** | `trajectory_dashboard.io.load_dataset`, `trajectory_dashboard.filters`, `trajectory_dashboard.grouping.FilterSpec`. |
-| 28-390 | **Config + ROI geometry** | `humanise_config`, ROI extraction, readable config LUT. |
-| 395-670 | **ROI tables/masks + CSV loader bridge** | `roi_reached_table`, `time_to_target_table`, `heading_target_angle_table`, `_roi_masks`, `_roi_apply`, `load_csv_fast`. |
-| 763-947 | **Filtering bridge / stats** | Compatibility wrappers; canonical implementations live in `trajectory_dashboard.filters`. |
-| 948-3410 | **Plotting** | `_prepare_merged_groups`, `build_trajectory_figure`, heatmap builders + variants, explicit-bin histograms, raw trace, ROI panels, circular/polar statistics, and grouped trial metrics. |
-| 3141-3980 | **Dash app, caches + layout** | `app`, data/filter/ROI/polar/transition caches, sidebar controls, and eight continuously mounted scroll sections. |
-| 3981-end | **Callbacks + clientside interaction** | URL/load state, the atomic all-section renderer, viewport sync, LUT, export, playback and guards. |
+| package | **Reusable pipeline + UI contract** | `trajectory_dashboard.io.load_dataset`, `trajectory_dashboard.filters`, `trajectory_dashboard.grouping.FilterSpec`, and the Dash-free control scopes/responsive grid policy in `trajectory_dashboard.ui_contract`. |
+| 75-900 | **Config, data and ROI geometry** | `humanise_config`, ROI extraction/tables/masks, readable config LUT, and loader bridge. |
+| 901-7364 | **Filtering + plotting** | Compatibility wrappers, `_prepare_merged_groups`, trajectory/heatmap/transition/direction builders, explicit-bin histograms, raw trace, ROI panels, circular/polar statistics, and grouped trial metrics. |
+| 7365-7866 | **Dash app, caches + progress** | `app`, data/filter/ROI/polar/transition caches, and unified operation progress. |
+| 7867-9371 | **Layout** | Frequency- and plot-ordered sidebar cards plus eight continuously mounted scroll sections. |
+| `dashboard_callbacks.py` | **Callbacks + clientside interaction** | URL/load state, focused and atomic renderers, viewport sync, LUT, export, playback and guards, registered through `register_callbacks`. |
 
 Assets (Dash auto-serves `/assets`):
 - `assets/dashboard.css` — dashboard chrome, tabs, buttons, drop target, and
@@ -93,6 +93,9 @@ Assets (Dash auto-serves `/assets`):
 - `assets/shared_legend.js` — shares categorical layer visibility between the
   trajectory and polar figures and reports counts for the currently visible
   layers.
+- `assets/status_sync.js` — reconciles the compact header from the mounted load
+  and plot status nodes. This browser-local guard handles duplicate-output
+  completion ordering without another Dash callback or server request.
 - `assets/loop_observer.js` — browser-local circle/polyline intersection and
   first-entry path splitting for the movable curtain-ring trajectory observer.
   The same module is inlined into offline exports.
@@ -164,7 +167,8 @@ same cache key.
   a colour collapse into ONE NaN-separated trace per (subplot, colour) via
   `_prepare_merged_groups` (vectorised). ~100 traces instead of ~4000.
 - **The plot workspace is one mounted document.** Trajectory, heatmap, local
-  direction field, diagnostics, target and polar figures stay in normal layout flow. The top
+  direction field, diagnostics, target, polar and optional heading-time figures
+  stay in normal layout flow. The top
   navigation only scrolls `.td-main`; it never hides graphs or asks the server
   to rebuild a tab. This preserves pan/zoom, hover, legends and WebGL contexts.
 - **Decimation budgets** (`_decimation_budget` / build): static WebGL
@@ -199,9 +203,11 @@ same cache key.
   visits never inflate the denominator. It computes both `crossed` (a later
   sample reaches the opposite horizontal half) and `ended` (the retained final
   sample is in that half) in one pass. Automatic split Z comes from the modal
-  segment-start row. `_transition_edges` then rebuilds only the transition
-  Z-lattice as `split + k × bin_size`, making an explicit `0` (or any manual
-  value) an exact row boundary. Cells with fewer than the requested unique
+  segment-start row. `_heatmap_edges` supplies one zero-centred lattice to
+  occupancy, Gandiva, and transitions: cell centres are integer multiples of
+  the grid size, including `(0, 0)`, while edges sit at half-grid increments.
+  The split line is independent analytical geometry and never shifts the bins.
+  Cells with fewer than the requested unique
   entering trials are blank. `update_transition_probability` owns a small
   dedicated cache and is disabled by default; it is triggered only by a
   completed render, enable/split/minimum changes, not by the master renderer.
@@ -233,8 +239,11 @@ same cache key.
   individual/config/scene/VR/folder/ROI categories, and sequential
   trial/local-time/velocity/tortuosity modes. Tortuosity uses the configurable
   time span in `trajectory.tortuosity_window_seconds`.
-- **Layout**: 2-col grid, `SUBPLOT_PX=480` per subplot → the figure is its
-  natural full height and the panel scrolls (no squishing). Subplot vertical
+- **Layout**: Auto chooses 1 column for one panel, 2 for 2–4, 3 for 5–9, and 4
+  above that; persisted explicit 1–4 column choices remain supported. Per-row
+  height scales from 500 px for one large panel to 300 px for high-cardinality
+  four-column grids, so figures keep a useful natural height without turning a
+  26-fly view into an excessively tall document. Subplot vertical
   spacing is deliberately tight so Plotly drag rectangles are easy to hit. 1:1
   aspect on trajectories via `scaleanchor` (see §7 for why the heatmap can't use
   it). The optional comparison workspace places trajectory and polar sections
@@ -283,6 +292,17 @@ same cache key.
   clientside relayout places compact-letter labels over the mounted Cartesian
   distributions and Rayleigh stars/pairwise letters in padded polar subtitles;
   detailed named comparisons remain in annotation hover text.
+- **Heading over time**: `build_heading_time_figure` reuses the polar angle
+  source, moving gate and whole-trial Rayleigh quality mask. Trial paths are
+  NaN-separated into one `Scattergl` trace per animal/panel. Animal mode bins
+  segment-local elapsed time, circularly averages within trial/bin, then gives
+  every retained trial one equal vote; an optional wrapped ribbon shows the
+  within-animal circular standard deviation. Blank time-window input resolves
+  to about 1% of the longest retained trial, zero means native cadence, and a
+  positive value is an exact number of seconds. Density mode bins the same
+  per-trial circular values into configurable heading sectors and emits one
+  legend-toggleable `Heatmap` layer per animal, normalised by that animal's
+  contributing trials. Heading series reuse trajectory colour and panel rules.
 - **Style JSON**: Advanced exposes `_VISUAL_STYLE_DEFAULTS` with
   `group_labels` first (config, scene, VR, fly, source folder), then core
   trajectory/spatial/ring/region/Gandiva/heatmap sections and finally
@@ -366,6 +386,8 @@ same cache key.
   `trnmin=`.
   The outcome switch and cell selection are browser-local; enabling the panel or
   changing its split/support threshold only refreshes its dedicated bundle.
+- Heading-time state persists as `heading=1|0` and `htmode=trial|animal`; its
+  signed-angle source remains the shared `pang=` setting.
 - Observation windows persist as `region=`, `regions=` and `ractive=`; clean
   presentation state persists as `minimal=`. Distribution mode, violin dots,
   and the trial/animal unit persist as `dist=`, `dpts=`, and `sunit=`.
@@ -378,19 +400,30 @@ same cache key.
   active config/scene/VR/fly/folder grouping as a draggable order list. The
   default preserves loaded/config order; `assets/config_order.js` moves every
   compatible mounted subplot domain and numeric diagnostic category locally.
-- `update_plots` takes one filtered snapshot and returns trajectory, heatmap
-  store/variants, local direction field, target diagnostics, custom-window
-  diagnostics/shares, polar, trial metrics, raw traces, summary and render
-  state atomically. Retired
-  split-view/lazy callbacks are not registered. `update_polar_only` owns
-  direction-source/moving/R/quality changes and all three polar mini-histograms;
-  moving/source changes also refresh the local direction field, while heatmap
-  metric/scale/range changes refresh only that field. It reuses the
-  filtered-frame and Rayleigh caches rather than triggering the master renderer.
+- `update_plots` takes one filtered snapshot and returns the trajectory, optional
+  raw traces, summary, and `view-render-state` first. A chained staged pipeline
+  then builds occupancy → polar → optional heading time / trial metrics →
+  optional Gandiva → optional targets → optional transitions. Each stage reuses
+  `_filtered_df`; no stage
+  reloads or regroups the source. Gandiva, targets, and transitions are disabled
+  by default and still remain late when explicitly enabled. `update_polar_only`
+  owns direction-source/moving/R/quality changes and all three polar
+  mini-histograms. The moving gate also blanks slow trajectory coordinates with
+  NaNs, preserving segment rows and creating line gaps without changing any
+  analytical frame.
+  A core render returns `no_update` for every already-mounted downstream figure;
+  each focused callback replaces its figure only when the new payload is
+  complete, keeping before/after comparisons visible during computation.
   Heatmap-colour distributions are derived
   from the already-computed bin matrices and sent as a small sorted sample;
   value/percentile changes update only `zmin`, `zmax`, and colorbar ticks in
   `assets/heatmap_colors.js`, without a dataframe pass or server render.
+- `update_colour_views` owns colour, render-mode, playback, point-budget and the
+  movement drawing gate. It rebuilds only the trajectory payload; polar has its
+  own cached callback. `update_spatial_grid` owns grid size and bound changes and
+  rebuilds only occupancy. An enabled Gandiva and transition observer subscribe
+  to its completion independently; polar and trial metrics ignore grid-only
+  changes.
 - `_filtered_df` normalizes jump-buffer units for cache keys (`100` ms and old
   `0.1` second URLs share a signature). `_roi_masks` caches reached table,
   entered segment ids, and trim masks for fast ROI toggles.
@@ -426,7 +459,7 @@ same cache key.
   native velocity/displacement and starting-heading diagnostics, and selected
   raw traces.
 - The header `status-dock` mirrors load/filter/render/export state and uses
-  Dash's body loading class for immediate Working/Ready feedback. Its hover text
+  the unified operation-progress store for precise Working/Ready feedback. Its hover text
   exposes the latest stage timings. Python logging records load, cache, polar,
   render and export timings; Dash's `on_error` hook writes uncaught
   callback exceptions with full tracebacks to the server terminal.
@@ -438,10 +471,11 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Control / event | What it may update | What it must not update |
 |---|---|---|
 | Load / dropped folder | Load/cache data, options and metadata; reset range controls on a changed source; render once after that barrier | Stale prior-dataset ranges; URL from pan/zoom |
-| Update all plots (`btn-plot`) | Build every mounted section from one filtered state | Competing per-section builders; direct heatmap `dcc.Graph.figure` |
-| Colour mode | Rebuild only trajectory and polar marks from the cached filtered frame | Heatmap/Gandiva/ROI/diagnostic/metric rebuilds |
-| Plot order | Browser-local Cartesian/polar domain swap; persist rank for the next real render | Figure reconstruction, rebinning or analysis |
-| Heatmap bin/bound or data filter | Debounced all-section update; heatmap store + variants are built exactly | Concurrent heatmap sidebar aggregation |
+| Update all plots (`btn-plot`) | Return trajectory first, then advance the staged cached pipeline | One atomic response that blocks trajectories on advanced plots |
+| Colour, render mode, playback or point budget | Rebuild only trajectory marks; colour also refreshes polar through its focused callback | Heatmap/Gandiva/ROI/diagnostic/metric rebuilds |
+| Plot order | Browser-local Cartesian/polar domain swap; save the rank after 7 seconds idle | Figure reconstruction, rebinning, analysis, or rebuilding the list during drag |
+| Heatmap bin size / bound | Rebuild occupancy and then enabled Gandiva/transition grids from cached rows | Trajectory/polar/ROI/target/distribution rebuilds or the master renderer |
+| Data filter / grouping / ROI analytical mask | Debounced core render followed by the staged pipeline | Competing parallel all-section builders |
 | Heatmap metric/scale/color range mode/value | Clientside heatmap `Plotly.restyle` from current binning variants; rebuild the local direction field from the cached filtered frame so abundance matches | Dataframe refiltering, heatmap rebinning or master-section rebuild |
 | ROI entered/trim | Debounced atomic update of all affected sections | A second ROI/trajectory refresh callback |
 | Displayed-trial fraction / resample | Browser-local `Plotly.restyle` hides complete `_seg_id` paths/rays and updates the visible population ray; analytical spatial/ROI/metric panels retain the complete filtered frame | Server render/reanalysis; row-level random sampling; changes to target/metric denominators |
@@ -450,13 +484,13 @@ Keep this split tight; it is what prevents tiny datasets from feeling glitchy:
 | Transition crossed/ended switch or cell click | Browser-local heatmap restyle or mounted-path intersection/filter | Dataframe filtering, server callback, master render |
 | Observation-window add/delete/select/bounds or box drag | Rebuild polar + custom diagnostics from cached filtered rows; repaint rectangles and Gandiva percentages in the browser | Trajectory, heatmap or Gandiva-vector recomputation; master render |
 | Clean layout | Browser-local CSS class toggle and URL state | Any Plotly call, figure/data rebuild, viewport mutation, or relayout listener |
-| Gandiva maximum radius | Browser-local scaling of existing arrow tips and URL state | Direction recomputation, dataframe filtering or another figure build |
+| Gandiva enable / maximum radius | Enable performs the late opt-in vector build; radius rescales mounted arrows browser-side | Core render, occupancy, polar, metrics or targets |
 | Trajectory/heatmap pan/zoom | Immediate clientside peer relayout plus debounced `viewport-store` after idle | URL writes, server rebuilds, Dash `relayoutData` callbacks, live-patching hidden graphs |
 | Section navigation | Clientside scroll only, including replay of the active tab | Any server render, graph hide/show or Plotly reinitialisation |
-| ROI reach | Debounced atomic update of geometry-dependent target calculations | Competing overlay/ROI callbacks |
-| Show targets | Browser-local visibility of already-mounted target shapes, spokes, labels, and diagnostics | Filtering, target calculation, or any figure rebuild |
-| Polar direction source/moving controls | Gandiva + cached polar figure and quality histograms; delayed inferential stats follow the visual render | Master trajectory/heatmap/ROI/raw rebuild |
+| ROI reach / calculate targets | Dedicated late target calculation after Gandiva; off is a no-op stage | Core trajectory, occupancy, polar or metric blocking |
+| Polar direction source/moving controls | Cached polar + optional Gandiva; moving-only also redraws trajectories with slow samples blanked | Master filter, heatmap/ROI/raw rebuild |
 | Polar R/quality controls | Cached polar figure + three quality histograms only | Direction field or master trajectory/heatmap/ROI/raw rebuild |
+| Heading-time enable / trace-density / averaging controls | Dedicated cached heading-time callback after polar; prior mounted figure remains until replacement | Core render, occupancy, Gandiva, targets, metrics or raw rebuild |
 
 ---
 

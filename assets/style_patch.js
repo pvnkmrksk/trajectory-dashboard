@@ -15,6 +15,7 @@
     "transition-plot",
     "flow-plot",
     "polar-plot",
+    "heading-time-plot",
     "roi-plot",
     "custom-region-diagnostics-plot",
     "trial-metrics-plot",

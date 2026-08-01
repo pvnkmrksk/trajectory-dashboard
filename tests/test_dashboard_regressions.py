@@ -7,12 +7,14 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode
 
 import numpy as np
 import pandas as pd
 
 import app
+import dashboard_callbacks
 
 
 def _components(node):
@@ -83,6 +85,218 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(app._render_mode(None), "speed")
         self.assertEqual(app._render_mode("speed"), "speed")
         self.assertEqual(app._render_mode("accuracy"), "accuracy")
+
+    def test_expensive_optional_sections_are_off_by_default(self):
+        self.assertEqual(_component("gandiva-enabled").value, [])
+        self.assertEqual(_component("transition-enabled").value, [])
+        self.assertEqual(_component("roi-show").value, [])
+        ids = {getattr(node, "id", None) for node in _components(app.app.layout)}
+        self.assertNotIn("show-raw-config", ids)
+
+    def test_spatial_lattices_put_zero_at_a_cell_centre(self):
+        frame = _polar_frame()
+        xedges, yedges, _ = app._heatmap_edges(
+            frame, bin_size=1.0, bound_pct=100)
+        self.assertTrue(np.any(np.isclose(
+            0.5 * (xedges[:-1] + xedges[1:]), 0.0)))
+        self.assertTrue(np.any(np.isclose(
+            0.5 * (yedges[:-1] + yedges[1:]), 0.0)))
+        self.assertTrue(np.any(np.isclose(xedges, -0.5)))
+        self.assertTrue(np.any(np.isclose(xedges, 0.5)))
+        direction = app._direction_field_bins(
+            frame, "all", "pooled", 1, 1.0, 100,
+            "orientation", False, 0.0)
+        self.assertTrue(np.any(np.isclose(direction["xc"], 0.0)))
+        self.assertTrue(np.any(np.isclose(direction["yc"], 0.0)))
+
+    def test_moving_only_blanks_trajectory_points_without_dropping_rows(self):
+        frame = _polar_frame()
+        masked = app.mask_stationary_trajectory_points(
+            frame, moving_only=True, walk_thresh=1e9)
+        self.assertEqual(len(masked), len(frame))
+        self.assertTrue(masked["GameObjectPosX"].isna().all())
+        self.assertTrue(masked["GameObjectPosZ"].isna().all())
+        self.assertIs(
+            app.mask_stationary_trajectory_points(frame, moving_only=False),
+            frame,
+        )
+
+    def test_heading_time_panel_merges_trials_and_uses_circular_animal_means(self):
+        rows = []
+        for trial, angle in ((1, 170.0), (2, -170.0)):
+            for sample in range(3):
+                rows.append({
+                    "_seg_id": f"file_T{trial}_S0",
+                    "ConfigFile": "cfg.json", "SceneName": "scene",
+                    "SourceFolder": "folder", "animal": "1@VR1",
+                    "VR": "VR1", "FlyID": "1",
+                    "CurrentTrial": trial, "CurrentStep": 0,
+                    "SourceFile": "file.csv",
+                    "Current Time": (
+                        pd.Timestamp("2026-01-01")
+                        + pd.Timedelta(sample, "s")),
+                    "GameObjectPosX": float(sample),
+                    "GameObjectPosZ": 0.0,
+                    "GameObjectRotY": angle,
+                })
+        frame = pd.DataFrame(rows)
+        frame.attrs["_frame_token"] = ("test", "heading-time")
+
+        trials = app.build_heading_time_figure(
+            frame, group_by="all", pool_mode="pooled", ncols=1,
+            mode="trial", angle_source="orientation")
+        self.assertEqual(len(trials.data), 1)
+        self.assertIsNone(trials.layout.yaxis.range)
+        self.assertEqual(
+            tuple(trials.layout.yaxis.tickvals), (-180, -90, 0, 90, 180))
+        self.assertEqual(
+            set(row[6] for row in trials.data[0].customdata if row[6]),
+            {"file_T1_S0", "file_T2_S0"},
+        )
+
+        animal = app.build_heading_time_figure(
+            frame, group_by="all", pool_mode="pooled", ncols=1,
+            mode="animal", angle_source="orientation",
+            window_seconds=1, show_variability=True)
+        mean_trace = next(
+            trace for trace in animal.data
+            if (trace.meta or {}).get("td_heading_animal_mean"))
+        means = np.asarray(mean_trace.y, dtype=float)
+        means = means[np.isfinite(means)]
+        self.assertTrue(np.all(np.isclose(np.abs(means), 180.0)))
+        spreads = np.asarray(mean_trace.customdata, dtype=object)[:, 1].astype(float)
+        self.assertTrue(np.all(np.isfinite(spreads)))
+        self.assertTrue(any(
+            (trace.meta or {}).get("td_heading_variability")
+            for trace in animal.data))
+        self.assertEqual(animal.layout.meta["heading_time_mode"], "animal")
+        self.assertEqual(animal.layout.meta["window_mode"], "custom")
+        self.assertEqual(animal.layout.meta["time_bin_seconds"], 1)
+
+        second_animal = frame.copy()
+        second_animal["animal"] = "2@VR2"
+        second_animal["FlyID"] = "2"
+        second_animal["VR"] = "VR2"
+        second_animal["_seg_id"] = "animal2_" + second_animal["_seg_id"]
+        density_frame = pd.concat([frame, second_animal], ignore_index=True)
+        density_frame.attrs["_frame_token"] = ("test", "heading-density")
+        density = app.build_heading_time_figure(
+            density_frame, group_by="all", pool_mode="pooled", ncols=1,
+            representation="density", angle_bin_degrees=10)
+        self.assertEqual(len(density.data), 2)
+        self.assertTrue(all(trace.type == "heatmap" for trace in density.data))
+        self.assertTrue(all(trace.showlegend for trace in density.data))
+        self.assertEqual(
+            {trace.name for trace in density.data}, {"1@VR1", "2@VR2"})
+        self.assertTrue(all(
+            trace.meta["td_heading_density"] for trace in density.data))
+        self.assertEqual(density.layout.meta["heading_angle_bin_degrees"], 10)
+
+    def test_distance_walked_range_filters_complete_segments(self):
+        rows = []
+        paths = {
+            "short": [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)],
+            "long": [(0.0, 0.0), (0.0, 8.0), (0.0, 16.0)],
+        }
+        for trial, (segment, points) in enumerate(paths.items(), start=1):
+            for sample, (x, z) in enumerate(points):
+                rows.append({
+                    "_seg_id": segment, "ConfigFile": "cfg.json",
+                    "SceneName": "scene", "SourceFolder": "folder",
+                    "VR": "VR1", "FlyID": "1", "CurrentTrial": trial,
+                    "CurrentStep": 0, "GameObjectPosX": x,
+                    "GameObjectPosZ": z,
+                    "Current Time": (
+                        pd.Timestamp("2026-01-01")
+                        + pd.Timedelta(sample, "s")),
+                })
+        frame = pd.DataFrame(rows)
+        stats = app.compute_segment_stats(frame)
+        result = dashboard_callbacks.td_grouping.filter_frame(
+            frame,
+            dashboard_callbacks.td_grouping.FilterSpec(
+                distance_walked_range=(10.0, 20.0)),
+            stats=stats,
+        )
+        self.assertEqual(set(result.filtered["_seg_id"]), {"long"})
+        self.assertEqual(set(result.stats["seg_id"]), {"long"})
+
+    def test_staged_core_keeps_completed_figures_mounted_until_replacement(self):
+        source = inspect.getsource(app.update_plots)
+        self.assertIn("Downstream figures intentionally remain mounted", source)
+        self.assertNotIn("Queued — occupancy", source)
+        self.assertIn('generation.get("reset_controls")', source)
+        self.assertIn("walk_selection = None", source)
+
+    def test_explicit_target_request_bypasses_a_settling_gandiva_store(self):
+        frame = _polar_frame()
+        segments = list(pd.unique(frame["_seg_id"]))
+        target_table = pd.DataFrame({
+            "_seg_id": segments,
+            "reached_left": [True, False],
+            "reached_right": [False, True],
+        })
+        rois = {"cfg.json": [
+            {"x": -1.0, "z": 2.0, "side": "left"},
+            {"x": 1.0, "z": 2.0, "side": "right"},
+        ]}
+        trajectory = app.go.Figure()
+        trajectory.update_layout(
+            shapes=[dict(type="line", x0=0, x1=1, y0=0, y1=1,
+                         name="keep-me")],
+            annotations=[dict(text="panel", x=0, y=0, name="keep-me")],
+        )
+        heatmap = app.go.Figure(trajectory).to_plotly_json()
+
+        with (
+            patch.object(app, "ctx", SimpleNamespace(triggered_id="roi-show")),
+            patch.object(dashboard_callbacks, "_load_data",
+                         return_value=(frame, None, [{}])),
+            patch.object(
+                dashboard_callbacks.td_grouping, "filter_frame",
+                return_value=SimpleNamespace(
+                    filtered=frame, subset=frame, stats=None,
+                ),
+            ),
+            patch.object(dashboard_callbacks, "rois_by_config",
+                         return_value=rois),
+            patch.object(dashboard_callbacks, "_roi_apply",
+                         return_value=(frame, target_table)),
+            patch.object(dashboard_callbacks, "build_roi_swarm_figure",
+                         return_value=app.go.Figure()),
+        ):
+            result = app.update_targets_stage(
+                {}, ["on"], 3, "synthetic", None, 0, 0, 0,
+                None, None, None, None, None, None, None, None, None,
+                None, None, [], [], None, "config", "separate", 1, [],
+                "categorical", "time", trajectory.to_plotly_json(),
+                heatmap, None,
+            )
+
+        trajectory_out = result[0].to_plotly_json()
+        shape_names = [
+            shape.get("name")
+            for shape in trajectory_out["layout"].get("shapes", [])
+        ]
+        self.assertIn("keep-me", shape_names)
+        self.assertTrue(any(
+            str(name).startswith("td-target-overlay")
+            for name in shape_names
+        ))
+        self.assertTrue(result[4]["enabled"])
+        self.assertIn("Targets ready", result[-1])
+
+    def test_panel_order_save_is_delayed_and_does_not_rebuild_its_list(self):
+        source = Path("assets/config_order.js").read_text()
+        self.assertIn("}, 7000);", source)
+        order_callback = next(
+            meta for output, meta in app.app.callback_map.items()
+            if "panel-order-list.children" in output
+        )
+        self.assertNotIn(
+            "panel-order-store",
+            {item["id"] for item in order_callback["inputs"]},
+        )
 
     def test_orientation_uses_unity_forward_clockwise_convention(self):
         ray = app.rayleigh_by_segment(
@@ -281,11 +495,12 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertTrue(bundle["enabled"])
         self.assertEqual(set(bundle["variants"]), {"crossed", "ended"})
         self.assertEqual(bundle["split_z"], 0.0)
-        self.assertEqual(bundle["split_source"], "manual grid boundary")
+        self.assertEqual(bundle["split_source"], "manual split line")
         yedges = np.asarray(bundle["yedges"])
-        split_index = int(np.flatnonzero(yedges == 0.0)[0])
-        self.assertAlmostEqual(yedges[split_index - 1], -1.0)
-        self.assertAlmostEqual(yedges[split_index + 1], 1.0)
+        ycentres = 0.5 * (yedges[:-1] + yedges[1:])
+        self.assertTrue(np.any(np.isclose(ycentres, 0.0)))
+        self.assertTrue(np.any(np.isclose(yedges, -0.5)))
+        self.assertTrue(np.any(np.isclose(yedges, 0.5)))
         self.assertTrue(np.allclose(np.diff(yedges), 1.0))
         for outcome in ("crossed", "ended"):
             self.assertEqual(
@@ -625,6 +840,7 @@ class DashboardRegressionTests(unittest.TestCase):
     def test_large_callback_signatures_match_registered_inputs_and_states(self):
         checks = (
             ("trajectory-plot.figure", app.update_plots),
+            ("spatial-render-state.data", app.update_spatial_grid),
             ("transition-data-store.data",
              app.update_transition_probability),
             ("polar-r-hist.figure", app.update_polar_only),
@@ -665,7 +881,7 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(
             transition_inputs,
             {
-                "view-render-state", "transition-enabled",
+                "targets-render-state", "transition-enabled",
                 "transition-split-z", "transition-min-trials",
             },
         )
@@ -674,6 +890,101 @@ class DashboardRegressionTests(unittest.TestCase):
         update_url = app.app.callback_map["url.search"]
         update_ids = [item["id"] for item in update_url["inputs"]]
         self.assertEqual(len(update_ids), len(set(update_ids)))
+
+    def test_expensive_controls_follow_the_declared_update_scope(self):
+        auto = next(
+            meta for output, meta in app.app.callback_map.items()
+            if output.startswith("..auto-replot-state.data...")
+        )
+        auto_inputs = {item["id"] for item in auto["inputs"]}
+        for control in (
+                "color-by", "render-mode", "animate-toggle", "plot-points",
+                "heatmap-binsize", "heatmap-bound"):
+            self.assertNotIn(control, auto_inputs)
+
+        drawing = next(
+            meta for output, meta in app.app.callback_map.items()
+            if output.startswith("..trajectory-plot.figure@")
+            and {"color-by", "render-mode", "animate-toggle", "plot-points"}
+            <= {item["id"] for item in meta["inputs"]}
+        )
+        self.assertEqual(
+            {item["id"] for item in drawing["inputs"]},
+            app.td_ui.controls_for_scope(
+                app.td_ui.UpdateScope.TRAJECTORY_POLAR),
+        )
+
+        spatial = next(
+            meta for output, meta in app.app.callback_map.items()
+            if "spatial-render-state.data" in output
+        )
+        self.assertEqual(
+            {item["id"] for item in spatial["inputs"]}
+            - {"view-render-state"},
+            app.td_ui.controls_for_scope(app.td_ui.UpdateScope.SPATIAL_GRID),
+        )
+
+    def test_load_initialisation_cannot_arm_a_duplicate_full_render(self):
+        result = app.arm_auto_replot(
+            {"loaded": 100.0}, "dataset", 1, {"completed": 99.0}
+        )
+        self.assertIs(result[0], app.no_update)
+        self.assertTrue(result[1])
+        self.assertEqual(result[2], 0)
+        self.assertIs(result[3], app.no_update)
+
+        auto = next(
+            meta for output, meta in app.app.callback_map.items()
+            if output.startswith("..auto-replot-state.data...")
+        )
+        self.assertIn("view-render-state", {item["id"] for item in auto["state"]})
+
+    def test_progress_interval_has_one_enabler_and_one_poller(self):
+        interval = next(
+            child for child in app.app.layout.children
+            if getattr(child, "id", None) == "load-progress-interval"
+        )
+        self.assertTrue(interval.disabled)
+        self.assertEqual(interval.interval, 2000)
+        self.assertEqual(interval.max_intervals, 10)
+
+        owners = [
+            meta for output, meta in app.app.callback_map.items()
+            if "load-progress-interval.disabled" in output
+        ]
+        self.assertEqual(len(owners), 2)
+        input_sets = [{item["id"] for item in meta["inputs"]} for meta in owners]
+        self.assertIn({"load-progress-interval"}, input_sets)
+        enabler = next(inputs for inputs in input_sets
+                       if "load-progress-interval" not in inputs)
+        self.assertIn("btn-load", enabler)
+        self.assertIn("btn-plot", enabler)
+        self.assertIn("heatmap-binsize", enabler)
+        self.assertIn("color-by", enabler)
+
+    def test_auto_panel_layout_handles_sparse_and_dense_group_counts(self):
+        resolve = app.td_ui.resolve_panel_columns
+        self.assertEqual(resolve(0, 1), 1)
+        self.assertEqual(resolve(None, 4), 2)
+        self.assertEqual(resolve(0, 5), 3)
+        self.assertEqual(resolve(0, 26), 4)
+        self.assertEqual(resolve(2, 26), 2)
+        self.assertLess(
+            app.td_ui.subplot_pixel_height(7, 4),
+            app.td_ui.subplot_pixel_height(13, 2),
+        )
+
+    def test_legacy_name_editor_patches_without_clicking_master_renderer(self):
+        lut = next(
+            meta for output, meta in app.app.callback_map.items()
+            if "lut-status.children" in output
+        )
+        output_key = next(
+            output for output, meta in app.app.callback_map.items()
+            if meta is lut
+        )
+        self.assertIn("visual-style-diff-store.data", output_key)
+        self.assertNotIn("btn-plot.n_clicks", output_key)
 
     def test_region_geometry_arms_idle_request_not_analysis_directly(self):
         region = next(
@@ -694,7 +1005,8 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertIn("flow-field-legend", ids)
         positions = [ids.index(component_id) for component_id in (
             "view-traj", "view-heat", "view-transition", "view-flow",
-            "view-polar", "view-roi", "view-metrics", "view-diag")]
+            "view-polar", "view-heading", "view-roi", "view-metrics",
+            "view-diag")]
         self.assertEqual(positions, sorted(positions))
 
     def test_polar_controls_use_the_polar_only_callback(self):
@@ -713,17 +1025,38 @@ class DashboardRegressionTests(unittest.TestCase):
             if "polar-r-hist.figure" in output
         )
         fast_inputs = {item["id"] for item in fast["inputs"]}
-        self.assertIn("view-render-state", fast_inputs)
+        self.assertIn("spatial-render-state", fast_inputs)
         self.assertIn("polar-moving", fast_inputs)
         self.assertNotIn("flow-max-radius", fast_inputs)
         fast_states = {item["id"] for item in fast["state"]}
         self.assertIn("flow-max-radius", fast_states)
         self.assertIn("polar-min-animal-frac", fast_inputs)
-        self.assertIn("heatmap-metric", fast_inputs)
-        self.assertIn("heatmap-scale", fast_inputs)
-        self.assertIn("heatmap-cmin", fast_inputs)
-        self.assertIn("heatmap-cmax", fast_inputs)
-        self.assertIn("heatmap-crange", fast_inputs)
+        for control in ("heatmap-metric", "heatmap-scale", "heatmap-cmin",
+                        "heatmap-cmax", "heatmap-crange"):
+            self.assertNotIn(control, fast_inputs)
+        gandiva = next(
+            meta for output, meta in app.app.callback_map.items()
+            if "gandiva-render-state.data" in output
+        )
+        gandiva_inputs = {item["id"] for item in gandiva["inputs"]}
+        for control in ("heatmap-metric", "heatmap-scale", "heatmap-cmin",
+                        "heatmap-cmax", "heatmap-crange"):
+            self.assertIn(control, gandiva_inputs)
+
+        heading = next(
+            meta for output, meta in app.app.callback_map.items()
+            if "heading-time-render-state.data" in output
+        )
+        self.assertEqual(
+            {item["id"] for item in heading["inputs"]},
+            {
+                "polar-render-state", "heading-time-enabled",
+                "heading-time-mode", "heading-time-representation",
+                "heading-time-window", "heading-time-variability",
+                "heading-time-angle-bin",
+            },
+        )
+        self.assertNotIn("heading-time-enabled", master_inputs)
 
     def test_auto_threshold_refresh_does_not_duplicate_initial_render(self):
         original_ctx = app.ctx
@@ -912,8 +1245,18 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertIsNone(_component("transition-count-max").value)
         self.assertIsNone(_component("transition-split-z").value)
         self.assertEqual(_component("transition-min-trials").value, 3)
+        self.assertEqual(_component("heading-time-enabled").value, [])
+        self.assertEqual(_component("heading-time-mode").value, "trial")
+        self.assertEqual(_component("heading-time-representation").value, "traces")
+        self.assertIsNone(_component("heading-time-window").value)
+        self.assertEqual(_component("heading-time-window-slider").value, -1)
+        self.assertEqual(_component("heading-time-variability").value, [])
+        self.assertEqual(_component("heading-time-angle-bin").value, 5)
+        self.assertIsNotNone(_component("heading-time-plot"))
         self.assertIsNotNone(_component("disp-range-min"))
         self.assertIsNotNone(_component("disp-range-max"))
+        self.assertIsNotNone(_component("walk-range-min"))
+        self.assertIsNotNone(_component("walk-range-max"))
         self.assertEqual(len(_component("custom-regions-store").data), 1)
         self.assertIsNotNone(_component("loop-observer-plot"))
         self.assertIsNotNone(_component("custom-region-diagnostics-plot"))
@@ -923,20 +1266,26 @@ class DashboardRegressionTests(unittest.TestCase):
             "&tf=37&loop=1&lx=-4.5&lz=2&lr=7"
             "&uscale=0.1&ulabel=mm&trans=1&tmode=ended"
             "&tmetric=count&tcmin=2&tcmax=18&tsplit=-2.5&trnmin=7"
-            "&view=transition&minimal=1&pairs=0", False)
-        self.assertEqual(len(restored), 72)
+            "&view=transition&minimal=1&pairs=0"
+            "&heading=1&htmode=animal&htview=density&htwin=2.5"
+            "&htvar=1&htbin=10&wrmin=4&wrmax=40", False)
+        self.assertEqual(len(restored), 79)
         self.assertEqual(restored[24:26], (2, 4))
-        self.assertEqual(restored[36], [2.0, 4.0])
-        self.assertEqual(restored[44], 0.31)
-        self.assertEqual(restored[46:51], (37.0, ["on"], -4.5, 2, 7))
-        self.assertEqual(restored[60:63], ([], 0.1, "mm"))
-        self.assertEqual(restored[41], "transition")
+        self.assertEqual(restored[34], [4.0, 40.0])
+        self.assertEqual(restored[37], [2.0, 4.0])
         self.assertEqual(
-            restored[63:70],
+            restored[41:47],
+            (["on"], "animal", "density", 2.5, ["on"], 10))
+        self.assertEqual(restored[51], 0.31)
+        self.assertEqual(restored[53:58], (37.0, ["on"], -4.5, 2, 7))
+        self.assertEqual(restored[67:70], ([], 0.1, "mm"))
+        self.assertEqual(restored[48], "transition")
+        self.assertEqual(
+            restored[70:77],
             (["on"], "ended", "count", 2, 18, -2.5, 7),
         )
-        self.assertTrue(restored[70])
-        self.assertEqual(len(app.restore_from_url("", True)), 72)
+        self.assertTrue(restored[77])
+        self.assertEqual(len(app.restore_from_url("", True)), 79)
         legacy_color = app.restore_from_url("?color=one", False)
         self.assertEqual(legacy_color[7], "categorical")
         rings = [
@@ -953,8 +1302,8 @@ class DashboardRegressionTests(unittest.TestCase):
             }),
             False,
         )
-        self.assertEqual(ring_restore[51], rings)
-        self.assertEqual(ring_restore[52:54], ("ring-2", "all"))
+        self.assertEqual(ring_restore[58], rings)
+        self.assertEqual(ring_restore[59:61], ("ring-2", "all"))
         regions = [
             {"id": "region-1", "name": "Near",
              "x0": -2, "x1": 2, "z0": -1, "z1": 4},
@@ -969,21 +1318,47 @@ class DashboardRegressionTests(unittest.TestCase):
             }),
             False,
         )
-        self.assertEqual(region_restore[54], ["on"])
-        self.assertEqual(region_restore[55], regions)
-        self.assertEqual(region_restore[56], "region-2")
+        self.assertEqual(region_restore[61], ["on"])
+        self.assertEqual(region_restore[62], regions)
+        self.assertEqual(region_restore[63], "region-2")
         distribution_restore = app.restore_from_url(
             "?dist=violin&dpts=0&sunit=animal", False)
         self.assertEqual(
-            distribution_restore[57:60], ("violin", [], "animal"))
+            distribution_restore[64:67], ("violin", [], "animal"))
         value_restore = app.restore_from_url(
             "?hcmin=150&hcmax=200&hcrange=value", False)
-        self.assertEqual(value_restore[34], [150.0, 200.0])
+        self.assertEqual(value_restore[35], [150.0, 200.0])
 
         exact_velocity = app.restore_from_url(
             "?vrmin=2.5&vrmax=250&layout=compare", False)
         self.assertEqual(exact_velocity[31:33], (2.5, 250))
-        self.assertEqual(exact_velocity[42], "compare")
+        self.assertEqual(exact_velocity[49], "compare")
+
+        url_args = {
+            name: None for name in inspect.signature(app.update_url).parameters
+        }
+        url_args.update(
+            restored=True, rrange=[0, 1], anim=[],
+            heading_time_enabled=["on"], heading_time_mode="animal",
+            heading_time_representation="density", heading_time_window=2.5,
+            heading_time_variability=["on"], heading_time_angle_bin=10,
+            wrange=[4, 40],
+        )
+        heading_params = parse_qs(app.update_url(**url_args).lstrip("?"))
+        self.assertEqual(heading_params["heading"], ["1"])
+        self.assertEqual(heading_params["htmode"], ["animal"])
+        self.assertEqual(heading_params["htview"], ["density"])
+        self.assertEqual(heading_params["htwin"], ["2.5"])
+        self.assertEqual(heading_params["htvar"], ["1"])
+        self.assertEqual(heading_params["htbin"], ["10"])
+        self.assertEqual(heading_params["wrmin"], ["4.0"])
+        self.assertEqual(heading_params["wrmax"], ["40.0"])
+
+    def test_server_preload_preserves_shared_url_settings(self):
+        source = Path("app.py").read_text()
+        main = source[source.index('if __name__ == "__main__":'):]
+        self.assertNotIn("child.search =", main)
+        self.assertIn("component.value = args.glob", main)
 
     def test_long_horizontal_legends_reserve_plot_height(self):
         short_top, short_extra = app._horizontal_legend_layout(["VR1"], 2)
@@ -1196,7 +1571,6 @@ class DashboardRegressionTests(unittest.TestCase):
                 [],
                 [], [], [], [], [],
                 {},
-                None,
             )
             self.assertEqual(summary, "Plot order · Scene")
             self.assertEqual(
@@ -1282,8 +1656,8 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertEqual(slider.max, 100)
 
         restored = app.restore_from_url("?reach=250.5", False)
-        self.assertEqual(restored[45], 250.5)
-        self.assertIs(app.restore_from_url("?reach=-1", False)[45], app.no_update)
+        self.assertEqual(restored[52], 250.5)
+        self.assertIs(app.restore_from_url("?reach=-1", False)[52], app.no_update)
 
         args = {name: None for name in inspect.signature(app.update_url).parameters}
         args.update(restored=True, reach=250.5, rrange=[0, 1], anim=[])
@@ -1319,6 +1693,7 @@ class DashboardRegressionTests(unittest.TestCase):
         self.assertIn("plotly.js", document)
         self.assertIn("TrajectoryLoopObserver", document)
         self.assertIn("TransitionProbabilityObserver", document)
+        self.assertIn("Heading over time", document)
         self.assertIn('id="export-loop-radius"', document)
         self.assertIn('id="export-transition-metric"', document)
         self.assertNotIn('id="export-transition-observer"', document)
