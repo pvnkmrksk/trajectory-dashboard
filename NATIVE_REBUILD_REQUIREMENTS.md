@@ -56,6 +56,8 @@ has been verified.
 
 - Load a file, folder, or recursive glob and show files, source rows, retained
   rows, segments, and animals.
+- Accept a folder drop anywhere in the window, resolve its browser-safe relative
+  file list to a bounded local source, and begin loading without another click.
 - Populate config, scene, VR, fly, folder, raw-channel, trial, step, and metric
   ranges from the loaded data.
 - Persist the source and principal controls in the URL without writing the URL
@@ -78,16 +80,24 @@ has been verified.
 - Support categorical, neutral, individual/config/scene/VR/folder, trial,
   local-time, velocity, and tortuosity colour semantics.
 - Keep aspect ratio square and share one X/Z viewport with every spatial view.
+- Keep one physical X unit equal to one physical Z unit even when a dashboard
+  card, panel row, or browser window is rectangular.
 - Provide wheel zoom, drag pan, reset, hover coordinates, point-budget control,
   moving-only drawing, and deterministic whole-trial display sampling.
+- Provide an immediate, per-`FlyID@VR` visibility legend that does not filter or
+  rebuild the retained analysis table.
 - Run playback by updating a GPU time uniform; no frame arrays or server calls.
+- Playback uses segment-local time and ends at the 99th percentile of retained
+  segment durations so a single damaged long trial cannot compress the useful
+  time range for every other trial.
 
 ### Spatial summaries
 
 - Occupancy count, seconds, and percent on a zero-centred square grid.
 - Linear/log colour mapping and bounded bin count.
 - Local direction field using body orientation or movement heading, circular
-  mean angle, resultant strength, and abundance.
+  mean angle, resultant strength, and abundance. Present it as short animated
+  flow trails: length maps to R while particle count/opacity maps to abundance.
 - Shared instantaneous pan/zoom between trajectory, occupancy, and direction.
 - Target/ROI rings and observation geometry use the same coordinate transform.
 
@@ -97,6 +107,9 @@ has been verified.
 - Trial and animal population modes with the existing weighting semantics.
 - Signed heading-over-time traces that break across wrap boundaries.
 - Body-orientation and movement-heading sources; optional moving-only gate.
+- Polar, heading, ROI, metrics, histogram, and raw-channel views provide mature
+  chart interactions: item hover, interactive animal legends, zoom/reset, and
+  image export through a maintained browser plotting library.
 
 ### Diagnostics
 
@@ -145,8 +158,8 @@ trusted Python loader + exact summaries
       Web Worker analytical model
        |        |        |       |
        v        v        v       v
-   WebGL2    Canvas2D  Canvas2D Canvas2D
- trajectory occupancy  polar   diagnostics
+   WebGL2    Canvas2D  Canvas2D  Apache ECharts
+ trajectory occupancy flow     analytical charts
        \________ shared viewport _______/
 ```
 
@@ -156,8 +169,11 @@ trusted Python loader + exact summaries
   into a framework-neutral binary dataset contract.
 - `native_dashboard/static/worker.js` owns the retained row table and computes
   filtered products off the main thread.
-- `native_dashboard/static/renderers.js` contains small purpose-built WebGL2
-  and Canvas 2D renderers with no plotting dependency.
+- `native_dashboard/static/renderers.js` contains the purpose-built WebGL2
+  trajectory, occupancy, and animated flow renderers.
+- `native_dashboard/static/echarts_renderers.js` uses vendored Apache ECharts
+  for analytical views whose hover, legends, zoom, and export should come from
+  a maintained plotting library rather than local chart infrastructure.
 - `native_dashboard/static/app.js` owns UI state, URL persistence, render
   scheduling, and cancellation.
 

@@ -30,6 +30,7 @@ const PALETTE = Array.from({length: 64}, (_, i) => {
   return CATEGORICAL[i % CATEGORICAL.length];
 });
 PALETTE[NEUTRAL_INDEX] = "#7f8985";
+export const NATIVE_PALETTE = PALETTE;
 
 function hexRgb(color) {
   if (color.startsWith("rgb")) return color.match(/[\d.]+/g).slice(0, 3).map(Number);
@@ -65,6 +66,20 @@ function panelLayout(width, height, count, requested = 0) {
   return {cols, rows, cellW: width / cols, cellH: height / rows};
 }
 
+function panelPane(layout, panel) {
+  const col = panel % layout.cols;
+  const row = Math.floor(panel / layout.cols);
+  const cellLeft = col * layout.cellW;
+  const cellTop = row * layout.cellH;
+  const size = Math.max(2, Math.min(
+    layout.cellW * (1 - 2 * PANEL_PAD_X),
+    layout.cellH * (1 - 2 * PANEL_PAD_Y),
+  ));
+  const left = cellLeft + (layout.cellW - size) / 2;
+  const top = cellTop + (layout.cellH - size) / 2;
+  return {left, right: left + size, top, bottom: top + size, size, cellLeft, cellTop};
+}
+
 function squareBounds(bounds) {
   if (!bounds) return {xmin: -1, xmax: 1, zmin: -1, zmax: 1};
   const cx = (bounds.xmin + bounds.xmax) / 2;
@@ -93,20 +108,14 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
   ctx.font = "600 11px Inter, system-ui, sans-serif";
   ctx.textBaseline = "top";
   for (let panel = 0; panel < count; panel += 1) {
-    const col = panel % layout.cols;
-    const row = Math.floor(panel / layout.cols);
-    const x = col * layout.cellW;
-    const y = row * layout.cellH;
-    const left = x + layout.cellW * PANEL_PAD_X;
-    const right = x + layout.cellW * (1 - PANEL_PAD_X);
-    const top = y + layout.cellH * PANEL_PAD_Y;
-    const bottom = y + layout.cellH * (1 - PANEL_PAD_Y);
+    const pane = panelPane(layout, panel);
+    const {left, right, top, bottom} = pane;
     ctx.strokeStyle = "rgba(24,34,31,.14)";
     ctx.lineWidth = 1;
     ctx.strokeRect(left + .5, top + .5, right - left - 1, bottom - top - 1);
     ctx.fillStyle = "#27332f";
     const title = data?.panelNames?.[panel] || "All data";
-    ctx.fillText(String(title).slice(0, 42), left + 3, y + 7);
+    ctx.fillText(String(title).slice(0, 42), left + 3, Math.max(pane.cellTop + 3, top - 18));
     if (view && !options.hideTicks) {
       ctx.font = "9px ui-monospace, SFMono-Regular, monospace";
       ctx.fillStyle = "#7a827e";
@@ -133,11 +142,7 @@ function drawPanelRois(ctx, width, height, data, view, visible = true) {
   ctx.save();
   for (const roi of data.rois) {
     if (roi.panel < 0 || roi.panel >= data.panelCount) continue;
-    const col = roi.panel % layout.cols, row = Math.floor(roi.panel / layout.cols);
-    const left = (col + PANEL_PAD_X) * layout.cellW;
-    const right = (col + 1 - PANEL_PAD_X) * layout.cellW;
-    const top = (row + PANEL_PAD_Y) * layout.cellH;
-    const bottom = (row + 1 - PANEL_PAD_Y) * layout.cellH;
+    const {left, right, top, bottom} = panelPane(layout, roi.panel);
     const x = left + (roi.x - view.xmin) / (view.xmax - view.xmin) * (right - left);
     const y = bottom - (roi.z - view.zmin) / (view.zmax - view.zmin) * (bottom - top);
     const radius = Math.abs(roi.reach / (view.xmax - view.xmin) * (right - left));
@@ -150,10 +155,7 @@ function drawPanelRois(ctx, width, height, data, view, visible = true) {
   if (data.roiCounts) {
     ctx.font = "600 9px Inter, system-ui, sans-serif";
     for (let panel = 0; panel < data.panelCount; panel += 1) {
-      const col = panel % layout.cols, row = Math.floor(panel / layout.cols);
-      const left = (col + PANEL_PAD_X) * layout.cellW;
-      const right = (col + 1 - PANEL_PAD_X) * layout.cellW;
-      const top = (row + PANEL_PAD_Y) * layout.cellH;
+      const {left, right, top} = panelPane(layout, panel);
       ctx.fillStyle = "#315f8c"; ctx.textAlign = "left";
       ctx.fillText(`L-first ${data.roiCounts.left?.[panel] || 0}`, left + 5, top + 5);
       ctx.fillStyle = "#a64530"; ctx.textAlign = "right";
@@ -168,9 +170,7 @@ function drawPanelRings(ctx, width, height, data, view) {
   const layout = panelLayout(width, height, data.panelCount, data.columns);
   ctx.save(); ctx.setLineDash([]); ctx.font = "700 9px Inter, system-ui, sans-serif";
   for (let panel = 0; panel < data.panelCount; panel += 1) {
-    const col = panel % layout.cols, row = Math.floor(panel / layout.cols);
-    const left = (col + PANEL_PAD_X) * layout.cellW, right = (col + 1 - PANEL_PAD_X) * layout.cellW;
-    const top = (row + PANEL_PAD_Y) * layout.cellH, bottom = (row + 1 - PANEL_PAD_Y) * layout.cellH;
+    const {left, right, top, bottom} = panelPane(layout, panel);
     for (let index = 0; index < data.rings.length; index += 1) {
       const ring = data.rings[index];
       const x = left + (ring.x - view.xmin) / (view.xmax - view.xmin) * (right - left);
@@ -207,29 +207,58 @@ function installSpatialInteraction(renderer, canvas) {
 
   canvas.addEventListener("pointerdown", event => {
     if (!renderer.data || !renderer.view) return;
+    const rect = canvas.getBoundingClientRect();
+    const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
+    if (!point) return;
     canvas.setPointerCapture(event.pointerId);
-    drag = {x: event.clientX, y: event.clientY, view: {...renderer.view}, moved: false};
+    const ringIndex = renderer.hitRing?.(point) ?? -1;
+    if (ringIndex >= 0 && renderer.ringMoveHandler) {
+      const ring = renderer.data.rings[ringIndex];
+      drag = {
+        mode: "ring", ringIndex, offsetX: point.x - ring.x,
+        offsetZ: point.z - ring.z, moved: false,
+      };
+      canvas.style.cursor = "grabbing";
+    } else {
+      const layout = panelLayout(renderer.width, renderer.height, renderer.data.panelCount, renderer.data.columns);
+      drag = {
+        mode: "pan", x: event.clientX, y: event.clientY,
+        view: {...renderer.view}, paneSize: panelPane(layout, point.panel).size,
+        moved: false,
+      };
+    }
   });
   canvas.addEventListener("pointerup", event => {
     const finished = drag;
     drag = null;
+    canvas.style.cursor = "";
     try { canvas.releasePointerCapture(event.pointerId); } catch (_) { /* no-op */ }
+    if (finished?.mode === "ring") {
+      const rect = canvas.getBoundingClientRect();
+      const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
+      if (point) renderer.moveRing(finished.ringIndex, point.x - finished.offsetX, point.z - finished.offsetZ, true);
+      return;
+    }
     if (finished && !finished.moved && renderer.inspectHandler) {
       const rect = canvas.getBoundingClientRect();
       const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
       if (point) renderer.inspectHandler(point, renderer.view);
     }
   });
-  canvas.addEventListener("pointercancel", () => { drag = null; });
+  canvas.addEventListener("pointercancel", () => { drag = null; canvas.style.cursor = ""; });
   canvas.addEventListener("pointermove", event => {
     const rect = canvas.getBoundingClientRect();
     if (drag) {
+      if (drag.mode === "ring") {
+        const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
+        if (point) renderer.moveRing(drag.ringIndex, point.x - drag.offsetX, point.z - drag.offsetZ, false);
+        drag.moved = true;
+        tooltip.hidden = true;
+        return;
+      }
       if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 3) drag.moved = true;
-      const layout = panelLayout(renderer.width, renderer.height, renderer.data.panelCount, renderer.data.columns);
-      const innerW = layout.cellW * (1 - 2 * PANEL_PAD_X);
-      const innerH = layout.cellH * (1 - 2 * PANEL_PAD_Y);
-      const dx = (event.clientX - drag.x) / innerW * (drag.view.xmax - drag.view.xmin);
-      const dz = (event.clientY - drag.y) / innerH * (drag.view.zmax - drag.view.zmin);
+      const dx = (event.clientX - drag.x) / drag.paneSize * (drag.view.xmax - drag.view.xmin);
+      const dz = (event.clientY - drag.y) / drag.paneSize * (drag.view.zmax - drag.view.zmin);
       renderer.setView({
         xmin: drag.view.xmin - dx, xmax: drag.view.xmax - dx,
         zmin: drag.view.zmin + dz, zmax: drag.view.zmax + dz,
@@ -239,10 +268,12 @@ function installSpatialInteraction(renderer, canvas) {
     }
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
     if (!point) { tooltip.hidden = true; return; }
+    canvas.style.cursor = (renderer.hitRing?.(point) ?? -1) >= 0 ? "grab" : "";
     tooltip.hidden = false;
     tooltip.style.left = `${event.clientX - rect.left}px`;
     tooltip.style.top = `${event.clientY - rect.top}px`;
-    tooltip.textContent = `${renderer.data.panelNames?.[point.panel] || "All"} · X ${formatNumber(point.x, 3)} · Z ${formatNumber(point.z, 3)}`;
+    tooltip.textContent = renderer.tooltipText?.(point)
+      || `${renderer.data.panelNames?.[point.panel] || "All"} · X ${formatNumber(point.x, 3)} · Z ${formatNumber(point.z, 3)}`;
   });
   canvas.addEventListener("pointerleave", () => { if (!drag) tooltip.hidden = true; });
   canvas.addEventListener("wheel", event => {
@@ -283,6 +314,25 @@ class SpatialBase {
     this.draw();
   }
   setInspectHandler(handler) { this.inspectHandler = handler; }
+  setRingMoveHandler(handler) { this.ringMoveHandler = handler; }
+  hitRing(point) {
+    if (!this.data?.ringEnabled || !this.data?.rings?.length || !this.view) return -1;
+    const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+    const pane = panelPane(layout, point.panel);
+    const tolerance = (this.view.xmax - this.view.xmin) / Math.max(1, pane.size) * 10;
+    for (let index = this.data.rings.length - 1; index >= 0; index -= 1) {
+      const ring = this.data.rings[index];
+      const distance = Math.hypot(point.x - ring.x, point.z - ring.z);
+      if (distance <= tolerance * 1.3 || Math.abs(distance - ring.r) <= tolerance) return index;
+    }
+    return -1;
+  }
+  moveRing(index, x, z, final = false) {
+    if (!this.data?.rings?.[index] || !Number.isFinite(x) || !Number.isFinite(z)) return;
+    this.data.rings[index] = {...this.data.rings[index], x, z};
+    this.draw();
+    this.ringMoveHandler?.(index, x, z, final);
+  }
   setView(view, notify = false) {
     if (!view || !Object.values(view).every(Number.isFinite)) return;
     this.view = {...view};
@@ -300,10 +350,9 @@ class SpatialBase {
     const row = Math.max(0, Math.min(layout.rows - 1, Math.floor(py / layout.cellH)));
     const panel = row * layout.cols + col;
     if (panel >= this.data.panelCount) return null;
-    const ux = (px - col * layout.cellW) / layout.cellW;
-    const uy = (py - row * layout.cellH) / layout.cellH;
-    const u = (ux - PANEL_PAD_X) / (1 - 2 * PANEL_PAD_X);
-    const v = 1 - (uy - PANEL_PAD_Y) / (1 - 2 * PANEL_PAD_Y);
+    const pane = panelPane(layout, panel);
+    const u = (px - pane.left) / pane.size;
+    const v = 1 - (py - pane.top) / pane.size;
     if (u < 0 || u > 1 || v < 0 || v > 1) return null;
     return {
       panel,
@@ -354,8 +403,10 @@ export class TrajectoryRenderer extends SpatialBase {
       layout(location=2) in float a_color;
       layout(location=3) in float a_time;
       layout(location=4) in float a_sample;
+      layout(location=5) in float a_visible;
       uniform vec4 u_view;
       uniform vec2 u_grid;
+      uniform vec2 u_pane;
       uniform float u_fraction;
       uniform float u_time;
       uniform vec4 u_palette[64];
@@ -366,12 +417,12 @@ export class TrajectoryRenderer extends SpatialBase {
         float uz = (a_position.y - u_view.z) / (u_view.w - u_view.z);
         float col = mod(a_panel, u_grid.x);
         float row = floor(a_panel / u_grid.x);
-        float px = (col + ${PANEL_PAD_X.toFixed(4)} + ux * ${(1 - 2 * PANEL_PAD_X).toFixed(4)}) / u_grid.x;
-        float py = (u_grid.y - 1.0 - row + ${PANEL_PAD_Y.toFixed(4)} + uz * ${(1 - 2 * PANEL_PAD_Y).toFixed(4)}) / u_grid.y;
+        float px = (col + .5) / u_grid.x + (ux - .5) * u_pane.x;
+        float py = (u_grid.y - 1.0 - row + .5) / u_grid.y + (uz - .5) * u_pane.y;
         gl_Position = vec4(px * 2.0 - 1.0, py * 2.0 - 1.0, 0.0, 1.0);
         int colorIndex = clamp(int(a_color + .5), 0, 63);
         v_color = u_palette[colorIndex];
-        v_inside = (ux >= 0.0 && ux <= 1.0 && uz >= 0.0 && uz <= 1.0 && a_sample <= u_fraction && a_time <= u_time) ? 1.0 : 0.0;
+        v_inside = (ux >= 0.0 && ux <= 1.0 && uz >= 0.0 && uz <= 1.0 && a_sample <= u_fraction && a_time <= u_time && a_visible > .5) ? 1.0 : 0.0;
       }`, `#version 300 es
       precision highp float;
       in vec4 v_color;
@@ -380,7 +431,7 @@ export class TrajectoryRenderer extends SpatialBase {
       void main() { if (v_inside < .5) discard; outColor = v_color; }
     `);
     this.vao = gl.createVertexArray();
-    this.buffers = Array.from({length: 5}, () => gl.createBuffer());
+    this.buffers = Array.from({length: 6}, () => gl.createBuffer());
   }
   _attribute(index, data, size, type, normalized = false) {
     const gl = this.gl;
@@ -398,10 +449,24 @@ export class TrajectoryRenderer extends SpatialBase {
     this._attribute(2, data.colors, 1, gl.UNSIGNED_BYTE);
     this._attribute(3, data.times, 1, gl.FLOAT);
     this._attribute(4, data.samples, 1, gl.FLOAT);
+    this.visibility = new Uint8Array(data.animals.length);
+    this.visibility.fill(255);
+    this._attribute(5, this.visibility, 1, gl.UNSIGNED_BYTE, true);
     gl.bindVertexArray(null);
     this.vertexCount = data.panels.length;
     if (!preserveView || !this.view) this.view = squareBounds(data.bounds);
     this.draw();
+  }
+  setAnimalVisibility(visible) {
+    this.animalVisibility = visible ? [...visible] : null;
+    if (!this.data?.animals || !this.visibility) return;
+    for (let i = 0; i < this.visibility.length; i += 1) {
+      this.visibility[i] = this.animalVisibility?.[this.data.animals[i]] === false ? 0 : 255;
+    }
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers[5]);
+    gl.bufferData(gl.ARRAY_BUFFER, this.visibility, gl.DYNAMIC_DRAW);
+    this.drawGl();
   }
   setFraction(value) { this.fraction = Math.max(.01, Math.min(1, value)); this.drawGl(); }
   setTime(value) { this.timeLimit = Number.isFinite(value) ? value : Number.POSITIVE_INFINITY; this.drawGl(); }
@@ -412,15 +477,17 @@ export class TrajectoryRenderer extends SpatialBase {
   }
   drawGl() {
     const gl = this.gl;
-    gl.clearColor(1, .994, .976, 1);
+    gl.clearColor(1, 1, 1, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     if (!this.data || !this.view || !this.vertexCount) return;
     const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+    const pane = panelPane(layout, 0);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.program);
     gl.uniform4f(gl.getUniformLocation(this.program, "u_view"), this.view.xmin, this.view.xmax, this.view.zmin, this.view.zmax);
     gl.uniform2f(gl.getUniformLocation(this.program, "u_grid"), layout.cols, layout.rows);
+    gl.uniform2f(gl.getUniformLocation(this.program, "u_pane"), pane.size / this.width, pane.size / this.height);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_fraction"), this.fraction);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_time"), this.timeLimit);
     gl.uniform4fv(gl.getUniformLocation(this.program, "u_palette[0]"), PALETTE_FLOATS);
@@ -462,19 +529,12 @@ class CanvasSpatialRenderer extends SpatialBase {
     this.dpr = setupCanvas(this.canvas, this.width, this.height);
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.clearRect(0, 0, this.width, this.height);
-    this.ctx.fillStyle = "#fffdf9";
+    this.ctx.fillStyle = "#ffffff";
     this.ctx.fillRect(0, 0, this.width, this.height);
     return this.data ? panelLayout(this.width, this.height, this.data.panelCount, this.data.columns) : null;
   }
   pane(panel, layout) {
-    const col = panel % layout.cols;
-    const row = Math.floor(panel / layout.cols);
-    return {
-      left: (col + PANEL_PAD_X) * layout.cellW,
-      right: (col + 1 - PANEL_PAD_X) * layout.cellW,
-      top: (row + PANEL_PAD_Y) * layout.cellH,
-      bottom: (row + 1 - PANEL_PAD_Y) * layout.cellH,
-    };
+    return panelPane(layout, panel);
   }
   worldToPixel(x, z, pane) {
     return [
@@ -498,6 +558,22 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
     this.draw();
   }
   onDataChanged() { this.buildTextures(); }
+  tooltipText(point) {
+    const ix = Math.floor((point.x - this.data.x0) / this.data.bin);
+    const iz = Math.floor((point.z - this.data.z0) / this.data.bin);
+    if (ix < 0 || ix >= this.data.nx || iz < 0 || iz >= this.data.nz) return null;
+    const cells = this.data.nx * this.data.nz;
+    const index = point.panel * cells + iz * this.data.nx + ix;
+    let value = this.metric === "count" ? this.data.count[index] : this.data.time[index];
+    let unit = this.metric === "count" ? "samples" : "s";
+    if (this.metric === "percent") {
+      let total = 0;
+      for (let i = 0; i < cells; i += 1) total += this.data.time[point.panel * cells + i];
+      value = total > 0 ? this.data.time[index] / total * 100 : 0;
+      unit = "%";
+    }
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(value, 3)} ${unit} · X ${formatNumber(point.x, 2)} · Z ${formatNumber(point.z, 2)}`;
+  }
   buildTextures() {
     this.textures = [];
     if (!this.data) return;
@@ -569,13 +645,140 @@ function angleColor(angle, alpha = 1) {
 }
 
 export class DirectionRenderer extends CanvasSpatialRenderer {
+  constructor(host, onViewChange) {
+    super(host, onViewChange);
+    this.particleCanvas = document.createElement("canvas");
+    this.particleCanvas.style.pointerEvents = "none";
+    this.host.appendChild(this.particleCanvas);
+    this.particleCtx = this.particleCanvas.getContext("2d");
+    this.particles = [];
+    this.spawnTables = [];
+    this._rng = 0x6d2b79f5;
+    this.resize();
+    this._lastFrame = 0;
+    this._animate = now => {
+      if (this.data && document.visibilityState === "visible" && now - this._lastFrame > 45) {
+        const rect = this.host.getBoundingClientRect();
+        if (rect.bottom > 0 && rect.top < innerHeight) this.drawParticles(now);
+        this._lastFrame = now;
+      }
+      this._animationFrame = requestAnimationFrame(this._animate);
+    };
+    this._animationFrame = requestAnimationFrame(this._animate);
+  }
+  onDataChanged() {
+    const positive = [];
+    for (const value of this.data?.abundance || []) if (value > 0) positive.push(value);
+    positive.sort((a, b) => a - b);
+    this.abundanceReference = positive.length
+      ? positive[Math.floor((positive.length - 1) * .95)]
+      : 1;
+    this._buildSpawnTables();
+    this._resetParticles();
+  }
+  resize() {
+    super.resize();
+    if (this.particleCanvas) {
+      this.particleDpr = setupCanvas(this.particleCanvas, this.width, this.height);
+      this.particleCtx.setTransform(this.particleDpr, 0, 0, this.particleDpr, 0, 0);
+      this.particleCtx.clearRect(0, 0, this.width, this.height);
+      this._resetParticles();
+    }
+  }
+  _random() {
+    this._rng = (Math.imul(this._rng, 1664525) + 1013904223) >>> 0;
+    return this._rng / 4294967296;
+  }
+  _buildSpawnTables() {
+    this.spawnTables = [];
+    if (!this.data) return;
+    const {nx, nz, panelCount, abundance, angle} = this.data;
+    const cells = nx * nz, reference = Math.max(1, this.abundanceReference || 1);
+    for (let panel = 0; panel < panelCount; panel += 1) {
+      const entries = [];
+      let total = 0;
+      for (let cell = 0; cell < cells; cell += 1) {
+        const index = panel * cells + cell;
+        if (!(abundance[index] > 0) || !Number.isFinite(angle[index])) continue;
+        total += Math.pow(Math.min(1, abundance[index] / reference), .68);
+        entries.push({cell, cumulative: total});
+      }
+      this.spawnTables.push({entries, total});
+    }
+  }
+  _respawn(particle, panel = particle.panel) {
+    const table = this.spawnTables[panel];
+    if (!table?.entries.length) { particle.age = -1; return; }
+    const target = this._random() * table.total;
+    let lo = 0, hi = table.entries.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (table.entries[mid].cumulative < target) lo = mid + 1; else hi = mid;
+    }
+    const cell = table.entries[lo].cell;
+    const ix = cell % this.data.nx, iz = Math.floor(cell / this.data.nx);
+    particle.panel = panel;
+    particle.x = this.data.x0 + (ix + .08 + this._random() * .84) * this.data.bin;
+    particle.z = this.data.z0 + (iz + .08 + this._random() * .84) * this.data.bin;
+    particle.age = 0;
+    particle.maxAge = 28 + Math.floor(this._random() * 52);
+  }
+  _resetParticles() {
+    if (!this.data?.panelCount || !this.spawnTables.length) return;
+    const perPanel = Math.max(48, Math.min(150, Math.floor(900 / this.data.panelCount)));
+    this.particles = [];
+    for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+      for (let i = 0; i < perPanel; i += 1) {
+        const particle = {panel, x: 0, z: 0, age: -1, maxAge: 1};
+        this._respawn(particle, panel);
+        particle.age = Math.floor(this._random() * particle.maxAge);
+        this.particles.push(particle);
+      }
+    }
+    if (this.particleCtx) {
+      this.particleCtx.setTransform(this.particleDpr || 1, 0, 0, this.particleDpr || 1, 0, 0);
+      this.particleCtx.clearRect(0, 0, this.width, this.height);
+    }
+  }
+  _sampleVector(panel, x, z) {
+    const gx = (x - this.data.x0) / this.data.bin - .5;
+    const gz = (z - this.data.z0) / this.data.bin - .5;
+    const ix0 = Math.floor(gx), iz0 = Math.floor(gz);
+    const fx = gx - ix0, fz = gz - iz0;
+    let vx = 0, vz = 0, abundance = 0, weight = 0;
+    const cells = this.data.nx * this.data.nz;
+    for (let dz = 0; dz <= 1; dz += 1) for (let dx = 0; dx <= 1; dx += 1) {
+      const ix = ix0 + dx, iz = iz0 + dz;
+      if (ix < 0 || ix >= this.data.nx || iz < 0 || iz >= this.data.nz) continue;
+      const index = panel * cells + iz * this.data.nx + ix;
+      const angle = this.data.angle[index], strength = this.data.strength[index];
+      if (!Number.isFinite(angle) || !(strength > 0)) continue;
+      const w = (dx ? fx : 1 - fx) * (dz ? fz : 1 - fz);
+      const radians = angle * Math.PI / 180;
+      vx += Math.sin(radians) * strength * w;
+      vz += Math.cos(radians) * strength * w;
+      abundance += this.data.abundance[index] * w;
+      weight += w;
+    }
+    if (!(weight > .08)) return null;
+    vx /= weight; vz /= weight; abundance /= weight;
+    const strength = Math.hypot(vx, vz);
+    return strength > .025 ? {vx, vz, strength, abundance, angle: Math.atan2(vx, vz) * 180 / Math.PI} : null;
+  }
+  tooltipText(point) {
+    const ix = Math.floor((point.x - this.data.x0) / this.data.bin);
+    const iz = Math.floor((point.z - this.data.z0) / this.data.bin);
+    if (ix < 0 || ix >= this.data.nx || iz < 0 || iz >= this.data.nz) return null;
+    const index = point.panel * this.data.nx * this.data.nz + iz * this.data.nx + ix;
+    if (!Number.isFinite(this.data.angle[index])) return null;
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 2)} · ${formatNumber(this.data.abundance[index], 0)} samples`;
+  }
   draw() {
     const layout = this.begin();
     if (!layout || !this.view) return;
     const {nx, nz, panelCount, angle, strength, abundance} = this.data;
     const cells = nx * nz;
-    let maxAbundance = 0;
-    for (let i = 0; i < abundance.length; i += 1) maxAbundance = Math.max(maxAbundance, abundance[i]);
+    const maxAbundance = Math.max(1, this.abundanceReference || 1);
     for (let panel = 0; panel < panelCount; panel += 1) {
       const pane = this.pane(panel, layout);
       this.ctx.save();
@@ -589,28 +792,68 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
           const index = panel * cells + iz * nx + ix;
           const count = abundance[index];
           if (!(count > 0) || !Number.isFinite(angle[index])) continue;
+          if ((ix + iz) % 2) continue;
           const [cx, cy] = this.worldToPixel(x, z, pane);
           const [x0] = this.worldToPixel(x - this.data.bin / 2, z, pane);
           const [x1] = this.worldToPixel(x + this.data.bin / 2, z, pane);
           const cellPx = Math.abs(x1 - x0);
-          const abundanceScale = Math.sqrt(count / Math.max(1, maxAbundance));
-          const len = cellPx * .43 * strength[index];
+          const abundanceScale = Math.sqrt(Math.min(1, count / maxAbundance));
+          const len = cellPx * .72 * strength[index];
           const radians = angle[index] * Math.PI / 180;
-          const dx = Math.sin(radians) * len;
-          const dy = -Math.cos(radians) * len;
-          this.ctx.fillStyle = angleColor(angle[index], .04 + .14 * abundanceScale);
-          this.ctx.fillRect(cx - cellPx / 2, cy - cellPx / 2, cellPx, cellPx);
-          this.ctx.strokeStyle = angleColor(angle[index], .35 + .65 * abundanceScale);
-          this.ctx.lineWidth = .7 + 2 * abundanceScale;
-          this.ctx.beginPath(); this.ctx.moveTo(cx - dx, cy - dy); this.ctx.lineTo(cx + dx, cy + dy); this.ctx.stroke();
-          this.ctx.fillStyle = this.ctx.strokeStyle;
-          this.ctx.beginPath(); this.ctx.arc(cx + dx, cy + dy, 1.4 + abundanceScale, 0, Math.PI * 2); this.ctx.fill();
+          const dx = Math.sin(radians) * len * .5;
+          const dy = -Math.cos(radians) * len * .5;
+          this.ctx.lineCap = "round";
+          this.ctx.strokeStyle = angleColor(angle[index], .035 + .11 * abundanceScale);
+          this.ctx.lineWidth = .35 + .5 * abundanceScale;
+          this.ctx.beginPath();
+          this.ctx.moveTo(cx - dx, cy - dy);
+          this.ctx.lineTo(cx + dx, cy + dy);
+          this.ctx.stroke();
         }
       }
       this.ctx.restore();
     }
     drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view);
     drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
+    this._resetParticles();
+  }
+  drawParticles(now) {
+    if (!this.data || !this.view || !this.particleCtx || !this.particles.length) return;
+    const ctx = this.particleCtx;
+    const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+    const dt = this._particleTime ? Math.min(.08, (now - this._particleTime) / 1000) : .045;
+    this._particleTime = now;
+    ctx.setTransform(this.particleDpr || 1, 0, 0, this.particleDpr || 1, 0, 0);
+    ctx.globalCompositeOperation = "destination-out";
+    ctx.fillStyle = "rgba(0,0,0,.10)";
+    ctx.fillRect(0, 0, this.width, this.height);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.lineCap = "round";
+    const reference = Math.max(1, this.abundanceReference || 1);
+    for (const particle of this.particles) {
+      if (particle.age < 0 || particle.age >= particle.maxAge) {
+        this._respawn(particle);
+        continue;
+      }
+      const vector = this._sampleVector(particle.panel, particle.x, particle.z);
+      if (!vector) { this._respawn(particle); continue; }
+      const speed = this.data.bin * (1.15 + 4.1 * Math.min(1, vector.strength));
+      const nx = particle.x + vector.vx / vector.strength * speed * dt;
+      const nz = particle.z + vector.vz / vector.strength * speed * dt;
+      if (nx < this.view.xmin || nx > this.view.xmax || nz < this.view.zmin || nz > this.view.zmax) {
+        this._respawn(particle);
+        continue;
+      }
+      const pane = this.pane(particle.panel, layout);
+      const [x0, y0] = this.worldToPixel(particle.x, particle.z, pane);
+      const [x1, y1] = this.worldToPixel(nx, nz, pane);
+      const abundanceScale = Math.sqrt(Math.min(1, vector.abundance / reference));
+      const life = Math.sin(Math.PI * particle.age / Math.max(1, particle.maxAge));
+      ctx.strokeStyle = angleColor(vector.angle, (.12 + .58 * abundanceScale) * (.3 + .7 * life));
+      ctx.lineWidth = .5 + 1.55 * abundanceScale;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      particle.x = nx; particle.z = nz; particle.age += 1;
+    }
   }
 }
 
@@ -630,7 +873,7 @@ class CanvasRenderer {
     this.dpr = setupCanvas(this.canvas, this.width, this.height);
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.clearRect(0, 0, this.width, this.height);
-    this.ctx.fillStyle = "#fffdf9"; this.ctx.fillRect(0, 0, this.width, this.height);
+    this.ctx.fillStyle = "#ffffff"; this.ctx.fillRect(0, 0, this.width, this.height);
   }
   setData(data) { this.data = data; this.draw(); }
   draw() { this.begin(); }

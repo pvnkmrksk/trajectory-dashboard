@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import gzip
+import glob
 import logging
+import os
 from pathlib import Path
 import time
 
@@ -14,6 +16,62 @@ from .dataset import NativeDatasetError, load_native_dataset, raw_channel_binary
 
 LOGGER = logging.getLogger("trajectory.native")
 STATIC_DIR = Path(__file__).with_name("static")
+_DROP_PRUNE = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".next",
+    "dist", "build", ".cache", "Library", ".Trash",
+}
+
+
+def _drop_search_roots() -> list[str]:
+    cwd = os.path.abspath(os.getcwd())
+    roots = [cwd, os.path.dirname(cwd), os.path.dirname(os.path.dirname(cwd))]
+    configured = os.environ.get("TRAJ_DATA_ROOT")
+    if configured:
+        roots.insert(0, os.path.abspath(os.path.expanduser(configured)))
+    result: list[str] = []
+    for root in roots:
+        if root not in result and os.path.isdir(root):
+            result.append(root)
+    return result
+
+
+def _resolve_dropped_folder(folder: str, files: list[str]) -> str | None:
+    """Resolve the browser-visible relative names to a bounded local glob."""
+
+    csv_files = [
+        str(path).replace("\\", "/").lstrip("/")
+        for path in files
+        if str(path).lower().endswith(".csv")
+    ]
+    folder = os.path.basename(str(folder or "").strip())
+    if not folder or not csv_files:
+        return None
+    names = [path.rsplit("/", 1)[-1] for path in csv_files]
+    sample = csv_files[0].split("/", 1)[1] if "/" in csv_files[0] else names[0]
+    visited = 0
+    for root in _drop_search_roots():
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, _ in os.walk(root):
+            visited += 1
+            if visited > 120_000:
+                return None
+            if dirpath.count(os.sep) - root_depth >= 8:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [
+                name for name in dirnames
+                if not name.startswith(".") and name not in _DROP_PRUNE
+            ]
+            if os.path.basename(dirpath) != folder:
+                continue
+            if not os.path.isfile(os.path.join(dirpath, sample)):
+                continue
+            suffix = "*_VR*.csv" if any("_VR" in name for name in names) else "*.csv"
+            pattern = os.path.join(dirpath, "**", suffix)
+            if not glob.glob(pattern, recursive=True):
+                pattern = os.path.join(dirpath, "**", "*.csv")
+            return os.path.relpath(pattern, os.getcwd()) if pattern.startswith(os.getcwd() + os.sep) else pattern
+    return None
 
 
 def _binary_response(payload: bytes) -> Response:
@@ -74,6 +132,20 @@ def create_native_app(default_source: str = "") -> Flask:
         response = _binary_response(dataset.binary)
         response.headers["X-Dataset-Id"] = dataset.dataset_id
         return response
+
+    @app.post("/api/resolve-drop")
+    def api_resolve_drop():
+        payload = request.get_json(silent=True) or {}
+        pattern = _resolve_dropped_folder(
+            str(payload.get("folder") or ""),
+            list(payload.get("files") or []),
+        )
+        if not pattern:
+            return jsonify({
+                "error": "The dropped folder could not be located on this computer. "
+                         "Set TRAJ_DATA_ROOT when the data lives outside the project tree."
+            }), 404
+        return jsonify({"source": pattern})
 
     @app.get("/api/channel/<dataset_id>")
     def api_channel(dataset_id: str):

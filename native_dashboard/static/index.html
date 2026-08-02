@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f3f6f6">
+  <title>Dari Deepa — native trajectory explorer</title>
+  <meta name="description" content="A Plotly-free, browser-native explorer for VR trajectory experiments.">
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <div class="app-shell" id="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true"><span></span></div>
+        <div>
+          <div class="eyebrow">Trajectory workbench</div>
+          <h1>Dari Deepa <span>Native</span></h1>
+        </div>
+      </div>
+      <form class="source-form" id="source-form">
+        <label for="source-input">Data source</label>
+        <div class="source-row">
+          <input id="source-input" name="source" autocomplete="off"
+                 placeholder="CSV, folder, or **/*_VR*.csv glob">
+          <button class="primary" id="load-button" type="submit">Load data</button>
+        </div>
+      </form>
+      <div class="status-dock" id="status-dock" aria-live="polite">
+        <span class="status-light"></span>
+        <div><b id="status-title">Waiting for data</b><small id="status-detail">Python loads once; the browser explores locally.</small></div>
+      </div>
+    </header>
+
+    <aside class="sidebar" aria-label="Analysis controls">
+      <div class="sidebar-actions">
+        <button class="primary wide" id="apply-button" type="button" disabled>Update analysis</button>
+        <button class="quiet" id="reset-view-button" type="button" disabled>Reset view</button>
+        <button class="quiet" id="clean-button" type="button">Clean view</button>
+        <button class="quiet wide" id="export-button" type="button" disabled>Export native report</button>
+      </div>
+
+      <section class="control-card summary-card">
+        <div class="control-heading"><span>Dataset</span><small>retained / exact</small></div>
+        <div class="dataset-summary" id="dataset-summary">
+          <div><b>—</b><span>retained rows</span></div>
+          <div><b>—</b><span>segments</span></div>
+          <div><b>—</b><span>animals</span></div>
+          <div><b>—</b><span>files</span></div>
+        </div>
+      </section>
+
+      <details class="control-card animal-card" open>
+        <summary>Animal visibility</summary>
+        <div class="control-body">
+          <div class="visibility-actions">
+            <button class="compact" id="animals-all" type="button" disabled>Show all</button>
+            <button class="compact" id="animals-none" type="button" disabled>Hide all</button>
+          </div>
+          <div class="animal-visibility" id="animal-visibility">
+            <span class="empty-control">Load data to choose animals.</span>
+          </div>
+        </div>
+      </details>
+
+      <details class="control-card" open>
+        <summary>Panels and drawing</summary>
+        <div class="control-body two-up">
+          <label>Split panels
+            <select id="group-by" data-scope="full">
+              <option value="config">Treatment</option>
+              <option value="scene">Scene</option>
+              <option value="vr">VR arena</option>
+              <option value="fly">Animal</option>
+              <option value="folder">Source folder</option>
+              <option value="all">All pooled</option>
+            </select>
+          </label>
+          <label>Columns
+            <select id="panel-columns" data-scope="layout">
+              <option value="0">Auto</option><option value="1">1</option>
+              <option value="2">2</option><option value="3">3</option><option value="4">4</option>
+            </select>
+          </label>
+          <label>Colour
+            <select id="color-by" data-scope="trajectory">
+              <option value="categorical">Current panels</option>
+              <option value="none">Neutral</option>
+              <option value="fly">Animal</option>
+              <option value="config">Treatment</option>
+              <option value="scene">Scene</option>
+              <option value="vr">VR arena</option>
+              <option value="folder">Source folder</option>
+              <option value="roi">ROI outcome</option>
+              <option value="trial">Trial</option>
+              <option value="time">Local time</option>
+              <option value="speed">Velocity</option>
+              <option value="tortuosity">Tortuosity</option>
+            </select>
+          </label>
+          <label>Point budget
+            <input id="point-budget" data-scope="trajectory" type="number" min="10000" step="10000" value="250000">
+          </label>
+          <label class="check"><input id="moving-only" data-scope="trajectory" type="checkbox"> Moving samples only</label>
+          <label>Walk threshold
+            <input id="walk-threshold" data-scope="direction" type="number" min="0" step="0.01" value="0">
+          </label>
+        </div>
+      </details>
+
+      <details class="control-card" open>
+        <summary>Data filters</summary>
+        <div class="control-body">
+          <div id="category-filters" class="category-filters"></div>
+          <div class="two-up">
+            <label>Trial min<input id="trial-min" data-scope="full" type="number"></label>
+            <label>Trial max<input id="trial-max" data-scope="full" type="number"></label>
+            <label>Step min<input id="step-min" data-scope="full" type="number"></label>
+            <label>Step max<input id="step-max" data-scope="full" type="number"></label>
+          </div>
+        </div>
+      </details>
+
+      <details class="control-card">
+        <summary>Quality and segment ranges</summary>
+        <div class="control-body two-up">
+          <label>Jump threshold<input id="jump-threshold" data-scope="full" type="number" min="0" step="0.01" value="0"></label>
+          <label>Buffer (ms)<input id="jump-buffer" data-scope="full" type="number" min="0" step="10" value="100"></label>
+          <label>Min displacement<input id="min-displacement" data-scope="full" type="number" min="0" step="0.001" value="0"></label>
+          <label>Trim each edge<input id="edge-trim" data-scope="full" type="number" min="0" step="1" value="0"></label>
+          <label>Peak speed min<input id="peak-min" data-scope="full" type="number"></label>
+          <label>Peak speed max<input id="peak-max" data-scope="full" type="number"></label>
+          <label>Displacement min<input id="disp-min" data-scope="full" type="number"></label>
+          <label>Displacement max<input id="disp-max" data-scope="full" type="number"></label>
+          <label>Distance min<input id="distance-min" data-scope="full" type="number"></label>
+          <label>Distance max<input id="distance-max" data-scope="full" type="number"></label>
+        </div>
+      </details>
+
+      <details class="control-card">
+        <summary>Targets and ROI mask</summary>
+        <div class="control-body two-up">
+          <label class="check"><input id="roi-show" type="checkbox" checked> Show target rings</label>
+          <label>Reach radius<input id="roi-reach" data-scope="full" type="number" min="0.01" step="0.1" value="3"></label>
+          <label class="check"><input id="roi-entered" data-scope="full" type="checkbox"> Reached trials only</label>
+          <label class="check"><input id="roi-trim" data-scope="full" type="checkbox"> Trim after ROI exit</label>
+        </div>
+      </details>
+
+      <details class="control-card">
+        <summary>Curtain-ring observer</summary>
+        <div class="control-body two-up">
+          <label class="check"><input id="ring-enabled" type="checkbox"> Show matching paths</label>
+          <label>Match<select id="ring-match"><option value="any">Any ring</option><option value="all">All rings</option></select></label>
+          <label>Active ring<select id="ring-active"></select></label>
+          <div class="ring-buttons"><button class="compact" id="ring-add" type="button">Add</button><button class="compact" id="ring-delete" type="button">Delete</button></div>
+          <label>Centre X<input id="ring-x" type="number" step="0.1" value="0"></label>
+          <label>Centre Z<input id="ring-z" type="number" step="0.1" value="0"></label>
+          <label>Radius<input id="ring-radius" type="number" min="0.01" step="0.1" value="3"></label>
+        </div>
+      </details>
+
+      <details class="control-card">
+        <summary>Direction and statistics</summary>
+        <div class="control-body two-up">
+          <label>Angle source
+            <select id="angle-source" data-scope="direction">
+              <option value="orientation">Body orientation</option>
+              <option value="movement">Movement heading</option>
+            </select>
+          </label>
+          <label>Independent unit
+            <select id="stats-unit" data-scope="statistics">
+              <option value="trial">Trial</option><option value="animal">Animal</option>
+            </select>
+          </label>
+          <label>Polar R min<input id="polar-r-min" data-scope="direction" type="number" min="0" max="1" step="0.05" value="0"></label>
+          <label>Polar R max<input id="polar-r-max" data-scope="direction" type="number" min="0" max="1" step="0.05" value="1"></label>
+          <label>Valid points min<input id="polar-valid-min" data-scope="direction" type="number" min="0" max="1" step="0.05" value="0"></label>
+        </div>
+      </details>
+    </aside>
+
+    <main class="workspace" id="workspace">
+      <nav class="section-nav" aria-label="Plot sections">
+        <button data-target="trajectory-section" class="active">Paths</button>
+        <button data-target="occupancy-section">Occupancy</button>
+        <button data-target="direction-section">Direction</button>
+        <button data-target="polar-section">Polar</button>
+        <button data-target="roi-section">Targets</button>
+        <button data-target="heading-section">Heading time</button>
+        <button data-target="metrics-section">Trial metrics</button>
+        <button data-target="diagnostics-section">Diagnostics</button>
+      </nav>
+
+      <section class="plot-section hero-section" id="trajectory-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Spatial paths</span><h2>Trajectory field</h2></div>
+          <div class="section-summary" id="trajectory-summary">Load data to begin.</div>
+        </div>
+        <div class="plot-card spatial-card">
+          <div class="plot-toolbar">
+            <label class="check"><input id="playback-enabled" type="checkbox"> Playback</label>
+            <button class="compact" id="play-button" type="button" disabled>Play</button>
+            <input class="scrubber" id="time-scrubber" type="range" min="0" max="1" value="1" step="0.001" disabled aria-label="Playback position">
+            <output id="time-output">all time</output>
+            <label>Displayed trials <input id="trial-fraction" type="range" min="1" max="100" value="100"></label>
+            <output id="fraction-output">100%</output>
+            <button class="compact" id="resample-button" type="button" disabled>New sample</button>
+            <span class="segment-inspector" id="segment-inspector">Click near a path to inspect its exact segment.</span>
+          </div>
+          <div class="plot-host large" id="trajectory-plot" aria-label="Trajectory plot"></div>
+          <div class="plot-hint">Drag to pan · wheel to zoom · double-click to reset · grab a curtain-ring centre or edge to move it · spatial panels share one 1:1 view</div>
+        </div>
+      </section>
+
+      <section class="plot-section" id="occupancy-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Spatial density</span><h2>Occupancy</h2></div>
+          <div class="inline-controls">
+            <label>Metric<select id="heat-metric"><option value="time">Seconds</option><option value="count">Samples</option><option value="percent">Percent</option></select></label>
+            <label>Scale<select id="heat-scale"><option value="linear">Linear</option><option value="log">Log</option></select></label>
+            <label>Grid size<input id="bin-size" data-scope="spatial" type="number" min="0" step="0.01" placeholder="Auto"></label>
+            <label>Central %<input id="bound-percent" data-scope="spatial" type="number" min="50" max="100" value="98"></label>
+          </div>
+        </div>
+        <div class="plot-card"><div class="plot-host" id="heatmap-plot" aria-label="Occupancy heatmap"></div></div>
+      </section>
+
+      <section class="plot-section" id="direction-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Circular mean by cell</span><h2>Local direction field</h2></div>
+          <div class="legend-note">Flow length = R · particle density and opacity = occupancy</div>
+        </div>
+        <div class="plot-card"><div class="plot-host" id="direction-plot" aria-label="Local direction field"></div></div>
+      </section>
+
+      <section class="plot-section" id="polar-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Trial resultants</span><h2>Polar direction</h2></div>
+          <div class="section-summary" id="polar-summary"></div>
+        </div>
+        <div class="plot-card"><div class="plot-host" id="polar-plot" aria-label="Polar direction plot"></div></div>
+      </section>
+
+      <section class="plot-section" id="heading-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Signed angle</span><h2>Heading over local time</h2></div>
+          <div class="legend-note">Wrap crossings are broken · drag or wheel to zoom local trial time.</div>
+        </div>
+        <div class="plot-card"><div class="plot-host" id="heading-plot" aria-label="Heading over time"></div></div>
+      </section>
+
+      <section class="plot-section" id="roi-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Target interaction</span><h2>ROI outcomes</h2></div>
+          <div class="section-summary" id="roi-summary">Target geometry is loaded from the scene configs.</div>
+        </div>
+        <div class="plot-card"><div class="plot-host tall" id="roi-plot" aria-label="ROI outcome diagnostics"></div></div>
+      </section>
+
+      <section class="plot-section" id="metrics-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Exact segment summaries</span><h2>Trial metrics</h2></div>
+          <div class="legend-note">Distance · displacement · speed · tortuosity</div>
+        </div>
+        <div class="plot-card"><div class="plot-host tall" id="metrics-plot" aria-label="Trial metric distributions"></div></div>
+      </section>
+
+      <section class="plot-section" id="diagnostics-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Load-time reference</span><h2>Diagnostics</h2></div>
+          <div class="legend-note">These distributions describe the retained source frame.</div>
+        </div>
+        <div class="diagnostic-grid">
+          <div class="plot-card"><h3>Smoothed velocity</h3><div class="plot-host short" id="velocity-hist"></div></div>
+          <div class="plot-card"><h3>Net displacement</h3><div class="plot-host short" id="displacement-hist"></div></div>
+        </div>
+        <div class="plot-card raw-card">
+          <div class="raw-toolbar">
+            <label>Raw numeric channel<select id="raw-channel"><option value="">Choose a channel</option></select></label>
+            <button class="compact" id="raw-load" type="button" disabled>Load channel</button>
+            <span id="raw-status">Loaded only when requested.</span>
+          </div>
+          <div class="plot-host short" id="raw-plot"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="drop-overlay" id="drop-overlay" hidden>
+    <div class="drop-panel">
+      <span class="drop-icon" aria-hidden="true">↓</span>
+      <b>Drop the trajectory folder anywhere</b>
+      <small>Nested CSV files will be found and loaded automatically.</small>
+    </div>
+  </div>
+  <script src="/static/vendor/echarts.min.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

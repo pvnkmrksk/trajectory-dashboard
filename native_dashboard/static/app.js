@@ -1,7 +1,10 @@
 import {
-  TrajectoryRenderer, HeatmapRenderer, DirectionRenderer, PolarRenderer,
-  HeadingRenderer, MetricsRenderer, RoiRenderer, HistogramRenderer, RawRenderer, formatNumber,
+  TrajectoryRenderer, HeatmapRenderer, DirectionRenderer, NATIVE_PALETTE, formatNumber,
 } from "/static/renderers.js";
+import {
+  EChartsPolarRenderer, EChartsHeadingRenderer, EChartsMetricsRenderer,
+  EChartsRoiRenderer, EChartsHistogramRenderer, EChartsRawRenderer,
+} from "/static/echarts_renderers.js";
 
 const byId = id => document.getElementById(id);
 const shell = byId("app-shell");
@@ -29,6 +32,7 @@ let playbackFrame = null;
 let playbackLast = 0;
 let rings = [{x: 0, z: 0, r: 3}];
 let activeRing = 0;
+let animalVisibility = [];
 
 function setStatus(kind, title, detail) {
   statusDock.className = `status-dock ${kind || ""}`;
@@ -56,13 +60,13 @@ try {
   trajectoryRenderer = new TrajectoryRenderer(byId("trajectory-plot"), syncView);
   heatmapRenderer = new HeatmapRenderer(byId("heatmap-plot"), syncView);
   directionRenderer = new DirectionRenderer(byId("direction-plot"), syncView);
-  polarRenderer = new PolarRenderer(byId("polar-plot"));
-  headingRenderer = new HeadingRenderer(byId("heading-plot"));
-  metricsRenderer = new MetricsRenderer(byId("metrics-plot"));
-  roiRenderer = new RoiRenderer(byId("roi-plot"));
-  velocityHistogram = new HistogramRenderer(byId("velocity-hist"));
-  displacementHistogram = new HistogramRenderer(byId("displacement-hist"));
-  rawRenderer = new RawRenderer(byId("raw-plot"));
+  polarRenderer = new EChartsPolarRenderer(byId("polar-plot"));
+  headingRenderer = new EChartsHeadingRenderer(byId("heading-plot"));
+  metricsRenderer = new EChartsMetricsRenderer(byId("metrics-plot"));
+  roiRenderer = new EChartsRoiRenderer(byId("roi-plot"));
+  velocityHistogram = new EChartsHistogramRenderer(byId("velocity-hist"), "velocity-distribution");
+  displacementHistogram = new EChartsHistogramRenderer(byId("displacement-hist"), "displacement-distribution");
+  rawRenderer = new EChartsRawRenderer(byId("raw-plot"));
 } catch (error) {
   setStatus("error", "Renderer unavailable", error.message);
   throw error;
@@ -76,6 +80,13 @@ trajectoryRenderer.setInspectHandler((point, view) => {
     tolerance: Math.max(view.xmax - view.xmin, view.zmax - view.zmin) * .018,
   });
   byId("segment-inspector").textContent = "Finding the nearest retained segment…";
+});
+trajectoryRenderer.setRingMoveHandler((index, x, z, final) => {
+  if (!rings[index]) return;
+  rings[index] = {...rings[index], x, z};
+  activeRing = index;
+  renderRingControls();
+  if (final) scheduleCompute("trajectory", 20);
 });
 
 function parseBinary(buffer) {
@@ -98,6 +109,45 @@ function datasetSummary() {
     <div><b>${formatCount(counts.segments)}</b><span>segments</span></div>
     <div><b>${formatCount(counts.animals)}</b><span>animals</span></div>
     <div><b>${formatCount(counts.files)}</b><span>files</span></div>`;
+}
+
+function applyAnimalVisibility() {
+  trajectoryRenderer.setAnimalVisibility(animalVisibility);
+  const charts = [polarRenderer, headingRenderer, metricsRenderer, roiRenderer];
+  for (const chart of charts) chart.animalVisibility = [...animalVisibility];
+  const activeSection = document.querySelector(".section-nav button.active")?.dataset.target;
+  const activeChart = {
+    "polar-section": polarRenderer,
+    "heading-section": headingRenderer,
+    "metrics-section": metricsRenderer,
+    "roi-section": roiRenderer,
+  }[activeSection];
+  activeChart?.syncAnimalLegend?.();
+}
+
+function renderAnimalVisibility() {
+  const host = byId("animal-visibility");
+  host.replaceChildren();
+  const names = datasetHeader?.categories?.animal || [];
+  if (animalVisibility.length !== names.length) animalVisibility = names.map(() => true);
+  names.forEach((name, index) => {
+    const label = document.createElement("label");
+    label.className = "animal-toggle";
+    label.style.setProperty("--animal-color", NATIVE_PALETTE[index % 16]);
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox"; checkbox.checked = animalVisibility[index] !== false;
+    checkbox.setAttribute("aria-label", `Show ${name}`);
+    const dot = document.createElement("span"); dot.className = "animal-dot";
+    const text = document.createElement("span"); text.textContent = name;
+    label.append(checkbox, dot, text); host.appendChild(label);
+    checkbox.addEventListener("change", () => {
+      animalVisibility[index] = checkbox.checked;
+      label.classList.toggle("muted", !checkbox.checked);
+      applyAnimalVisibility();
+    });
+  });
+  byId("animals-all").disabled = !names.length;
+  byId("animals-none").disabled = !names.length;
 }
 
 function fillRange(idMin, idMax, values) {
@@ -134,11 +184,13 @@ function populateControls() {
   rawLoadButton.disabled = true;
   applyButton.disabled = false; resetViewButton.disabled = false; byId("resample-button").disabled = false;
   byId("export-button").disabled = false;
-  const maxTime = Math.max(0, datasetHeader.ranges.time[1]);
+  const maxTime = Math.max(0, datasetHeader.playbackMax ?? datasetHeader.ranges.time[1]);
   byId("time-scrubber").max = maxTime; byId("time-scrubber").value = maxTime;
   byId("time-output").textContent = "all time";
   restoreViewStateFromUrl();
   renderRingControls();
+  animalVisibility = (datasetHeader.categories.animal || []).map(() => true);
+  renderAnimalVisibility();
 }
 
 function selectedCodes(key) {
@@ -257,7 +309,7 @@ function updateColumns() {
   const columns = numberValue("panel-columns");
   for (const value of Object.values(products)) if (value && typeof value === "object" && "columns" in value) value.columns = columns;
   for (const renderer of [...spatialRenderers, polarRenderer, headingRenderer]) renderer.setColumns?.(columns);
-  polarRenderer.draw(); headingRenderer.draw(); persistState();
+  persistState();
 }
 
 function renderProducts(incoming, summary) {
@@ -299,6 +351,7 @@ function renderProducts(incoming, summary) {
   if (incoming.raw) { rawRenderer.setData(incoming.raw); byId("raw-status").textContent = `${incoming.raw.column} · ${formatCount(incoming.raw.vertices.length / 4)} drawn links`; }
   const fraction = numberValue("trial-fraction", 100) / 100;
   trajectoryRenderer.setFraction(fraction); polarRenderer.setFraction(fraction); headingRenderer.setFraction(fraction);
+  applyAnimalVisibility();
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
   newDataset = false;
 }
@@ -434,7 +487,9 @@ function renderRingControls() {
   rings.forEach((_, index) => select.add(new Option(`Ring ${index + 1}`, String(index))));
   select.value = String(activeRing);
   const ring = rings[activeRing] || {x: 0, z: 0, r: 3};
-  byId("ring-x").value = ring.x; byId("ring-z").value = ring.z; byId("ring-radius").value = ring.r;
+  byId("ring-x").value = Number(ring.x.toFixed(3));
+  byId("ring-z").value = Number(ring.z.toFixed(3));
+  byId("ring-radius").value = Number(ring.r.toFixed(3));
   byId("ring-delete").disabled = rings.length <= 1;
 }
 
@@ -448,7 +503,7 @@ function updateActiveRing() {
 
 function updatePlaybackTime() {
   const enabled = byId("playback-enabled").checked;
-  const value = numberValue("time-scrubber", datasetHeader?.ranges.time[1] || 0);
+  const value = numberValue("time-scrubber", datasetHeader?.playbackMax ?? datasetHeader?.ranges.time[1] ?? 0);
   trajectoryRenderer.setTime(enabled ? value : Number.POSITIVE_INFINITY);
   byId("time-output").textContent = enabled ? `${formatNumber(value, 2)} s` : "all time";
 }
@@ -478,6 +533,12 @@ byId("clean-button").addEventListener("click", () => {
   setTimeout(() => spatialRenderers.forEach(renderer => { renderer.resize(); renderer.draw(); }), 40);
 });
 byId("export-button").addEventListener("click", exportNativeReport);
+byId("animals-all").addEventListener("click", () => {
+  animalVisibility.fill(true); renderAnimalVisibility(); applyAnimalVisibility();
+});
+byId("animals-none").addEventListener("click", () => {
+  animalVisibility.fill(false); renderAnimalVisibility(); applyAnimalVisibility();
+});
 byId("trial-fraction").addEventListener("input", updateFraction);
 byId("resample-button").addEventListener("click", () => { sampleSeed += 1; scheduleCompute("trajectory"); });
 byId("roi-show").addEventListener("change", () => {
@@ -522,15 +583,88 @@ for (const control of document.querySelectorAll("[data-scope]")) {
 
 for (const button of document.querySelectorAll(".section-nav button")) {
   button.addEventListener("click", () => {
+    for (const item of document.querySelectorAll(".section-nav button")) item.classList.toggle("active", item === button);
     byId(button.dataset.target).scrollIntoView({behavior: "smooth", block: "start"});
+    setTimeout(() => ({
+      "polar-section": polarRenderer,
+      "heading-section": headingRenderer,
+      "metrics-section": metricsRenderer,
+      "roi-section": roiRenderer,
+    }[button.dataset.target]?.syncAnimalLegend?.()), 260);
   });
 }
+const sectionRatios = new Map();
 const sectionObserver = new IntersectionObserver(entries => {
-  const visible = entries.filter(entry => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+  for (const entry of entries) sectionRatios.set(entry.target, entry.isIntersecting ? entry.intersectionRatio : 0);
+  const visible = [...sectionRatios.entries()]
+    .filter(([, ratio]) => ratio > 0)
+    .sort((a, b) => b[1] - a[1])[0]?.[0];
   if (!visible) return;
-  for (const button of document.querySelectorAll(".section-nav button")) button.classList.toggle("active", button.dataset.target === visible.target.id);
+  for (const button of document.querySelectorAll(".section-nav button")) button.classList.toggle("active", button.dataset.target === visible.id);
 }, {root: byId("workspace"), threshold: [.15, .4, .7]});
 for (const section of document.querySelectorAll(".plot-section")) sectionObserver.observe(section);
+
+async function readDroppedEntry(entry, prefix, paths) {
+  if (entry.isFile) {
+    if (entry.name.toLowerCase().endsWith(".csv")) paths.push(`${prefix}${entry.name}`);
+    return;
+  }
+  if (!entry.isDirectory) return;
+  const reader = entry.createReader();
+  while (true) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (!batch.length) break;
+    for (const child of batch) await readDroppedEntry(child, `${prefix}${entry.name}/`, paths);
+  }
+}
+
+async function droppedPaths(transfer) {
+  const paths = [];
+  const entries = [...(transfer.items || [])].map(item => item.webkitGetAsEntry?.()).filter(Boolean);
+  if (entries.length) {
+    for (const entry of entries) await readDroppedEntry(entry, "", paths);
+  } else {
+    for (const file of transfer.files || []) {
+      const path = file.webkitRelativePath || file.name;
+      if (path.toLowerCase().endsWith(".csv")) paths.push(path);
+    }
+  }
+  return paths;
+}
+
+let dragDepth = 0;
+const dropOverlay = byId("drop-overlay");
+window.addEventListener("dragenter", event => {
+  if (![...(event.dataTransfer?.types || [])].includes("Files")) return;
+  event.preventDefault(); dragDepth += 1; dropOverlay.hidden = false;
+});
+window.addEventListener("dragover", event => {
+  if (![...(event.dataTransfer?.types || [])].includes("Files")) return;
+  event.preventDefault(); event.dataTransfer.dropEffect = "copy"; dropOverlay.hidden = false;
+});
+window.addEventListener("dragleave", event => {
+  event.preventDefault(); dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) dropOverlay.hidden = true;
+});
+window.addEventListener("drop", async event => {
+  event.preventDefault(); dragDepth = 0; dropOverlay.hidden = true;
+  try {
+    const files = await droppedPaths(event.dataTransfer);
+    if (!files.length) throw new Error("No CSV files were found in that drop.");
+    const folder = files[0].split("/")[0];
+    setStatus("working", "Locating dropped folder", `${files.length.toLocaleString()} CSV files detected; resolving the local data path.`);
+    const response = await fetch("/api/resolve-drop", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({folder, files}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Folder resolution failed with HTTP ${response.status}`);
+    sourceInput.value = result.source;
+    await loadDataset(result.source);
+  } catch (error) {
+    setStatus("error", "Could not load the dropped folder", error.message);
+  }
+});
 
 const urlSource = new URLSearchParams(location.search).get("source");
 fetch("/native-config.json").then(response => response.json()).then(config => {

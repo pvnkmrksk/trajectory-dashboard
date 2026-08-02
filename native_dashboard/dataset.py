@@ -359,6 +359,18 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         category_codes[key] = codes
         category_labels[key] = labels
 
+    # Fly IDs can repeat across VR arenas.  The UI's per-animal visibility
+    # control therefore uses the same FlyID@VR identity as the dataset summary,
+    # while the existing FlyID filter remains available for parity.
+    animal_values = (
+        first.get("FlyID", pd.Series(["unknown"] * len(starts))).astype("string")
+        + "@"
+        + first.get("VR", pd.Series(["unknown"] * len(starts))).astype("string")
+    )
+    animal_codes, animal_labels = _encode_labels(animal_values)
+    category_codes["animal"] = animal_codes
+    category_labels["animal"] = animal_labels
+
     segment_ids = [str(value) for value in segment_labels.tolist()]
     segment_trial = _finite_float(first["CurrentTrial"], fill=0.0)
     segment_step = _finite_float(first["CurrentStep"], fill=0.0)
@@ -401,6 +413,13 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         f"{pattern}|{token}|{len(frame)}|{len(starts)}".encode("utf-8")
     ).hexdigest()[:16]
     rois = rois_by_config(metadata)
+    segment_durations = local_time[ends - 1]
+    finite_durations = segment_durations[np.isfinite(segment_durations)]
+    playback_max = (
+        float(np.percentile(finite_durations, 99))
+        if finite_durations.size
+        else 0.0
+    )
     meta = {
         "datasetId": dataset_id,
         "pattern": pattern,
@@ -425,6 +444,7 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
             "displacement": _range(arrays["segmentDisplacement"], (0.0, 1.0)),
             "distance": _range(arrays["segmentDistance"], (0.0, 1.0)),
         },
+        "playbackMax": playback_max,
         "categories": category_labels,
         "segmentIds": segment_ids,
         "rawColumns": _raw_numeric_columns(frame),

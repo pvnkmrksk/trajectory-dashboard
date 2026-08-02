@@ -52,6 +52,8 @@ def test_native_binary_is_aligned_and_file_scoped(tmp_path):
     # source files remain distinct even though trial and step are reused.
     assert header["counts"]["segments"] == 2
     assert len(set(header["segmentIds"])) == 2
+    assert header["playbackMax"] == 2.0
+    assert sorted(header["categories"]["animal"]) == ["fly-0@unknown", "fly-4@unknown"]
     assert "SensorValue" in header["rawColumns"]
     for descriptor in header["arrays"].values():
         item_size = np.dtype(descriptor["dtype"]).itemsize
@@ -70,7 +72,8 @@ def test_native_server_serves_plotly_free_shell_and_binary(tmp_path):
     shell = client.get("/")
     assert shell.status_code == 200
     assert b"TrajectoryRenderer" not in shell.data
-    assert b"plotly" not in shell.data.lower()
+    assert b"plotly.min.js" not in shell.data.lower()
+    assert b"vendor/echarts.min.js" in shell.data
 
     response = client.post("/api/load", json={"source": str(tmp_path)})
     assert response.status_code == 200
@@ -78,6 +81,47 @@ def test_native_server_serves_plotly_free_shell_and_binary(tmp_path):
     header, _ = _header(response.data)
     assert header["counts"]["retainedRows"] == 12
     assert header["arrays"]["x"]["length"] == 12
+
+
+def test_native_server_resolves_a_dropped_folder(monkeypatch, tmp_path):
+    folder = tmp_path / "Dropped Session"
+    folder.mkdir()
+    _write_csv(folder / "session_VR1_.csv", 0)
+    monkeypatch.setenv("TRAJ_DATA_ROOT", str(tmp_path))
+    client = create_native_app().test_client()
+
+    response = client.post("/api/resolve-drop", json={
+        "folder": folder.name,
+        "files": [f"{folder.name}/session_VR1_.csv"],
+    })
+
+    assert response.status_code == 200
+    assert response.json["source"].endswith("**/*_VR*.csv")
+
+
+def test_playback_uses_duration_p99_instead_of_the_longest_outlier(tmp_path):
+    rows = []
+    base = pd.Timestamp("2026-01-01T00:00:00")
+    for trial in range(101):
+        duration = 1000 if trial == 100 else 10
+        for seconds in (0, duration):
+            rows.append({
+                "Current Time": base + pd.Timedelta(seconds=seconds),
+                "CurrentTrial": trial,
+                "CurrentStep": 0,
+                "GameObjectPosX": seconds,
+                "GameObjectPosZ": trial,
+                "GameObjectRotY": 0,
+                "ConfigFile": "Choice_Test.json",
+                "Scene": "Choice",
+                "FlyID": "fly-1",
+            })
+    pd.DataFrame(rows).to_csv(tmp_path / "outlier_VR1_.csv", index=False)
+
+    header = load_native_dataset(str(tmp_path)).header
+
+    assert header["ranges"]["time"][1] == 1000
+    assert header["playbackMax"] == 10
 
 
 def test_roi_geometry_keeps_unity_xz_convention():

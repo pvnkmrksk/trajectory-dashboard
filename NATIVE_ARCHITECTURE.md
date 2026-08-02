@@ -48,15 +48,23 @@ queue. Results from an obsolete request are ignored. Filtering/grouping changes
 run a full worker pass; colour, spatial-grid, direction, statistics, raw-channel,
 and layout changes take narrower paths.
 
-`renderers.js` contains no plotting library:
+The rendering boundary is deliberately hybrid:
 
 - trajectories are `gl.LINES` in WebGL2 with panel placement, colour,
-  displayed-trial fraction, and playback time handled by shaders;
+  displayed-trial fraction, animal visibility, and playback time handled by
+  shaders/buffers;
 - occupancy is a small per-panel raster stretched through the shared viewport;
-- direction, polar, heading time, ROI diagnostics, metrics, histograms, and raw
-  channels use Canvas 2D;
+- the direction field uses a lightweight Canvas particle layer because its
+  spatial transform must remain exactly synchronized with trajectory/occupancy;
+- polar, heading time, ROI diagnostics, metrics, histograms, and raw channels
+  use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
+  interactive legends, data zoom, reset, accessibility, and export;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
 - section navigation leaves every renderer mounted and measurable.
+
+Every spatial pane is a square pixel viewport inside its responsive card. The
+WebGL shader and both Canvas transforms consume the same square-pixel geometry,
+so one X unit always has the same screen length as one Z unit.
 
 ## Measured reference workload
 
@@ -103,7 +111,7 @@ worker request or server request.
 | Trial/step/peak/displacement/distance and quality filters | Complete |
 | GPU trajectories, colour modes, moving gate, point budget | Complete |
 | Shared pan/zoom, reset, responsive columns, clean layout | Complete |
-| GPU playback and deterministic displayed-trial fraction | Complete |
+| GPU playback (local time, duration p99 cap) and displayed-trial fraction | Complete |
 | Occupancy count/time/percent and linear/log colour | Complete |
 | Local body/movement direction field | Complete |
 | Trial/animal polar and heading time | Complete |
@@ -114,8 +122,10 @@ worker request or server request.
 | Exact nearest-segment inspection | Complete |
 | Static self-contained native HTML report | Complete |
 | Shareable principal URL state | Complete |
-| Multi-ring curtain observer, Any/All, editable geometry | Complete (numeric editing; direct canvas drag remains polish) |
-| Drag/drop path resolution | Compatibility work |
+| Multi-ring curtain observer, Any/All, editable geometry | Complete (numeric and direct canvas drag) |
+| Whole-window folder drop, bounded path resolution, automatic load | Complete |
+| Per-animal immediate visibility across trajectory and interactive charts | Complete |
+| ECharts hover/legend/zoom/export for analytical charts | Complete |
 | Draggable panel ordering | Compatibility work |
 | Editable observation windows and paired window inference | Compatibility work |
 | Transition-probability cell observer | Compatibility work |
