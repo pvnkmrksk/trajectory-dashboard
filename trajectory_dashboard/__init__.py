@@ -31,11 +31,21 @@ from .io import (
     load_folder_metadata,
 )
 from .roi import roi_xz, rois_by_config, rois_from_config
+from .recipe import (
+    RecipeResult,
+    ViewRecipe,
+    filter_spec_from_recipe,
+    load_view_recipe,
+    parse_view_recipe,
+    recipe_from_url,
+)
 
 __all__ = [
     "FilterResult",
     "FilterSpec",
     "TrajectoryDataset",
+    "RecipeResult",
+    "ViewRecipe",
     "assign_trial_index",
     "concatenate_restarted_trials",
     "apply_filters",
@@ -43,12 +53,16 @@ __all__ = [
     "compute_tortuosity",
     "filter_by_stat_range",
     "filter_frame",
+    "filter_spec_from_recipe",
     "find_csv_files",
     "group_frames",
     "jump_buffer_seconds",
     "load_csv_fast",
     "load_dataset",
     "load_folder_metadata",
+    "load_view_recipe",
+    "parse_view_recipe",
+    "recipe_from_url",
     "roi_xz",
     "rois_by_config",
     "rois_from_config",

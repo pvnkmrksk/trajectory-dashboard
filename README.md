@@ -128,6 +128,20 @@ discovery, tolerant JSON metadata loading, segment ID normalization, vectorized
 quality filters, histogram-range filters, and grouping. You can use it for a
 plain script or notebook without starting the dashboard.
 
+The native dashboard's **View recipe (JSON)** panel captures the same choices
+in a readable file. A captured recipe—or a shareable native-dashboard URL—can
+be translated back into the public Python pipeline without reproducing the UI
+steps:
+
+```python
+from trajectory_dashboard import load_view_recipe
+
+view = load_view_recipe("daari-deepa-view-2026-08-02.json")
+print(view.filter_spec)
+for panel, frame in view.groups.items():
+    print(panel, frame["_seg_id"].nunique())
+```
+
 ```python
 from trajectory_dashboard import FilterSpec, filter_frame, group_frames, load_dataset
 

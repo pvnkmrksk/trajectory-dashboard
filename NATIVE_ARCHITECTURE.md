@@ -46,9 +46,11 @@ table off the main thread and prepares narrow drawing products:
 - load-time velocity/displacement histograms.
 
 Newer UI requests replace a pending request instead of accumulating a callback
-queue. Results from an obsolete request are ignored. Filtering/grouping changes
-run a full worker pass; colour, spatial-grid, direction, playback, statistics,
-and layout changes take narrower paths.
+queue. Results from an obsolete request are ignored. Filtering changes run a
+full worker pass. Panel labels/order remap the cached visible segments without
+rerunning the filter, occupancy is cached separately from direction, and
+colour, movement, heading, polar, playback, statistics, and layout changes
+rebuild only their dependent products.
 
 The rendering boundary is deliberately hybrid:
 
@@ -65,7 +67,8 @@ The rendering boundary is deliberately hybrid:
   use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
   interactive legends, data zoom, reset, accessibility, and export;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
-- section navigation leaves every renderer mounted and measurable.
+- the linked-lens workspace can focus Paths, Occupancy, Flow, or Polar, or show
+  all four in a compact 2×2 comparison without changing the analysis state.
 
 Spatial panes use the available rectangular card area. Their world ranges are
 expanded to the pane's pixel aspect, so the WebGL shader and both Canvas
@@ -83,8 +86,8 @@ Browser smoke on 2026-08-02 used the exact `tests/SubScale` folder source:
 | Source rows | about 4.19 million |
 | Retained rows | 1,906,400 |
 | Segments | 2,122 |
-| Uncompressed typed payload | 68.8 MB |
-| Python load + package | 9.17 s |
+| Uncompressed typed payload | 65.6 MB |
+| Python load + package | 6.96 s |
 | Repeat unchanged source lookup/package | 4 ms (in-process binary cache) |
 | Gzip response/transfer on localhost | about 1.45 s |
 | Default filtered-table pass | 87 ms |
@@ -94,7 +97,10 @@ Browser smoke on 2026-08-02 used the exact `tests/SubScale` folder source:
 
 Pan/zoom and displayed-trial fraction are renderer-local. Playback advanced a
 GPU time uniform while the application status remained Ready; it created no
-worker request or server request.
+worker request or server request. The curtain observer is also renderer-local:
+it scans only mounted GPU links once per animation frame and uploads a small
+per-segment entry-time texture instead of rescanning retained rows or rebuilding
+the trajectory product.
 
 ## Analytical invariants preserved
 
@@ -128,13 +134,15 @@ worker request or server request.
 | Native filter mini-histograms with dual range and exact numeric controls | Complete |
 | Exact nearest-segment inspection | Complete |
 | Static self-contained native HTML report | Complete |
-| Shareable principal URL state | Complete |
-| Multi-ring curtain observer, Any/All, editable geometry | Complete (live numeric/slider update; direct center move and edge resize) |
+| Shareable principal URL state and readable JSON view recipe | Complete |
+| Python recipe/URL → `FilterSpec`/grouped frames bridge | Complete |
+| Multi-ring curtain observer, Any/All, editable geometry | Complete (renderer-local live update; direct center move and edge resize) |
 | Whole-window folder drop, exact manifest/path resolution, strict source boundary, automatic load | Complete |
 | Per-animal immediate visibility across trajectory and interactive charts | Complete |
 | ECharts hover/legend/zoom/export for analytical charts | Complete |
-| Device-local human-readable treatment label overrides | Complete |
-| Draggable panel ordering | Compatibility work |
+| Device-local human-readable labels for every grouping axis | Complete |
+| Draggable/keyboard panel ordering across linked views | Complete |
+| Focused spatial lens and compact 2×2 comparison workspace | Complete |
 | Editable observation windows and paired window inference | Compatibility work |
 | Transition-probability cell observer | Compatibility work |
 | Delayed Holm/Rayleigh annotation layer | Compatibility work |
@@ -160,6 +168,28 @@ reloading or recomputing the complete table:
    separately throttled cadence), while the active trajectory remains live.
 5. Define file rotation, partial-line, checkpoint, duplicate-row, backpressure,
    and reconnect behavior before exposing the mode as an analysis source.
+
+## Privacy-first browser deployment roadmap (not implemented on this branch)
+
+The target deployment remains local-first: experimental files must never be
+uploaded merely to view them. The current trusted Python server is a practical
+reference loader and future streaming gateway, not a requirement that data
+leave the acquisition computer.
+
+1. Keep the `daari-deepa-view/v1` recipe and typed-column payload as stable
+   contracts. A captured recipe can already be passed to
+   `trajectory_dashboard.load_view_recipe()` to recover a readable
+   `FilterSpec`, filtered frame, and grouped frames for Matplotlib or notebooks.
+2. Add a static-site mode using the File System Access API/folder drop, a
+   Worker-based CSV parser, and the same segment-normalisation contract. All
+   parsing and analysis must remain in that browser tab; no upload endpoint is
+   involved.
+3. Validate the pure-browser parser against the Python reference on malformed
+   Unity timestamps, metadata fallbacks, restarted trials, and multi-file
+   segment identity before presenting it as scientifically equivalent.
+4. Retain the installable Python mode for very large sources, publication
+   workflows, file watching, and ZMQ. A static website is a convenience path,
+   while the locally trusted server is the high-capacity path.
 
 ## Verification
 

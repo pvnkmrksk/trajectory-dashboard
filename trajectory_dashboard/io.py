@@ -34,6 +34,13 @@ SCENE_COLUMN_PRIORITY = (
     "SequenceScene",
 )
 _MISSING_SCENE_LABELS = frozenset({"", "nan", "none", "null", "unknown", "n/a", "na"})
+_ANALYSIS_LOAD_COLUMNS = frozenset({
+    *REQUIRED_COLUMNS,
+    *SCENE_COLUMN_PRIORITY,
+    "ConfigFile", "VR", "Sex", "GameObjectRotY",
+    "FlyID", "FlyId", "fly_id", "flyid", "Fly ID",
+    "AnimalID", "AnimalId", "animal_id", "Animal ID",
+})
 
 
 @dataclass(frozen=True)
@@ -183,6 +190,8 @@ def _scene_name_from_frame(df: pd.DataFrame) -> pd.Series:
         missing = candidate.isna() | candidate.str.lower().isin(
             _MISSING_SCENE_LABELS)
         resolved = resolved.fillna(candidate.mask(missing))
+        if resolved.notna().all():
+            break
     return resolved.fillna("unknown")
 
 
@@ -399,17 +408,22 @@ def _sequence_mapping(path: str | None) -> dict[int, str]:
     return mapping
 
 
-def load_csv_fast(filepath: str) -> pd.DataFrame | None:
+def load_csv_fast(filepath: str, *, include_numeric: bool = True) -> pd.DataFrame | None:
     """Load and normalize one trajectory CSV.
 
     Trial and step values are coerced before both `ConfigFile` mapping and
     `_seg_id` construction, so mixed raw text such as `0` and `0.0` remains one
     segment. The returned frame keeps required columns, metadata columns, and
-    additional numeric sensor columns.
+    additional numeric sensor columns by default. Browser-native callers can
+    set ``include_numeric=False`` to avoid parsing unrelated sensor channels;
+    trajectory, orientation, scene, and animal identity columns are retained.
     """
 
     try:
-        df = pd.read_csv(filepath, parse_dates=["Current Time"])
+        read_options = {"parse_dates": ["Current Time"]}
+        if not include_numeric:
+            read_options["usecols"] = lambda column: column in _ANALYSIS_LOAD_COLUMNS
+        df = pd.read_csv(filepath, **read_options)
     except Exception:
         return None
     if not all(col in df.columns for col in REQUIRED_COLUMNS):
@@ -471,7 +485,8 @@ def load_csv_fast(filepath: str) -> pd.DataFrame | None:
     }
     numeric_keep = {
         col for col in df.columns
-        if pd.api.types.is_numeric_dtype(df[col])
+        if (include_numeric or col == "GameObjectRotY")
+        and pd.api.types.is_numeric_dtype(df[col])
         and col not in base_keep
         and not df[col].isna().all()
     }

@@ -101,6 +101,24 @@ function niceScaleDistance(span) {
   return (unit >= 5 ? 5 : (unit >= 2 ? 2 : 1)) * power;
 }
 
+function circleEntryFraction(x0, z0, x1, z1, ring) {
+  const rx = x0 - ring.x, rz = z0 - ring.z;
+  const radius2 = ring.r * ring.r;
+  if (rx * rx + rz * rz <= radius2) return 0;
+  const dx = x1 - x0, dz = z1 - z0;
+  const a = dx * dx + dz * dz;
+  if (!(a > 0)) return null;
+  const b = 2 * (rx * dx + rz * dz);
+  const c = rx * rx + rz * rz - radius2;
+  const discriminant = b * b - 4 * a * c;
+  if (discriminant < 0) return null;
+  const root = Math.sqrt(discriminant);
+  const first = (-b - root) / (2 * a), second = (-b + root) / (2 * a);
+  if (first >= 0 && first <= 1) return first;
+  if (second >= 0 && second <= 1) return second;
+  return null;
+}
+
 function squareBounds(bounds) {
   if (!bounds) return {xmin: -1, xmax: 1, zmin: -1, zmax: 1};
   const cx = (bounds.xmin + bounds.xmax) / 2;
@@ -406,14 +424,14 @@ class SpatialBase {
   moveRing(index, x, z, final = false) {
     if (!this.data?.rings?.[index] || !Number.isFinite(x) || !Number.isFinite(z)) return;
     this.data.rings[index] = {...this.data.rings[index], x, z};
-    this.draw();
+    this.drawOverlay?.();
     this.ringMoveHandler?.(index, x, z, final);
   }
   resizeRing(index, radius, final = false) {
     if (!this.data?.rings?.[index] || !Number.isFinite(radius)) return;
     const ring = this.data.rings[index];
     ring.r = Math.max(.01, radius);
-    this.draw();
+    this.drawOverlay?.();
     this.ringMoveHandler?.(index, ring.x, ring.z, final, ring.r);
   }
   setView(view, notify = false) {
@@ -501,6 +519,9 @@ export class TrajectoryRenderer extends SpatialBase {
       uniform float u_selected_segment;
       uniform float u_line_width;
       uniform float u_opacity;
+      uniform sampler2D u_ring_entries;
+      uniform float u_ring_enabled;
+      uniform float u_ring_texture_width;
       uniform vec4 u_palette[64];
       out vec4 v_color;
       out float v_inside;
@@ -537,11 +558,20 @@ export class TrajectoryRenderer extends SpatialBase {
         vec2 base = atEnd ? p1 : p0;
         gl_Position = vec4(base + (positive ? normal : -normal), 0.0, 1.0);
         v_world = atEnd ? world1 : world0;
-        int colorIndex = clamp(int(a_color + .5), 0, 63);
+        int segmentId = max(0, int(a_segment_id + .5));
+        int textureWidth = max(1, int(u_ring_texture_width + .5));
+        float ringEntry = texelFetch(
+          u_ring_entries, ivec2(segmentId % textureWidth, segmentId / textureWidth), 0
+        ).r;
+        bool ringVisible = u_ring_enabled < .5 || ringEntry >= 0.0;
+        float vertexTime = atEnd ? a_time.y : a_time.x;
+        bool beforeRing = u_ring_enabled > .5 && ringEntry >= 0.0 && vertexTime < ringEntry;
+        int colorIndex = beforeRing ? 20 : clamp(int(a_color + .5), 0, 63);
         v_color = u_palette[colorIndex];
         v_color.a = u_opacity * (colorIndex == 20 ? .72 : 1.0);
         bool selected = u_selected_segment < 0.0 || abs(a_segment_id - u_selected_segment) < .5;
-        v_inside = (a_sample <= u_fraction && a_time.x <= u_time && a_visible > .5 && selected) ? 1.0 : 0.0;
+        v_inside = (a_sample <= u_fraction && a_time.x <= u_time && a_visible > .5
+          && selected && ringVisible) ? 1.0 : 0.0;
       }`, `#version 300 es
       precision highp float;
       in vec4 v_color;
@@ -557,6 +587,11 @@ export class TrajectoryRenderer extends SpatialBase {
     `);
     this.vao = gl.createVertexArray();
     this.buffers = Array.from({length: 7}, () => gl.createBuffer());
+    this.ringTexture = gl.createTexture();
+    this.ringEntries = new Float32Array([-1]);
+    this.ringTextureWidth = 1;
+    this.ringEnabled = false;
+    this._uploadRingEntries();
   }
   _attribute(index, data, size, type, normalized = false, stride = 0) {
     const gl = this.gl;
@@ -581,8 +616,69 @@ export class TrajectoryRenderer extends SpatialBase {
     this._attribute(6, data.segments, 1, gl.UNSIGNED_INT, false, 8);
     gl.bindVertexArray(null);
     this.instanceCount = data.links;
+    this.ringEntries = new Float32Array(Math.max(1, data.segmentCount || 1));
+    this.ringEntries.fill(-1);
+    this.ringEnabled = false;
+    this._uploadRingEntries();
     if (!preserveView || !this.view) this.view = squareBounds(data.bounds);
     this.draw();
+  }
+  _uploadRingEntries() {
+    const gl = this.gl;
+    const maxWidth = Math.max(1, Math.min(2048, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
+    this.ringTextureWidth = Math.min(maxWidth, Math.max(1, this.ringEntries.length));
+    const height = Math.max(1, Math.ceil(this.ringEntries.length / this.ringTextureWidth));
+    const packed = new Float32Array(this.ringTextureWidth * height);
+    packed.fill(-1); packed.set(this.ringEntries);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.ringTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, this.ringTextureWidth, height, 0, gl.RED, gl.FLOAT, packed);
+  }
+  setRingObserver(enabled, rings, match = "any") {
+    if (!this.data) return {matches: 0, buildMs: 0};
+    const started = performance.now();
+    const active = (rings || []).filter(ring => Number(ring.r) > 0).map(ring => ({
+      x: Number(ring.x) || 0, z: Number(ring.z) || 0, r: Math.max(.01, Number(ring.r) || .01),
+    }));
+    this.data.rings = active; this.data.ringEnabled = !!enabled; this.data.ringMatch = match;
+    this.ringEnabled = !!enabled && active.length > 0;
+    this.ringEntries.fill(-1);
+    let matches = this.ringEnabled ? 0 : (this.data.visibleSegments || 0);
+    if (this.ringEnabled) {
+      const hitTimes = active.map(() => {
+        const values = new Float32Array(this.ringEntries.length); values.fill(-1); return values;
+      });
+      for (let link = 0; link < this.data.links; link += 1) {
+        const segment = this.data.segments[link * 2];
+        const vertex = link * 4, time = link * 2;
+        for (let index = 0; index < active.length; index += 1) {
+          if (hitTimes[index][segment] >= 0) continue;
+          const fraction = circleEntryFraction(
+            this.data.vertices[vertex], this.data.vertices[vertex + 1],
+            this.data.vertices[vertex + 2], this.data.vertices[vertex + 3], active[index],
+          );
+          if (fraction != null) hitTimes[index][segment] = this.data.times[time]
+            + fraction * (this.data.times[time + 1] - this.data.times[time]);
+        }
+      }
+      for (let segment = 0; segment < this.ringEntries.length; segment += 1) {
+        let entry = match === "all" ? -Infinity : Infinity, reached = 0;
+        for (const values of hitTimes) if (values[segment] >= 0) {
+          reached += 1;
+          entry = match === "all" ? Math.max(entry, values[segment]) : Math.min(entry, values[segment]);
+        }
+        const qualifies = match === "all" ? reached === active.length : reached > 0;
+        if (qualifies) { this.ringEntries[segment] = entry; matches += 1; }
+      }
+    }
+    this.data.ringMatches = matches;
+    this._uploadRingEntries();
+    this.drawGl(); this.drawOverlay();
+    return {matches, buildMs: performance.now() - started};
   }
   setAnimalVisibility(visible) {
     this.animalVisibility = visible ? [...visible] : null;
@@ -632,6 +728,11 @@ export class TrajectoryRenderer extends SpatialBase {
     gl.uniform1f(gl.getUniformLocation(this.program, "u_selected_segment"), this.selectedSegment);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_line_width"), this.lineWidth);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_opacity"), this.lineOpacity);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.ringTexture);
+    gl.uniform1i(gl.getUniformLocation(this.program, "u_ring_entries"), 0);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_enabled"), this.ringEnabled ? 1 : 0);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_texture_width"), this.ringTextureWidth);
     gl.uniform4fv(gl.getUniformLocation(this.program, "u_palette[0]"), PALETTE_FLOATS);
     gl.bindVertexArray(this.vao);
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
@@ -639,6 +740,9 @@ export class TrajectoryRenderer extends SpatialBase {
   }
   draw() {
     this.drawGl();
+    this.drawOverlay();
+  }
+  drawOverlay() {
     const dpr = setupCanvas(this.overlay, this.width, this.height);
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.ctx.clearRect(0, 0, this.width, this.height);

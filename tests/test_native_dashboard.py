@@ -8,6 +8,7 @@ import pandas as pd
 
 from native_dashboard.dataset import FORMAT_NAME, load_native_dataset
 from native_dashboard.server import create_native_app
+from trajectory_dashboard.recipe import load_view_recipe, recipe_from_url
 from trajectory_dashboard.roi import roi_xz, rois_by_config, rois_from_config
 
 
@@ -213,3 +214,35 @@ def test_roi_geometry_keeps_unity_xz_convention():
     mapped = rois_by_config(metadata)
     assert mapped["Choice_Targets.json"]
     assert mapped["Choice_None.json"][0]["inferred"] is True
+
+
+def test_native_view_recipe_returns_readable_python_groups(tmp_path):
+    _write_csv(tmp_path / "session_VR1_.csv", 0)
+    recipe = {
+        "schema": "daari-deepa-view/v1",
+        "source": str(tmp_path),
+        "filtersByLabel": {"config": ["Choice_Test.json"]},
+        "state": {
+            "groupBy": "config",
+            "filters": {},
+            "ranges": {"trial": [0, 0], "step": [0, 0]},
+        },
+        "visuals": {"trajectory-width": "1.7"},
+    }
+
+    view = load_view_recipe(recipe)
+
+    assert view.filter_spec.configs == ("Choice_Test.json",)
+    assert len(view.filter_result.filtered) == 6
+    assert list(view.groups) == ["Choice_Test.json"]
+
+
+def test_native_url_state_is_parseable_without_starting_the_dashboard():
+    recipe = recipe_from_url(
+        "http://127.0.0.1:8060/?source=data%2Fsession&group=scene"
+        "&filters=%7B%22config%22%3A%5B0%5D%7D"
+    )
+
+    assert recipe.source == "data/session"
+    assert recipe.state["groupBy"] == "scene"
+    assert recipe.state["filters"] == {"config": [0]}

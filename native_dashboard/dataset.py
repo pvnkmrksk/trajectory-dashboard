@@ -289,12 +289,16 @@ def _load_reference_dataset(pattern: str):
 
     def load_one(item):
         index, path = item
-        frame = td_io.load_csv_fast(path)
+        frame = td_io.load_csv_fast(path, include_numeric=False)
         if frame is None:
             return index, path, None, None, 0
         raw_rows = len(frame)
-        speed = smoothed_velocity(frame, window=10)
-        stats = compute_segment_stats(frame, speed=speed)
+        raw_speed = velocity_all(frame)
+        speed = smoothed_velocity(frame, window=10, raw_speed=raw_speed)
+        tortuosity = compute_tortuosity(frame, window=15)
+        stats = compute_segment_stats(
+            frame, speed=speed, tortuosity=tortuosity,
+        )
         quota = None
         if LOAD_ROW_BUDGET > 0:
             quota = max(
@@ -304,6 +308,8 @@ def _load_reference_dataset(pattern: str):
                 )),
             )
         frame["_smoothed_velocity"] = np.asarray(speed, dtype=np.float32)
+        frame["_raw_velocity"] = np.asarray(raw_speed, dtype=np.float32)
+        frame["_local_tortuosity"] = np.asarray(tortuosity, dtype=np.float32)
         if quota and len(frame) > quota:
             frame = frame.loc[
                 _segment_endpoint_keep(frame["_seg_id"].to_numpy(), quota)
@@ -381,14 +387,14 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
     z = _finite_float(frame["GameObjectPosZ"])
     local_time = _local_time_seconds(frame, starts, ends)
     smooth_speed = _finite_float(frame["_smoothed_velocity"])
-    raw_speed = velocity_all(frame).astype(np.float32)
+    raw_speed = _finite_float(frame["_raw_velocity"])
     movement = _movement_heading(x, z, starts)
     if "GameObjectRotY" in frame:
         orientation = _finite_float(frame["GameObjectRotY"])
         orientation = ((orientation + 180.0) % 360.0 - 180.0).astype(np.float32)
     else:
         orientation = movement.copy()
-    local_tortuosity = compute_tortuosity(frame, window=15).astype(np.float32)
+    local_tortuosity = _finite_float(frame["_local_tortuosity"])
 
     first = frame.iloc[starts]
     category_columns = {

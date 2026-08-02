@@ -83,7 +83,7 @@
             </select>
           </label>
           <label>Colour
-            <select id="color-by" data-scope="trajectory">
+            <select id="color-by" data-scope="color">
               <option value="categorical">Current panels</option>
               <option value="none">Neutral</option>
               <option value="fly">Animal</option>
@@ -107,10 +107,10 @@
           <label>Path opacity
             <input id="trajectory-opacity" type="range" min="0.03" max="1" step="0.01" value="0.34">
           </label>
-          <label class="check"><input id="moving-only" data-scope="trajectory" type="checkbox"> Moving samples only</label>
+          <label class="check"><input id="moving-only" data-scope="movement" type="checkbox"> Moving samples only</label>
           <label class="check"><input id="spatial-grid" type="checkbox" checked> Spatial grid</label>
           <label>Walk threshold
-            <input id="walk-threshold" data-scope="direction" type="number" min="0" step="0.01" value="0">
+            <input id="walk-threshold" data-scope="movement" type="number" min="0" step="0.01" value="0">
           </label>
         </div>
       </details>
@@ -158,9 +158,38 @@
       </details>
 
       <details class="control-card">
-        <summary>Treatment display names</summary>
-        <div class="control-body label-editor" id="config-labels">
-          <span class="empty-control">Load data to edit plot labels.</span>
+        <summary>Plot display names</summary>
+        <div class="control-body">
+          <label>Label set<select id="label-axis">
+            <option value="config">Treatments</option><option value="scene">Scenes</option>
+            <option value="vr">VR arenas</option><option value="fly">Animals</option>
+            <option value="folder">Source folders</option>
+          </select></label>
+          <div class="label-editor" id="panel-labels">
+            <span class="empty-control">Load data to edit plot labels.</span>
+          </div>
+        </div>
+      </details>
+
+      <details class="control-card">
+        <summary>Panel order</summary>
+        <div class="control-body">
+          <p class="control-note">Drag panels or use the arrows. The order applies to every linked view.</p>
+          <div class="panel-order" id="panel-order"><span class="empty-control">Load data to reorder panels.</span></div>
+        </div>
+      </details>
+
+      <details class="control-card">
+        <summary>View recipe (JSON)</summary>
+        <div class="control-body recipe-editor">
+          <p class="control-note">A readable record of the source, subsets, analysis gates, labels, ordering, and visual settings.</p>
+          <textarea id="recipe-json" rows="10" spellcheck="false" placeholder="Capture the current view or paste a recipe here."></textarea>
+          <div class="recipe-actions">
+            <button class="compact" id="recipe-capture" type="button">Capture</button>
+            <button class="compact" id="recipe-apply" type="button">Apply</button>
+            <button class="compact" id="recipe-copy" type="button">Copy</button>
+            <button class="compact" id="recipe-download" type="button">Download</button>
+          </div>
         </div>
       </details>
 
@@ -168,7 +197,7 @@
         <summary>Direction and statistics</summary>
         <div class="control-body two-up">
           <label>Angle source
-            <select id="angle-source" data-scope="direction">
+            <select id="angle-source" data-scope="movement">
               <option value="orientation">Body orientation</option>
               <option value="movement">Movement heading</option>
             </select>
@@ -178,26 +207,40 @@
               <option value="trial">Trial</option><option value="animal">Animal</option>
             </select>
           </label>
-          <label>Polar R min<input id="polar-r-min" data-scope="direction" type="number" min="0" max="1" step="0.05" value="0"></label>
-          <label>Polar R max<input id="polar-r-max" data-scope="direction" type="number" min="0" max="1" step="0.05" value="1"></label>
-          <label>Valid points min<input id="polar-valid-min" data-scope="direction" type="number" min="0" max="1" step="0.05" value="0"></label>
+          <label>Polar R min<input id="polar-r-min" data-scope="polar" type="number" min="0" max="1" step="0.05" value="0"></label>
+          <label>Polar R max<input id="polar-r-max" data-scope="polar" type="number" min="0" max="1" step="0.05" value="1"></label>
+          <label>Valid points min<input id="polar-valid-min" data-scope="polar" type="number" min="0" max="1" step="0.05" value="0"></label>
         </div>
       </details>
     </aside>
 
     <main class="workspace" id="workspace">
       <nav class="section-nav" aria-label="Plot sections">
-        <button data-target="trajectory-section" class="active">Paths</button>
-        <button data-target="occupancy-section">Occupancy</button>
-        <button data-target="direction-section">Direction</button>
-        <button data-target="polar-section">Polar</button>
+        <button data-target="explore-section" class="active">Explore</button>
         <button data-target="roi-section">Targets</button>
         <button data-target="heading-section">Heading time</button>
         <button data-target="metrics-section">Trial metrics</button>
         <button data-target="diagnostics-section">Diagnostics</button>
       </nav>
 
-      <section class="plot-section hero-section" id="trajectory-section">
+      <section class="plot-section explore-section" id="explore-section" data-lens="trajectory">
+        <div class="explore-heading">
+          <div>
+            <span class="section-kicker">Linked views · one spatial frame</span>
+            <h2>From paths to population structure</h2>
+            <p>Move through the same filtered data as raw paths, occupancy, local flow, or trial resultants. Spatial zoom is shared.</p>
+          </div>
+          <div class="lens-switch" role="group" aria-label="Exploration view">
+            <button class="active" type="button" data-lens-button="trajectory">Paths</button>
+            <button type="button" data-lens-button="occupancy">Occupancy</button>
+            <button type="button" data-lens-button="direction">Flow</button>
+            <button type="button" data-lens-button="polar">Polar</button>
+            <button type="button" data-lens-button="compare">Compare 2×2</button>
+            <button class="quiet" id="download-plot-button" type="button">Download PNG</button>
+          </div>
+        </div>
+        <div class="explore-grid">
+      <article class="lens-panel hero-section" id="trajectory-section" data-view="trajectory">
         <div class="section-heading">
           <div><span class="section-kicker">Spatial paths</span><h2>Trajectory field</h2></div>
           <div class="section-summary" id="trajectory-summary">Load data to begin.</div>
@@ -222,9 +265,9 @@
           <div class="plot-host large" id="trajectory-plot" aria-label="Trajectory plot"></div>
           <div class="plot-hint">Drag to pan · wheel to zoom · double-click to reset · drag a ring centre to move or its edge to resize · spatial panels preserve one X unit = one Z unit</div>
         </div>
-      </section>
+      </article>
 
-      <section class="plot-section" id="occupancy-section">
+      <article class="lens-panel" id="occupancy-section" data-view="occupancy">
         <div class="section-heading">
           <div><span class="section-kicker">Spatial density</span><h2>Occupancy</h2></div>
           <div class="inline-controls">
@@ -238,9 +281,9 @@
           </div>
         </div>
         <div class="plot-card"><div class="plot-host" id="heatmap-plot" aria-label="Occupancy heatmap"></div></div>
-      </section>
+      </article>
 
-      <section class="plot-section" id="direction-section">
+      <article class="lens-panel" id="direction-section" data-view="direction">
         <div class="section-heading">
           <div><span class="section-kicker">Circular mean by cell</span><h2>Local direction field</h2></div>
           <div class="inline-controls flow-controls">
@@ -261,23 +304,25 @@
           </div>
           <div class="plot-host" id="direction-plot" aria-label="Local direction field"></div>
         </div>
-      </section>
+      </article>
 
-      <section class="plot-section" id="polar-section">
+      <article class="lens-panel" id="polar-section" data-view="polar">
         <div class="section-heading">
           <div><span class="section-kicker">Trial resultants</span><h2>Polar direction</h2></div>
           <div class="section-summary" id="polar-summary"></div>
         </div>
         <div class="plot-card"><div class="plot-host" id="polar-plot" aria-label="Polar direction plot"></div></div>
+      </article>
+        </div>
       </section>
 
       <section class="plot-section" id="heading-section">
         <div class="section-heading">
           <div><span class="section-kicker">Signed angle</span><h2>Heading over local time</h2></div>
           <div class="inline-controls">
-            <label>Representation<select id="heading-mode" data-scope="direction"><option value="trial">Trial traces</option><option value="mean">Animal circular mean</option><option value="density">Time × heading heatmap</option></select></label>
-            <label>Time bin (s)<input id="heading-bin" data-scope="direction" type="number" min="0.05" step="0.05" value="0.25"></label>
-            <label>Angle sectors<input id="heading-sectors" data-scope="direction" type="number" min="12" max="72" step="4" value="36"></label>
+            <label>Representation<select id="heading-mode" data-scope="heading"><option value="trial">Trial traces</option><option value="mean">Animal circular mean</option><option value="density">Time × heading heatmap</option></select></label>
+            <label>Time bin (s)<input id="heading-bin" data-scope="heading" type="number" min="0.05" step="0.05" value="0.25"></label>
+            <label>Angle sectors<input id="heading-sectors" data-scope="heading" type="number" min="12" max="72" step="4" value="36"></label>
           </div>
         </div>
         <div class="plot-card"><div class="plot-host" id="heading-plot" aria-label="Heading over time"></div></div>

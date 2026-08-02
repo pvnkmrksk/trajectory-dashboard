@@ -35,6 +35,10 @@ let animalVisibility = [];
 let displayNames = {};
 let visibleSegmentOptions = [];
 let currentDurationSummary = null;
+let lastSummary = null;
+let ringFrame = null;
+let currentLens = "trajectory";
+let panelOrders = {};
 const rangeControls = new Map();
 
 function setStatus(kind, title, detail) {
@@ -87,8 +91,8 @@ trajectoryRenderer.setRingMoveHandler((index, x, z, final, radius = null) => {
   rings[index] = {...rings[index], x, z,
     r: Number.isFinite(radius) ? Math.max(.01, radius) : rings[index].r};
   activeRing = index;
-  renderRingControls();
-  scheduleCompute("trajectory", final ? 0 : 45);
+  updateRingControlValues();
+  scheduleLocalRingObserver(final);
 });
 
 function parseBinary(buffer) {
@@ -119,7 +123,9 @@ function applyAnimalVisibility() {
   trajectoryRenderer.setAnimalVisibility(animalVisibility);
   const charts = [polarRenderer, headingRenderer, metricsRenderer, roiRenderer];
   for (const chart of charts) chart.animalVisibility = [...animalVisibility];
-  const activeSection = document.querySelector(".section-nav button.active")?.dataset.target;
+  const activeSection = currentLens === "polar" || currentLens === "compare"
+    ? "polar-section"
+    : document.querySelector(".section-nav button.active")?.dataset.target;
   const activeChart = {
     "polar-section": polarRenderer,
     "heading-section": headingRenderer,
@@ -215,35 +221,42 @@ function createRangeControl(key, label, idMin, idMax) {
   });
   new ResizeObserver(redraw).observe(canvas);
   redraw();
-  rangeControls.set(key, {host, redraw});
+  rangeControls.set(key, {host, redraw, low, high, loInput, hiInput});
 }
 
 function loadDisplayNames() {
   displayNames = structuredClone(datasetHeader.displayCategories || datasetHeader.categories || {});
   try {
     const stored = JSON.parse(localStorage.getItem("daari-deepa-labels") || "{}");
-    const raw = datasetHeader.categories.config || [];
-    displayNames.config = raw.map((name, index) => stored[name] || displayNames.config?.[index] || name);
+    for (const key of ["config", "scene", "vr", "fly", "folder"]) {
+      const raw = datasetHeader.categories[key] || [];
+      const overrides = stored[key] && typeof stored[key] === "object" ? stored[key] : {};
+      displayNames[key] = raw.map((name, index) =>
+        overrides[name] || (key === "config" ? stored[name] : null)
+        || displayNames[key]?.[index] || name);
+    }
   } catch (_) { /* device-local overrides are optional */ }
 }
 
-function renderConfigLabels() {
-  const host = byId("config-labels"); host.replaceChildren();
-  const raw = datasetHeader.categories.config || [];
+function renderDisplayLabels() {
+  const key = byId("label-axis").value;
+  const host = byId("panel-labels"); host.replaceChildren();
+  const raw = datasetHeader.categories[key] || [];
   raw.forEach((name, index) => {
     const label = document.createElement("label");
     const source = document.createElement("span"); source.textContent = name;
-    const input = document.createElement("input"); input.value = displayNames.config?.[index] || name;
+    const input = document.createElement("input"); input.value = displayNames[key]?.[index] || name;
     label.append(source, input); host.appendChild(label);
     input.addEventListener("change", () => {
-      displayNames.config[index] = input.value.trim() || name;
+      displayNames[key][index] = input.value.trim() || name;
       try {
         const stored = JSON.parse(localStorage.getItem("daari-deepa-labels") || "{}");
-        stored[name] = displayNames.config[index];
+        stored[key] = stored[key] && typeof stored[key] === "object" ? stored[key] : {};
+        stored[key][name] = displayNames[key][index];
         localStorage.setItem("daari-deepa-labels", JSON.stringify(stored));
       } catch (_) { /* local persistence is best-effort */ }
-      const option = byId("filter-config")?.options[index];
-      if (option) option.textContent = displayNames.config[index];
+      const option = byId(`filter-${key}`)?.options[index];
+      if (option) option.textContent = displayNames[key][index];
       scheduleCompute("full", 20);
     });
   });
@@ -273,7 +286,9 @@ function populateControls() {
   createRangeControl("peak", "Peak smoothed velocity", "peak-min", "peak-max");
   createRangeControl("displacement", "Net displacement", "disp-min", "disp-max");
   createRangeControl("distance", "Distance walked", "distance-min", "distance-max");
-  renderConfigLabels();
+  const grouped = byId("group-by").value;
+  if (["config", "scene", "vr", "fly", "folder"].includes(grouped)) byId("label-axis").value = grouped;
+  renderDisplayLabels();
   applyButton.disabled = false; resetViewButton.disabled = false; byId("resample-button").disabled = false;
   byId("export-button").disabled = false;
   const maxTime = Math.max(0, datasetHeader.playbackQuantiles?.p95 ?? datasetHeader.playbackMax ?? 0);
@@ -339,6 +354,8 @@ function collectState() {
     headingMode: byId("heading-mode").value,
     headingBin: numberValue("heading-bin", .25),
     headingSectors: numberValue("heading-sectors", 36),
+    lens: currentLens,
+    panelOrders,
     sampleSeed,
   };
 }
@@ -355,6 +372,18 @@ function persistState() {
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
   params.set("pcap", state.playbackPercentile);
   params.set("hmode", state.headingMode); params.set("hbin", state.headingBin); params.set("hsec", state.headingSectors);
+  params.set("lens", currentLens);
+  if (Object.keys(panelOrders).length) params.set("order", JSON.stringify(panelOrders));
+  else params.delete("order");
+  params.set("filters", JSON.stringify(state.filters));
+  params.set("ranges", JSON.stringify(state.ranges));
+  params.set("quality", JSON.stringify({
+    jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
+    minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
+    movingOnly: state.movingOnly, walkThreshold: state.walkThreshold,
+    roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
+    polarR: state.polarR, polarValidMin: state.polarValidMin,
+  }));
   params.set("tw", byId("trajectory-width").value); params.set("topacity", byId("trajectory-opacity").value);
   params.set("hrange", byId("heat-range-mode").value); params.set("hcmin", byId("heat-cmin").value); params.set("hcmax", byId("heat-cmax").value);
   params.set("fmetric", byId("flow-metric").value); params.set("frange", byId("flow-range-mode").value);
@@ -383,6 +412,35 @@ function restoreViewStateFromUrl() {
     "flow-speed": params.get("fspeed"), "flow-variability": params.get("fvar"),
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
+  setSpatialLens(params.get("lens") || "trajectory", false);
+  try {
+    const restoredOrder = JSON.parse(params.get("order") || "{}");
+    panelOrders = restoredOrder && typeof restoredOrder === "object" ? restoredOrder : {};
+  } catch (_) { panelOrders = {}; }
+  try {
+    const filters = JSON.parse(params.get("filters") || "{}");
+    for (const [key, selected] of Object.entries(filters)) {
+      const select = byId(`filter-${key}`); if (!select || !Array.isArray(selected)) continue;
+      for (const option of select.options) option.selected = selected.map(Number).includes(Number(option.value));
+    }
+  } catch (_) { /* malformed optional URL state is ignored */ }
+  try {
+    const ranges = JSON.parse(params.get("ranges") || "{}");
+    const ids = {trial:["trial-min","trial-max"], step:["step-min","step-max"], peak:["peak-min","peak-max"], displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"]};
+    for (const [key, valuesForRange] of Object.entries(ranges)) {
+      if (!ids[key] || !Array.isArray(valuesForRange)) continue;
+      byId(ids[key][0]).value = valuesForRange[0]; byId(ids[key][1]).value = valuesForRange[1];
+      const control = rangeControls.get(key);
+      if (control) { control.low.value = valuesForRange[0]; control.high.value = valuesForRange[1]; control.redraw(); }
+    }
+  } catch (_) { /* malformed optional URL state is ignored */ }
+  try {
+    const quality = JSON.parse(params.get("quality") || "{}");
+    const numbers = {jumpThreshold:"jump-threshold",jumpBufferMs:"jump-buffer",minDisplacement:"min-displacement",edgeTrim:"edge-trim",walkThreshold:"walk-threshold",roiReach:"roi-reach",polarValidMin:"polar-valid-min"};
+    for (const [key, id] of Object.entries(numbers)) if (quality[key] != null) byId(id).value = quality[key];
+    if (Array.isArray(quality.polarR)) { byId("polar-r-min").value = quality.polarR[0]; byId("polar-r-max").value = quality.polarR[1]; }
+    for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim"})) if (quality[key] != null) byId(id).checked = !!quality[key];
+  } catch (_) { /* malformed optional URL state is ignored */ }
   byId("ring-enabled").checked = params.get("ring") === "1";
   byId("ring-match").value = params.get("ringmatch") || "any";
   try {
@@ -391,17 +449,38 @@ function restoreViewStateFromUrl() {
   } catch (_) { /* retain safe default */ }
 }
 
-function scopePriority(scope) {
-  return {layout: 0, trajectory: 1, playback: 2, direction: 2, statistics: 2, spatial: 3, full: 4}[scope] || 1;
+const scopeProducts = {
+  layout: [], trajectory: ["trajectory"], playback: ["heading"], heading: ["heading"],
+  polar: ["polar"], spatial: ["heatmap", "direction"],
+  color: ["trajectory", "polar", "heading"], sample: ["trajectory", "polar", "heading"],
+  statistics: ["polar", "metrics", "roi"],
+  movement: ["trajectory", "direction", "polar", "heading", "roi"],
+};
+
+function mergeScopes(first, second) {
+  if (!first || first === second) return second || first || null;
+  if (first === "full" || second === "full") return "full";
+  const needed = new Set([...(scopeProducts[first] || []), ...(scopeProducts[second] || [])]);
+  const candidates = Object.entries(scopeProducts)
+    .filter(([, productsForScope]) => [...needed].every(product => productsForScope.includes(product)))
+    .sort((a, b) => a[1].length - b[1].length);
+  return candidates[0]?.[0] || "full";
 }
 
 let computeTimer = null;
+let scheduledScope = null;
+let scheduledExtra = {};
 function scheduleCompute(scope = "full", delay = 0, extra = {}) {
   if (!workerReady || !datasetHeader) return;
   clearTimeout(computeTimer);
-  const existing = pendingCompute;
-  const chosenScope = existing && scopePriority(existing.scope) > scopePriority(scope) ? existing.scope : scope;
-  computeTimer = setTimeout(() => queueCompute(chosenScope, extra), delay);
+  scheduledScope = mergeScopes(mergeScopes(pendingCompute?.scope, scheduledScope), scope);
+  scheduledExtra = {...scheduledExtra, ...extra};
+  computeTimer = setTimeout(() => {
+    const chosenScope = scheduledScope || "full";
+    const chosenExtra = scheduledExtra;
+    scheduledScope = null; scheduledExtra = {};
+    queueCompute(chosenScope, chosenExtra);
+  }, delay);
 }
 
 function queueCompute(scope, extra = {}) {
@@ -512,6 +591,7 @@ function stepPlaybackSegment(delta) {
 }
 
 function renderProducts(incoming, summary) {
+  lastSummary = summary;
   Object.assign(products, incoming);
   datasetSummary(summary);
   if (summary.segmentOptions) {
@@ -519,6 +599,7 @@ function renderProducts(incoming, summary) {
     populatePlaybackSegments();
   }
   updatePlaybackLimit(summary.durationSummary);
+  if (summary.panelKeys) renderPanelOrder(summary.panelKeys);
   const preserve = !newDataset && !!sharedView;
   if (incoming.trajectory) {
     incoming.trajectory.columns = numberValue("panel-columns");
@@ -527,8 +608,7 @@ function renderProducts(incoming, summary) {
     updatePlaybackScope();
     if (!preserve) sharedView = {...trajectoryRenderer.view};
     syncView(sharedView, trajectoryRenderer);
-    const ringText = incoming.trajectory.ringEnabled ? ` · ${formatCount(incoming.trajectory.ringMatches)} ring matches` : "";
-    byId("trajectory-summary").textContent = `${formatCount(summary.visibleSegments)} segments · ${formatCount(summary.visibleRows)} retained points · ${formatCount(incoming.trajectory.links)} GPU line segments${ringText}`;
+    updateTrajectorySummary(applyLocalRingObserver(false));
   }
   if (incoming.heatmap) {
     incoming.heatmap.columns = numberValue("panel-columns");
@@ -638,6 +718,144 @@ function compositePlot(hostId) {
   return output.toDataURL("image/png");
 }
 
+function setSpatialLens(lens, save = true) {
+  const allowed = new Set(["trajectory", "occupancy", "direction", "polar", "compare"]);
+  currentLens = allowed.has(lens) ? lens : "trajectory";
+  byId("explore-section").dataset.lens = currentLens;
+  for (const button of document.querySelectorAll("[data-lens-button]")) {
+    button.classList.toggle("active", button.dataset.lensButton === currentLens);
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const shown = currentLens === "compare"
+      ? new Set(["trajectory", "occupancy", "direction", "polar"])
+      : new Set([currentLens]);
+    if (shown.has("trajectory")) { trajectoryRenderer.resize(); trajectoryRenderer.draw(); }
+    if (shown.has("occupancy")) { heatmapRenderer.resize(); heatmapRenderer.draw(); }
+    if (shown.has("direction")) { directionRenderer.resize(); directionRenderer.draw(); }
+    if (shown.has("polar")) { polarRenderer.chart.resize({animation: {duration: 0}}); polarRenderer.draw(); }
+    applyAnimalVisibility();
+  }));
+  if (save) persistState();
+}
+
+function downloadActivePlot() {
+  const lens = currentLens === "compare" ? "trajectory" : currentLens;
+  const host = {
+    trajectory: "trajectory-plot", occupancy: "heatmap-plot",
+    direction: "direction-plot", polar: "polar-plot",
+  }[lens];
+  const url = compositePlot(host);
+  if (!url) return;
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `daari-deepa-${lens}-${new Date().toISOString().slice(0, 10)}.png`;
+  anchor.click();
+}
+
+const recipeVisualIds = [
+  "trajectory-width", "trajectory-opacity", "heat-metric", "heat-scale",
+  "heat-range-mode", "heat-cmin", "heat-cmax", "flow-metric",
+  "flow-range-mode", "flow-cmin", "flow-cmax", "particle-rate",
+  "trail-length", "flow-speed", "flow-variability", "trial-fraction",
+];
+
+function currentRecipe() {
+  const state = collectState();
+  return {
+    schema: "daari-deepa-view/v1",
+    source: sourceInput.value,
+    filtersByLabel: Object.fromEntries(Object.entries(state.filters).map(([key, codes]) => [
+      key, codes.map(code => datasetHeader?.categories?.[key]?.[code]).filter(Boolean),
+    ])),
+    state,
+    visuals: Object.fromEntries(recipeVisualIds.map(id => [id, byId(id).value])),
+  };
+}
+
+function captureRecipe() {
+  if (!datasetHeader) return null;
+  const recipe = currentRecipe();
+  byId("recipe-json").value = JSON.stringify(recipe, null, 2);
+  return recipe;
+}
+
+function applyRecipeControls(recipe) {
+  const state = recipe?.state || {};
+  const filterCodes = state.filters || {};
+  for (const key of ["config", "scene", "vr", "fly", "folder"]) {
+    const select = byId(`filter-${key}`); if (!select) continue;
+    let selected = Array.isArray(filterCodes[key]) ? filterCodes[key].map(Number) : [];
+    const labels = recipe.filtersByLabel?.[key];
+    if (Array.isArray(labels)) selected = labels.map(label => datasetHeader.categories[key].indexOf(label)).filter(code => code >= 0);
+    for (const option of select.options) option.selected = selected.includes(Number(option.value));
+  }
+  const rangeIds = {trial:["trial-min","trial-max"], step:["step-min","step-max"], peak:["peak-min","peak-max"], displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"]};
+  for (const [key, ids] of Object.entries(rangeIds)) {
+    const values = state.ranges?.[key]; if (!Array.isArray(values)) continue;
+    byId(ids[0]).value = values[0]; byId(ids[1]).value = values[1];
+    const control = rangeControls.get(key);
+    if (control) { control.low.value = values[0]; control.high.value = values[1]; control.redraw(); }
+  }
+  const valueIds = {
+    jumpThreshold:"jump-threshold", jumpBufferMs:"jump-buffer",
+    minDisplacement:"min-displacement", edgeTrim:"edge-trim", groupBy:"group-by",
+    panelColumns:"panel-columns", colorBy:"color-by", pointBudget:"point-budget",
+    walkThreshold:"walk-threshold", binSize:"bin-size", boundPercent:"bound-percent",
+    angleSource:"angle-source", statsUnit:"stats-unit", polarValidMin:"polar-valid-min",
+    roiReach:"roi-reach", ringMatch:"ring-match", playbackPercentile:"playback-cap",
+    headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
+  };
+  for (const [key, id] of Object.entries(valueIds)) if (state[key] != null) byId(id).value = state[key];
+  for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled"})) {
+    if (state[key] != null) byId(id).checked = !!state[key];
+  }
+  if (Array.isArray(state.polarR)) { byId("polar-r-min").value = state.polarR[0]; byId("polar-r-max").value = state.polarR[1]; }
+  if (state.labels && typeof state.labels === "object") {
+    displayNames = structuredClone(state.labels);
+    for (const key of ["config", "scene", "vr", "fly", "folder"]) {
+      const select = byId(`filter-${key}`);
+      if (select) for (let index = 0; index < select.options.length; index += 1) {
+        select.options[index].textContent = displayNames[key]?.[index] || datasetHeader.categories[key][index];
+      }
+    }
+  }
+  panelOrders = state.panelOrders && typeof state.panelOrders === "object" ? structuredClone(state.panelOrders) : panelOrders;
+  if (Array.isArray(state.rings) && state.rings.length) rings = state.rings.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||.01)}));
+  sampleSeed = Number(state.sampleSeed) || 0;
+  for (const [id, value] of Object.entries(recipe.visuals || {})) if (byId(id) && value != null) byId(id).value = value;
+  setSpatialLens(state.lens || "trajectory", false);
+  renderRingControls(); renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
+  trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.7), numberValue("trajectory-opacity", .34));
+  applyHeatmapVisuals(); applyDirectionVisuals(); updateFraction(); updatePlaybackLimit(); applyLocalRingObserver(false);
+}
+
+async function applyRecipe() {
+  try {
+    const recipe = JSON.parse(byId("recipe-json").value);
+    if (!recipe || recipe.schema !== "daari-deepa-view/v1") throw new Error("Expected a daari-deepa-view/v1 recipe.");
+    const requestedSource = String(recipe.source || "").trim();
+    if (requestedSource && requestedSource !== sourceInput.value) await loadDataset(requestedSource);
+    applyRecipeControls(recipe);
+    if (workerReady) scheduleCompute("full", 0);
+    setStatus("ready", "View recipe applied", "The source, subsets, ordering, labels, analysis gates, and visual settings were restored.");
+  } catch (error) {
+    setStatus("error", "Could not apply recipe", error.message);
+  }
+}
+
+async function copyRecipe() {
+  if (!byId("recipe-json").value.trim()) captureRecipe();
+  await navigator.clipboard.writeText(byId("recipe-json").value);
+}
+
+function downloadRecipe() {
+  if (!byId("recipe-json").value.trim()) captureRecipe();
+  const blob = new Blob([byId("recipe-json").value], {type: "application/json"});
+  const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
+  anchor.href = url; anchor.download = `daari-deepa-view-${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>\"]/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[character]));
 }
@@ -675,6 +893,11 @@ function renderRingControls() {
   const select = byId("ring-active"); select.replaceChildren();
   rings.forEach((_, index) => select.add(new Option(`Ring ${index + 1}`, String(index))));
   select.value = String(activeRing);
+  updateRingControlValues();
+  byId("ring-delete").disabled = rings.length <= 1;
+}
+
+function updateRingControlValues() {
   const ring = rings[activeRing] || {x: 0, z: 0, r: 3};
   byId("ring-x").value = Number(ring.x.toFixed(3));
   byId("ring-z").value = Number(ring.z.toFixed(3));
@@ -683,7 +906,75 @@ function renderRingControls() {
   slider.max = Math.max(30, ring.r * 2,
     Math.abs(datasetHeader?.ranges?.x?.[1] || 0), Math.abs(datasetHeader?.ranges?.z?.[1] || 0));
   slider.value = ring.r;
-  byId("ring-delete").disabled = rings.length <= 1;
+}
+
+function renderPanelOrder(codes = lastSummary?.panelKeys || []) {
+  const host = byId("panel-order");
+  host.replaceChildren();
+  const key = byId("group-by").value;
+  if (key === "all" || !codes.length) {
+    const empty = document.createElement("span"); empty.className = "empty-control";
+    empty.textContent = key === "all" ? "All data is pooled into one panel." : "No visible panels.";
+    host.appendChild(empty); return;
+  }
+  const names = displayNames[key] || datasetHeader?.categories?.[key] || [];
+  const commit = next => {
+    panelOrders = {...panelOrders, [key]: next};
+    renderPanelOrder(next);
+    scheduleCompute("full", 30);
+  };
+  codes.map(Number).forEach((code, index) => {
+    const item = document.createElement("div"); item.className = "panel-order-item";
+    item.draggable = true; item.dataset.code = code;
+    const grip = document.createElement("span"); grip.className = "grip"; grip.textContent = "⋮⋮";
+    const text = document.createElement("span"); text.textContent = names[code] || `Panel ${code + 1}`;
+    const up = document.createElement("button"); up.type = "button"; up.textContent = "↑"; up.disabled = index === 0;
+    const down = document.createElement("button"); down.type = "button"; down.textContent = "↓"; down.disabled = index === codes.length - 1;
+    up.addEventListener("click", () => { const next = codes.map(Number); [next[index - 1], next[index]] = [next[index], next[index - 1]]; commit(next); });
+    down.addEventListener("click", () => { const next = codes.map(Number); [next[index + 1], next[index]] = [next[index], next[index + 1]]; commit(next); });
+    item.addEventListener("dragstart", event => { item.classList.add("dragging"); event.dataTransfer.setData("text/plain", String(code)); });
+    item.addEventListener("dragend", () => item.classList.remove("dragging"));
+    item.addEventListener("dragover", event => event.preventDefault());
+    item.addEventListener("drop", event => {
+      event.preventDefault();
+      const moved = Number(event.dataTransfer.getData("text/plain"));
+      const next = codes.map(Number).filter(value => value !== moved);
+      next.splice(next.indexOf(code), 0, moved); commit(next);
+    });
+    item.append(grip, text, up, down); host.appendChild(item);
+  });
+}
+
+function updateTrajectorySummary(ringStats = null) {
+  const trajectory = products.trajectory;
+  if (!trajectory || !lastSummary) return;
+  const ringText = byId("ring-enabled").checked
+    ? ` · ${formatCount(ringStats?.matches ?? trajectory.ringMatches)} ring matches · local ${formatNumber(ringStats?.buildMs ?? 0, 1)} ms`
+    : "";
+  byId("trajectory-summary").textContent = `${formatCount(lastSummary.visibleSegments)} segments · ${formatCount(lastSummary.visibleRows)} retained points · ${formatCount(trajectory.links)} GPU line segments${ringText}`;
+}
+
+function applyLocalRingObserver(save = false) {
+  const stats = trajectoryRenderer.setRingObserver(
+    byId("ring-enabled").checked, rings, byId("ring-match").value,
+  );
+  updateTrajectorySummary(stats);
+  if (save) persistState();
+  return stats;
+}
+
+function scheduleLocalRingObserver(final = false) {
+  if (final && ringFrame) cancelAnimationFrame(ringFrame);
+  if (final) {
+    ringFrame = null;
+    applyLocalRingObserver(true);
+    return;
+  }
+  if (ringFrame) return;
+  ringFrame = requestAnimationFrame(() => {
+    ringFrame = null;
+    applyLocalRingObserver(false);
+  });
 }
 
 function updateActiveRing() {
@@ -692,11 +983,7 @@ function updateActiveRing() {
     r: Math.max(.01, numberValue("ring-radius", 3)),
   };
   byId("ring-radius-slider").value = rings[activeRing].r;
-  if (trajectoryRenderer.data?.rings?.[activeRing]) {
-    trajectoryRenderer.data.rings[activeRing] = {...rings[activeRing]};
-    trajectoryRenderer.draw();
-  }
-  scheduleCompute("trajectory", 35);
+  scheduleLocalRingObserver(false);
 }
 
 function updatePlaybackTime() {
@@ -739,6 +1026,23 @@ byId("clean-button").addEventListener("click", () => setCleanMode(!shell.classLi
 byId("clean-exit").addEventListener("click", () => setCleanMode(false));
 document.addEventListener("keydown", event => { if (event.key === "Escape" && shell.classList.contains("clean-mode")) setCleanMode(false); });
 byId("export-button").addEventListener("click", exportNativeReport);
+byId("download-plot-button").addEventListener("click", downloadActivePlot);
+byId("recipe-capture").addEventListener("click", captureRecipe);
+byId("recipe-apply").addEventListener("click", applyRecipe);
+byId("recipe-copy").addEventListener("click", () => copyRecipe().catch(error => setStatus("error", "Could not copy recipe", error.message)));
+byId("recipe-download").addEventListener("click", downloadRecipe);
+byId("label-axis").addEventListener("change", renderDisplayLabels);
+byId("group-by").addEventListener("change", () => {
+  const grouped = byId("group-by").value;
+  if (["config", "scene", "vr", "fly", "folder"].includes(grouped)) {
+    byId("label-axis").value = grouped;
+    renderDisplayLabels();
+  }
+  renderPanelOrder([]);
+});
+for (const button of document.querySelectorAll("[data-lens-button]")) {
+  button.addEventListener("click", () => setSpatialLens(button.dataset.lensButton));
+}
 byId("animals-all").addEventListener("click", () => {
   animalVisibility.fill(true); renderAnimalVisibility(); applyAnimalVisibility();
 });
@@ -746,25 +1050,29 @@ byId("animals-none").addEventListener("click", () => {
   animalVisibility.fill(false); renderAnimalVisibility(); applyAnimalVisibility();
 });
 byId("trial-fraction").addEventListener("input", updateFraction);
-byId("resample-button").addEventListener("click", () => { sampleSeed += 1; scheduleCompute("trajectory"); });
+byId("resample-button").addEventListener("click", () => { sampleSeed += 1; scheduleCompute("sample"); });
 byId("roi-show").addEventListener("change", () => {
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
 });
-byId("ring-enabled").addEventListener("change", () => scheduleCompute("trajectory", 30));
-byId("ring-match").addEventListener("change", () => scheduleCompute("trajectory", 30));
+byId("ring-enabled").addEventListener("change", () => applyLocalRingObserver(true));
+byId("ring-match").addEventListener("change", () => applyLocalRingObserver(true));
 byId("ring-active").addEventListener("change", () => { activeRing = Number(byId("ring-active").value) || 0; renderRingControls(); });
-for (const id of ["ring-x", "ring-z", "ring-radius"]) byId(id).addEventListener("input", updateActiveRing);
+for (const id of ["ring-x", "ring-z", "ring-radius"]) {
+  byId(id).addEventListener("input", updateActiveRing);
+  byId(id).addEventListener("change", () => applyLocalRingObserver(true));
+}
 byId("ring-radius-slider").addEventListener("input", () => {
   byId("ring-radius").value = byId("ring-radius-slider").value;
   updateActiveRing();
 });
+byId("ring-radius-slider").addEventListener("change", () => applyLocalRingObserver(true));
 byId("ring-add").addEventListener("click", () => {
   const current = rings[activeRing] || {x:0,z:0,r:3}; rings.push({...current, x: current.x + current.r * .5}); activeRing = rings.length - 1;
-  renderRingControls(); scheduleCompute("trajectory", 30);
+  renderRingControls(); applyLocalRingObserver(true);
 });
 byId("ring-delete").addEventListener("click", () => {
   if (rings.length <= 1) return; rings.splice(activeRing, 1); activeRing = Math.max(0, activeRing - 1);
-  renderRingControls(); scheduleCompute("trajectory", 30);
+  renderRingControls(); applyLocalRingObserver(true);
 });
 for (const id of ["heat-metric", "heat-scale", "heat-range-mode", "heat-cmin", "heat-cmax"]) {
   byId(id).addEventListener(id.startsWith("heat-c") ? "input" : "change", () => {

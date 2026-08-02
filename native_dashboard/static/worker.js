@@ -12,6 +12,9 @@ let ends = null;
 let medianDt = .01;
 let lastAnalysis = null;
 let lastAnalysisKey = "";
+let lastPanelKey = "";
+let lastOccupancy = null;
+let lastOccupancyKey = "";
 
 function typedArray(dtype, buffer, offset, length) {
   const byteOffset = bodyOffset + offset;
@@ -71,7 +74,12 @@ function analysisKey(state) {
     jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
     minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
     roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
-    groupBy: state.groupBy, labels: state.labels,
+  });
+}
+
+function panelKey(state) {
+  return JSON.stringify({
+    groupBy: state.groupBy, labels: state.labels, panelOrders: state.panelOrders,
   });
 }
 
@@ -210,7 +218,7 @@ function buildAnalysis(state) {
     visibleRows += count; visibleSegments.push(seg);
   }
 
-  let panelNames = ["All data"];
+  let panelNames = ["All data"], panelKeys = [0];
   const segmentPanel = new Int32Array(ns); segmentPanel.fill(-1);
   if (state.groupBy === "all") {
     for (const seg of visibleSegments) segmentPanel[seg] = 0;
@@ -220,17 +228,22 @@ function buildAnalysis(state) {
       || header.displayCategories?.[state.groupBy]
       || header.categories[state.groupBy]
       || header.categories.config;
-    const panelByCategory = new Map();
-    panelNames = [];
+    const visibleCategories = [];
+    const seenCategories = new Set();
     for (const seg of visibleSegments) {
       const category = field[seg];
-      if (!panelByCategory.has(category)) {
-        panelByCategory.set(category, panelNames.length);
-        panelNames.push(labels[category] ?? "unknown");
-      }
+      if (!seenCategories.has(category)) { seenCategories.add(category); visibleCategories.push(category); }
+    }
+    const requested = (state.panelOrders?.[state.groupBy] || []).map(Number);
+    panelKeys = requested.filter(category => seenCategories.has(category));
+    for (const category of visibleCategories) if (!panelKeys.includes(category)) panelKeys.push(category);
+    const panelByCategory = new Map(panelKeys.map((category, index) => [category, index]));
+    panelNames = panelKeys.map(category => labels[category] ?? "unknown");
+    for (const seg of visibleSegments) {
+      const category = field[seg];
       segmentPanel[seg] = panelByCategory.get(category);
     }
-    if (!panelNames.length) panelNames = ["No matching data"];
+    if (!panelNames.length) { panelNames = ["No matching data"]; panelKeys = []; }
   }
 
   const animals = new Set();
@@ -259,7 +272,7 @@ function buildAnalysis(state) {
     }
   }
   return {
-    rowKeep, segmentKeep, visibleSegments, segmentPanel, panelNames,
+    rowKeep, segmentKeep, visibleSegments, segmentPanel, panelNames, panelKeys,
     panelCount: panelNames.length, visibleRows, animals: animals.size,
     roiStats, roiBaseSegments, segmentOutcome, panelRois,
     roiCounts: {left: roiLeft, right: roiRight}, roiReach,
@@ -273,6 +286,54 @@ function percentile(sorted, q) {
   const at = Math.max(0, Math.min(sorted.length - 1, (sorted.length - 1) * q));
   const lo = Math.floor(at), hi = Math.ceil(at), f = at - lo;
   return sorted[lo] * (1 - f) + sorted[hi] * f;
+}
+
+function applyPanelMapping(state, analysis) {
+  const ns = starts.length;
+  const fields = {
+    config: data.segmentConfig, scene: data.segmentScene, vr: data.segmentVr,
+    fly: data.segmentFly, folder: data.segmentFolder,
+  };
+  let panelNames = ["All data"], panelKeys = [0];
+  const segmentPanel = new Int32Array(ns); segmentPanel.fill(-1);
+  if (state.groupBy === "all") {
+    for (const seg of analysis.visibleSegments) segmentPanel[seg] = 0;
+  } else {
+    const field = fields[state.groupBy] || data.segmentConfig;
+    const labels = state.labels?.[state.groupBy]
+      || header.displayCategories?.[state.groupBy]
+      || header.categories[state.groupBy]
+      || header.categories.config;
+    const visibleCategories = [], seen = new Set();
+    for (const seg of analysis.visibleSegments) {
+      const category = field[seg];
+      if (!seen.has(category)) { seen.add(category); visibleCategories.push(category); }
+    }
+    const requested = (state.panelOrders?.[state.groupBy] || []).map(Number);
+    panelKeys = requested.filter(category => seen.has(category));
+    for (const category of visibleCategories) if (!panelKeys.includes(category)) panelKeys.push(category);
+    const indices = new Map(panelKeys.map((category, index) => [category, index]));
+    panelNames = panelKeys.map(category => labels[category] ?? "unknown");
+    for (const seg of analysis.visibleSegments) segmentPanel[seg] = indices.get(field[seg]);
+    if (!panelNames.length) { panelNames = ["No matching data"]; panelKeys = []; }
+  }
+  const panelRois = [], roiSeen = new Set();
+  const left = new Uint32Array(panelNames.length), right = new Uint32Array(panelNames.length);
+  for (const seg of analysis.visibleSegments) {
+    const panel = segmentPanel[seg];
+    if (analysis.segmentOutcome[seg] === 1) left[panel] += 1;
+    else if (analysis.segmentOutcome[seg] === 2) right[panel] += 1;
+    for (const target of targetsForSegment(seg)) {
+      const key = `${panel}|${Number(target.x).toFixed(4)}|${Number(target.z).toFixed(4)}|${target.side}`;
+      if (roiSeen.has(key)) continue;
+      roiSeen.add(key);
+      panelRois.push({panel, x: Number(target.x), z: Number(target.z), side: target.side, reach: analysis.roiReach});
+    }
+  }
+  Object.assign(analysis, {
+    segmentPanel, panelNames, panelKeys, panelCount: panelNames.length,
+    panelRois, roiCounts: {left, right},
+  });
 }
 
 function spatialBounds(analysis, pct = 98) {
@@ -332,52 +393,10 @@ function playbackLimit(state, analysis) {
   return Math.max(0, Number(analysis.durationSummary?.[key]) || 0);
 }
 
-function segmentIntersectsCircle(x0, z0, x1, z1, ring) {
-  const dx = x1 - x0, dz = z1 - z0;
-  const length2 = dx * dx + dz * dz;
-  let t = length2 > 0 ? ((ring.x - x0) * dx + (ring.z - z0) * dz) / length2 : 0;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(x0 + t * dx - ring.x, z0 + t * dz - ring.z) <= ring.r;
-}
-
-function ringEntryTable(state, analysis) {
-  const rings = (state.rings || []).filter(ring => Number(ring.r) > 0);
-  if (!state.ringEnabled || !rings.length) return null;
-  const entries = new Int32Array(starts.length); entries.fill(-1);
-  let matches = 0;
-  for (const seg of analysis.visibleSegments) {
-    const hits = new Int32Array(rings.length); hits.fill(-1);
-    let previous = -1;
-    for (let row = starts[seg]; row < ends[seg]; row += 1) {
-      if (!analysis.rowKeep[row]) continue;
-      for (let index = 0; index < rings.length; index += 1) {
-        if (hits[index] >= 0) continue;
-        const ring = rings[index];
-        const inside = Math.hypot(data.x[row] - ring.x, data.z[row] - ring.z) <= ring.r;
-        const crossed = previous >= 0 && segmentIntersectsCircle(
-          data.x[previous], data.z[previous], data.x[row], data.z[row], ring
-        );
-        if (inside || crossed) hits[index] = row;
-      }
-      previous = row;
-    }
-    const reached = [...hits].filter(value => value >= 0);
-    const qualifies = state.ringMatch === "all" ? reached.length === rings.length : reached.length > 0;
-    if (qualifies) {
-      entries[seg] = state.ringMatch === "all" ? Math.max(...reached) : Math.min(...reached);
-      matches += 1;
-    }
-  }
-  return {entries, matches, rings};
-}
-
 function buildTrajectory(state, analysis) {
   const started = performance.now();
   const ns = starts.length;
-  const ringObserver = ringEntryTable(state, analysis);
-  const trajectorySegments = ringObserver
-    ? analysis.visibleSegments.filter(seg => ringObserver.entries[seg] >= 0)
-    : analysis.visibleSegments;
+  const trajectorySegments = analysis.visibleSegments;
   const eligibleCount = new Uint32Array(ns);
   let totalLinks = 0;
   for (const seg of trajectorySegments) {
@@ -418,9 +437,8 @@ function buildTrajectory(state, analysis) {
           vertices[v] = data.x[previous]; vertices[v + 1] = data.z[previous];
           vertices[v + 2] = data.x[i]; vertices[v + 3] = data.z[i];
           panels[a] = analysis.segmentPanel[seg]; panels[a + 1] = analysis.segmentPanel[seg];
-          const entry = ringObserver?.entries[seg] ?? -1;
-          colors[a] = entry >= 0 && previous < entry ? NEUTRAL_INDEX : rowColor(previous, seg, state, analysis);
-          colors[a + 1] = entry >= 0 && i < entry ? NEUTRAL_INDEX : rowColor(i, seg, state, analysis);
+          colors[a] = rowColor(previous, seg, state, analysis);
+          colors[a + 1] = rowColor(i, seg, state, analysis);
           animals[a] = data.segmentAnimal[seg]; animals[a + 1] = data.segmentAnimal[seg];
           segments[a] = seg; segments[a + 1] = seg;
           times[a] = data.time[previous]; times[a + 1] = data.time[i];
@@ -445,9 +463,12 @@ function buildTrajectory(state, analysis) {
     rois: analysis.panelRois,
     roiCounts: {left: Array.from(analysis.roiCounts.left), right: Array.from(analysis.roiCounts.right)},
     reach: analysis.roiReach,
-    rings: ringObserver?.rings || (state.rings || []),
+    rings: state.rings || [],
     ringEnabled: !!state.ringEnabled,
-    ringMatches: ringObserver?.matches ?? analysis.visibleSegments.length,
+    ringMatch: state.ringMatch || "any",
+    ringMatches: analysis.visibleSegments.length,
+    visibleSegments: analysis.visibleSegments.length,
+    segmentCount: starts.length,
     buildMs: performance.now() - started,
   };
 }
@@ -464,49 +485,74 @@ function gridGeometry(state, analysis) {
   return {bin, nx, nz, x0: -(half + .5) * bin, z0: -(half + .5) * bin, bounds};
 }
 
-function buildSpatial(state, analysis) {
-  const started = performance.now();
-  const grid = gridGeometry(state, analysis);
-  const cells = grid.nx * grid.nz;
-  const count = new Float32Array(analysis.panelCount * cells);
-  const sumSin = new Float64Array(count.length), sumCos = new Float64Array(count.length);
-  const validDirection = new Uint32Array(count.length);
-  const heading = state.angleSource === "movement" ? data.movement : data.orientation;
-  for (let row = 0; row < data.x.length; row += 1) {
-    if (!analysis.rowKeep[row]) continue;
-    const seg = data.segment[row], panel = analysis.segmentPanel[seg];
-    const ix = Math.floor((data.x[row] - grid.x0) / grid.bin);
-    const iz = Math.floor((data.z[row] - grid.z0) / grid.bin);
-    if (ix < 0 || ix >= grid.nx || iz < 0 || iz >= grid.nz || panel < 0) continue;
-    const index = panel * cells + iz * grid.nx + ix;
-    count[index] += 1;
-    const angle = heading[row];
-    if (Number.isFinite(angle) && (!state.movingOnly || data.speed[row] >= (Number(state.walkThreshold) || 0))) {
-      const radians = angle * Math.PI / 180;
-      sumSin[index] += Math.sin(radians); sumCos[index] += Math.cos(radians); validDirection[index] += 1;
-    }
-  }
-  const time = new Float32Array(count.length), angle = new Float32Array(count.length), strength = new Float32Array(count.length);
-  angle.fill(NaN);
-  for (let i = 0; i < count.length; i += 1) {
-    time[i] = count[i] * medianDt;
-    if (validDirection[i]) {
-      angle[i] = Math.atan2(sumSin[i], sumCos[i]) * 180 / Math.PI;
-      strength[i] = Math.hypot(sumSin[i], sumCos[i]) / validDirection[i];
-    }
-  }
-  const common = {
+function spatialCommon(state, analysis, grid) {
+  return {
     ...grid, panelCount: analysis.panelCount, panelNames: analysis.panelNames,
     columns: Number(state.panelColumns) || 0,
     rois: analysis.panelRois,
     roiCounts: {left: Array.from(analysis.roiCounts.left), right: Array.from(analysis.roiCounts.right)},
     reach: analysis.roiReach,
   };
-  return {
-    heatmap: {...common, count, time, buildMs: performance.now() - started},
-    direction: {...common, angle, strength, abundance: count, time,
-      buildMs: performance.now() - started},
-  };
+}
+
+function buildOccupancy(state, analysis) {
+  const started = performance.now();
+  const grid = gridGeometry(state, analysis);
+  const cells = grid.nx * grid.nz;
+  const count = new Float32Array(analysis.panelCount * cells);
+  for (let row = 0; row < data.x.length; row += 1) {
+    if (!analysis.rowKeep[row]) continue;
+    const seg = data.segment[row], panel = analysis.segmentPanel[seg];
+    const ix = Math.floor((data.x[row] - grid.x0) / grid.bin);
+    const iz = Math.floor((data.z[row] - grid.z0) / grid.bin);
+    if (ix < 0 || ix >= grid.nx || iz < 0 || iz >= grid.nz || panel < 0) continue;
+    count[panel * cells + iz * grid.nx + ix] += 1;
+  }
+  const time = new Float32Array(count.length);
+  for (let i = 0; i < count.length; i += 1) time[i] = count[i] * medianDt;
+  const common = spatialCommon(state, analysis, grid);
+  lastOccupancy = {common, count, time};
+  lastOccupancyKey = `${lastAnalysisKey}|${state.binSize}|${state.boundPercent}`;
+  return {...common, count: count.slice(), time: time.slice(), buildMs: performance.now() - started};
+}
+
+function occupancyFor(state, analysis) {
+  const key = `${lastAnalysisKey}|${state.binSize}|${state.boundPercent}`;
+  if (lastOccupancy && lastOccupancyKey === key) return lastOccupancy;
+  buildOccupancy(state, analysis);
+  return lastOccupancy;
+}
+
+function buildDirection(state, analysis) {
+  const started = performance.now();
+  const occupancy = occupancyFor(state, analysis);
+  const {common, count, time} = occupancy;
+  const cells = common.nx * common.nz;
+  const sumSin = new Float64Array(count.length), sumCos = new Float64Array(count.length);
+  const validDirection = new Uint32Array(count.length);
+  const heading = state.angleSource === "movement" ? data.movement : data.orientation;
+  for (let row = 0; row < data.x.length; row += 1) {
+    if (!analysis.rowKeep[row]) continue;
+    const seg = data.segment[row], panel = analysis.segmentPanel[seg];
+    const ix = Math.floor((data.x[row] - common.x0) / common.bin);
+    const iz = Math.floor((data.z[row] - common.z0) / common.bin);
+    if (ix < 0 || ix >= common.nx || iz < 0 || iz >= common.nz || panel < 0) continue;
+    const angle = heading[row];
+    if (!Number.isFinite(angle) || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
+    const index = panel * cells + iz * common.nx + ix;
+    const radians = angle * Math.PI / 180;
+    sumSin[index] += Math.sin(radians); sumCos[index] += Math.cos(radians); validDirection[index] += 1;
+  }
+  const angle = new Float32Array(count.length), strength = new Float32Array(count.length);
+  angle.fill(NaN);
+  for (let i = 0; i < count.length; i += 1) {
+    if (validDirection[i]) {
+      angle[i] = Math.atan2(sumSin[i], sumCos[i]) * 180 / Math.PI;
+      strength[i] = Math.hypot(sumSin[i], sumCos[i]) / validDirection[i];
+    }
+  }
+  return {...common, angle, strength, abundance: count.slice(), time: time.slice(),
+    buildMs: performance.now() - started};
 }
 
 function unitColor(seg, state, analysis) {
@@ -884,21 +930,39 @@ function buffers(value, into = []) {
 function compute(message) {
   const {state, requestId} = message;
   const key = analysisKey(state);
+  const layoutKey = panelKey(state);
   const analysisChanged = key !== lastAnalysisKey;
+  const panelChanged = layoutKey !== lastPanelKey;
   if (analysisChanged || !lastAnalysis) {
     lastAnalysis = buildAnalysis(state); lastAnalysisKey = key;
+    lastPanelKey = layoutKey;
+    lastOccupancy = null; lastOccupancyKey = "";
+  } else if (panelChanged) {
+    applyPanelMapping(state, lastAnalysis); lastPanelKey = layoutKey;
+    lastOccupancy = null; lastOccupancyKey = "";
   }
   let scope = message.scope || "full";
-  if (analysisChanged) scope = "full";
+  if (analysisChanged || panelChanged) scope = "full";
   const products = {};
-  if (scope === "full" || scope === "trajectory" || scope === "playback") products.trajectory = buildTrajectory(state, lastAnalysis);
-  if (scope === "full" || scope === "spatial") Object.assign(products, buildSpatial(state, lastAnalysis));
-  if (scope === "full" || scope === "direction" || scope === "statistics" || scope === "playback") {
-    if (scope !== "playback") products.polar = buildPolar(state, lastAnalysis);
-    if (scope !== "statistics") products.heading = buildHeading(state, lastAnalysis);
+  if (["full", "trajectory", "movement", "color", "sample"].includes(scope)) {
+    products.trajectory = buildTrajectory(state, lastAnalysis);
   }
-  if (scope === "full" || scope === "statistics") {
+  if (scope === "full" || scope === "spatial") {
+    products.heatmap = buildOccupancy(state, lastAnalysis);
+    products.direction = buildDirection(state, lastAnalysis);
+  } else if (scope === "movement") {
+    products.direction = buildDirection(state, lastAnalysis);
+  }
+  if (["full", "movement", "color", "sample", "statistics", "polar"].includes(scope)) {
+    products.polar = buildPolar(state, lastAnalysis);
+  }
+  if (["full", "movement", "color", "sample", "heading", "playback"].includes(scope)) {
+    products.heading = buildHeading(state, lastAnalysis);
+  }
+  if (["full", "statistics"].includes(scope)) {
     products.metrics = buildMetrics(state, lastAnalysis);
+  }
+  if (["full", "statistics", "movement"].includes(scope)) {
     products.roi = buildRoi(state, lastAnalysis);
   }
   if (scope === "full") products.diagnostics = buildDiagnostics();
@@ -919,6 +983,7 @@ function compute(message) {
       panels: lastAnalysis.panelCount,
       filterMs: lastAnalysis.filterMs,
       durationSummary: lastAnalysis.durationSummary,
+      panelKeys: lastAnalysis.panelKeys,
       segmentOptions,
     },
   };

@@ -127,6 +127,15 @@ button.wide { width: 100%; }
 .label-editor label { display: grid; gap: 3px; }
 .label-editor label span { overflow: hidden; color: #7b8581; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .label-editor input { min-height: 29px; }
+.control-note { margin: 8px 0; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.panel-order { display: grid; gap: 5px; }
+.panel-order-item { display: grid; grid-template-columns: 16px minmax(0, 1fr) 25px 25px; align-items: center; gap: 4px; padding: 5px; border: 1px solid #dfe7e5; border-radius: 8px; background: white; font-size: 9px; cursor: grab; }
+.panel-order-item.dragging { opacity: .4; }
+.panel-order-item .grip { color: #93a19d; text-align: center; }
+.panel-order-item span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel-order-item button { min-height: 23px; padding: 2px; font-size: 10px; }
+.recipe-editor textarea { width: 100%; resize: vertical; padding: 8px; border: 1px solid #cedbd8; border-radius: 8px; color: #273431; background: #fbfdfc; font: 9px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.recipe-actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin-top: 6px; }
 .ring-buttons { display: flex; align-items: end; gap: 5px; padding-top: 15px; }
 .ring-radius-control { grid-column: 1 / -1; }
 .control-heading { display: flex; justify-content: space-between; }
@@ -143,6 +152,35 @@ button.wide { width: 100%; }
 .section-nav button.active { color: #0f5f56; background: white; border-color: #cad8d5; box-shadow: 0 2px 8px rgba(25,52,46,.04); }
 .plot-section { padding: 22px 24px 8px; scroll-margin-top: 48px; }
 .plot-section:last-child { padding-bottom: 40px; }
+.explore-section { padding-top: 16px; }
+.explore-heading { display: flex; align-items: end; justify-content: space-between; gap: 22px; margin-bottom: 12px; }
+.explore-heading h2 { margin: 3px 0 0; font-size: 23px; letter-spacing: -.025em; }
+.explore-heading p { max-width: 720px; margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.lens-switch { display: flex; align-items: center; justify-content: end; flex-wrap: wrap; gap: 4px; }
+.lens-switch button { padding: 6px 9px; color: var(--muted); background: transparent; border-color: transparent; font-size: 10px; }
+.lens-switch button.active { color: #0f5f56; background: white; border-color: #bdcfcb; box-shadow: 0 2px 8px rgba(25,52,46,.05); }
+.lens-switch #download-plot-button { margin-left: 5px; color: var(--ink); border-color: var(--line); background: white; }
+.explore-grid { display: block; }
+.lens-panel { display: none; min-width: 0; }
+.explore-section[data-lens="trajectory"] .lens-panel[data-view="trajectory"],
+.explore-section[data-lens="occupancy"] .lens-panel[data-view="occupancy"],
+.explore-section[data-lens="direction"] .lens-panel[data-view="direction"],
+.explore-section[data-lens="polar"] .lens-panel[data-view="polar"] { display: block; }
+.explore-section[data-lens="compare"] .explore-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.explore-section[data-lens="compare"] .lens-panel { display: block; min-width: 0; overflow: hidden; padding: 9px; border: 1px solid var(--line); border-radius: 13px; background: var(--panel); box-shadow: var(--shadow); }
+.explore-section[data-lens="compare"] .lens-panel > .plot-card { padding: 4px; border: 0; border-radius: 8px; box-shadow: none; }
+.explore-section[data-lens="compare"] .section-heading { min-height: 34px; margin: 0 3px 4px; align-items: center; }
+.explore-section[data-lens="compare"] .section-heading h2 { font-size: 15px; }
+.explore-section[data-lens="compare"] .section-kicker,
+.explore-section[data-lens="compare"] .section-summary,
+.explore-section[data-lens="compare"] .inline-controls,
+.explore-section[data-lens="compare"] .plot-toolbar,
+.explore-section[data-lens="compare"] .plot-hint { display: none; }
+.explore-section[data-lens="compare"] .plot-host,
+.explore-section[data-lens="compare"] .plot-host.large { height: clamp(275px, 34vh, 360px); min-height: 275px; }
+.explore-section[data-lens="compare"] .direction-key { top: 8px; right: 10px; max-width: 130px; padding: 5px; }
+.explore-section[data-lens="compare"] .direction-key > span { display: none; }
+.explore-section[data-lens="compare"] .direction-wheel { transform: scale(.72); }
 .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 9px; }
 .section-heading h2 { margin: 3px 0 0; font-size: 23px; font-weight: 700; letter-spacing: -.025em; }
 .section-summary, .legend-note { max-width: 55%; color: var(--muted); font-size: 11px; text-align: right; }
@@ -154,8 +192,8 @@ button.wide { width: 100%; }
 .plot-toolbar .scrubber { flex: 1 1 220px; }
 .plot-toolbar output { min-width: 48px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .segment-inspector { flex: 1 1 100%; min-height: 24px; padding: 6px 9px; border-radius: 7px; color: var(--muted); background: #f3f6f5; border: 1px solid #e6ecea; font-size: 9px; line-height: 1.35; }
-.plot-host { position: relative; width: 100%; height: min(74vh, 820px); min-height: 460px; background: #fff; border-radius: 9px; overflow: hidden; touch-action: none; }
-.plot-host.large { height: min(80vh, 900px); }
+.plot-host { position: relative; width: 100%; height: clamp(470px, calc(100vh - 265px), 760px); min-height: 430px; background: #fff; border-radius: 9px; overflow: hidden; touch-action: none; }
+.plot-host.large { height: clamp(490px, calc(100vh - 285px), 780px); }
 .plot-host.tall { height: 620px; }
 .plot-host.short { height: 260px; min-height: 220px; }
 .plot-host canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
@@ -213,6 +251,9 @@ button.wide { width: 100%; }
   .status-dock { display: none; }
   .sidebar { top: 72px; }
   .diagnostic-grid { grid-template-columns: 1fr; }
+  .explore-heading { align-items: start; flex-direction: column; }
+  .lens-switch { justify-content: start; }
+  .explore-section[data-lens="compare"] .explore-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {

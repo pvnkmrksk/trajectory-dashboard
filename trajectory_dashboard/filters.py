@@ -57,14 +57,20 @@ def smoothed_velocity(
     df: pd.DataFrame,
     window: int = 10,
     spike_pct: float = 99.5,
+    *,
+    raw_speed: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Speed smoothed within each segment after dropping reset spikes."""
+    """Speed smoothed within each segment after dropping reset spikes.
+
+    ``raw_speed`` lets load pipelines reuse an already computed velocity array
+    when both raw and smoothed values are needed.
+    """
 
     if "_smoothed_velocity" in df.columns:
         return pd.to_numeric(
             df["_smoothed_velocity"], errors="coerce"
         ).to_numpy(dtype=float)
-    speed = velocity_all(df)
+    speed = velocity_all(df) if raw_speed is None else np.asarray(raw_speed, dtype=float)
     finite = speed[np.isfinite(speed)]
     if finite.size:
         threshold = np.percentile(finite, spike_pct)

@@ -64,6 +64,10 @@ has been verified.
   or merely same-named directory.
 - Persist the source and principal controls in the URL without writing the URL
   during pan or zoom.
+- Capture/apply/download a readable JSON view recipe covering subsets,
+  analysis gates, labels, panel order, and visual settings. The Python package
+  must translate that recipe or URL back to `FilterSpec` and grouped frames for
+  transparent publication workflows.
 - Report working, ready, empty, stale-result, and error states.
 
 ### Filtering and grouping
@@ -74,6 +78,9 @@ has been verified.
 - Split panels by config, scene, VR, fly, source folder, or pooled data.
 - Use the adaptive 1/2/3/4-column grid policy and allow an explicit override.
 - Reorder panels without recomputing the filtered dataset.
+- Offer one linked exploration workspace that can focus trajectories,
+  occupancy, local flow, or polar summaries, plus an optional compact 2×2
+  comparison; switching lenses is presentation-only.
 
 ### Trajectories
 
