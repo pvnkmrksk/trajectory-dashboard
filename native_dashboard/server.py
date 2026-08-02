@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import gzip
-import glob
 import logging
 import os
 from pathlib import Path
 import time
+from typing import Any
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from .dataset import NativeDatasetError, load_native_dataset, raw_channel_binary
+from .dataset import NativeDatasetError, load_native_dataset
 
 
 LOGGER = logging.getLogger("trajectory.native")
@@ -35,20 +35,46 @@ def _drop_search_roots() -> list[str]:
     return result
 
 
-def _resolve_dropped_folder(folder: str, files: list[str]) -> str | None:
-    """Resolve the browser-visible relative names to a bounded local glob."""
+def _normalise_drop_manifest(folder: str, files: list[Any]) -> dict[str, int | None]:
+    manifest: dict[str, int | None] = {}
+    for item in files:
+        raw_path = item.get("path") if isinstance(item, dict) else item
+        raw_size = item.get("size") if isinstance(item, dict) else None
+        path = str(raw_path or "").replace("\\", "/").lstrip("/")
+        if not path.lower().endswith(".csv"):
+            continue
+        parts = [part for part in path.split("/") if part not in ("", ".")]
+        if parts and parts[0] == folder:
+            parts = parts[1:]
+        if not parts or any(part == ".." for part in parts):
+            continue
+        manifest["/".join(parts)] = int(raw_size) if raw_size is not None else None
+    return manifest
 
-    csv_files = [
-        str(path).replace("\\", "/").lstrip("/")
-        for path in files
-        if str(path).lower().endswith(".csv")
-    ]
+
+def _candidate_manifest(folder: str) -> dict[str, int]:
+    root = Path(folder)
+    return {
+        path.relative_to(root).as_posix(): path.stat().st_size
+        for path in sorted(root.rglob("*.csv"))
+        if path.is_file()
+    }
+
+
+def _resolve_dropped_folder(folder: str, files: list[Any]) -> str | None:
+    """Resolve a dropped folder by its complete relative CSV manifest.
+
+    Browsers hide absolute paths. Matching every relative CSV path (and file
+    size when available) prevents a same-named sibling folder from being chosen
+    merely because one filename happens to match.
+    """
+
     folder = os.path.basename(str(folder or "").strip())
-    if not folder or not csv_files:
+    expected = _normalise_drop_manifest(folder, files)
+    if not folder or not expected:
         return None
-    names = [path.rsplit("/", 1)[-1] for path in csv_files]
-    sample = csv_files[0].split("/", 1)[1] if "/" in csv_files[0] else names[0]
     visited = 0
+    matches: list[str] = []
     for root in _drop_search_roots():
         root_depth = root.rstrip(os.sep).count(os.sep)
         for dirpath, dirnames, _ in os.walk(root):
@@ -64,14 +90,21 @@ def _resolve_dropped_folder(folder: str, files: list[str]) -> str | None:
             ]
             if os.path.basename(dirpath) != folder:
                 continue
-            if not os.path.isfile(os.path.join(dirpath, sample)):
+            actual = _candidate_manifest(dirpath)
+            if set(actual) != set(expected):
                 continue
-            suffix = "*_VR*.csv" if any("_VR" in name for name in names) else "*.csv"
-            pattern = os.path.join(dirpath, "**", suffix)
-            if not glob.glob(pattern, recursive=True):
-                pattern = os.path.join(dirpath, "**", "*.csv")
-            return os.path.relpath(pattern, os.getcwd()) if pattern.startswith(os.getcwd() + os.sep) else pattern
-    return None
+            if any(size is not None and actual[path] != size
+                   for path, size in expected.items()):
+                continue
+            resolved = os.path.realpath(dirpath)
+            if resolved not in matches:
+                matches.append(resolved)
+    if len(matches) != 1:
+        return None
+    resolved = matches[0]
+    return (os.path.relpath(resolved, os.getcwd())
+            if resolved.startswith(os.path.realpath(os.getcwd()) + os.sep)
+            else resolved)
 
 
 def _binary_response(payload: bytes) -> Response:
@@ -146,14 +179,6 @@ def create_native_app(default_source: str = "") -> Flask:
                          "Set TRAJ_DATA_ROOT when the data lives outside the project tree."
             }), 404
         return jsonify({"source": pattern})
-
-    @app.get("/api/channel/<dataset_id>")
-    def api_channel(dataset_id: str):
-        column = str(request.args.get("name") or "")
-        try:
-            return _binary_response(raw_channel_binary(dataset_id, column))
-        except NativeDatasetError as exc:
-            return jsonify({"error": str(exc)}), 404
 
     @app.get("/api/health")
     def health():

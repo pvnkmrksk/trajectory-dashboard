@@ -27,7 +27,9 @@ with three responsibilities:
 The payload stores row-varying values only at row granularity: X, Z, local time,
 smoothed/raw speed, body/movement heading, local tortuosity, and segment code.
 Trial, step, source/category codes, and exact summaries are stored once per
-segment. Optional raw channels are fetched separately.
+segment. Filter mini-histograms and robust segment-duration quantiles are stored
+once in the compact header. The generic raw-channel explorer is intentionally
+not part of the product.
 
 ## Browser model
 
@@ -45,30 +47,35 @@ table off the main thread and prepares narrow drawing products:
 
 Newer UI requests replace a pending request instead of accumulating a callback
 queue. Results from an obsolete request are ignored. Filtering/grouping changes
-run a full worker pass; colour, spatial-grid, direction, statistics, raw-channel,
+run a full worker pass; colour, spatial-grid, direction, playback, statistics,
 and layout changes take narrower paths.
 
 The rendering boundary is deliberately hybrid:
 
-- trajectories are `gl.LINES` in WebGL2 with panel placement, colour,
-  displayed-trial fraction, animal visibility, and playback time handled by
-  shaders/buffers;
-- occupancy is a small per-panel raster stretched through the shared viewport;
+- trajectories are instanced WebGL2 line quads with panel placement, tunable
+  pixel width/opacity, colour, displayed-trial fraction, animal visibility,
+  selected-segment visibility, and playback time handled by shaders/buffers;
+- occupancy is a crisp nearest-neighbour per-panel raster with a visible colour
+  bar and absolute or percentile colour clipping;
 - the direction field uses a lightweight Canvas particle layer because its
   spatial transform must remain exactly synchronized with trajectory/occupancy;
-- polar, heading time, ROI diagnostics, metrics, histograms, and raw channels
+  abundance drives spawning, R drives mean alignment/angular spread, and the
+  layer sleeps when off-screen or while a viewport gesture is active;
+- polar, heading time, ROI diagnostics, metrics, and histograms
   use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
   interactive legends, data zoom, reset, accessibility, and export;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
 - section navigation leaves every renderer mounted and measurable.
 
-Every spatial pane is a square pixel viewport inside its responsive card. The
-WebGL shader and both Canvas transforms consume the same square-pixel geometry,
-so one X unit always has the same screen length as one Z unit.
+Spatial panes use the available rectangular card area. Their world ranges are
+expanded to the pane's pixel aspect, so the WebGL shader and both Canvas
+transforms still make one X unit exactly the same screen length as one Z unit.
+Grid lines and a physical-unit scale bar provide reference in full and clean
+presentation modes.
 
 ## Measured reference workload
 
-Browser smoke on 2026-08-01 used `tests/SubScale/**/*_VR*.csv`:
+Browser smoke on 2026-08-02 used the exact `tests/SubScale` folder source:
 
 | Measurement | Native result |
 |---|---:|
@@ -82,7 +89,7 @@ Browser smoke on 2026-08-01 used `tests/SubScale/**/*_VR*.csv`:
 | Gzip response/transfer on localhost | about 1.45 s |
 | Default filtered-table pass | 87 ms |
 | Regroup to treatment, including every view | ready within 927 ms |
-| Default trajectory GPU links | 239,204 |
+| Default trajectory GPU links | 239,430 |
 | Browser console warnings/errors | 0 |
 
 Pan/zoom and displayed-trial fraction are renderer-local. Playback advanced a
@@ -111,21 +118,22 @@ worker request or server request.
 | Trial/step/peak/displacement/distance and quality filters | Complete |
 | GPU trajectories, colour modes, moving gate, point budget | Complete |
 | Shared pan/zoom, reset, responsive columns, clean layout | Complete |
-| GPU playback (local time, duration p99 cap) and displayed-trial fraction | Complete |
-| Occupancy count/time/percent and linear/log colour | Complete |
-| Local body/movement direction field | Complete |
-| Trial/animal polar and heading time | Complete |
+| GPU playback (segment-local time; all/single; p95/p99/max caps) and displayed-trial fraction | Complete |
+| Occupancy count/time/percent, crisp cells, linear/log and adjustable colour limits | Complete |
+| Local body/movement flow field with abundance/R uncertainty controls and hue legend | Complete |
+| Trial/animal polar and trial/mean/density heading time | Complete |
 | Trial/animal movement metrics | Complete |
 | ROI rings, first-reached counts, entered-only, tail trim | Complete |
 | ROI fraction/residence/time/error diagnostics | Complete |
-| Native histograms and on-demand raw channels | Complete |
+| Native filter mini-histograms with dual range and exact numeric controls | Complete |
 | Exact nearest-segment inspection | Complete |
 | Static self-contained native HTML report | Complete |
 | Shareable principal URL state | Complete |
-| Multi-ring curtain observer, Any/All, editable geometry | Complete (numeric and direct canvas drag) |
-| Whole-window folder drop, bounded path resolution, automatic load | Complete |
+| Multi-ring curtain observer, Any/All, editable geometry | Complete (live numeric/slider update; direct center move and edge resize) |
+| Whole-window folder drop, exact manifest/path resolution, strict source boundary, automatic load | Complete |
 | Per-animal immediate visibility across trajectory and interactive charts | Complete |
 | ECharts hover/legend/zoom/export for analytical charts | Complete |
+| Device-local human-readable treatment label overrides | Complete |
 | Draggable panel ordering | Compatibility work |
 | Editable observation windows and paired window inference | Compatibility work |
 | Transition-probability cell observer | Compatibility work |
@@ -135,6 +143,23 @@ The compatibility rows are not considered superfluous and remain in the
 requirements. The old Dash app stays runnable on this branch for those
 workflows until their native equivalents land; no Plotly code is loaded by the
 native process.
+
+## Streaming roadmap (not implemented on this branch)
+
+The current binary dataset remains an immutable snapshot. A later streaming
+mode should preserve that fast warm-interaction model instead of repeatedly
+reloading or recomputing the complete table:
+
+1. Accept either a watched folder of append-only/rotating CSV files or a ZMQ
+   source with an explicit schema and reconnect policy.
+2. Normalize incoming rows through the same segment identity and numeric rules,
+   then send compact row and segment deltas to the browser.
+3. Append trajectory buffers on a roughly 250 ms to 1 s cadence. Do not rebuild
+   settled segments or unrelated analytical products for every packet.
+4. Refresh occupancy, flow, ROI, and metrics at a segment/trial boundary (or a
+   separately throttled cadence), while the active trajectory remains live.
+5. Define file rotation, partial-line, checkpoint, duplicate-row, backpressure,
+   and reconnect behavior before exposing the mode as an analysis source.
 
 ## Verification
 

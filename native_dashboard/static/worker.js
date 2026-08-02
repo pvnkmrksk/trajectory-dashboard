@@ -12,7 +12,6 @@ let ends = null;
 let medianDt = .01;
 let lastAnalysis = null;
 let lastAnalysisKey = "";
-const rawChannels = new Map();
 
 function typedArray(dtype, buffer, offset, length) {
   const byteOffset = bodyOffset + offset;
@@ -72,7 +71,7 @@ function analysisKey(state) {
     jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
     minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
     roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
-    groupBy: state.groupBy,
+    groupBy: state.groupBy, labels: state.labels,
   });
 }
 
@@ -217,7 +216,10 @@ function buildAnalysis(state) {
     for (const seg of visibleSegments) segmentPanel[seg] = 0;
   } else {
     const field = categoryFields[state.groupBy] || data.segmentConfig;
-    const labels = header.categories[state.groupBy] || header.categories.config;
+    const labels = state.labels?.[state.groupBy]
+      || header.displayCategories?.[state.groupBy]
+      || header.categories[state.groupBy]
+      || header.categories.config;
     const panelByCategory = new Map();
     panelNames = [];
     for (const seg of visibleSegments) {
@@ -233,6 +235,16 @@ function buildAnalysis(state) {
 
   const animals = new Set();
   for (const seg of visibleSegments) animals.add(`${data.segmentFly[seg]}@${data.segmentVr[seg]}`);
+  const durations = visibleSegments
+    .map(seg => data.segmentDuration[seg])
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const durationSummary = {
+    median: percentile(durations, .50),
+    p95: percentile(durations, .95),
+    p99: percentile(durations, .99),
+    max: durations.length ? durations[durations.length - 1] : 0,
+  };
   const panelRois = [], roiSeen = new Set();
   const roiLeft = new Uint32Array(panelNames.length), roiRight = new Uint32Array(panelNames.length);
   for (const seg of visibleSegments) {
@@ -251,6 +263,7 @@ function buildAnalysis(state) {
     panelCount: panelNames.length, visibleRows, animals: animals.size,
     roiStats, roiBaseSegments, segmentOutcome, panelRois,
     roiCounts: {left: roiLeft, right: roiRight}, roiReach,
+    durationSummary,
     filterMs: performance.now() - started,
   };
 }
@@ -311,6 +324,12 @@ function rowColor(row, seg, state, analysis) {
 
 function eligibleForDrawing(row, state) {
   return !state.movingOnly || (Number.isFinite(data.speed[row]) && data.speed[row] >= (Number(state.walkThreshold) || 0));
+}
+
+function playbackLimit(state, analysis) {
+  const key = state.playbackPercentile === "99" ? "p99"
+    : (state.playbackPercentile === "max" ? "max" : "p95");
+  return Math.max(0, Number(analysis.durationSummary?.[key]) || 0);
 }
 
 function segmentIntersectsCircle(x0, z0, x1, z1, ring) {
@@ -381,6 +400,7 @@ function buildTrajectory(state, analysis) {
   const panels = new Uint16Array(selectedLinks * 2);
   const colors = new Uint8Array(selectedLinks * 2);
   const animals = new Uint16Array(selectedLinks * 2);
+  const segments = new Uint32Array(selectedLinks * 2);
   const times = new Float32Array(selectedLinks * 2);
   const samples = new Float32Array(selectedLinks * 2);
   let link = 0;
@@ -402,6 +422,7 @@ function buildTrajectory(state, analysis) {
           colors[a] = entry >= 0 && previous < entry ? NEUTRAL_INDEX : rowColor(previous, seg, state, analysis);
           colors[a + 1] = entry >= 0 && i < entry ? NEUTRAL_INDEX : rowColor(i, seg, state, analysis);
           animals[a] = data.segmentAnimal[seg]; animals[a + 1] = data.segmentAnimal[seg];
+          segments[a] = seg; segments[a + 1] = seg;
           times[a] = data.time[previous]; times[a + 1] = data.time[i];
           samples[a] = sample; samples[a + 1] = sample;
           link += 1;
@@ -415,10 +436,12 @@ function buildTrajectory(state, analysis) {
     vertices: vertices.subarray(0, link * 4), panels: panels.subarray(0, link * 2),
     colors: colors.subarray(0, link * 2), times: times.subarray(0, link * 2),
     animals: animals.subarray(0, link * 2),
+    segments: segments.subarray(0, link * 2),
     samples: samples.subarray(0, link * 2), panelCount: analysis.panelCount,
     panelNames: analysis.panelNames, bounds: spatialBounds(analysis, 98),
     animalNames: header.categories.animal,
-    columns: Number(state.panelColumns) || 0, links: link, maxTime: header.playbackMax,
+    columns: Number(state.panelColumns) || 0, links: link,
+    maxTime: playbackLimit(state, analysis),
     rois: analysis.panelRois,
     roiCounts: {left: Array.from(analysis.roiCounts.left), right: Array.from(analysis.roiCounts.right)},
     reach: analysis.roiReach,
@@ -481,7 +504,8 @@ function buildSpatial(state, analysis) {
   };
   return {
     heatmap: {...common, count, time, buildMs: performance.now() - started},
-    direction: {...common, angle, strength, abundance: count, buildMs: performance.now() - started},
+    direction: {...common, angle, strength, abundance: count, time,
+      buildMs: performance.now() - started},
   };
 }
 
@@ -564,12 +588,109 @@ function buildPolar(state, analysis) {
 
 function buildHeading(state, analysis) {
   const heading = state.angleSource === "movement" ? data.movement : data.orientation;
+  const maxTime = Math.max(.001, playbackLimit(state, analysis));
+  const mode = state.headingMode || "trial";
+  const timeBin = Math.max(.05, Number(state.headingBin) || Math.max(.1, maxTime / 120));
+  const sectors = Math.max(12, Math.min(72, Math.round(Number(state.headingSectors) || 36)));
+
+  if (mode === "density") {
+    const nTime = Math.max(1, Math.ceil(maxTime / timeBin));
+    const density = new Float32Array(analysis.panelCount * nTime * sectors);
+    for (const seg of analysis.visibleSegments) {
+      const panel = analysis.segmentPanel[seg];
+      for (let row = starts[seg]; row < ends[seg]; row += 1) {
+        const angle = heading[row], time = data.time[row];
+        if (!analysis.rowKeep[row] || !Number.isFinite(angle) || time < 0 || time > maxTime
+          || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
+        const tx = Math.min(nTime - 1, Math.floor(time / timeBin));
+        const ay = Math.min(sectors - 1, Math.floor((wrapAngle(angle) + 180) / 360 * sectors));
+        density[(panel * nTime + tx) * sectors + ay] += 1;
+      }
+    }
+    for (let panel = 0; panel < analysis.panelCount; panel += 1) {
+      for (let tx = 0; tx < nTime; tx += 1) {
+        const base = (panel * nTime + tx) * sectors;
+        let total = 0;
+        for (let ay = 0; ay < sectors; ay += 1) total += density[base + ay];
+        if (total > 0) for (let ay = 0; ay < sectors; ay += 1) density[base + ay] = density[base + ay] / total * 100;
+      }
+    }
+    return {
+      mode, density, nTime, sectors, timeBin, maxTime,
+      panelCount: analysis.panelCount, panelNames: analysis.panelNames,
+      animalNames: header.categories.animal,
+      columns: Number(state.panelColumns) || 0,
+    };
+  }
+
+  if (mode === "mean") {
+    const grouped = new Map();
+    for (const seg of analysis.visibleSegments) {
+      const perTrial = new Map();
+      for (let row = starts[seg]; row < ends[seg]; row += 1) {
+        const angle = heading[row], time = data.time[row];
+        if (!analysis.rowKeep[row] || !Number.isFinite(angle) || time < 0 || time > maxTime
+          || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
+        const bin = Math.floor(time / timeBin);
+        const item = perTrial.get(bin) || {sin: 0, cos: 0};
+        const radians = angle * Math.PI / 180;
+        item.sin += Math.sin(radians); item.cos += Math.cos(radians);
+        perTrial.set(bin, item);
+      }
+      for (const [bin, item] of perTrial) {
+        const magnitude = Math.hypot(item.sin, item.cos);
+        if (!(magnitude > 0)) continue;
+        const key = `${analysis.segmentPanel[seg]}|${data.segmentAnimal[seg]}|${bin}`;
+        const aggregate = grouped.get(key) || {
+          panel: analysis.segmentPanel[seg], animal: data.segmentAnimal[seg],
+          bin, sin: 0, cos: 0, trials: 0,
+        };
+        aggregate.sin += item.sin / magnitude; aggregate.cos += item.cos / magnitude;
+        aggregate.trials += 1; grouped.set(key, aggregate);
+      }
+    }
+    const bySeries = new Map();
+    for (const item of grouped.values()) {
+      const key = `${item.panel}|${item.animal}`;
+      if (!bySeries.has(key)) bySeries.set(key, []);
+      bySeries.get(key).push({
+        ...item,
+        time: Math.min(maxTime, (item.bin + .5) * timeBin),
+        angle: Math.atan2(item.sin, item.cos) * 180 / Math.PI,
+        r: Math.hypot(item.sin, item.cos) / Math.max(1, item.trials),
+      });
+    }
+    const vertices = [], panels = [], colors = [], samples = [], animals = [], trials = [], steps = [];
+    for (const values of bySeries.values()) {
+      values.sort((a, b) => a.bin - b.bin);
+      for (let i = 1; i < values.length; i += 1) {
+        const previous = values[i - 1], current = values[i];
+        if (current.bin !== previous.bin + 1 || Math.abs(current.angle - previous.angle) > 180) continue;
+        vertices.push(previous.time, previous.angle, current.time, current.angle);
+        panels.push(current.panel, current.panel);
+        colors.push(current.animal % CATEGORY_COLORS, current.animal % CATEGORY_COLORS);
+        samples.push(0, 0); animals.push(current.animal, current.animal);
+        trials.push(NaN, NaN); steps.push(current.r, current.r);
+      }
+    }
+    return {
+      mode, vertices: Float32Array.from(vertices), panels: Uint16Array.from(panels),
+      colors: Uint8Array.from(colors), samples: Float32Array.from(samples),
+      animals: Uint16Array.from(animals), trials: Float32Array.from(trials),
+      steps: Float32Array.from(steps), maxTime, timeBin,
+      panelCount: analysis.panelCount, panelNames: analysis.panelNames,
+      animalNames: header.categories.animal,
+      columns: Number(state.panelColumns) || 0,
+    };
+  }
+
   let totalLinks = 0;
   const eligibleCount = new Uint32Array(starts.length);
   for (const seg of analysis.visibleSegments) {
     let count = 0, prev = NaN;
     for (let row = starts[seg]; row < ends[seg]; row += 1) {
-      if (!analysis.rowKeep[row] || !Number.isFinite(heading[row]) || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
+      if (!analysis.rowKeep[row] || !Number.isFinite(heading[row]) || data.time[row] > maxTime
+        || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
       if (Number.isFinite(prev) && Math.abs(heading[row] - prev) <= 180) totalLinks += 1;
       prev = heading[row]; count += 1;
     }
@@ -582,7 +703,8 @@ function buildHeading(state, analysis) {
     const sample = hashSample(seg, state.sampleSeed || 0);
     for (let row = starts[seg]; row < ends[seg]; row += 1) {
       const a = heading[row];
-      if (!analysis.rowKeep[row] || !Number.isFinite(a) || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
+      if (!analysis.rowKeep[row] || !Number.isFinite(a) || data.time[row] > maxTime
+        || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
       const select = position === 0 || position === eligibleCount[seg] - 1 || position % stride === 0;
       if (select) {
         if (previous >= 0 && Math.abs(a - previousAngle) <= 180) {
@@ -599,10 +721,11 @@ function buildHeading(state, analysis) {
     }
   }
   return {
+    mode,
     vertices: Float32Array.from(vertices), panels: Uint16Array.from(panels),
     colors: Uint8Array.from(colors), samples: Float32Array.from(samples),
     animals: Uint16Array.from(animals), trials: Float32Array.from(trials),
-    steps: Float32Array.from(steps), maxTime: header.playbackMax,
+    steps: Float32Array.from(steps), maxTime,
     panelCount: analysis.panelCount, panelNames: analysis.panelNames,
     animalNames: header.categories.animal,
     columns: Number(state.panelColumns) || 0,
@@ -751,29 +874,6 @@ function buildDiagnostics() {
   return {velocity: histogram(data.speed), displacement: histogram(data.segmentDisplacement)};
 }
 
-function buildRaw(analysis, column) {
-  const values = rawChannels.get(column);
-  if (!values) return null;
-  let links = 0;
-  for (const seg of analysis.visibleSegments) {
-    let count = 0; for (let i = starts[seg]; i < ends[seg]; i += 1) if (analysis.rowKeep[i] && Number.isFinite(values[i])) count += 1;
-    links += Math.max(0, count - 1);
-  }
-  const stride = Math.max(1, Math.ceil(links / 80000)), vertices = [];
-  for (const seg of analysis.visibleSegments) {
-    let pos = 0, previous = -1;
-    for (let i = starts[seg]; i < ends[seg]; i += 1) {
-      if (!analysis.rowKeep[i] || !Number.isFinite(values[i])) continue;
-      if (pos === 0 || pos % stride === 0 || i === ends[seg] - 1) {
-        if (previous >= 0) vertices.push(data.time[previous], values[previous], data.time[i], values[i]);
-        previous = i;
-      }
-      pos += 1;
-    }
-  }
-  return {vertices: Float32Array.from(vertices), maxTime: header.playbackMax, column};
-}
-
 function buffers(value, into = []) {
   if (!value || typeof value !== "object") return into;
   if (ArrayBuffer.isView(value)) { into.push(value.buffer); return into; }
@@ -791,10 +891,10 @@ function compute(message) {
   let scope = message.scope || "full";
   if (analysisChanged) scope = "full";
   const products = {};
-  if (scope === "full" || scope === "trajectory") products.trajectory = buildTrajectory(state, lastAnalysis);
+  if (scope === "full" || scope === "trajectory" || scope === "playback") products.trajectory = buildTrajectory(state, lastAnalysis);
   if (scope === "full" || scope === "spatial") Object.assign(products, buildSpatial(state, lastAnalysis));
-  if (scope === "full" || scope === "direction" || scope === "statistics") {
-    products.polar = buildPolar(state, lastAnalysis);
+  if (scope === "full" || scope === "direction" || scope === "statistics" || scope === "playback") {
+    if (scope !== "playback") products.polar = buildPolar(state, lastAnalysis);
     if (scope !== "statistics") products.heading = buildHeading(state, lastAnalysis);
   }
   if (scope === "full" || scope === "statistics") {
@@ -802,7 +902,14 @@ function compute(message) {
     products.roi = buildRoi(state, lastAnalysis);
   }
   if (scope === "full") products.diagnostics = buildDiagnostics();
-  if (scope === "raw") products.raw = buildRaw(lastAnalysis, message.column);
+  const segmentOptions = scope === "full"
+    ? lastAnalysis.visibleSegments.map(seg => ({
+      code: seg,
+      label: `${header.categories.file[data.segmentFile[seg]]} · trial ${data.segmentTrial[seg]} / step ${data.segmentStep[seg]}`,
+      duration: data.segmentDuration[seg],
+      animal: data.segmentAnimal[seg],
+    }))
+    : null;
   const result = {
     type: "result", requestId, scope, products,
     summary: {
@@ -811,6 +918,8 @@ function compute(message) {
       animals: lastAnalysis.animals,
       panels: lastAnalysis.panelCount,
       filterMs: lastAnalysis.filterMs,
+      durationSummary: lastAnalysis.durationSummary,
+      segmentOptions,
     },
   };
   postMessage(result, [...new Set(buffers(products))]);
@@ -857,11 +966,6 @@ self.onmessage = event => {
     if (message.type === "init") initDataset(message);
     else if (message.type === "compute") compute(message);
     else if (message.type === "inspect") inspectPoint(message);
-    else if (message.type === "channel") {
-      const values = unpack(message.header, message.buffer).values;
-      rawChannels.set(message.column, values);
-      postMessage({type: "channel-ready", column: message.column});
-    }
   } catch (error) {
     postMessage({type: "error", requestId: event.data?.requestId, error: error?.stack || String(error)});
   }

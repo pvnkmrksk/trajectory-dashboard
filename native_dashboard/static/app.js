@@ -3,7 +3,7 @@ import {
 } from "/static/renderers.js";
 import {
   EChartsPolarRenderer, EChartsHeadingRenderer, EChartsMetricsRenderer,
-  EChartsRoiRenderer, EChartsHistogramRenderer, EChartsRawRenderer,
+  EChartsRoiRenderer, EChartsHistogramRenderer,
 } from "/static/echarts_renderers.js";
 
 const byId = id => document.getElementById(id);
@@ -14,7 +14,6 @@ const statusDetail = byId("status-detail");
 const sourceInput = byId("source-input");
 const applyButton = byId("apply-button");
 const resetViewButton = byId("reset-view-button");
-const rawLoadButton = byId("raw-load");
 
 let datasetHeader = null;
 let worker = null;
@@ -33,6 +32,10 @@ let playbackLast = 0;
 let rings = [{x: 0, z: 0, r: 3}];
 let activeRing = 0;
 let animalVisibility = [];
+let displayNames = {};
+let visibleSegmentOptions = [];
+let currentDurationSummary = null;
+const rangeControls = new Map();
 
 function setStatus(kind, title, detail) {
   statusDock.className = `status-dock ${kind || ""}`;
@@ -54,7 +57,6 @@ let metricsRenderer;
 let roiRenderer;
 let velocityHistogram;
 let displacementHistogram;
-let rawRenderer;
 
 try {
   trajectoryRenderer = new TrajectoryRenderer(byId("trajectory-plot"), syncView);
@@ -66,7 +68,6 @@ try {
   roiRenderer = new EChartsRoiRenderer(byId("roi-plot"));
   velocityHistogram = new EChartsHistogramRenderer(byId("velocity-hist"), "velocity-distribution");
   displacementHistogram = new EChartsHistogramRenderer(byId("displacement-hist"), "displacement-distribution");
-  rawRenderer = new EChartsRawRenderer(byId("raw-plot"));
 } catch (error) {
   setStatus("error", "Renderer unavailable", error.message);
   throw error;
@@ -81,12 +82,13 @@ trajectoryRenderer.setInspectHandler((point, view) => {
   });
   byId("segment-inspector").textContent = "Finding the nearest retained segment…";
 });
-trajectoryRenderer.setRingMoveHandler((index, x, z, final) => {
+trajectoryRenderer.setRingMoveHandler((index, x, z, final, radius = null) => {
   if (!rings[index]) return;
-  rings[index] = {...rings[index], x, z};
+  rings[index] = {...rings[index], x, z,
+    r: Number.isFinite(radius) ? Math.max(.01, radius) : rings[index].r};
   activeRing = index;
   renderRingControls();
-  if (final) scheduleCompute("trajectory", 20);
+  scheduleCompute("trajectory", final ? 0 : 45);
 });
 
 function parseBinary(buffer) {
@@ -101,12 +103,14 @@ function formatCount(value) {
   return new Intl.NumberFormat().format(Number(value) || 0);
 }
 
-function datasetSummary() {
+function datasetSummary(visible = null) {
   const counts = datasetHeader?.counts;
   if (!counts) return;
+  const rows = visible?.visibleRows ?? counts.retainedRows;
+  const segments = visible?.visibleSegments ?? counts.segments;
   byId("dataset-summary").innerHTML = `
-    <div><b>${formatCount(counts.retainedRows)}</b><span>retained rows</span></div>
-    <div><b>${formatCount(counts.segments)}</b><span>segments</span></div>
+    <div><b>${formatCount(rows)}</b><span>visible / ${formatCount(counts.retainedRows)} rows</span></div>
+    <div><b>${formatCount(segments)}</b><span>visible / ${formatCount(counts.segments)} segments</span></div>
     <div><b>${formatCount(counts.animals)}</b><span>animals</span></div>
     <div><b>${formatCount(counts.files)}</b><span>files</span></div>`;
 }
@@ -150,16 +154,104 @@ function renderAnimalVisibility() {
   byId("animals-none").disabled = !names.length;
 }
 
-function fillRange(idMin, idMax, values) {
-  const lo = byId(idMin), hi = byId(idMax);
-  // Preserve the exact float32 extrema. Cosmetic rounding here silently
-  // excluded the segment owning a rounded-down maximum on first render.
-  lo.value = String(values[0]); hi.value = String(values[1]);
-  lo.placeholder = formatNumber(values[0]); hi.placeholder = formatNumber(values[1]);
+function drawMiniHistogram(canvas, histogram, selected) {
+  const width = Math.max(180, canvas.clientWidth || 260), height = 46;
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+  const context = canvas.getContext("2d");
+  context.setTransform(dpr, 0, 0, dpr, 0, 0); context.clearRect(0, 0, width, height);
+  const counts = histogram.counts || [], edges = histogram.edges || [0, 1];
+  const maximum = Math.max(1, ...counts);
+  const span = Math.max(1e-12, edges[edges.length - 1] - edges[0]);
+  for (let index = 0; index < counts.length; index += 1) {
+    const x0 = (edges[index] - edges[0]) / span * width;
+    const x1 = (edges[index + 1] - edges[0]) / span * width;
+    const bar = Math.max(1, counts[index] / maximum * (height - 5));
+    const midpoint = (edges[index] + edges[index + 1]) / 2;
+    context.fillStyle = midpoint >= selected[0] && midpoint <= selected[1]
+      ? "rgba(8,124,114,.76)" : "rgba(113,132,126,.22)";
+    context.fillRect(x0, height - bar, Math.max(1, x1 - x0 - .5), bar);
+  }
+  if (histogram.overflow) {
+    context.fillStyle = "rgba(221,101,72,.72)";
+    context.fillRect(width - 3, 0, 3, height);
+  }
+}
+
+function createRangeControl(key, label, idMin, idMax) {
+  const histogram = datasetHeader.filterHistograms[key];
+  const exact = histogram.range, display = histogram.displayRange;
+  const integer = key === "trial" || key === "step";
+  const step = integer ? 1 : Math.max(1e-6, (display[1] - display[0]) / 500);
+  const host = document.createElement("section"); host.className = "range-filter";
+  host.innerHTML = `
+    <div class="range-filter-head"><b>${label}</b><small>${histogram.overflow ? `${formatCount(histogram.overflow)} above mini-chart` : "complete distribution"}</small></div>
+    <canvas class="mini-hist" aria-label="${label} distribution"></canvas>
+    <div class="dual-range">
+      <input class="range-low" type="range" min="${display[0]}" max="${display[1]}" step="${step}" value="${display[0]}" aria-label="${label} lower bound">
+      <input class="range-high" type="range" min="${display[0]}" max="${display[1]}" step="${step}" value="${display[1]}" aria-label="${label} upper bound">
+    </div>
+    <div class="range-values">
+      <label>Minimum<input id="${idMin}" type="number" step="${step}" value="${exact[0]}"></label>
+      <label>Maximum<input id="${idMax}" type="number" step="${step}" value="${exact[1]}"></label>
+    </div>`;
+  byId("range-filters").appendChild(host);
+  const canvas = host.querySelector("canvas"), low = host.querySelector(".range-low"), high = host.querySelector(".range-high");
+  const loInput = byId(idMin), hiInput = byId(idMax);
+  const redraw = () => drawMiniHistogram(canvas, histogram, [Number(loInput.value), Number(hiInput.value)]);
+  const fromSlider = changed => {
+    if (Number(low.value) > Number(high.value)) {
+      if (changed === low) high.value = low.value; else low.value = high.value;
+    }
+    loInput.value = low.value; hiInput.value = high.value; redraw();
+    scheduleCompute("full", 120);
+  };
+  low.addEventListener("input", () => fromSlider(low));
+  high.addEventListener("input", () => fromSlider(high));
+  for (const input of [loInput, hiInput]) input.addEventListener("change", () => {
+    low.value = Math.max(Number(low.min), Math.min(Number(low.max), Number(loInput.value)));
+    high.value = Math.max(Number(high.min), Math.min(Number(high.max), Number(hiInput.value)));
+    redraw(); scheduleCompute("full", 100);
+  });
+  new ResizeObserver(redraw).observe(canvas);
+  redraw();
+  rangeControls.set(key, {host, redraw});
+}
+
+function loadDisplayNames() {
+  displayNames = structuredClone(datasetHeader.displayCategories || datasetHeader.categories || {});
+  try {
+    const stored = JSON.parse(localStorage.getItem("daari-deepa-labels") || "{}");
+    const raw = datasetHeader.categories.config || [];
+    displayNames.config = raw.map((name, index) => stored[name] || displayNames.config?.[index] || name);
+  } catch (_) { /* device-local overrides are optional */ }
+}
+
+function renderConfigLabels() {
+  const host = byId("config-labels"); host.replaceChildren();
+  const raw = datasetHeader.categories.config || [];
+  raw.forEach((name, index) => {
+    const label = document.createElement("label");
+    const source = document.createElement("span"); source.textContent = name;
+    const input = document.createElement("input"); input.value = displayNames.config?.[index] || name;
+    label.append(source, input); host.appendChild(label);
+    input.addEventListener("change", () => {
+      displayNames.config[index] = input.value.trim() || name;
+      try {
+        const stored = JSON.parse(localStorage.getItem("daari-deepa-labels") || "{}");
+        stored[name] = displayNames.config[index];
+        localStorage.setItem("daari-deepa-labels", JSON.stringify(stored));
+      } catch (_) { /* local persistence is best-effort */ }
+      const option = byId("filter-config")?.options[index];
+      if (option) option.textContent = displayNames.config[index];
+      scheduleCompute("full", 20);
+    });
+  });
 }
 
 function populateControls() {
   datasetSummary();
+  loadDisplayNames();
   const categories = byId("category-filters");
   categories.replaceChildren();
   const labels = {config: "Treatments", scene: "Scenes", vr: "VR arenas", fly: "Animals", folder: "Source folders"};
@@ -169,22 +261,22 @@ function populateControls() {
     const select = document.createElement("select");
     select.multiple = true; select.id = `filter-${key}`; select.dataset.scope = "full";
     for (const [index, text] of datasetHeader.categories[key].entries()) {
-      const option = document.createElement("option"); option.value = index; option.textContent = text; select.appendChild(option);
+      const option = document.createElement("option"); option.value = index;
+      option.textContent = displayNames[key]?.[index] || text; select.appendChild(option);
     }
     label.appendChild(select); categories.appendChild(label);
     select.addEventListener("change", () => scheduleCompute("full", 140));
   }
-  fillRange("trial-min", "trial-max", datasetHeader.ranges.trial);
-  fillRange("step-min", "step-max", datasetHeader.ranges.step);
-  fillRange("peak-min", "peak-max", datasetHeader.ranges.peakSpeed);
-  fillRange("disp-min", "disp-max", datasetHeader.ranges.displacement);
-  fillRange("distance-min", "distance-max", datasetHeader.ranges.distance);
-  const raw = byId("raw-channel"); raw.replaceChildren(new Option("Choose a channel", ""));
-  for (const column of datasetHeader.rawColumns || []) raw.add(new Option(column, column));
-  rawLoadButton.disabled = true;
+  byId("range-filters").replaceChildren(); rangeControls.clear();
+  createRangeControl("trial", "Trial number", "trial-min", "trial-max");
+  createRangeControl("step", "Step / segment", "step-min", "step-max");
+  createRangeControl("peak", "Peak smoothed velocity", "peak-min", "peak-max");
+  createRangeControl("displacement", "Net displacement", "disp-min", "disp-max");
+  createRangeControl("distance", "Distance walked", "distance-min", "distance-max");
+  renderConfigLabels();
   applyButton.disabled = false; resetViewButton.disabled = false; byId("resample-button").disabled = false;
   byId("export-button").disabled = false;
-  const maxTime = Math.max(0, datasetHeader.playbackMax ?? datasetHeader.ranges.time[1]);
+  const maxTime = Math.max(0, datasetHeader.playbackQuantiles?.p95 ?? datasetHeader.playbackMax ?? 0);
   byId("time-scrubber").max = maxTime; byId("time-scrubber").value = maxTime;
   byId("time-output").textContent = "all time";
   restoreViewStateFromUrl();
@@ -242,6 +334,11 @@ function collectState() {
     ringEnabled: byId("ring-enabled").checked,
     ringMatch: byId("ring-match").value,
     rings: rings.map(ring => ({...ring})),
+    labels: displayNames,
+    playbackPercentile: byId("playback-cap").value,
+    headingMode: byId("heading-mode").value,
+    headingBin: numberValue("heading-bin", .25),
+    headingSectors: numberValue("heading-sectors", 36),
     sampleSeed,
   };
 }
@@ -256,6 +353,14 @@ function persistState() {
   if (state.panelColumns) params.set("cols", state.panelColumns); else params.delete("cols");
   if (state.binSize) params.set("bin", state.binSize); else params.delete("bin");
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
+  params.set("pcap", state.playbackPercentile);
+  params.set("hmode", state.headingMode); params.set("hbin", state.headingBin); params.set("hsec", state.headingSectors);
+  params.set("tw", byId("trajectory-width").value); params.set("topacity", byId("trajectory-opacity").value);
+  params.set("hrange", byId("heat-range-mode").value); params.set("hcmin", byId("heat-cmin").value); params.set("hcmax", byId("heat-cmax").value);
+  params.set("fmetric", byId("flow-metric").value); params.set("frange", byId("flow-range-mode").value);
+  params.set("fcmin", byId("flow-cmin").value); params.set("fcmax", byId("flow-cmax").value);
+  params.set("prate", byId("particle-rate").value); params.set("trail", byId("trail-length").value);
+  params.set("fspeed", byId("flow-speed").value); params.set("fvar", byId("flow-variability").value);
   if (state.ringEnabled) params.set("ring", "1"); else params.delete("ring");
   params.set("rings", JSON.stringify(rings)); params.set("ringmatch", state.ringMatch);
   history.replaceState(null, "", url);
@@ -267,7 +372,15 @@ function restoreViewStateFromUrl() {
     "group-by": params.get("group"), "color-by": params.get("color"),
     "panel-columns": params.get("cols"), "bin-size": params.get("bin"),
     "bound-percent": params.get("bound"), "angle-source": params.get("angle"),
-    "stats-unit": params.get("unit"),
+    "stats-unit": params.get("unit"), "playback-cap": params.get("pcap"),
+    "heading-mode": params.get("hmode"), "heading-bin": params.get("hbin"),
+    "heading-sectors": params.get("hsec"), "trajectory-width": params.get("tw"),
+    "trajectory-opacity": params.get("topacity"), "heat-range-mode": params.get("hrange"),
+    "heat-cmin": params.get("hcmin"), "heat-cmax": params.get("hcmax"),
+    "flow-metric": params.get("fmetric"), "flow-range-mode": params.get("frange"),
+    "flow-cmin": params.get("fcmin"), "flow-cmax": params.get("fcmax"),
+    "particle-rate": params.get("prate"), "trail-length": params.get("trail"),
+    "flow-speed": params.get("fspeed"), "flow-variability": params.get("fvar"),
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
   byId("ring-enabled").checked = params.get("ring") === "1";
@@ -279,7 +392,7 @@ function restoreViewStateFromUrl() {
 }
 
 function scopePriority(scope) {
-  return {layout: 0, trajectory: 1, direction: 2, statistics: 2, spatial: 3, raw: 3, full: 4}[scope] || 1;
+  return {layout: 0, trajectory: 1, playback: 2, direction: 2, statistics: 2, spatial: 3, full: 4}[scope] || 1;
 }
 
 let computeTimer = null;
@@ -312,12 +425,106 @@ function updateColumns() {
   persistState();
 }
 
+function optionalNumber(id) {
+  const text = byId(id)?.value;
+  if (text === "" || text == null) return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+function applyHeatmapVisuals() {
+  if (!heatmapRenderer.data) return;
+  heatmapRenderer.setMetricScale(
+    byId("heat-metric").value, byId("heat-scale").value,
+    byId("heat-range-mode").value,
+    optionalNumber("heat-cmin"), optionalNumber("heat-cmax"),
+  );
+}
+
+function applyDirectionVisuals() {
+  if (!directionRenderer.data) return;
+  directionRenderer.setVisualOptions({
+    metric: byId("flow-metric").value,
+    clipMode: byId("flow-range-mode").value,
+    clipMin: optionalNumber("flow-cmin"), clipMax: optionalNumber("flow-cmax"),
+    particleRate: numberValue("particle-rate", 1),
+    trailLength: numberValue("trail-length", 1),
+    speed: numberValue("flow-speed", 1),
+    variability: numberValue("flow-variability", 1),
+  });
+}
+
+function populatePlaybackSegments() {
+  const select = byId("playback-trial");
+  const previous = Number(select.value);
+  select.replaceChildren();
+  for (const item of visibleSegmentOptions) {
+    select.add(new Option(`${item.label} · ${formatNumber(item.duration, 2)} s`, String(item.code)));
+  }
+  const next = visibleSegmentOptions.some(item => item.code === previous)
+    ? previous : visibleSegmentOptions[0]?.code;
+  if (next != null) select.value = String(next);
+  updatePlaybackScope();
+}
+
+function selectedSegmentOption() {
+  const code = Number(byId("playback-trial").value);
+  return visibleSegmentOptions.find(item => item.code === code) || null;
+}
+
+function updatePlaybackLimit(summary = currentDurationSummary) {
+  if (summary) currentDurationSummary = summary;
+  if (!datasetHeader) return;
+  const single = byId("playback-scope").value === "single";
+  const selected = selectedSegmentOption();
+  const key = byId("playback-cap").value === "99" ? "p99"
+    : (byId("playback-cap").value === "max" ? "max" : "p95");
+  const maximum = Math.max(.001, single && selected
+    ? Number(selected.duration) || .001
+    : Number(currentDurationSummary?.[key] ?? datasetHeader.playbackQuantiles?.[key] ?? datasetHeader.playbackMax) || .001);
+  const scrubber = byId("time-scrubber");
+  scrubber.max = maximum;
+  if (Number(scrubber.value) > maximum) scrubber.value = maximum;
+  byId("time-output").title = single && selected
+    ? `Exact duration of ${selected.label}`
+    : `${key.toUpperCase()} of visible segment durations`;
+}
+
+function updatePlaybackScope() {
+  const single = byId("playback-scope").value === "single";
+  const select = byId("playback-trial");
+  select.disabled = !single || !visibleSegmentOptions.length;
+  byId("trial-prev").disabled = !single || visibleSegmentOptions.length < 2;
+  byId("trial-next").disabled = !single || visibleSegmentOptions.length < 2;
+  const selected = single ? Number(select.value) : -1;
+  trajectoryRenderer.setPlaybackSegment(single && Number.isFinite(selected) ? selected : -1);
+  updatePlaybackLimit();
+  updatePlaybackTime();
+}
+
+function stepPlaybackSegment(delta) {
+  if (!visibleSegmentOptions.length) return;
+  const current = visibleSegmentOptions.findIndex(item => item.code === Number(byId("playback-trial").value));
+  const next = (Math.max(0, current) + delta + visibleSegmentOptions.length) % visibleSegmentOptions.length;
+  byId("playback-trial").value = String(visibleSegmentOptions[next].code);
+  byId("time-scrubber").value = 0;
+  updatePlaybackScope();
+}
+
 function renderProducts(incoming, summary) {
   Object.assign(products, incoming);
+  datasetSummary(summary);
+  if (summary.segmentOptions) {
+    visibleSegmentOptions = summary.segmentOptions;
+    populatePlaybackSegments();
+  }
+  updatePlaybackLimit(summary.durationSummary);
   const preserve = !newDataset && !!sharedView;
   if (incoming.trajectory) {
     incoming.trajectory.columns = numberValue("panel-columns");
     trajectoryRenderer.setData(incoming.trajectory, preserve);
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.7), numberValue("trajectory-opacity", .34));
+    updatePlaybackScope();
     if (!preserve) sharedView = {...trajectoryRenderer.view};
     syncView(sharedView, trajectoryRenderer);
     const ringText = incoming.trajectory.ringEnabled ? ` · ${formatCount(incoming.trajectory.ringMatches)} ring matches` : "";
@@ -326,12 +533,13 @@ function renderProducts(incoming, summary) {
   if (incoming.heatmap) {
     incoming.heatmap.columns = numberValue("panel-columns");
     heatmapRenderer.setData(incoming.heatmap, !!sharedView);
-    heatmapRenderer.setMetricScale(byId("heat-metric").value, byId("heat-scale").value);
+    applyHeatmapVisuals();
     if (sharedView) heatmapRenderer.setView(sharedView, false);
   }
   if (incoming.direction) {
     incoming.direction.columns = numberValue("panel-columns");
     directionRenderer.setData(incoming.direction, !!sharedView);
+    applyDirectionVisuals();
     if (sharedView) directionRenderer.setView(sharedView, false);
   }
   if (incoming.polar) {
@@ -348,11 +556,11 @@ function renderProducts(incoming, summary) {
     velocityHistogram.setData(incoming.diagnostics.velocity);
     displacementHistogram.setData(incoming.diagnostics.displacement);
   }
-  if (incoming.raw) { rawRenderer.setData(incoming.raw); byId("raw-status").textContent = `${incoming.raw.column} · ${formatCount(incoming.raw.vertices.length / 4)} drawn links`; }
   const fraction = numberValue("trial-fraction", 100) / 100;
   trajectoryRenderer.setFraction(fraction); polarRenderer.setFraction(fraction); headingRenderer.setFraction(fraction);
   applyAnimalVisibility();
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
+  for (const renderer of spatialRenderers) renderer.setGridVisible(byId("spatial-grid").checked);
   newDataset = false;
 }
 
@@ -372,11 +580,6 @@ function handleWorkerMessage(event) {
       setStatus("ready", "Ready for exploration", `${formatCount(message.summary.visibleRows)} points · ${formatCount(message.summary.visibleSegments)} segments · worker filter ${message.summary.filterMs.toFixed(0)} ms`);
     }
     flushCompute();
-    return;
-  }
-  if (message.type === "channel-ready") {
-    workerBusy = false;
-    queueCompute("raw", {column: message.column});
     return;
   }
   if (message.type === "inspect-result") {
@@ -409,6 +612,7 @@ async function loadDataset(source) {
     const buffer = await response.arrayBuffer();
     const parsed = parseBinary(buffer);
     datasetHeader = parsed.header; sourceInput.value = source;
+    visibleSegmentOptions = []; currentDurationSummary = datasetHeader.playbackQuantiles || null;
     populateControls(); products = {}; sharedView = null; newDataset = true; sampleSeed = 0;
     if (worker) worker.terminate();
     workerReady = false; workerBusy = false; pendingCompute = null;
@@ -421,21 +625,6 @@ async function loadDataset(source) {
   } finally {
     byId("load-button").disabled = false;
     applyButton.disabled = !datasetHeader;
-  }
-}
-
-async function loadRawChannel() {
-  const column = byId("raw-channel").value;
-  if (!column || !datasetHeader || !worker) return;
-  rawLoadButton.disabled = true; byId("raw-status").textContent = `Loading ${column}…`;
-  try {
-    const response = await fetch(`/api/channel/${datasetHeader.datasetId}?name=${encodeURIComponent(column)}`);
-    if (!response.ok) throw new Error((await response.json()).error || `HTTP ${response.status}`);
-    const buffer = await response.arrayBuffer(), parsed = parseBinary(buffer);
-    workerBusy = true;
-    worker.postMessage({type: "channel", column, header: parsed.header, buffer, bodyOffset: parsed.bodyOffset}, [buffer]);
-  } catch (error) {
-    byId("raw-status").textContent = error.message; rawLoadButton.disabled = false;
   }
 }
 
@@ -464,9 +653,9 @@ function exportNativeReport() {
   ];
   const figures = sections.map(([title, id]) => [title, compositePlot(id)]).filter(([, image]) => image);
   const counts = datasetHeader.counts;
-  const html = `<!doctype html><meta charset="utf-8"><title>Dari Deepa native report</title>
+  const html = `<!doctype html><meta charset="utf-8"><title>Daari Deepa native report</title>
     <style>body{margin:32px auto;max-width:1500px;padding:0 24px;color:#18221f;background:#f4f1ea;font:14px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}section{margin:28px 0;padding:14px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px}img{display:block;width:100%;height:auto}small{color:#66716d}</style>
-    <header><h1>Dari Deepa — native analysis report</h1><p>${escapeHtml(sourceInput.value)}</p><small>${formatCount(counts.retainedRows)} retained of ${formatCount(counts.sourceRows)} source rows · ${formatCount(counts.segments)} segments · ${formatCount(counts.animals)} animals</small></header>
+    <header><h1>Daari Deepa — native analysis report</h1><p>${escapeHtml(sourceInput.value)}</p><small>${formatCount(counts.retainedRows)} retained of ${formatCount(counts.sourceRows)} source rows · ${formatCount(counts.segments)} segments · ${formatCount(counts.animals)} animals</small></header>
     ${figures.map(([title, image]) => `<section><h2>${escapeHtml(title)}</h2><img src="${image}" alt="${escapeHtml(title)}"></section>`).join("")}
     <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Figures are a static record of the current native browser state.</small></footer>`;
   const blob = new Blob([html], {type: "text/html"});
@@ -490,6 +679,10 @@ function renderRingControls() {
   byId("ring-x").value = Number(ring.x.toFixed(3));
   byId("ring-z").value = Number(ring.z.toFixed(3));
   byId("ring-radius").value = Number(ring.r.toFixed(3));
+  const slider = byId("ring-radius-slider");
+  slider.max = Math.max(30, ring.r * 2,
+    Math.abs(datasetHeader?.ranges?.x?.[1] || 0), Math.abs(datasetHeader?.ranges?.z?.[1] || 0));
+  slider.value = ring.r;
   byId("ring-delete").disabled = rings.length <= 1;
 }
 
@@ -498,21 +691,30 @@ function updateActiveRing() {
     x: numberValue("ring-x"), z: numberValue("ring-z"),
     r: Math.max(.01, numberValue("ring-radius", 3)),
   };
-  scheduleCompute("trajectory", 90);
+  byId("ring-radius-slider").value = rings[activeRing].r;
+  if (trajectoryRenderer.data?.rings?.[activeRing]) {
+    trajectoryRenderer.data.rings[activeRing] = {...rings[activeRing]};
+    trajectoryRenderer.draw();
+  }
+  scheduleCompute("trajectory", 35);
 }
 
 function updatePlaybackTime() {
   const enabled = byId("playback-enabled").checked;
-  const value = numberValue("time-scrubber", datasetHeader?.playbackMax ?? datasetHeader?.ranges.time[1] ?? 0);
+  const value = numberValue("time-scrubber", 0);
+  const single = byId("playback-scope").value === "single";
+  trajectoryRenderer.setPlaybackSegment(single ? Number(byId("playback-trial").value) : -1);
   trajectoryRenderer.setTime(enabled ? value : Number.POSITIVE_INFINITY);
-  byId("time-output").textContent = enabled ? `${formatNumber(value, 2)} s` : "all time";
+  byId("time-output").textContent = enabled
+    ? `${formatNumber(value, 2)} / ${formatNumber(Number(byId("time-scrubber").max), 2)} s`
+    : (single ? "full segment" : "all time");
 }
 
 function playbackTick(now) {
   if (!byId("playback-enabled").checked || byId("play-button").textContent !== "Pause") { playbackFrame = null; return; }
   const maxTime = Number(byId("time-scrubber").max) || 1;
   const elapsed = playbackLast ? (now - playbackLast) / 1000 : 0; playbackLast = now;
-  let value = numberValue("time-scrubber") + elapsed * maxTime / 20;
+  let value = numberValue("time-scrubber") + elapsed * numberValue("playback-speed", 1);
   if (value >= maxTime) value = 0;
   byId("time-scrubber").value = value; updatePlaybackTime();
   playbackFrame = requestAnimationFrame(playbackTick);
@@ -527,11 +729,15 @@ function stopPlayback() {
 byId("source-form").addEventListener("submit", event => { event.preventDefault(); loadDataset(sourceInput.value); });
 applyButton.addEventListener("click", () => scheduleCompute("full"));
 resetViewButton.addEventListener("click", () => trajectoryRenderer.resetView(true));
-byId("clean-button").addEventListener("click", () => {
-  shell.classList.toggle("clean-mode");
+function setCleanMode(enabled) {
+  shell.classList.toggle("clean-mode", enabled);
   byId("clean-button").textContent = shell.classList.contains("clean-mode") ? "Full view" : "Clean view";
+  for (const renderer of spatialRenderers) renderer.setCleanMode(enabled);
   setTimeout(() => spatialRenderers.forEach(renderer => { renderer.resize(); renderer.draw(); }), 40);
-});
+}
+byId("clean-button").addEventListener("click", () => setCleanMode(!shell.classList.contains("clean-mode")));
+byId("clean-exit").addEventListener("click", () => setCleanMode(false));
+document.addEventListener("keydown", event => { if (event.key === "Escape" && shell.classList.contains("clean-mode")) setCleanMode(false); });
 byId("export-button").addEventListener("click", exportNativeReport);
 byId("animals-all").addEventListener("click", () => {
   animalVisibility.fill(true); renderAnimalVisibility(); applyAnimalVisibility();
@@ -548,6 +754,10 @@ byId("ring-enabled").addEventListener("change", () => scheduleCompute("trajector
 byId("ring-match").addEventListener("change", () => scheduleCompute("trajectory", 30));
 byId("ring-active").addEventListener("change", () => { activeRing = Number(byId("ring-active").value) || 0; renderRingControls(); });
 for (const id of ["ring-x", "ring-z", "ring-radius"]) byId(id).addEventListener("input", updateActiveRing);
+byId("ring-radius-slider").addEventListener("input", () => {
+  byId("ring-radius").value = byId("ring-radius-slider").value;
+  updateActiveRing();
+});
 byId("ring-add").addEventListener("click", () => {
   const current = rings[activeRing] || {x:0,z:0,r:3}; rings.push({...current, x: current.x + current.r * .5}); activeRing = rings.length - 1;
   renderRingControls(); scheduleCompute("trajectory", 30);
@@ -556,10 +766,25 @@ byId("ring-delete").addEventListener("click", () => {
   if (rings.length <= 1) return; rings.splice(activeRing, 1); activeRing = Math.max(0, activeRing - 1);
   renderRingControls(); scheduleCompute("trajectory", 30);
 });
-byId("heat-metric").addEventListener("change", () => heatmapRenderer.setMetricScale(byId("heat-metric").value, byId("heat-scale").value));
-byId("heat-scale").addEventListener("change", () => heatmapRenderer.setMetricScale(byId("heat-metric").value, byId("heat-scale").value));
-byId("raw-channel").addEventListener("change", () => { rawLoadButton.disabled = !byId("raw-channel").value; });
-rawLoadButton.addEventListener("click", loadRawChannel);
+for (const id of ["heat-metric", "heat-scale", "heat-range-mode", "heat-cmin", "heat-cmax"]) {
+  byId(id).addEventListener(id.startsWith("heat-c") ? "input" : "change", () => {
+    applyHeatmapVisuals(); persistState();
+  });
+}
+for (const id of ["flow-metric", "flow-range-mode", "flow-cmin", "flow-cmax",
+  "particle-rate", "trail-length", "flow-speed", "flow-variability"]) {
+  const event = id === "flow-metric" || id === "flow-range-mode" ? "change" : "input";
+  byId(id).addEventListener(event, () => { applyDirectionVisuals(); persistState(); });
+}
+for (const id of ["trajectory-width", "trajectory-opacity"]) {
+  byId(id).addEventListener("input", () => {
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.7), numberValue("trajectory-opacity", .34));
+    persistState();
+  });
+}
+byId("spatial-grid").addEventListener("change", () => {
+  for (const renderer of spatialRenderers) renderer.setGridVisible(byId("spatial-grid").checked);
+});
 byId("playback-enabled").addEventListener("change", () => {
   const enabled = byId("playback-enabled").checked;
   byId("play-button").disabled = !enabled; byId("time-scrubber").disabled = !enabled;
@@ -567,6 +792,17 @@ byId("playback-enabled").addEventListener("change", () => {
   updatePlaybackTime();
 });
 byId("time-scrubber").addEventListener("input", updatePlaybackTime);
+byId("playback-scope").addEventListener("change", () => {
+  byId("time-scrubber").value = 0; updatePlaybackScope();
+});
+byId("playback-trial").addEventListener("change", () => {
+  byId("time-scrubber").value = 0; updatePlaybackScope();
+});
+byId("trial-prev").addEventListener("click", () => stepPlaybackSegment(-1));
+byId("trial-next").addEventListener("click", () => stepPlaybackSegment(1));
+byId("playback-cap").addEventListener("change", () => {
+  updatePlaybackLimit(); scheduleCompute("playback", 20);
+});
 byId("play-button").addEventListener("click", () => {
   const playing = byId("play-button").textContent === "Pause";
   if (playing) stopPlayback();
@@ -606,7 +842,10 @@ for (const section of document.querySelectorAll(".plot-section")) sectionObserve
 
 async function readDroppedEntry(entry, prefix, paths) {
   if (entry.isFile) {
-    if (entry.name.toLowerCase().endsWith(".csv")) paths.push(`${prefix}${entry.name}`);
+    if (entry.name.toLowerCase().endsWith(".csv")) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+      paths.push({path: `${prefix}${entry.name}`, size: file.size});
+    }
     return;
   }
   if (!entry.isDirectory) return;
@@ -626,7 +865,7 @@ async function droppedPaths(transfer) {
   } else {
     for (const file of transfer.files || []) {
       const path = file.webkitRelativePath || file.name;
-      if (path.toLowerCase().endsWith(".csv")) paths.push(path);
+      if (path.toLowerCase().endsWith(".csv")) paths.push({path, size: file.size});
     }
   }
   return paths;
@@ -651,7 +890,7 @@ window.addEventListener("drop", async event => {
   try {
     const files = await droppedPaths(event.dataTransfer);
     if (!files.length) throw new Error("No CSV files were found in that drop.");
-    const folder = files[0].split("/")[0];
+    const folder = files[0].path.split("/")[0];
     setStatus("working", "Locating dropped folder", `${files.length.toLocaleString()} CSV files detected; resolving the local data path.`);
     const response = await fetch("/api/resolve-drop", {
       method: "POST", headers: {"Content-Type": "application/json"},

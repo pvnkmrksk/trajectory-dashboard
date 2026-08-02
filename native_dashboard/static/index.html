@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f3f6f6">
-  <title>Dari Deepa — native trajectory explorer</title>
+  <title>Daari Deepa — native trajectory explorer</title>
   <meta name="description" content="A Plotly-free, browser-native explorer for VR trajectory experiments.">
   <link rel="stylesheet" href="/static/dashboard.css">
 </head>
@@ -15,7 +15,7 @@
         <div class="brand-mark" aria-hidden="true"><span></span></div>
         <div>
           <div class="eyebrow">Trajectory workbench</div>
-          <h1>Dari Deepa <span>Native</span></h1>
+          <h1>Daari Deepa <span>Native</span></h1>
         </div>
       </div>
       <form class="source-form" id="source-form">
@@ -101,7 +101,14 @@
           <label>Point budget
             <input id="point-budget" data-scope="trajectory" type="number" min="10000" step="10000" value="250000">
           </label>
+          <label>Path width
+            <input id="trajectory-width" type="range" min="0.5" max="5" step="0.1" value="1.7">
+          </label>
+          <label>Path opacity
+            <input id="trajectory-opacity" type="range" min="0.03" max="1" step="0.01" value="0.34">
+          </label>
           <label class="check"><input id="moving-only" data-scope="trajectory" type="checkbox"> Moving samples only</label>
+          <label class="check"><input id="spatial-grid" type="checkbox" checked> Spatial grid</label>
           <label>Walk threshold
             <input id="walk-threshold" data-scope="direction" type="number" min="0" step="0.01" value="0">
           </label>
@@ -112,12 +119,7 @@
         <summary>Data filters</summary>
         <div class="control-body">
           <div id="category-filters" class="category-filters"></div>
-          <div class="two-up">
-            <label>Trial min<input id="trial-min" data-scope="full" type="number"></label>
-            <label>Trial max<input id="trial-max" data-scope="full" type="number"></label>
-            <label>Step min<input id="step-min" data-scope="full" type="number"></label>
-            <label>Step max<input id="step-max" data-scope="full" type="number"></label>
-          </div>
+          <div class="range-filters" id="range-filters"></div>
         </div>
       </details>
 
@@ -128,12 +130,6 @@
           <label>Buffer (ms)<input id="jump-buffer" data-scope="full" type="number" min="0" step="10" value="100"></label>
           <label>Min displacement<input id="min-displacement" data-scope="full" type="number" min="0" step="0.001" value="0"></label>
           <label>Trim each edge<input id="edge-trim" data-scope="full" type="number" min="0" step="1" value="0"></label>
-          <label>Peak speed min<input id="peak-min" data-scope="full" type="number"></label>
-          <label>Peak speed max<input id="peak-max" data-scope="full" type="number"></label>
-          <label>Displacement min<input id="disp-min" data-scope="full" type="number"></label>
-          <label>Displacement max<input id="disp-max" data-scope="full" type="number"></label>
-          <label>Distance min<input id="distance-min" data-scope="full" type="number"></label>
-          <label>Distance max<input id="distance-max" data-scope="full" type="number"></label>
         </div>
       </details>
 
@@ -157,6 +153,14 @@
           <label>Centre X<input id="ring-x" type="number" step="0.1" value="0"></label>
           <label>Centre Z<input id="ring-z" type="number" step="0.1" value="0"></label>
           <label>Radius<input id="ring-radius" type="number" min="0.01" step="0.1" value="3"></label>
+          <label class="ring-radius-control">Radius slider<input id="ring-radius-slider" type="range" min="0.05" max="30" step="0.05" value="3"></label>
+        </div>
+      </details>
+
+      <details class="control-card">
+        <summary>Treatment display names</summary>
+        <div class="control-body label-editor" id="config-labels">
+          <span class="empty-control">Load data to edit plot labels.</span>
         </div>
       </details>
 
@@ -202,6 +206,12 @@
           <div class="plot-toolbar">
             <label class="check"><input id="playback-enabled" type="checkbox"> Playback</label>
             <button class="compact" id="play-button" type="button" disabled>Play</button>
+            <label>Mode<select id="playback-scope"><option value="all">All segments together</option><option value="single">One segment</option></select></label>
+            <button class="compact trial-stepper" id="trial-prev" type="button" disabled aria-label="Previous segment">←</button>
+            <label class="trial-picker">Segment<select id="playback-trial" disabled><option value="">Choose a segment</option></select></label>
+            <button class="compact trial-stepper" id="trial-next" type="button" disabled aria-label="Next segment">→</button>
+            <label>All-segment cap<select id="playback-cap"><option value="95">p95 duration</option><option value="99">p99 duration</option><option value="max">Maximum</option></select></label>
+            <label>Speed<select id="playback-speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
             <input class="scrubber" id="time-scrubber" type="range" min="0" max="1" value="1" step="0.001" disabled aria-label="Playback position">
             <output id="time-output">all time</output>
             <label>Displayed trials <input id="trial-fraction" type="range" min="1" max="100" value="100"></label>
@@ -210,7 +220,7 @@
             <span class="segment-inspector" id="segment-inspector">Click near a path to inspect its exact segment.</span>
           </div>
           <div class="plot-host large" id="trajectory-plot" aria-label="Trajectory plot"></div>
-          <div class="plot-hint">Drag to pan · wheel to zoom · double-click to reset · grab a curtain-ring centre or edge to move it · spatial panels share one 1:1 view</div>
+          <div class="plot-hint">Drag to pan · wheel to zoom · double-click to reset · drag a ring centre to move or its edge to resize · spatial panels preserve one X unit = one Z unit</div>
         </div>
       </section>
 
@@ -220,6 +230,9 @@
           <div class="inline-controls">
             <label>Metric<select id="heat-metric"><option value="time">Seconds</option><option value="count">Samples</option><option value="percent">Percent</option></select></label>
             <label>Scale<select id="heat-scale"><option value="linear">Linear</option><option value="log">Log</option></select></label>
+            <label>Colour limits<select id="heat-range-mode"><option value="percentile">Percentiles</option><option value="absolute">Values</option></select></label>
+            <label>Colour min<input id="heat-cmin" type="number" step="0.1" value="0"></label>
+            <label>Colour max<input id="heat-cmax" type="number" step="0.1" value="99"></label>
             <label>Grid size<input id="bin-size" data-scope="spatial" type="number" min="0" step="0.01" placeholder="Auto"></label>
             <label>Central %<input id="bound-percent" data-scope="spatial" type="number" min="50" max="100" value="98"></label>
           </div>
@@ -230,9 +243,24 @@
       <section class="plot-section" id="direction-section">
         <div class="section-heading">
           <div><span class="section-kicker">Circular mean by cell</span><h2>Local direction field</h2></div>
-          <div class="legend-note">Flow length = R · particle density and opacity = occupancy</div>
+          <div class="inline-controls flow-controls">
+            <label>Abundance<select id="flow-metric"><option value="count">Samples</option><option value="time">Seconds</option></select></label>
+            <label>Limits<select id="flow-range-mode"><option value="percentile">Percentiles</option><option value="absolute">Values</option></select></label>
+            <label>Minimum<input id="flow-cmin" type="number" step="0.1" value="0"></label>
+            <label>Maximum<input id="flow-cmax" type="number" step="0.1" value="99"></label>
+            <label>Particle rate<input id="particle-rate" type="range" min="0.2" max="3" step="0.1" value="1"></label>
+            <label>Trail lifetime<input id="trail-length" type="range" min="0.25" max="3" step="0.05" value="1"></label>
+            <label>Flow speed<input id="flow-speed" type="range" min="0.25" max="3" step="0.05" value="1"></label>
+            <label>R variability<input id="flow-variability" type="range" min="0" max="2" step="0.05" value="1"></label>
+          </div>
         </div>
-        <div class="plot-card"><div class="plot-host" id="direction-plot" aria-label="Local direction field"></div></div>
+        <div class="plot-card">
+          <div class="direction-key" aria-label="Direction colour legend">
+            <div class="direction-wheel"><span class="north">0°</span><span class="east">90°</span><span class="south">180°</span><span class="west">−90°</span></div>
+            <span>Hue = direction · angular spread = uncertainty from R · rate = abundance</span>
+          </div>
+          <div class="plot-host" id="direction-plot" aria-label="Local direction field"></div>
+        </div>
       </section>
 
       <section class="plot-section" id="polar-section">
@@ -246,7 +274,11 @@
       <section class="plot-section" id="heading-section">
         <div class="section-heading">
           <div><span class="section-kicker">Signed angle</span><h2>Heading over local time</h2></div>
-          <div class="legend-note">Wrap crossings are broken · drag or wheel to zoom local trial time.</div>
+          <div class="inline-controls">
+            <label>Representation<select id="heading-mode" data-scope="direction"><option value="trial">Trial traces</option><option value="mean">Animal circular mean</option><option value="density">Time × heading heatmap</option></select></label>
+            <label>Time bin (s)<input id="heading-bin" data-scope="direction" type="number" min="0.05" step="0.05" value="0.25"></label>
+            <label>Angle sectors<input id="heading-sectors" data-scope="direction" type="number" min="12" max="72" step="4" value="36"></label>
+          </div>
         </div>
         <div class="plot-card"><div class="plot-host" id="heading-plot" aria-label="Heading over time"></div></div>
       </section>
@@ -276,17 +308,10 @@
           <div class="plot-card"><h3>Smoothed velocity</h3><div class="plot-host short" id="velocity-hist"></div></div>
           <div class="plot-card"><h3>Net displacement</h3><div class="plot-host short" id="displacement-hist"></div></div>
         </div>
-        <div class="plot-card raw-card">
-          <div class="raw-toolbar">
-            <label>Raw numeric channel<select id="raw-channel"><option value="">Choose a channel</option></select></label>
-            <button class="compact" id="raw-load" type="button" disabled>Load channel</button>
-            <span id="raw-status">Loaded only when requested.</span>
-          </div>
-          <div class="plot-host short" id="raw-plot"></div>
-        </div>
       </section>
     </main>
   </div>
+  <button class="clean-exit" id="clean-exit" type="button">Return to full controls</button>
   <div class="drop-overlay" id="drop-overlay" hidden>
     <div class="drop-panel">
       <span class="drop-icon" aria-hidden="true">↓</span>

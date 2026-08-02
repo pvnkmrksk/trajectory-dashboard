@@ -1,4 +1,4 @@
-# Architecture & context — Dari Deepa
+# Architecture & context — Daari Deepa
 
 > One-stop context for a developer or coding agent. The dashboard shell and
 > Plotly figure builders live in `app.py`; callback registration lives in

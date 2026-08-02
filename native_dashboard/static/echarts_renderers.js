@@ -183,12 +183,20 @@ export class EChartsPolarRenderer extends EChartRenderer {
     const series = [];
     for (const [key, values] of grouped) {
       const [panel, animal] = key.split("|").map(Number);
+      const name = data.animalNames?.[animal] || `Animal ${animal + 1}`;
       series.push({
-        name: data.animalNames?.[animal] || `Animal ${animal + 1}`,
+        name,
         type: "lines", coordinateSystem: "polar", polarIndex: panel,
-        data: values, polyline: false, silent: false, large: values.length > 2000,
+        data: values, polyline: false, silent: true, large: values.length > 2000,
         lineStyle: {color: animalColor(animal), width: 1, opacity: .34},
-        emphasis: {lineStyle: {width: 2, opacity: .9}},
+        emphasis: {disabled: true}, select: {disabled: true},
+      });
+      series.push({
+        name, type: "scatter", coordinateSystem: "polar", polarIndex: panel,
+        data: values.map(item => ({...item, value: item.value})),
+        symbolSize: 4,
+        itemStyle: {color: animalColor(animal), opacity: .48},
+        emphasis: {scale: 1.7, itemStyle: {opacity: 1}},
       });
     }
     for (let panel = 0; panel < count; panel += 1) {
@@ -198,7 +206,14 @@ export class EChartsPolarRenderer extends EChartRenderer {
         name: "Population mean", type: "lines", coordinateSystem: "polar", polarIndex: panel,
         data: [{coords: [[0, angle], [r, angle]], value: [r, angle], population: true,
           panel: data.panelNames?.[panel] || "All data"}],
-        lineStyle: {color: INK, width: 4, opacity: .92}, z: 10,
+        lineStyle: {color: INK, width: 4, opacity: .92}, silent: true,
+        emphasis: {disabled: true}, z: 10,
+      });
+      series.push({
+        name: "Population mean", type: "scatter", coordinateSystem: "polar", polarIndex: panel,
+        data: [{value: [r, angle], population: true,
+          panel: data.panelNames?.[panel] || "All data"}],
+        symbolSize: 7, itemStyle: {color: INK}, z: 11,
       });
     }
     return {
@@ -241,6 +256,70 @@ export class EChartsHeadingRenderer extends EChartRenderer {
       yAxis.push({gridIndex: panel, type: "value", min: -180, max: 180, interval: 90, axisLabel: {...axisBase().axisLabel, formatter: value => `${value}°`}, ...axisBase()});
       titles.push({text: data.panelNames?.[panel] || "All data", left: col * cellW + 48, top: top + row * cellH, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
     }
+    const axisIndices = Array.from({length: count}, (_, i) => i);
+    const dataZoom = [
+      {type: "inside", xAxisIndex: axisIndices, filterMode: "none", throttle: 40},
+      {type: "slider", xAxisIndex: axisIndices, filterMode: "none", left: 56, right: 24, bottom: 8, height: 16, borderColor: "transparent", fillerColor: "rgba(14,124,115,.14)", handleStyle: {color: "#0e7c73"}},
+    ];
+    if (data.mode === "density") {
+      const timeLabels = Array.from({length: data.nTime}, (_, tx) => Math.min(data.maxTime, (tx + .5) * data.timeBin));
+      const angleLabels = Array.from({length: data.sectors}, (_, ay) => -180 + (ay + .5) * 360 / data.sectors);
+      const timeLabelEvery = Math.max(1, Math.ceil(data.nTime / 5));
+      const angleLabelEvery = Math.max(1, Math.round(data.sectors / 4));
+      for (let panel = 0; panel < count; panel += 1) {
+        xAxis[panel] = {
+          gridIndex: panel, type: "category", data: timeLabels, boundaryGap: true,
+          axisTick: {show: false}, axisLine: axisBase().axisLine, splitLine: {show: false},
+          axisLabel: {
+            ...axisBase().axisLabel,
+            interval: (index) => index % timeLabelEvery === 0,
+            formatter: value => formatNumber(Number(value), 1),
+          },
+        };
+        yAxis[panel] = {
+          gridIndex: panel, type: "category", data: angleLabels, boundaryGap: true,
+          axisTick: {show: false}, axisLine: axisBase().axisLine, splitLine: {show: false},
+          axisLabel: {
+            ...axisBase().axisLabel,
+            interval: (index) => index % angleLabelEvery === 0,
+            formatter: value => `${formatNumber(Number(value), 0)}°`,
+          },
+        };
+      }
+      const series = [];
+      let maximum = 0;
+      for (let panel = 0; panel < count; panel += 1) {
+        const values = [];
+        for (let tx = 0; tx < data.nTime; tx += 1) {
+          for (let ay = 0; ay < data.sectors; ay += 1) {
+            const value = data.density[(panel * data.nTime + tx) * data.sectors + ay];
+            maximum = Math.max(maximum, value);
+            if (value > 0) values.push([tx, ay, value]);
+          }
+        }
+        series.push({
+          name: data.panelNames?.[panel] || "All data",
+          type: "heatmap", xAxisIndex: panel, yAxisIndex: panel,
+          data: values, progressive: 4000,
+          itemStyle: {borderWidth: 0},
+          emphasis: {itemStyle: {borderColor: "#1b2a26", borderWidth: 1}},
+        });
+      }
+      return {
+        ...this.base("heading-density"), title: titles,
+        tooltip: {trigger: "item", confine: true, formatter: params => {
+          const value = params.data || [];
+          return `<b>${escapeHtml(params.seriesName)}</b><br>${formatNumber(timeLabels[value[0]], 2)} s · ${formatNumber(angleLabels[value[1]], 1)}°<br>${formatNumber(value[2], 2)}% of samples in this time bin`;
+        }},
+        visualMap: {
+          min: 0, max: Math.max(1, maximum), calculable: true,
+          orient: "horizontal", left: "center", top: 8, itemWidth: 12, itemHeight: 120,
+          textStyle: {color: MUTED, fontSize: 9},
+          inRange: {color: ["#f4f7f6", "#2c768d", "#48a67a", "#f0be37"]},
+        },
+        grid, xAxis, yAxis, dataZoom, series,
+      };
+    }
     const grouped = new Map();
     for (let i = 0; i < data.panels.length; i += 2) {
       const animal = data.animals[i];
@@ -250,7 +329,8 @@ export class EChartsHeadingRenderer extends EChartRenderer {
       grouped.get(key).push({
         coords: [[data.vertices[i * 2], data.vertices[i * 2 + 1]], [data.vertices[(i + 1) * 2], data.vertices[(i + 1) * 2 + 1]]],
         animal: data.animalNames?.[animal] || `Animal ${animal + 1}`,
-        panel: data.panelNames?.[panel] || "All data", trial: data.trials[i], step: data.steps[i],
+        panel: data.panelNames?.[panel] || "All data", trial: data.trials[i],
+        step: data.steps[i], r: data.mode === "mean" ? data.steps[i] : NaN,
       });
     }
     const series = [];
@@ -260,23 +340,20 @@ export class EChartsHeadingRenderer extends EChartRenderer {
         name: data.animalNames?.[animal] || `Animal ${animal + 1}`,
         type: "lines", coordinateSystem: "cartesian2d", xAxisIndex: panel, yAxisIndex: panel,
         data: values, polyline: false, progressive: 5000, progressiveThreshold: 3000,
-        lineStyle: {color: animalColor(animal), width: .8, opacity: .26},
+        lineStyle: {color: animalColor(animal), width: data.mode === "mean" ? 1.8 : .8, opacity: data.mode === "mean" ? .82 : .26},
         emphasis: {disabled: values.length > 12000},
       });
     }
-    const axisIndices = Array.from({length: count}, (_, i) => i);
     return {
       ...this.base("heading-local-time"), title: titles,
       legend: {type: "scroll", left: 12, right: 100, top: 8, selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 16, itemHeight: 7},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {}, end = item.coords?.[1] || [];
+        if (data.mode === "mean") return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>${formatNumber(end[0], 2)} s · circular mean ${formatNumber(end[1], 1)}°<br>Across-trial R ${formatNumber(item.r, 3)}`;
         return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${formatNumber(end[0], 2)} s · ${formatNumber(end[1], 1)}°`;
       }},
       grid, xAxis, yAxis,
-      dataZoom: [
-        {type: "inside", xAxisIndex: axisIndices, filterMode: "none", throttle: 40},
-        {type: "slider", xAxisIndex: axisIndices, filterMode: "none", left: 56, right: 24, bottom: 8, height: 16, borderColor: "transparent", fillerColor: "rgba(14,124,115,.14)", handleStyle: {color: "#0e7c73"}},
-      ],
+      dataZoom,
       series,
     };
   }
@@ -398,22 +475,6 @@ export class EChartsHistogramRenderer extends EChartRenderer {
       xAxis: {type: "value", ...axisBase()}, yAxis: {type: "value", ...axisBase()},
       dataZoom: [{type: "inside", xAxisIndex: 0, filterMode: "none"}, {type: "slider", xAxisIndex: 0, bottom: 7, height: 15}],
       series: [{type: "bar", data: bars, barWidth: "98%", itemStyle: {color: "rgba(49,95,140,.72)", borderRadius: [2, 2, 0, 0]}, large: true}],
-    };
-  }
-}
-
-export class EChartsRawRenderer extends EChartRenderer {
-  option() {
-    const lines = [];
-    for (let i = 0; i < this.data.vertices.length; i += 4) lines.push({coords: [[this.data.vertices[i], this.data.vertices[i + 1]], [this.data.vertices[i + 2], this.data.vertices[i + 3]]]});
-    return {
-      ...this.base(`raw-${this.data.column}`),
-      grid: {left: 56, right: 22, top: 34, bottom: 48},
-      tooltip: {trigger: "axis", axisPointer: {type: "cross"}},
-      xAxis: {type: "value", min: 0, max: this.data.maxTime, name: "local time (s)", ...axisBase()},
-      yAxis: {type: "value", name: this.data.column, scale: true, ...axisBase()},
-      dataZoom: [{type: "inside", xAxisIndex: 0, filterMode: "none"}, {type: "slider", xAxisIndex: 0, bottom: 7, height: 15}],
-      series: [{name: this.data.column, type: "lines", coordinateSystem: "cartesian2d", data: lines, progressive: 5000, lineStyle: {color: "#0e7c73", opacity: .28, width: .8}}],
     };
   }
 }

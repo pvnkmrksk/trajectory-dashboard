@@ -71,13 +71,34 @@ function panelPane(layout, panel) {
   const row = Math.floor(panel / layout.cols);
   const cellLeft = col * layout.cellW;
   const cellTop = row * layout.cellH;
-  const size = Math.max(2, Math.min(
-    layout.cellW * (1 - 2 * PANEL_PAD_X),
-    layout.cellH * (1 - 2 * PANEL_PAD_Y),
-  ));
-  const left = cellLeft + (layout.cellW - size) / 2;
-  const top = cellTop + (layout.cellH - size) / 2;
-  return {left, right: left + size, top, bottom: top + size, size, cellLeft, cellTop};
+  const left = cellLeft + Math.max(34, layout.cellW * PANEL_PAD_X);
+  const right = cellLeft + layout.cellW - Math.max(15, layout.cellW * .025);
+  const top = cellTop + Math.max(27, layout.cellH * PANEL_PAD_Y * .55);
+  const bottom = cellTop + layout.cellH - Math.max(30, layout.cellH * .045);
+  return {
+    left, right, top, bottom,
+    width: Math.max(2, right - left), height: Math.max(2, bottom - top),
+    size: Math.max(2, Math.min(right - left, bottom - top)),
+    cellLeft, cellTop,
+  };
+}
+
+function equalScaleView(view, pane) {
+  if (!view) return null;
+  const cx = (view.xmin + view.xmax) / 2, cz = (view.zmin + view.zmax) / 2;
+  let xr = Math.max(1e-9, view.xmax - view.xmin);
+  let zr = Math.max(1e-9, view.zmax - view.zmin);
+  const paneAspect = Math.max(1e-9, pane.width / pane.height);
+  if (xr / zr < paneAspect) xr = zr * paneAspect;
+  else zr = xr / paneAspect;
+  return {xmin: cx - xr / 2, xmax: cx + xr / 2, zmin: cz - zr / 2, zmax: cz + zr / 2};
+}
+
+function niceScaleDistance(span) {
+  const raw = Math.max(1e-12, span * .18);
+  const power = 10 ** Math.floor(Math.log10(raw));
+  const unit = raw / power;
+  return (unit >= 5 ? 5 : (unit >= 2 ? 2 : 1)) * power;
 }
 
 function squareBounds(bounds) {
@@ -110,6 +131,19 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
   for (let panel = 0; panel < count; panel += 1) {
     const pane = panelPane(layout, panel);
     const {left, right, top, bottom} = pane;
+    const shown = equalScaleView(view, pane);
+    if (shown && options.showGrid) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(34,63,57,.075)";
+      ctx.lineWidth = 1;
+      for (let tick = 1; tick < 5; tick += 1) {
+        const x = left + pane.width * tick / 5;
+        const y = top + pane.height * tick / 5;
+        ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+      }
+      ctx.restore();
+    }
     ctx.strokeStyle = "rgba(24,34,31,.14)";
     ctx.lineWidth = 1;
     ctx.strokeRect(left + .5, top + .5, right - left - 1, bottom - top - 1);
@@ -120,16 +154,29 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
       ctx.font = "9px ui-monospace, SFMono-Regular, monospace";
       ctx.fillStyle = "#7a827e";
       ctx.textBaseline = "bottom";
-      ctx.fillText(formatNumber(view.xmin), left, bottom + 15);
-      const xr = formatNumber(view.xmax);
+      ctx.fillText(formatNumber(shown.xmin), left, bottom + 15);
+      const xr = formatNumber(shown.xmax);
       ctx.fillText(xr, right - ctx.measureText(xr).width, bottom + 15);
       ctx.save();
       ctx.translate(left - 5, bottom);
       ctx.rotate(-Math.PI / 2);
-      ctx.fillText(formatNumber(view.zmin), 0, 0);
+      ctx.fillText(formatNumber(shown.zmin), 0, 0);
       ctx.restore();
       ctx.textBaseline = "top";
       ctx.font = "600 11px Inter, system-ui, sans-serif";
+    }
+    if (shown && options.scaleBar) {
+      const distance = niceScaleDistance(shown.xmax - shown.xmin);
+      const pixels = distance / (shown.xmax - shown.xmin) * pane.width;
+      const x = left + 12, y = bottom - 14;
+      ctx.strokeStyle = "rgba(28,47,43,.82)"; ctx.fillStyle = "rgba(28,47,43,.88)";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + pixels, y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x, y - 4); ctx.lineTo(x, y + 4);
+      ctx.moveTo(x + pixels, y - 4); ctx.lineTo(x + pixels, y + 4); ctx.stroke();
+      ctx.font = "700 9px Inter, system-ui, sans-serif";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(`${formatNumber(distance, 2)} cm`, x, y - 5);
     }
   }
   ctx.restore();
@@ -143,9 +190,10 @@ function drawPanelRois(ctx, width, height, data, view, visible = true) {
   for (const roi of data.rois) {
     if (roi.panel < 0 || roi.panel >= data.panelCount) continue;
     const {left, right, top, bottom} = panelPane(layout, roi.panel);
-    const x = left + (roi.x - view.xmin) / (view.xmax - view.xmin) * (right - left);
-    const y = bottom - (roi.z - view.zmin) / (view.zmax - view.zmin) * (bottom - top);
-    const radius = Math.abs(roi.reach / (view.xmax - view.xmin) * (right - left));
+    const shown = equalScaleView(view, panelPane(layout, roi.panel));
+    const x = left + (roi.x - shown.xmin) / (shown.xmax - shown.xmin) * (right - left);
+    const y = bottom - (roi.z - shown.zmin) / (shown.zmax - shown.zmin) * (bottom - top);
+    const radius = Math.abs(roi.reach / (shown.xmax - shown.xmin) * (right - left));
     ctx.strokeStyle = roi.side === "left" ? "rgba(49,95,140,.68)" : "rgba(201,91,63,.68)";
     ctx.fillStyle = roi.side === "left" ? "rgba(49,95,140,.05)" : "rgba(201,91,63,.05)";
     ctx.setLineDash([4, 3]); ctx.lineWidth = 1.2;
@@ -171,11 +219,12 @@ function drawPanelRings(ctx, width, height, data, view) {
   ctx.save(); ctx.setLineDash([]); ctx.font = "700 9px Inter, system-ui, sans-serif";
   for (let panel = 0; panel < data.panelCount; panel += 1) {
     const {left, right, top, bottom} = panelPane(layout, panel);
+    const shown = equalScaleView(view, panelPane(layout, panel));
     for (let index = 0; index < data.rings.length; index += 1) {
       const ring = data.rings[index];
-      const x = left + (ring.x - view.xmin) / (view.xmax - view.xmin) * (right - left);
-      const y = bottom - (ring.z - view.zmin) / (view.zmax - view.zmin) * (bottom - top);
-      const radius = Math.abs(ring.r / (view.xmax - view.xmin) * (right - left));
+      const x = left + (ring.x - shown.xmin) / (shown.xmax - shown.xmin) * (right - left);
+      const y = bottom - (ring.z - shown.zmin) / (shown.zmax - shown.zmin) * (bottom - top);
+      const radius = Math.abs(ring.r / (shown.xmax - shown.xmin) * (right - left));
       ctx.strokeStyle = "rgba(24,34,31,.82)"; ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.stroke();
       ctx.fillStyle = "rgba(24,34,31,.82)"; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
@@ -211,19 +260,20 @@ function installSpatialInteraction(renderer, canvas) {
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
     if (!point) return;
     canvas.setPointerCapture(event.pointerId);
-    const ringIndex = renderer.hitRing?.(point) ?? -1;
-    if (ringIndex >= 0 && renderer.ringMoveHandler) {
-      const ring = renderer.data.rings[ringIndex];
+    const ringHit = renderer.hitRing?.(point) || null;
+    if (ringHit && renderer.ringMoveHandler) {
+      const ring = renderer.data.rings[ringHit.index];
       drag = {
-        mode: "ring", ringIndex, offsetX: point.x - ring.x,
-        offsetZ: point.z - ring.z, moved: false,
+        mode: ringHit.mode, ringIndex: ringHit.index,
+        offsetX: point.x - ring.x, offsetZ: point.z - ring.z,
+        startRadius: ring.r, moved: false,
       };
       canvas.style.cursor = "grabbing";
     } else {
       const layout = panelLayout(renderer.width, renderer.height, renderer.data.panelCount, renderer.data.columns);
       drag = {
         mode: "pan", x: event.clientX, y: event.clientY,
-        view: {...renderer.view}, paneSize: panelPane(layout, point.panel).size,
+        view: {...renderer.view}, panel: point.panel,
         moved: false,
       };
     }
@@ -233,10 +283,16 @@ function installSpatialInteraction(renderer, canvas) {
     drag = null;
     canvas.style.cursor = "";
     try { canvas.releasePointerCapture(event.pointerId); } catch (_) { /* no-op */ }
-    if (finished?.mode === "ring") {
+    if (finished?.mode === "ring-move" || finished?.mode === "ring-resize") {
       const rect = canvas.getBoundingClientRect();
       const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
-      if (point) renderer.moveRing(finished.ringIndex, point.x - finished.offsetX, point.z - finished.offsetZ, true);
+      if (point && finished.mode === "ring-resize") renderer.resizeRing(
+        finished.ringIndex, Math.hypot(
+          point.x - renderer.data.rings[finished.ringIndex].x,
+          point.z - renderer.data.rings[finished.ringIndex].z,
+        ), true,
+      );
+      else if (point) renderer.moveRing(finished.ringIndex, point.x - finished.offsetX, point.z - finished.offsetZ, true);
       return;
     }
     if (finished && !finished.moved && renderer.inspectHandler) {
@@ -249,26 +305,39 @@ function installSpatialInteraction(renderer, canvas) {
   canvas.addEventListener("pointermove", event => {
     const rect = canvas.getBoundingClientRect();
     if (drag) {
-      if (drag.mode === "ring") {
+      if (drag.mode === "ring-move" || drag.mode === "ring-resize") {
         const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
-        if (point) renderer.moveRing(drag.ringIndex, point.x - drag.offsetX, point.z - drag.offsetZ, false);
+        if (point && drag.mode === "ring-resize") renderer.resizeRing(
+          drag.ringIndex,
+          Math.hypot(point.x - renderer.data.rings[drag.ringIndex].x,
+            point.z - renderer.data.rings[drag.ringIndex].z),
+          false,
+        );
+        else if (point) renderer.moveRing(drag.ringIndex, point.x - drag.offsetX, point.z - drag.offsetZ, false);
         drag.moved = true;
         tooltip.hidden = true;
         return;
       }
       if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 3) drag.moved = true;
-      const dx = (event.clientX - drag.x) / drag.paneSize * (drag.view.xmax - drag.view.xmin);
-      const dz = (event.clientY - drag.y) / drag.paneSize * (drag.view.zmax - drag.view.zmin);
+      const pane = panelPane(
+        panelLayout(renderer.width, renderer.height, renderer.data.panelCount, renderer.data.columns),
+        drag.panel || 0,
+      );
+      const shown = equalScaleView(drag.view, pane);
+      const dx = (event.clientX - drag.x) / pane.width * (shown.xmax - shown.xmin);
+      const dz = (event.clientY - drag.y) / pane.height * (shown.zmax - shown.zmin);
       renderer.setView({
         xmin: drag.view.xmin - dx, xmax: drag.view.xmax - dx,
         zmin: drag.view.zmin + dz, zmax: drag.view.zmax + dz,
       }, true);
+      renderer.pauseAnimation?.(190);
       tooltip.hidden = true;
       return;
     }
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
     if (!point) { tooltip.hidden = true; return; }
-    canvas.style.cursor = (renderer.hitRing?.(point) ?? -1) >= 0 ? "grab" : "";
+    const hit = renderer.hitRing?.(point);
+    canvas.style.cursor = hit?.mode === "ring-resize" ? "nwse-resize" : (hit ? "grab" : "");
     tooltip.hidden = false;
     tooltip.style.left = `${event.clientX - rect.left}px`;
     tooltip.style.top = `${event.clientY - rect.top}px`;
@@ -290,6 +359,7 @@ function installSpatialInteraction(renderer, canvas) {
       zmin: point.z + (view.zmin - point.z) * factor,
       zmax: point.z + (view.zmax - point.z) * factor,
     }, true);
+    renderer.pauseAnimation?.(190);
   }, {passive: false});
   canvas.addEventListener("dblclick", event => {
     event.preventDefault();
@@ -306,8 +376,12 @@ class SpatialBase {
     this.width = host.clientWidth || 800;
     this.height = host.clientHeight || 500;
     this.roisVisible = true;
+    this.gridVisible = true;
+    this.cleanMode = false;
   }
   setRoisVisible(value) { this.roisVisible = !!value; this.draw(); }
+  setGridVisible(value) { this.gridVisible = !!value; this.draw(); }
+  setCleanMode(value) { this.cleanMode = !!value; this.draw(); }
   setColumns(columns) {
     if (!this.data) return;
     this.data.columns = Number(columns) || 0;
@@ -316,22 +390,31 @@ class SpatialBase {
   setInspectHandler(handler) { this.inspectHandler = handler; }
   setRingMoveHandler(handler) { this.ringMoveHandler = handler; }
   hitRing(point) {
-    if (!this.data?.ringEnabled || !this.data?.rings?.length || !this.view) return -1;
+    if (!this.data?.ringEnabled || !this.data?.rings?.length || !this.view) return null;
     const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
     const pane = panelPane(layout, point.panel);
-    const tolerance = (this.view.xmax - this.view.xmin) / Math.max(1, pane.size) * 10;
+    const shown = equalScaleView(this.view, pane);
+    const tolerance = (shown.xmax - shown.xmin) / Math.max(1, pane.width) * 11;
     for (let index = this.data.rings.length - 1; index >= 0; index -= 1) {
       const ring = this.data.rings[index];
       const distance = Math.hypot(point.x - ring.x, point.z - ring.z);
-      if (distance <= tolerance * 1.3 || Math.abs(distance - ring.r) <= tolerance) return index;
+      if (Math.abs(distance - ring.r) <= tolerance) return {index, mode: "ring-resize"};
+      if (distance <= tolerance * 1.5) return {index, mode: "ring-move"};
     }
-    return -1;
+    return null;
   }
   moveRing(index, x, z, final = false) {
     if (!this.data?.rings?.[index] || !Number.isFinite(x) || !Number.isFinite(z)) return;
     this.data.rings[index] = {...this.data.rings[index], x, z};
     this.draw();
     this.ringMoveHandler?.(index, x, z, final);
+  }
+  resizeRing(index, radius, final = false) {
+    if (!this.data?.rings?.[index] || !Number.isFinite(radius)) return;
+    const ring = this.data.rings[index];
+    ring.r = Math.max(.01, radius);
+    this.draw();
+    this.ringMoveHandler?.(index, ring.x, ring.z, final, ring.r);
   }
   setView(view, notify = false) {
     if (!view || !Object.values(view).every(Number.isFinite)) return;
@@ -351,13 +434,14 @@ class SpatialBase {
     const panel = row * layout.cols + col;
     if (panel >= this.data.panelCount) return null;
     const pane = panelPane(layout, panel);
-    const u = (px - pane.left) / pane.size;
-    const v = 1 - (py - pane.top) / pane.size;
+    const shown = equalScaleView(this.view, pane);
+    const u = (px - pane.left) / pane.width;
+    const v = 1 - (py - pane.top) / pane.height;
     if (u < 0 || u > 1 || v < 0 || v > 1) return null;
     return {
       panel,
-      x: this.view.xmin + u * (this.view.xmax - this.view.xmin),
-      z: this.view.zmin + v * (this.view.zmax - this.view.zmin),
+      x: shown.xmin + u * (shown.xmax - shown.xmin),
+      z: shown.zmin + v * (shown.zmax - shown.zmin),
     };
   }
 }
@@ -389,7 +473,10 @@ export class TrajectoryRenderer extends SpatialBase {
     if (!this.gl) throw new Error("This dashboard requires WebGL2 for dense trajectories.");
     this.ctx = this.overlay.getContext("2d");
     this.fraction = 1;
-    this.timeLimit = Number.POSITIVE_INFINITY;
+    this.timeLimit = 1e30;
+    this.selectedSegment = -1;
+    this.lineWidth = 1.65;
+    this.lineOpacity = .34;
     this._initGl();
     installSpatialInteraction(this, this.overlay);
     installResize(this);
@@ -398,62 +485,102 @@ export class TrajectoryRenderer extends SpatialBase {
     const gl = this.gl;
     this.program = program(gl, `#version 300 es
       precision highp float;
-      layout(location=0) in vec2 a_position;
+      layout(location=0) in vec4 a_segment;
       layout(location=1) in float a_panel;
       layout(location=2) in float a_color;
-      layout(location=3) in float a_time;
+      layout(location=3) in vec2 a_time;
       layout(location=4) in float a_sample;
       layout(location=5) in float a_visible;
+      layout(location=6) in float a_segment_id;
       uniform vec4 u_view;
       uniform vec2 u_grid;
-      uniform vec2 u_pane;
+      uniform vec2 u_canvas;
+      uniform vec4 u_pane;
       uniform float u_fraction;
       uniform float u_time;
+      uniform float u_selected_segment;
+      uniform float u_line_width;
+      uniform float u_opacity;
       uniform vec4 u_palette[64];
       out vec4 v_color;
       out float v_inside;
-      void main() {
-        float ux = (a_position.x - u_view.x) / (u_view.y - u_view.x);
-        float uz = (a_position.y - u_view.z) / (u_view.w - u_view.z);
+      out vec2 v_world;
+
+      vec2 worldToClip(vec2 world) {
+        float ux = (world.x - u_view.x) / (u_view.y - u_view.x);
+        float uz = (world.y - u_view.z) / (u_view.w - u_view.z);
         float col = mod(a_panel, u_grid.x);
         float row = floor(a_panel / u_grid.x);
-        float px = (col + .5) / u_grid.x + (ux - .5) * u_pane.x;
-        float py = (u_grid.y - 1.0 - row + .5) / u_grid.y + (uz - .5) * u_pane.y;
-        gl_Position = vec4(px * 2.0 - 1.0, py * 2.0 - 1.0, 0.0, 1.0);
+        vec2 cell = u_canvas / u_grid;
+        float px = col * cell.x + u_pane.x + ux * u_pane.z;
+        float py = row * cell.y + u_pane.y + (1.0 - uz) * u_pane.w;
+        return vec2(px / u_canvas.x * 2.0 - 1.0, 1.0 - py / u_canvas.y * 2.0);
+      }
+
+      void main() {
+        vec2 world0 = a_segment.xy;
+        vec2 world1 = a_segment.zw;
+        float fraction = clamp(
+          (u_time - a_time.x) / max(0.000001, a_time.y - a_time.x), 0.0, 1.0
+        );
+        world1 = mix(world0, world1, fraction);
+        vec2 p0 = worldToClip(world0);
+        vec2 p1 = worldToClip(world1);
+        vec2 directionPx = (p1 - p0) * u_canvas * .5;
+        vec2 normalPx = length(directionPx) > .0001
+          ? normalize(vec2(-directionPx.y, directionPx.x)) * u_line_width * .5
+          : vec2(0.0);
+        vec2 normal = normalPx * 2.0 / u_canvas;
+        int vertex = gl_VertexID % 6;
+        bool atEnd = vertex == 2 || vertex == 3 || vertex == 5;
+        bool positive = vertex == 1 || vertex == 4 || vertex == 5;
+        vec2 base = atEnd ? p1 : p0;
+        gl_Position = vec4(base + (positive ? normal : -normal), 0.0, 1.0);
+        v_world = atEnd ? world1 : world0;
         int colorIndex = clamp(int(a_color + .5), 0, 63);
         v_color = u_palette[colorIndex];
-        v_inside = (ux >= 0.0 && ux <= 1.0 && uz >= 0.0 && uz <= 1.0 && a_sample <= u_fraction && a_time <= u_time && a_visible > .5) ? 1.0 : 0.0;
+        v_color.a = u_opacity * (colorIndex == 20 ? .72 : 1.0);
+        bool selected = u_selected_segment < 0.0 || abs(a_segment_id - u_selected_segment) < .5;
+        v_inside = (a_sample <= u_fraction && a_time.x <= u_time && a_visible > .5 && selected) ? 1.0 : 0.0;
       }`, `#version 300 es
       precision highp float;
       in vec4 v_color;
       in float v_inside;
+      in vec2 v_world;
+      uniform vec4 u_view;
       out vec4 outColor;
-      void main() { if (v_inside < .5) discard; outColor = v_color; }
+      void main() {
+        if (v_inside < .5 || v_world.x < u_view.x || v_world.x > u_view.y
+          || v_world.y < u_view.z || v_world.y > u_view.w) discard;
+        outColor = v_color;
+      }
     `);
     this.vao = gl.createVertexArray();
-    this.buffers = Array.from({length: 6}, () => gl.createBuffer());
+    this.buffers = Array.from({length: 7}, () => gl.createBuffer());
   }
-  _attribute(index, data, size, type, normalized = false) {
+  _attribute(index, data, size, type, normalized = false, stride = 0) {
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers[index]);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(index);
-    gl.vertexAttribPointer(index, size, type, normalized, 0, 0);
+    gl.vertexAttribPointer(index, size, type, normalized, stride, 0);
+    gl.vertexAttribDivisor(index, 1);
   }
   setData(data, preserveView = true) {
     this.data = data;
     const gl = this.gl;
     gl.bindVertexArray(this.vao);
-    this._attribute(0, data.vertices, 2, gl.FLOAT);
-    this._attribute(1, data.panels, 1, gl.UNSIGNED_SHORT);
-    this._attribute(2, data.colors, 1, gl.UNSIGNED_BYTE);
-    this._attribute(3, data.times, 1, gl.FLOAT);
-    this._attribute(4, data.samples, 1, gl.FLOAT);
-    this.visibility = new Uint8Array(data.animals.length);
+    this._attribute(0, data.vertices, 4, gl.FLOAT);
+    this._attribute(1, data.panels, 1, gl.UNSIGNED_SHORT, false, 4);
+    this._attribute(2, data.colors, 1, gl.UNSIGNED_BYTE, false, 2);
+    this._attribute(3, data.times, 2, gl.FLOAT);
+    this._attribute(4, data.samples, 1, gl.FLOAT, false, 8);
+    this.visibility = new Uint8Array(data.links);
     this.visibility.fill(255);
     this._attribute(5, this.visibility, 1, gl.UNSIGNED_BYTE, true);
+    this._attribute(6, data.segments, 1, gl.UNSIGNED_INT, false, 8);
     gl.bindVertexArray(null);
-    this.vertexCount = data.panels.length;
+    this.instanceCount = data.links;
     if (!preserveView || !this.view) this.view = squareBounds(data.bounds);
     this.draw();
   }
@@ -461,7 +588,7 @@ export class TrajectoryRenderer extends SpatialBase {
     this.animalVisibility = visible ? [...visible] : null;
     if (!this.data?.animals || !this.visibility) return;
     for (let i = 0; i < this.visibility.length; i += 1) {
-      this.visibility[i] = this.animalVisibility?.[this.data.animals[i]] === false ? 0 : 255;
+      this.visibility[i] = this.animalVisibility?.[this.data.animals[i * 2]] === false ? 0 : 255;
     }
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers[5]);
@@ -469,7 +596,16 @@ export class TrajectoryRenderer extends SpatialBase {
     this.drawGl();
   }
   setFraction(value) { this.fraction = Math.max(.01, Math.min(1, value)); this.drawGl(); }
-  setTime(value) { this.timeLimit = Number.isFinite(value) ? value : Number.POSITIVE_INFINITY; this.drawGl(); }
+  setTime(value) { this.timeLimit = Number.isFinite(value) ? value : 1e30; this.drawGl(); }
+  setPlaybackSegment(value) {
+    this.selectedSegment = Number.isFinite(Number(value)) ? Number(value) : -1;
+    this.drawGl();
+  }
+  setLineStyle(width, opacity) {
+    this.lineWidth = Math.max(.5, Math.min(8, Number(width) || 1.65));
+    this.lineOpacity = Math.max(.03, Math.min(1, Number(opacity) || .34));
+    this.drawGl();
+  }
   resize() {
     const dpr = setupCanvas(this.canvas, this.width, this.height);
     setupCanvas(this.overlay, this.width, this.height);
@@ -479,20 +615,26 @@ export class TrajectoryRenderer extends SpatialBase {
     const gl = this.gl;
     gl.clearColor(1, 1, 1, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    if (!this.data || !this.view || !this.vertexCount) return;
+    if (!this.data || !this.view || !this.instanceCount) return;
     const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
     const pane = panelPane(layout, 0);
+    const shown = equalScaleView(this.view, pane);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.program);
-    gl.uniform4f(gl.getUniformLocation(this.program, "u_view"), this.view.xmin, this.view.xmax, this.view.zmin, this.view.zmax);
+    gl.uniform4f(gl.getUniformLocation(this.program, "u_view"), shown.xmin, shown.xmax, shown.zmin, shown.zmax);
     gl.uniform2f(gl.getUniformLocation(this.program, "u_grid"), layout.cols, layout.rows);
-    gl.uniform2f(gl.getUniformLocation(this.program, "u_pane"), pane.size / this.width, pane.size / this.height);
+    gl.uniform2f(gl.getUniformLocation(this.program, "u_canvas"), this.width, this.height);
+    gl.uniform4f(gl.getUniformLocation(this.program, "u_pane"),
+      pane.left - pane.cellLeft, pane.top - pane.cellTop, pane.width, pane.height);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_fraction"), this.fraction);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_time"), this.timeLimit);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_selected_segment"), this.selectedSegment);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_line_width"), this.lineWidth);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_opacity"), this.lineOpacity);
     gl.uniform4fv(gl.getUniformLocation(this.program, "u_palette[0]"), PALETTE_FLOATS);
     gl.bindVertexArray(this.vao);
-    gl.drawArrays(gl.LINES, 0, this.vertexCount);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
     gl.bindVertexArray(null);
   }
   draw() {
@@ -501,7 +643,10 @@ export class TrajectoryRenderer extends SpatialBase {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.ctx.clearRect(0, 0, this.width, this.height);
     if (this.data) {
-      drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view);
+      drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view, {
+        hideTicks: this.cleanMode, showGrid: this.gridVisible && !this.cleanMode,
+        scaleBar: true,
+      });
       drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
       drawPanelRings(this.ctx, this.width, this.height, this.data, this.view);
     }
@@ -537,9 +682,10 @@ class CanvasSpatialRenderer extends SpatialBase {
     return panelPane(layout, panel);
   }
   worldToPixel(x, z, pane) {
+    const shown = equalScaleView(this.view, pane);
     return [
-      pane.left + (x - this.view.xmin) / (this.view.xmax - this.view.xmin) * (pane.right - pane.left),
-      pane.bottom - (z - this.view.zmin) / (this.view.zmax - this.view.zmin) * (pane.bottom - pane.top),
+      pane.left + (x - shown.xmin) / (shown.xmax - shown.xmin) * pane.width,
+      pane.bottom - (z - shown.zmin) / (shown.zmax - shown.zmin) * pane.height,
     ];
   }
 }
@@ -549,11 +695,18 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
     super(host, onViewChange);
     this.metric = "time";
     this.scale = "linear";
+    this.clipMode = "percentile";
+    this.clipMin = 0;
+    this.clipMax = 99;
     this.textures = [];
   }
-  setMetricScale(metric, scale) {
+  setMetricScale(metric, scale, clipMode = this.clipMode,
+                 clipMin = this.clipMin, clipMax = this.clipMax) {
     this.metric = metric;
     this.scale = scale;
+    this.clipMode = clipMode || "percentile";
+    this.clipMin = clipMin;
+    this.clipMax = clipMax;
     this.buildTextures();
     this.draw();
   }
@@ -579,32 +732,52 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
     if (!this.data) return;
     const {nx, nz, panelCount, count, time} = this.data;
     const cells = nx * nz;
+    const panelValues = [];
+    const positive = [];
     for (let panel = 0; panel < panelCount; panel += 1) {
-      const source = this.metric === "count" ? count : time;
       let total = 0;
-      let max = 0;
+      for (let i = 0; i < cells; i += 1) total += time[panel * cells + i];
+      const values = new Float32Array(cells);
       for (let i = 0; i < cells; i += 1) {
-        const v = source[panel * cells + i];
-        total += v;
-        if (v > max) max = v;
+        const index = panel * cells + i;
+        const value = this.metric === "count" ? count[index]
+          : (this.metric === "percent" ? (total > 0 ? time[index] / total * 100 : 0) : time[index]);
+        values[i] = value;
+        if (value > 0 && Number.isFinite(value)) positive.push(value);
       }
+      panelValues.push(values);
+    }
+    positive.sort((a, b) => a - b);
+    const autoLo = positive[0] || 0, autoHi = positive[positive.length - 1] || 1;
+    let lo, hi;
+    if (this.clipMode === "percentile") {
+      lo = quantile(positive, Math.max(0, Math.min(100, Number(this.clipMin) || 0)) / 100);
+      hi = quantile(positive, Math.max(0, Math.min(100, Number(this.clipMax) || 99)) / 100);
+    } else {
+      lo = this.clipMin != null && Number.isFinite(Number(this.clipMin)) ? Number(this.clipMin) : autoLo;
+      hi = this.clipMax != null && Number.isFinite(Number(this.clipMax)) ? Number(this.clipMax) : autoHi;
+    }
+    if (!Number.isFinite(lo)) lo = autoLo;
+    if (!Number.isFinite(hi) || hi <= lo) hi = Math.max(autoHi, lo + 1e-9);
+    this.valueRange = {lo, hi};
+    const transform = value => this.scale === "log" ? Math.log1p(Math.max(0, value)) : value;
+    const scaledLo = transform(lo), scaledHi = transform(hi);
+    for (let panel = 0; panel < panelCount; panel += 1) {
+      const values = panelValues[panel];
       const canvas = document.createElement("canvas");
       canvas.width = nx; canvas.height = nz;
       const context = canvas.getContext("2d");
       const image = context.createImageData(nx, nz);
       for (let iz = 0; iz < nz; iz += 1) {
         for (let ix = 0; ix < nx; ix += 1) {
-          const sourceIndex = panel * cells + iz * nx + ix;
-          let value = source[sourceIndex];
-          if (this.metric === "percent") value = total > 0 ? time[sourceIndex] / total * 100 : 0;
-          const vmax = this.metric === "percent" ? 100 : max;
-          const norm = value > 0 && vmax > 0
-            ? (this.scale === "log" ? Math.log1p(value) / Math.log1p(vmax) : value / vmax)
+          const value = values[iz * nx + ix];
+          const norm = value > 0
+            ? Math.max(0, Math.min(1, (transform(value) - scaledLo) / Math.max(1e-12, scaledHi - scaledLo)))
             : 0;
           const rgb = hexRgb(sequentialColor(norm));
           const target = ((nz - 1 - iz) * nx + ix) * 4;
           image.data[target] = rgb[0]; image.data[target + 1] = rgb[1]; image.data[target + 2] = rgb[2];
-          image.data[target + 3] = value > 0 ? Math.round(42 + norm * 208) : 0;
+          image.data[target + 3] = value > 0 ? 255 : 0;
         }
       }
       context.putImageData(image, 0, 0);
@@ -618,23 +791,43 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
     const gridX1 = gridX0 + this.data.nx * this.data.bin;
     const gridZ0 = this.data.z0;
     const gridZ1 = gridZ0 + this.data.nz * this.data.bin;
-    const ix0 = Math.max(0, (this.view.xmin - gridX0) / (gridX1 - gridX0) * this.data.nx);
-    const ix1 = Math.min(this.data.nx, (this.view.xmax - gridX0) / (gridX1 - gridX0) * this.data.nx);
-    const iz0 = Math.max(0, (gridZ1 - this.view.zmax) / (gridZ1 - gridZ0) * this.data.nz);
-    const iz1 = Math.min(this.data.nz, (gridZ1 - this.view.zmin) / (gridZ1 - gridZ0) * this.data.nz);
+    const shown = equalScaleView(this.view, this.pane(0, layout));
+    const ix0 = Math.max(0, (shown.xmin - gridX0) / (gridX1 - gridX0) * this.data.nx);
+    const ix1 = Math.min(this.data.nx, (shown.xmax - gridX0) / (gridX1 - gridX0) * this.data.nx);
+    const iz0 = Math.max(0, (gridZ1 - shown.zmax) / (gridZ1 - gridZ0) * this.data.nz);
+    const iz1 = Math.min(this.data.nz, (gridZ1 - shown.zmin) / (gridZ1 - gridZ0) * this.data.nz);
     for (let panel = 0; panel < this.data.panelCount; panel += 1) {
       const pane = this.pane(panel, layout);
-      const [dx0, dy1] = this.worldToPixel(Math.max(this.view.xmin, gridX0), Math.max(this.view.zmin, gridZ0), pane);
-      const [dx1, dy0] = this.worldToPixel(Math.min(this.view.xmax, gridX1), Math.min(this.view.zmax, gridZ1), pane);
+      const [dx0, dy1] = this.worldToPixel(Math.max(shown.xmin, gridX0), Math.max(shown.zmin, gridZ0), pane);
+      const [dx1, dy0] = this.worldToPixel(Math.min(shown.xmax, gridX1), Math.min(shown.zmax, gridZ1), pane);
       this.ctx.save();
       this.ctx.beginPath(); this.ctx.rect(pane.left, pane.top, pane.right - pane.left, pane.bottom - pane.top); this.ctx.clip();
       if (ix1 > ix0 && iz1 > iz0) {
-        this.ctx.imageSmoothingEnabled = true;
+        this.ctx.imageSmoothingEnabled = false;
         this.ctx.drawImage(this.textures[panel], ix0, iz0, ix1 - ix0, iz1 - iz0, dx0, dy0, dx1 - dx0, dy1 - dy0);
+      }
+      this.ctx.imageSmoothingEnabled = true;
+      if (this.valueRange) {
+        const barW = 10, barH = Math.min(120, pane.height * .28);
+        const bx = pane.right - barW - 8, by = pane.top + 10;
+        const gradient = this.ctx.createLinearGradient(0, by + barH, 0, by);
+        for (let stop = 0; stop <= 1; stop += .2) gradient.addColorStop(stop, sequentialColor(stop));
+        this.ctx.fillStyle = "rgba(255,255,255,.82)";
+        this.ctx.fillRect(bx - 32, by - 6, barW + 40, barH + 22);
+        this.ctx.fillStyle = gradient; this.ctx.fillRect(bx, by, barW, barH);
+        this.ctx.strokeStyle = "rgba(25,45,40,.25)"; this.ctx.strokeRect(bx + .5, by + .5, barW - 1, barH - 1);
+        this.ctx.fillStyle = "#44514d"; this.ctx.font = "700 8px Inter, system-ui";
+        this.ctx.textAlign = "right"; this.ctx.textBaseline = "top";
+        this.ctx.fillText(formatNumber(this.valueRange.hi, 2), bx - 3, by);
+        this.ctx.textBaseline = "bottom";
+        this.ctx.fillText(formatNumber(this.valueRange.lo, 2), bx - 3, by + barH);
       }
       this.ctx.restore();
     }
-    drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view);
+    drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view, {
+      hideTicks: this.cleanMode, showGrid: this.gridVisible && !this.cleanMode,
+      scaleBar: true,
+    });
     drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
   }
 }
@@ -653,28 +846,93 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     this.particleCtx = this.particleCanvas.getContext("2d");
     this.particles = [];
     this.spawnTables = [];
+    this.visualOptions = {
+      particleRate: 1, trailLength: 1, speed: 1, variability: 1,
+      metric: "time", clipMode: "percentile", clipMin: 0, clipMax: 99,
+    };
     this._rng = 0x6d2b79f5;
+    this._pausedUntil = 0;
+    this._visible = false;
     this.resize();
     this._lastFrame = 0;
     this._animate = now => {
-      if (this.data && document.visibilityState === "visible" && now - this._lastFrame > 45) {
-        const rect = this.host.getBoundingClientRect();
-        if (rect.bottom > 0 && rect.top < innerHeight) this.drawParticles(now);
+      if (this.data && this._visible && document.visibilityState === "visible"
+          && now >= this._pausedUntil && now - this._lastFrame > 35) {
+        this.drawParticles(now);
         this._lastFrame = now;
       }
       this._animationFrame = requestAnimationFrame(this._animate);
     };
+    this._visibilityObserver = new IntersectionObserver(entries => {
+      this._visible = entries.some(entry => entry.isIntersecting);
+    }, {rootMargin: "120px"});
+    this._visibilityObserver.observe(host);
     this._animationFrame = requestAnimationFrame(this._animate);
   }
-  onDataChanged() {
-    const positive = [];
-    for (const value of this.data?.abundance || []) if (value > 0) positive.push(value);
-    positive.sort((a, b) => a - b);
-    this.abundanceReference = positive.length
-      ? positive[Math.floor((positive.length - 1) * .95)]
-      : 1;
+  setVisualOptions(options = {}) {
+    Object.assign(this.visualOptions, options);
+    this._updateAbundanceReference();
     this._buildSpawnTables();
     this._resetParticles();
+    this.draw();
+  }
+  setView(view, notify = false) {
+    this.pauseAnimation(190);
+    super.setView(view, notify);
+  }
+  pauseAnimation(delay = 190) {
+    this._pausedUntil = performance.now() + delay;
+    this._particleTime = 0;
+    clearTimeout(this._resumeTimer);
+    if (this.particleCtx) this.particleCtx.clearRect(0, 0, this.width, this.height);
+    this._resumeTimer = setTimeout(() => {
+      this._resetParticles();
+      this._pausedUntil = 0;
+    }, delay);
+  }
+  onDataChanged() {
+    this._updateAbundanceReference();
+    this._buildSpawnTables();
+    this._resetParticles();
+  }
+  _updateAbundanceReference() {
+    if (!this.data) return;
+    const cells = this.data.nx * this.data.nz;
+    this.abundanceValues = new Float32Array(this.data.abundance.length);
+    for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+      let total = 0;
+      for (let cell = 0; cell < cells; cell += 1) total += this.data.time[panel * cells + cell];
+      for (let cell = 0; cell < cells; cell += 1) {
+        const index = panel * cells + cell;
+        this.abundanceValues[index] = this.visualOptions.metric === "count"
+          ? this.data.abundance[index]
+          : (this.visualOptions.metric === "percent"
+            ? (total > 0 ? this.data.time[index] / total * 100 : 0)
+            : this.data.time[index]);
+      }
+    }
+    const positive = [];
+    for (const value of this.abundanceValues) if (value > 0) positive.push(value);
+    positive.sort((a, b) => a - b);
+    if (!positive.length) { this.abundanceReference = 1; return; }
+    if (this.visualOptions.clipMode === "absolute") {
+      this.abundanceFloor = Math.max(0, Number(this.visualOptions.clipMin) || 0);
+      this.abundanceReference = Math.max(1e-9,
+        Number(this.visualOptions.clipMax) || positive[positive.length - 1]);
+    } else {
+      const floorQ = Math.max(0, Math.min(100,
+        Number(this.visualOptions.clipMin) || 0)) / 100;
+      const q = Math.max(0, Math.min(100,
+        Number(this.visualOptions.clipMax) || 99)) / 100;
+      this.abundanceFloor = Math.max(0, quantile(positive, floorQ) || 0);
+      this.abundanceReference = Math.max(1e-9, quantile(positive, q));
+    }
+  }
+  _abundanceScale(value) {
+    const floor = Math.max(0, this.abundanceFloor || 0);
+    return Math.max(0, Math.min(1,
+      (value - floor) / Math.max(1e-9, (this.abundanceReference || 1) - floor)
+    ));
   }
   resize() {
     super.resize();
@@ -689,18 +947,24 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     this._rng = (Math.imul(this._rng, 1664525) + 1013904223) >>> 0;
     return this._rng / 4294967296;
   }
+  _normalRandom() {
+    return Math.sqrt(-2 * Math.log(Math.max(1e-9, this._random())))
+      * Math.cos(2 * Math.PI * this._random());
+  }
   _buildSpawnTables() {
     this.spawnTables = [];
     if (!this.data) return;
-    const {nx, nz, panelCount, abundance, angle} = this.data;
-    const cells = nx * nz, reference = Math.max(1, this.abundanceReference || 1);
+    const {nx, nz, panelCount, angle} = this.data;
+    const abundance = this.abundanceValues;
+    const cells = nx * nz;
     for (let panel = 0; panel < panelCount; panel += 1) {
       const entries = [];
       let total = 0;
       for (let cell = 0; cell < cells; cell += 1) {
         const index = panel * cells + cell;
-        if (!(abundance[index] > 0) || !Number.isFinite(angle[index])) continue;
-        total += Math.pow(Math.min(1, abundance[index] / reference), .68);
+        const scaled = this._abundanceScale(abundance[index]);
+        if (!(scaled > 0) || !Number.isFinite(angle[index])) continue;
+        total += Math.pow(scaled, .68);
         entries.push({cell, cumulative: total});
       }
       this.spawnTables.push({entries, total});
@@ -717,19 +981,30 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     }
     const cell = table.entries[lo].cell;
     const ix = cell % this.data.nx, iz = Math.floor(cell / this.data.nx);
+    const index = panel * this.data.nx * this.data.nz + cell;
+    const strength = Math.max(.001, Math.min(.999999, this.data.strength[index] || 0));
+    const abundanceScale = Math.sqrt(this._abundanceScale(this.abundanceValues[index] || 0));
+    const circularSigma = Math.sqrt(Math.max(0, -2 * Math.log(strength)));
     particle.panel = panel;
     particle.x = this.data.x0 + (ix + .08 + this._random() * .84) * this.data.bin;
     particle.z = this.data.z0 + (iz + .08 + this._random() * .84) * this.data.bin;
     particle.age = 0;
-    particle.maxAge = 28 + Math.floor(this._random() * 52);
+    particle.bias = this._normalRandom() * circularSigma * this.visualOptions.variability;
+    const directedMass = abundanceScale * strength;
+    particle.maxAge = Math.max(8, Math.round(
+      (16 + 76 * directedMass) * this.visualOptions.trailLength
+      * (.82 + this._random() * .36)
+    ));
   }
   _resetParticles() {
     if (!this.data?.panelCount || !this.spawnTables.length) return;
-    const perPanel = Math.max(48, Math.min(150, Math.floor(900 / this.data.panelCount)));
+    const perPanel = Math.max(18, Math.min(420, Math.floor(
+      900 / this.data.panelCount * this.visualOptions.particleRate
+    )));
     this.particles = [];
     for (let panel = 0; panel < this.data.panelCount; panel += 1) {
       for (let i = 0; i < perPanel; i += 1) {
-        const particle = {panel, x: 0, z: 0, age: -1, maxAge: 1};
+        const particle = {panel, x: 0, z: 0, age: -1, maxAge: 1, bias: 0};
         this._respawn(particle, panel);
         particle.age = Math.floor(this._random() * particle.maxAge);
         this.particles.push(particle);
@@ -746,6 +1021,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     const ix0 = Math.floor(gx), iz0 = Math.floor(gz);
     const fx = gx - ix0, fz = gz - iz0;
     let vx = 0, vz = 0, abundance = 0, weight = 0;
+    let strongestWeight = -1, fallbackAngle = NaN, fallbackStrength = 0;
     const cells = this.data.nx * this.data.nz;
     for (let dz = 0; dz <= 1; dz += 1) for (let dx = 0; dx <= 1; dx += 1) {
       const ix = ix0 + dx, iz = iz0 + dz;
@@ -757,13 +1033,24 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       const radians = angle * Math.PI / 180;
       vx += Math.sin(radians) * strength * w;
       vz += Math.cos(radians) * strength * w;
-      abundance += this.data.abundance[index] * w;
+      abundance += this.abundanceValues[index] * w;
       weight += w;
+      const candidate = this.abundanceValues[index] * w;
+      if (candidate > strongestWeight) {
+        strongestWeight = candidate; fallbackAngle = angle; fallbackStrength = strength;
+      }
     }
     if (!(weight > .08)) return null;
     vx /= weight; vz /= weight; abundance /= weight;
-    const strength = Math.hypot(vx, vz);
-    return strength > .025 ? {vx, vz, strength, abundance, angle: Math.atan2(vx, vz) * 180 / Math.PI} : null;
+    const vectorStrength = Math.hypot(vx, vz);
+    const angle = vectorStrength > .005
+      ? Math.atan2(vx, vz) * 180 / Math.PI
+      : fallbackAngle;
+    if (!Number.isFinite(angle)) return null;
+    return {
+      strength: Math.max(.001, Math.min(1, vectorStrength > .005 ? vectorStrength : fallbackStrength)),
+      abundance, angle,
+    };
   }
   tooltipText(point) {
     const ix = Math.floor((point.x - this.data.x0) / this.data.bin);
@@ -771,24 +1058,27 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     if (ix < 0 || ix >= this.data.nx || iz < 0 || iz >= this.data.nz) return null;
     const index = point.panel * this.data.nx * this.data.nz + iz * this.data.nx + ix;
     if (!Number.isFinite(this.data.angle[index])) return null;
-    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 2)} · ${formatNumber(this.data.abundance[index], 0)} samples`;
+    const unit = this.visualOptions.metric === "count" ? "samples"
+      : (this.visualOptions.metric === "percent" ? "%" : "s");
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 2)} · ${formatNumber(this.abundanceValues[index], 2)} ${unit}`;
   }
   draw() {
     const layout = this.begin();
     if (!layout || !this.view) return;
-    const {nx, nz, panelCount, angle, strength, abundance} = this.data;
+    const {nx, nz, panelCount, angle, strength} = this.data;
+    const abundance = this.abundanceValues;
     const cells = nx * nz;
-    const maxAbundance = Math.max(1, this.abundanceReference || 1);
     for (let panel = 0; panel < panelCount; panel += 1) {
       const pane = this.pane(panel, layout);
+      const shown = equalScaleView(this.view, pane);
       this.ctx.save();
       this.ctx.beginPath(); this.ctx.rect(pane.left, pane.top, pane.right - pane.left, pane.bottom - pane.top); this.ctx.clip();
       for (let iz = 0; iz < nz; iz += 1) {
         const z = this.data.z0 + (iz + .5) * this.data.bin;
-        if (z < this.view.zmin - this.data.bin || z > this.view.zmax + this.data.bin) continue;
+        if (z < shown.zmin - this.data.bin || z > shown.zmax + this.data.bin) continue;
         for (let ix = 0; ix < nx; ix += 1) {
           const x = this.data.x0 + (ix + .5) * this.data.bin;
-          if (x < this.view.xmin - this.data.bin || x > this.view.xmax + this.data.bin) continue;
+          if (x < shown.xmin - this.data.bin || x > shown.xmax + this.data.bin) continue;
           const index = panel * cells + iz * nx + ix;
           const count = abundance[index];
           if (!(count > 0) || !Number.isFinite(angle[index])) continue;
@@ -797,7 +1087,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
           const [x0] = this.worldToPixel(x - this.data.bin / 2, z, pane);
           const [x1] = this.worldToPixel(x + this.data.bin / 2, z, pane);
           const cellPx = Math.abs(x1 - x0);
-          const abundanceScale = Math.sqrt(Math.min(1, count / maxAbundance));
+          const abundanceScale = Math.sqrt(this._abundanceScale(count));
           const len = cellPx * .72 * strength[index];
           const radians = angle[index] * Math.PI / 180;
           const dx = Math.sin(radians) * len * .5;
@@ -813,9 +1103,11 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       }
       this.ctx.restore();
     }
-    drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view);
+    drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view, {
+      hideTicks: this.cleanMode, showGrid: this.gridVisible && !this.cleanMode,
+      scaleBar: true,
+    });
     drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
-    this._resetParticles();
   }
   drawParticles(now) {
     if (!this.data || !this.view || !this.particleCtx || !this.particles.length) return;
@@ -825,11 +1117,11 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     this._particleTime = now;
     ctx.setTransform(this.particleDpr || 1, 0, 0, this.particleDpr || 1, 0, 0);
     ctx.globalCompositeOperation = "destination-out";
-    ctx.fillStyle = "rgba(0,0,0,.10)";
+    const fade = Math.max(.025, Math.min(.24, .11 / Math.max(.25, this.visualOptions.trailLength)));
+    ctx.fillStyle = `rgba(0,0,0,${fade})`;
     ctx.fillRect(0, 0, this.width, this.height);
     ctx.globalCompositeOperation = "source-over";
     ctx.lineCap = "round";
-    const reference = Math.max(1, this.abundanceReference || 1);
     for (const particle of this.particles) {
       if (particle.age < 0 || particle.age >= particle.maxAge) {
         this._respawn(particle);
@@ -837,17 +1129,24 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       }
       const vector = this._sampleVector(particle.panel, particle.x, particle.z);
       if (!vector) { this._respawn(particle); continue; }
-      const speed = this.data.bin * (1.15 + 4.1 * Math.min(1, vector.strength));
-      const nx = particle.x + vector.vx / vector.strength * speed * dt;
-      const nz = particle.z + vector.vz / vector.strength * speed * dt;
-      if (nx < this.view.xmin || nx > this.view.xmax || nz < this.view.zmin || nz > this.view.zmax) {
+      const abundanceScale = Math.sqrt(this._abundanceScale(vector.abundance));
+      const sigma = Math.sqrt(Math.max(0, -2 * Math.log(Math.max(.001, Math.min(.999999, vector.strength)))))
+        * this.visualOptions.variability;
+      particle.bias += (this._normalRandom() * sigma - particle.bias) * .035;
+      const radians = (vector.angle + particle.bias * 180 / Math.PI) * Math.PI / 180;
+      const speed = this.data.bin * this.visualOptions.speed
+        * (.45 + 3.9 * Math.min(1, vector.strength))
+        * (.72 + .55 * abundanceScale);
+      const nx = particle.x + Math.sin(radians) * speed * dt;
+      const nz = particle.z + Math.cos(radians) * speed * dt;
+      const pane = this.pane(particle.panel, layout);
+      const shown = equalScaleView(this.view, pane);
+      if (nx < shown.xmin || nx > shown.xmax || nz < shown.zmin || nz > shown.zmax) {
         this._respawn(particle);
         continue;
       }
-      const pane = this.pane(particle.panel, layout);
       const [x0, y0] = this.worldToPixel(particle.x, particle.z, pane);
       const [x1, y1] = this.worldToPixel(nx, nz, pane);
-      const abundanceScale = Math.sqrt(Math.min(1, vector.abundance / reference));
       const life = Math.sin(Math.PI * particle.age / Math.max(1, particle.maxAge));
       ctx.strokeStyle = angleColor(vector.angle, (.12 + .58 * abundanceScale) * (.3 + .7 * life));
       ctx.lineWidth = .5 + 1.55 * abundanceScale;

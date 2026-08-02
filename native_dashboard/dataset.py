@@ -194,16 +194,66 @@ def _pack_arrays(meta: dict[str, Any], arrays: dict[str, np.ndarray]) -> bytes:
     )
 
 
-def _raw_numeric_columns(frame: pd.DataFrame) -> list[str]:
-    excluded = {
-        "CurrentTrial", "CurrentStep", "GameObjectPosX", "GameObjectPosZ",
-        "TrialIndex", "OriginalCurrentTrial", "_smoothed_velocity",
+_CONFIG_LABELS = {
+    "Choice_00.json": "Blank",
+    "Choice_All.json": "All (Push + Pull + Shear)",
+    "Choice_Push.json": "Push",
+    "Choice_Pull.json": "Pull",
+    "Choice_Shear.json": "Shear",
+    "Choice_empty.json": "Empty",
+    "Choice_Empty_Empty.json": "Empty vs Empty",
+}
+
+
+def _display_config(raw: str) -> str:
+    """Return a useful default label; the browser can still edit it live."""
+
+    text = str(raw or "unknown")
+    if text in _CONFIG_LABELS:
+        return _CONFIG_LABELS[text]
+    stem = os.path.splitext(text)[0]
+    stem = stem.removeprefix("Choice_").removeprefix("BinaryChoice_")
+    words = [part for part in stem.replace("-", "_").split("_") if part]
+    if not words:
+        return text
+    replacements = {
+        "noflip": "no flip",
+        "subnoflip": "near / no flip",
+        "subflip": "near / flip",
+        "bigfarnoflip": "far / no flip",
+        "bigfarflip": "far / flip",
+        "uniBG": "uniform background",
     }
-    return [
-        str(column)
-        for column in frame.select_dtypes(include=[np.number]).columns
-        if column not in excluded and not str(column).startswith("_source_")
-    ]
+    return " · ".join(
+        replacements.get(word, word.replace("noflip", "no flip"))
+        for word in words
+    )
+
+
+def _histogram_payload(values: np.ndarray, bins: int = 48) -> dict[str, Any]:
+    """Small bounded histogram for data-guided browser range controls."""
+
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return {
+            "edges": [0.0, 1.0], "counts": [0], "range": [0.0, 1.0],
+            "displayRange": [0.0, 1.0], "overflow": 0,
+        }
+    lo, hi = float(np.min(finite)), float(np.max(finite))
+    display_hi = float(np.percentile(finite, 99.5))
+    if not math.isfinite(display_hi) or display_hi <= lo:
+        display_hi = hi if hi > lo else lo + 1.0
+    counts, edges = np.histogram(
+        finite, bins=max(8, int(bins)), range=(lo, display_hi)
+    )
+    return {
+        "edges": edges.astype(float).tolist(),
+        "counts": counts.astype(int).tolist(),
+        "range": [lo, hi],
+        "displayRange": [lo, display_hi],
+        "overflow": int(np.count_nonzero(finite > display_hi)),
+    }
 
 
 def _segment_endpoint_keep(segment_ids, max_points: int | None) -> np.ndarray:
@@ -404,6 +454,9 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         "segmentTortuosity": _stats_by_segment(
             stats, segment_ids, "median_local_tortuosity", 1.0
         ),
+        "segmentDuration": np.maximum(0, local_time[ends - 1]).astype(
+            np.float32, copy=False
+        ),
     }
     for key, codes in category_codes.items():
         arrays[f"segment{key.title()}"] = codes
@@ -413,13 +466,20 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         f"{pattern}|{token}|{len(frame)}|{len(starts)}".encode("utf-8")
     ).hexdigest()[:16]
     rois = rois_by_config(metadata)
-    segment_durations = local_time[ends - 1]
+    segment_durations = arrays["segmentDuration"]
     finite_durations = segment_durations[np.isfinite(segment_durations)]
-    playback_max = (
-        float(np.percentile(finite_durations, 99))
-        if finite_durations.size
-        else 0.0
-    )
+    duration_quantiles = {
+        "median": float(np.percentile(finite_durations, 50)) if finite_durations.size else 0.0,
+        "p95": float(np.percentile(finite_durations, 95)) if finite_durations.size else 0.0,
+        "p99": float(np.percentile(finite_durations, 99)) if finite_durations.size else 0.0,
+        "max": float(np.max(finite_durations)) if finite_durations.size else 0.0,
+    }
+    playback_max = duration_quantiles["p95"]
+    display_categories = {
+        key: ([_display_config(value) for value in labels]
+              if key == "config" else list(labels))
+        for key, labels in category_labels.items()
+    }
     meta = {
         "datasetId": dataset_id,
         "pattern": pattern,
@@ -445,9 +505,17 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
             "distance": _range(arrays["segmentDistance"], (0.0, 1.0)),
         },
         "playbackMax": playback_max,
+        "playbackQuantiles": duration_quantiles,
         "categories": category_labels,
+        "displayCategories": display_categories,
         "segmentIds": segment_ids,
-        "rawColumns": _raw_numeric_columns(frame),
+        "filterHistograms": {
+            "trial": _histogram_payload(segment_trial),
+            "step": _histogram_payload(segment_step),
+            "peak": _histogram_payload(arrays["segmentPeakSpeed"]),
+            "displacement": _histogram_payload(arrays["segmentDisplacement"]),
+            "distance": _histogram_payload(arrays["segmentDistance"]),
+        },
         "rois": _json_safe(rois),
     }
     binary = _pack_arrays(meta, arrays)
@@ -500,16 +568,3 @@ def get_native_dataset(dataset_id: str) -> NativeDataset | None:
         if dataset is not None:
             _CACHE.move_to_end(str(dataset_id))
         return dataset
-
-
-def raw_channel_binary(dataset_id: str, column: str) -> bytes:
-    dataset = get_native_dataset(dataset_id)
-    if dataset is None:
-        raise NativeDatasetError("The loaded dataset is no longer in memory.")
-    if column not in dataset.header.get("rawColumns", []):
-        raise NativeDatasetError("That numeric channel is not available.")
-    values = _finite_float(dataset.frame[column])
-    return _pack_arrays(
-        {"datasetId": dataset_id, "column": column},
-        {"values": values},
-    )

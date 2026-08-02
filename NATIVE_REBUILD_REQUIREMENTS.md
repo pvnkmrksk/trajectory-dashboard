@@ -2,7 +2,7 @@
 
 ## Objective
 
-Rebuild Dari Deepa's interactive presentation layer so that a loaded dataset
+Rebuild Daari Deepa's interactive presentation layer so that a loaded dataset
 feels immediate during exploration. Keep the proven Python loader, segment
 model, metadata recovery, vectorised filters, and exact per-segment summaries
 as the reference analysis pipeline for the first migration stage. Remove Dash
@@ -58,8 +58,10 @@ has been verified.
   rows, segments, and animals.
 - Accept a folder drop anywhere in the window, resolve its browser-safe relative
   file list to a bounded local source, and begin loading without another click.
-- Populate config, scene, VR, fly, folder, raw-channel, trial, step, and metric
-  ranges from the loaded data.
+- Populate config, scene, VR, fly, folder, trial, step, and metric ranges from
+  the loaded data. A directory source is a strict boundary: loading or dropping
+  it may recurse below that directory but must never search a parent, sibling,
+  or merely same-named directory.
 - Persist the source and principal controls in the URL without writing the URL
   during pan or zoom.
 - Report working, ready, empty, stale-result, and error states.
@@ -87,17 +89,26 @@ has been verified.
 - Provide an immediate, per-`FlyID@VR` visibility legend that does not filter or
   rebuild the retained analysis table.
 - Run playback by updating a GPU time uniform; no frame arrays or server calls.
-- Playback uses segment-local time and ends at the 99th percentile of retained
-  segment durations so a single damaged long trial cannot compress the useful
-  time range for every other trial.
+- Playback uses segment-local time. All-segment playback defaults to the 95th
+  percentile of retained segment durations, with p99 and maximum available as
+  explicit choices; single-segment playback uses that segment's exact duration.
+- Playback can reveal every segment at the same local time or step through one
+  exact source-file/trial/step segment at a time.
 
 ### Spatial summaries
 
 - Occupancy count, seconds, and percent on a zero-centred square grid.
-- Linear/log colour mapping and bounded bin count.
+- Linear/log colour mapping and bounded bin count. Cells remain crisp rather
+  than blurred, with a visible colour bar and adjustable absolute or percentile
+  colour limits that remap the full palette after clipping.
 - Local direction field using body orientation or movement heading, circular
   mean angle, resultant strength, and abundance. Present it as short animated
-  flow trails: length maps to R while particle count/opacity maps to abundance.
+  flow trails: particle availability maps to abundance; angular spread maps to
+  uncertainty inferred from R; and speed/lifetime make abundant, strongly
+  directed regions visible without stacking every particle on one short mark.
+- Expose particle generation rate, lifetime, speed, variability strength, and
+  abundance clipping. Show a direction hue ring. Pause animation during a
+  viewport gesture and resume shortly after the gesture settles.
 - Shared instantaneous pan/zoom between trajectory, occupancy, and direction.
 - Target/ROI rings and observation geometry use the same coordinate transform.
 
@@ -106,8 +117,10 @@ has been verified.
 - One resultant per trial with R and valid-point quality gates.
 - Trial and animal population modes with the existing weighting semantics.
 - Signed heading-over-time traces that break across wrap boundaries.
+- Heading time supports trial traces, time-binned animal circular means, and a
+  time-by-heading density heatmap.
 - Body-orientation and movement-heading sources; optional moving-only gate.
-- Polar, heading, ROI, metrics, histogram, and raw-channel views provide mature
+- Polar, heading, ROI, metrics, and histogram views provide mature
   chart interactions: item hover, interactive animal legends, zoom/reset, and
   image export through a maintained browser plotting library.
 
@@ -116,8 +129,6 @@ has been verified.
 - Native velocity and displacement histograms.
 - Per-trial distance, displacement, median speed, and local tortuosity grouped
   by the active panel axis, with trial/animal independent units.
-- Optional raw numeric time-series loaded on demand rather than included in the
-  initial binary payload.
 - Segment inspection must show source file, trial, step, group metadata, and
   exact statistics; a rendered colour group must not masquerade as one trial.
 
@@ -144,6 +155,7 @@ be reproduced:
   clean layout, displayed-trial fraction, playback position, or viewport.
 - Maintaining two copies of the application or treating the 9,000-line Dash
   shell as the reusable analysis API.
+- A generic raw-numeric-channel explorer with no defined analytical workflow.
 - Explanatory microcopy whose only purpose is to warn about a framework bug.
 
 ## Architecture

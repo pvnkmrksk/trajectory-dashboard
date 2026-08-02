@@ -8039,7 +8039,7 @@ app = Dash(
     update_title="Working…",
     on_error=_dash_error_handler,
 )
-app.title = "Dari Deepa"
+app.title = "Daari Deepa"
 
 
 @app.server.before_request
@@ -8569,7 +8569,7 @@ app.layout = html.Div([
     # Header
     html.Div([
         html.H3(
-                "Dari Deepa",
+                "Daari Deepa",
                 title=(
                     "Kannada: a lamp for the path — illuminating trajectories "
                     "so their routes and transitions can be understood."
@@ -10204,7 +10204,7 @@ globals().update(register_callbacks(globals()))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Dari Deepa — interactive trajectory analysis",
+        description="Daari Deepa — interactive trajectory analysis",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

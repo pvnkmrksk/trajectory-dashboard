@@ -54,7 +54,13 @@ class TrajectoryDataset:
 
 
 def find_csv_files(pattern: str) -> list[str]:
-    """Resolve a file, folder, or glob into CSV file paths."""
+    """Resolve a file, folder, or glob into CSV file paths.
+
+    A directory is a hard source boundary: every returned CSV is a descendant
+    of that directory (including nested session folders), and no sibling or
+    parent directory is searched. Explicit glob patterns retain their normal
+    glob semantics.
+    """
 
     pattern = str(pattern or "").strip()
     if not pattern:
@@ -62,8 +68,19 @@ def find_csv_files(pattern: str) -> list[str]:
     if os.path.isfile(pattern):
         return [pattern]
     if os.path.isdir(pattern):
-        found = sorted(glob.glob(os.path.join(pattern, "*_VR*_.csv")))
-        return found or sorted(glob.glob(os.path.join(pattern, "*.csv")))
+        root = Path(pattern)
+        resolved_root = root.resolve()
+
+        def inside(path: Path) -> bool:
+            try:
+                return os.path.commonpath(
+                    (str(resolved_root), str(path.resolve()))
+                ) == str(resolved_root)
+            except (OSError, ValueError):
+                return False
+
+        found = sorted(path for path in root.rglob("*.csv") if inside(path))
+        return [str(path) for path in found if path.is_file()]
     found = sorted(glob.glob(pattern, recursive=True))
     if not found and not pattern.endswith(".csv"):
         found = sorted(glob.glob(pattern + ".csv", recursive=True))
@@ -93,14 +110,13 @@ def _find_sequence_config(csv_dir: str, csv_basename: str) -> str | None:
 
 
 def _find_fly_metadata(csv_dir: str) -> str | None:
-    """Find the nearest fly metadata file for a CSV directory."""
+    """Find fly metadata beside a CSV without crossing its source folder."""
 
-    root = Path(csv_dir)
-    for folder in [root, *root.parents[:2]]:
-        for pattern in ("*FlyMetaData.json", "*metadata.json"):
-            hits = sorted(folder.glob(pattern))
-            if hits:
-                return str(hits[0])
+    folder = Path(csv_dir)
+    for pattern in ("*FlyMetaData.json", "*metadata.json"):
+        hits = sorted(folder.glob(pattern))
+        if hits:
+            return str(hits[0])
     return None
 
 

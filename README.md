@@ -1,6 +1,6 @@
-# Dari Deepa
+# Daari Deepa
 
-*Dari Deepa* is Kannada wordplay for a light or lamp along a path: an
+*Daari Deepa* is Kannada wordplay for a light or lamp along a path: an
 interactive dashboard for illuminating movement trajectories, their local
 direction, spatial occupancy, target visits, and transitions.
 
@@ -16,19 +16,21 @@ parity checks while advanced workflows finish migrating.
 Run the rebuilt UI locally:
 
 ```bash
-uv run python native_app.py --glob "/path/to/Data/**/*_VR*.csv"
+uv run python native_app.py --glob "/path/to/Data"
 ```
 
 Open `http://127.0.0.1:8060/`. You can also start without `--glob` and enter a
-file, folder, or recursive glob in the header.
+file, folder, or recursive glob in the header. Folder input recursively loads
+CSV files only below that exact folder boundary.
 
 The browser receives one compact typed-column payload, transfers ownership to a
 Web Worker, and then keeps filtering, grouping, binning, playback, displayed-
 trial sampling, and circular summaries off the main thread. Trajectories use
-one WebGL draw call; occupancy, local direction, polar, ROI, heading-time,
-metrics, and diagnostics use dependency-free Canvas renderers. Pan and zoom are
-shared locally between all spatial views. Raw numeric channels load only when
-requested.
+one instanced WebGL draw call; occupancy and animated flow use focused Canvas
+renderers; polar, ROI, heading-time, metrics, and diagnostics use vendored
+Apache ECharts for mature hover, zoom, legend, and export interactions. Pan and
+zoom are shared locally between all spatial views. The generic raw-channel
+explorer has been removed.
 
 The behavioral contract and the distinction between scientific requirements
 and old framework artifacts are in
