@@ -39,6 +39,7 @@ _CACHE_LOOKUP: dict[tuple, str] = {}
 _CACHE_LOCK = threading.RLock()
 LOAD_ROW_BUDGET = max(0, int(os.environ.get("TRAJ_LOAD_ROW_BUDGET", "2000000")))
 LOAD_WORKERS = min(8, max(1, int(os.environ.get("TRAJ_LOAD_WORKERS", "2"))))
+_DUPLICATE_DIGEST_BYTES = 128 * 1024
 
 
 @dataclass
@@ -56,6 +57,61 @@ class NativeDataset:
 
 class NativeDatasetError(RuntimeError):
     """Raised when a requested source cannot form a trajectory dataset."""
+
+
+def _sample_file_digest(path: str) -> bytes:
+    """Hash bounded start/end samples for same-name, same-size candidates."""
+
+    size = os.path.getsize(path)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(size).encode("ascii"))
+    with open(path, "rb") as handle:
+        digest.update(handle.read(_DUPLICATE_DIGEST_BYTES))
+        if size > _DUPLICATE_DIGEST_BYTES:
+            handle.seek(max(0, size - _DUPLICATE_DIGEST_BYTES))
+            digest.update(handle.read(_DUPLICATE_DIGEST_BYTES))
+    return digest.digest()
+
+
+def _metadata_score(path: str) -> tuple[int, int]:
+    folder = os.path.dirname(path)
+    try:
+        json_count = sum(
+            name.lower().endswith(".json") for name in os.listdir(folder)
+        )
+    except OSError:
+        json_count = 0
+    return json_count, len(os.path.normpath(folder).split(os.sep))
+
+
+def _deduplicate_source_files(files: list[str]) -> tuple[list[str], list[str]]:
+    """Drop confirmed duplicate copies while retaining metadata-rich paths.
+
+    Candidates must share basename, byte size, and nanosecond modification
+    time, then match a bounded digest of both file ends. Distinctly named or
+    independently written recordings are never merged.
+    """
+
+    groups: dict[tuple[str, int, int], list[str]] = {}
+    for path in files:
+        stat = os.stat(path)
+        groups.setdefault(
+            (os.path.basename(path), stat.st_size, stat.st_mtime_ns), []
+        ).append(path)
+    kept: list[str] = []
+    skipped: list[str] = []
+    for paths in groups.values():
+        if len(paths) == 1:
+            kept.append(paths[0])
+            continue
+        by_digest: dict[bytes, list[str]] = {}
+        for path in paths:
+            by_digest.setdefault(_sample_file_digest(path), []).append(path)
+        for copies in by_digest.values():
+            preferred = max(copies, key=_metadata_score)
+            kept.append(preferred)
+            skipped.extend(path for path in copies if path != preferred)
+    return sorted(kept), sorted(skipped)
 
 
 def _finite_float(values, *, fill=np.nan) -> np.ndarray:
@@ -100,7 +156,9 @@ def _segment_boundaries(segment: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def _local_time_seconds(frame: pd.DataFrame, starts: np.ndarray,
                         ends: np.ndarray) -> np.ndarray:
-    time_ns = frame["Current Time"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    time_ns = frame["Current Time"].astype(
+        "int64", copy=False
+    ).to_numpy(dtype=np.int64)
     base = np.repeat(time_ns[starts], ends - starts)
     return ((time_ns - base) / 1e9).astype(np.float32)
 
@@ -282,9 +340,10 @@ def _segment_endpoint_keep(segment_ids, max_points: int | None) -> np.ndarray:
 def _load_reference_dataset(pattern: str):
     """Bounded parallel load using only the reusable analysis package."""
 
-    files = td_io.find_csv_files(pattern)
-    if not files:
+    discovered_files = td_io.find_csv_files(pattern)
+    if not discovered_files:
         raise NativeDatasetError("No trajectory CSV files matched this source.")
+    files, duplicate_files = _deduplicate_source_files(discovered_files)
     total_bytes = sum(max(1, os.path.getsize(path)) for path in files)
 
     def load_one(item):
@@ -357,6 +416,8 @@ def _load_reference_dataset(pattern: str):
         if column in frame:
             frame[column] = frame[column].astype("category")
     frame.attrs["_raw_rows"] = int(sum(item[4] for item in results))
+    frame.attrs["_discovered_files"] = len(discovered_files)
+    frame.attrs["_duplicate_files_skipped"] = len(duplicate_files)
     frame.attrs["_frame_token"] = (
         pattern,
         tuple(
@@ -491,6 +552,8 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         "pattern": pattern,
         "counts": {
             "files": int(frame["SourceFile"].nunique()),
+            "discoveredFiles": int(frame.attrs.get("_discovered_files", frame["SourceFile"].nunique())),
+            "duplicateFilesSkipped": int(frame.attrs.get("_duplicate_files_skipped", 0)),
             "sourceRows": int(frame.attrs.get("_raw_rows", len(frame))),
             "retainedRows": int(len(frame)),
             "segments": int(len(starts)),
@@ -540,7 +603,7 @@ def load_native_dataset(pattern: str) -> NativeDataset:
     pattern = str(pattern or "").strip()
     if not pattern:
         raise NativeDatasetError("Enter a CSV file, folder, or recursive glob.")
-    files = td_io.find_csv_files(pattern)
+    files, _ = _deduplicate_source_files(td_io.find_csv_files(pattern))
     cache_key = (
         pattern,
         tuple(

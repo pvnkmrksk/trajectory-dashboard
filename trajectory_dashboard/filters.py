@@ -12,6 +12,18 @@ import numpy as np
 import pandas as pd
 
 
+def _time_seconds(df: pd.DataFrame) -> np.ndarray:
+    """Return timestamps as UTC epoch seconds without timezone warnings."""
+
+    values = df["Current Time"]
+    if not (
+        pd.api.types.is_datetime64_any_dtype(values.dtype)
+        or isinstance(values.dtype, pd.DatetimeTZDtype)
+    ):
+        values = pd.to_datetime(values, errors="coerce", utc=True)
+    return values.astype("int64", copy=False).to_numpy(dtype=np.int64) / 1e9
+
+
 def jump_buffer_seconds(value) -> float:
     """Normalize jump-buffer UI/URL values to seconds.
 
@@ -39,7 +51,7 @@ def velocity_all(df: pd.DataFrame) -> np.ndarray:
         return np.array([], dtype=float)
     x = df["GameObjectPosX"].to_numpy()
     z = df["GameObjectPosZ"].to_numpy()
-    t = df["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64") / 1e9
+    t = _time_seconds(df)
     dx = np.empty(len(df)); dx[0] = np.nan; dx[1:] = np.diff(x)
     dz = np.empty(len(df)); dz[0] = np.nan; dz[1:] = np.diff(z)
     dt = np.empty(len(df)); dt[0] = np.nan; dt[1:] = np.diff(t)
@@ -240,7 +252,7 @@ def apply_filters(
         jumps = np.nan_to_num(speed, nan=0.0) > float(vel_threshold)
         if jumps.any():
             seg = df["_seg_id"].to_numpy()
-            time_s = df["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64") / 1e9
+            time_s = _time_seconds(df)
             df = df[_dilate_keep(seg, time_s, jumps, float(jump_buffer))]
             changed = True
 

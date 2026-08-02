@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import struct
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -66,6 +68,49 @@ def test_native_binary_is_aligned_and_file_scoped(tmp_path):
     for descriptor in header["arrays"].values():
         item_size = np.dtype(descriptor["dtype"]).itemsize
         assert (body_offset + descriptor["offset"]) % item_size == 0
+
+
+def test_native_loader_normalizes_mixed_timezone_files_without_warnings(tmp_path):
+    naive = pd.DataFrame([{
+        "Current Time": "2026-01-01T00:00:00",
+        "CurrentTrial": 0, "CurrentStep": 0,
+        "GameObjectPosX": 0, "GameObjectPosZ": 0, "GameObjectRotY": 0,
+        "ConfigFile": "Choice_Test.json", "Scene": "Choice", "FlyID": "fly-1",
+    }, {
+        "Current Time": "2026-01-01T00:00:01",
+        "CurrentTrial": 0, "CurrentStep": 0,
+        "GameObjectPosX": 1, "GameObjectPosZ": 0, "GameObjectRotY": 0,
+        "ConfigFile": "Choice_Test.json", "Scene": "Choice", "FlyID": "fly-1",
+    }])
+    aware = naive.copy()
+    aware["Current Time"] = ["2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"]
+    naive.to_csv(tmp_path / "naive_VR1_.csv", index=False)
+    aware.to_csv(tmp_path / "aware_VR1_.csv", index=False)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dataset = load_native_dataset(str(tmp_path))
+
+    assert dataset.frame["Current Time"].dtype == np.dtype("datetime64[ns]")
+    assert dataset.header["counts"]["segments"] == 2
+    assert not [warning for warning in caught if "timezone" in str(warning.message).lower()]
+
+
+def test_native_loader_skips_confirmed_duplicate_copies(tmp_path):
+    original = tmp_path / "session_VR1_.csv"
+    nested = tmp_path / "recording" / original.name
+    nested.parent.mkdir()
+    _write_csv(original, 0)
+    shutil.copy2(original, nested)
+    (nested.parent / "experiment.json").write_text("{}")
+
+    dataset = load_native_dataset(str(tmp_path))
+
+    assert dataset.header["counts"]["discoveredFiles"] == 2
+    assert dataset.header["counts"]["duplicateFilesSkipped"] == 1
+    assert dataset.header["counts"]["sourceRows"] == 6
+    assert dataset.header["counts"]["retainedRows"] == 6
+    assert set(dataset.frame["SourceFolder"].astype(str)) == {nested.parent.name}
 
 
 def test_native_server_serves_plotly_free_shell_and_binary(tmp_path):

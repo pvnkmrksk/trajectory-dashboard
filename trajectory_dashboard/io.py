@@ -357,7 +357,13 @@ def is_segment_time_sorted(df: pd.DataFrame | None) -> bool:
     starts[1:] = seg[1:] != seg[:-1]
     if int(starts.sum()) != int(df["_seg_id"].nunique()):
         return False
-    t = df["Current Time"].to_numpy().astype("datetime64[ns]").astype("int64")
+    time_values = df["Current Time"]
+    if not (
+        pd.api.types.is_datetime64_any_dtype(time_values.dtype)
+        or isinstance(time_values.dtype, pd.DatetimeTZDtype)
+    ):
+        time_values = pd.to_datetime(time_values, errors="coerce", utc=True)
+    t = time_values.astype("int64", copy=False).to_numpy(dtype=np.int64)
     same_segment = ~starts[1:]
     return not bool(np.any(np.diff(t)[same_segment] < 0))
 
@@ -420,7 +426,7 @@ def load_csv_fast(filepath: str, *, include_numeric: bool = True) -> pd.DataFram
     """
 
     try:
-        read_options = {"parse_dates": ["Current Time"]}
+        read_options = {}
         if not include_numeric:
             read_options["usecols"] = lambda column: column in _ANALYSIS_LOAD_COLUMNS
         df = pd.read_csv(filepath, **read_options)
@@ -428,6 +434,19 @@ def load_csv_fast(filepath: str, *, include_numeric: bool = True) -> pd.DataFram
         return None
     if not all(col in df.columns for col in REQUIRED_COLUMNS):
         return None
+
+    # Unity exports can mix offset-aware ISO timestamps with local/naive rows
+    # across files. Normalize both forms to one UTC-naive datetime64 column at
+    # the load boundary so sorting and NumPy conversion are deterministic.
+    try:
+        parsed_time = pd.to_datetime(
+            df["Current Time"], errors="coerce", utc=True, format="mixed",
+        )
+    except (TypeError, ValueError):
+        parsed_time = pd.to_datetime(
+            df["Current Time"], errors="coerce", utc=True,
+        )
+    df["Current Time"] = parsed_time.dt.tz_localize(None)
 
     for col in ["CurrentTrial", "CurrentStep", "GameObjectPosX", "GameObjectPosZ"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")

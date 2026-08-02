@@ -38,11 +38,13 @@ let currentDurationSummary = null;
 let lastSummary = null;
 let ringFrame = null;
 let currentLens = "trajectory";
+let currentView = "trajectory";
 let panelOrders = {};
 const rangeControls = new Map();
 
 function setStatus(kind, title, detail) {
   statusDock.className = `status-dock ${kind || ""}`;
+  statusDock.title = detail ? `${title} — ${detail}` : title;
   statusTitle.textContent = title;
   statusDetail.textContent = detail || "";
 }
@@ -107,6 +109,14 @@ function formatCount(value) {
   return new Intl.NumberFormat().format(Number(value) || 0);
 }
 
+function displayRangeBound(value, integer = false, upper = false) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  if (integer) return Math.round(number);
+  const scaled = number * 10;
+  return (upper ? Math.ceil(scaled - 1e-9) : Math.floor(scaled + 1e-9)) / 10;
+}
+
 function datasetSummary(visible = null) {
   const counts = datasetHeader?.counts;
   if (!counts) return;
@@ -116,16 +126,17 @@ function datasetSummary(visible = null) {
     <div><b>${formatCount(rows)}</b><span>visible / ${formatCount(counts.retainedRows)} rows</span></div>
     <div><b>${formatCount(segments)}</b><span>visible / ${formatCount(counts.segments)} segments</span></div>
     <div><b>${formatCount(counts.animals)}</b><span>animals</span></div>
-    <div><b>${formatCount(counts.files)}</b><span>files</span></div>`;
+    <div><b>${formatCount(counts.files)}</b><span>files${counts.duplicateFilesSkipped ? ` · ${formatCount(counts.duplicateFilesSkipped)} duplicate copies skipped` : ""}</span></div>`;
 }
 
 function applyAnimalVisibility() {
   trajectoryRenderer.setAnimalVisibility(animalVisibility);
   const charts = [polarRenderer, headingRenderer, metricsRenderer, roiRenderer];
   for (const chart of charts) chart.animalVisibility = [...animalVisibility];
-  const activeSection = currentLens === "polar" || currentLens === "compare"
-    ? "polar-section"
-    : document.querySelector(".section-nav button.active")?.dataset.target;
+  const activeSection = {
+    polar: "polar-section", heading: "heading-section", metrics: "metrics-section",
+    roi: "roi-section",
+  }[currentView];
   const activeChart = {
     "polar-section": polarRenderer,
     "heading-section": headingRenderer,
@@ -189,6 +200,11 @@ function createRangeControl(key, label, idMin, idMax) {
   const exact = histogram.range, display = histogram.displayRange;
   const integer = key === "trial" || key === "step";
   const step = integer ? 1 : Math.max(1e-6, (display[1] - display[0]) / 500);
+  const inputStep = integer ? 1 : .1;
+  const shownExact = [
+    displayRangeBound(exact[0], integer, false),
+    displayRangeBound(exact[1], integer, true),
+  ];
   const host = document.createElement("section"); host.className = "range-filter";
   host.innerHTML = `
     <div class="range-filter-head"><b>${label}</b><small>${histogram.overflow ? `${formatCount(histogram.overflow)} above mini-chart` : "complete distribution"}</small></div>
@@ -198,8 +214,8 @@ function createRangeControl(key, label, idMin, idMax) {
       <input class="range-high" type="range" min="${display[0]}" max="${display[1]}" step="${step}" value="${display[1]}" aria-label="${label} upper bound">
     </div>
     <div class="range-values">
-      <label>Minimum<input id="${idMin}" type="number" step="${step}" value="${exact[0]}"></label>
-      <label>Maximum<input id="${idMax}" type="number" step="${step}" value="${exact[1]}"></label>
+      <label>Minimum<input id="${idMin}" type="number" step="${inputStep}" value="${shownExact[0]}"></label>
+      <label>Maximum<input id="${idMax}" type="number" step="${inputStep}" value="${shownExact[1]}"></label>
     </div>`;
   byId("range-filters").appendChild(host);
   const canvas = host.querySelector("canvas"), low = host.querySelector(".range-low"), high = host.querySelector(".range-high");
@@ -209,7 +225,9 @@ function createRangeControl(key, label, idMin, idMax) {
     if (Number(low.value) > Number(high.value)) {
       if (changed === low) high.value = low.value; else low.value = high.value;
     }
-    loInput.value = low.value; hiInput.value = high.value; redraw();
+    loInput.value = displayRangeBound(low.value, integer, false);
+    hiInput.value = displayRangeBound(high.value, integer, true);
+    redraw();
     scheduleCompute("full", 120);
   };
   low.addEventListener("input", () => fromSlider(low));
@@ -347,6 +365,7 @@ function collectState() {
     roiEntered: byId("roi-entered").checked,
     roiTrim: byId("roi-trim").checked,
     ringEnabled: byId("ring-enabled").checked,
+    ringContext: byId("ring-context").checked,
     ringMatch: byId("ring-match").value,
     rings: rings.map(ring => ({...ring})),
     labels: displayNames,
@@ -355,6 +374,7 @@ function collectState() {
     headingBin: numberValue("heading-bin", .25),
     headingSectors: numberValue("heading-sectors", 36),
     lens: currentLens,
+    view: currentView,
     panelOrders,
     sampleSeed,
   };
@@ -373,6 +393,7 @@ function persistState() {
   params.set("pcap", state.playbackPercentile);
   params.set("hmode", state.headingMode); params.set("hbin", state.headingBin); params.set("hsec", state.headingSectors);
   params.set("lens", currentLens);
+  params.set("view", currentView);
   if (Object.keys(panelOrders).length) params.set("order", JSON.stringify(panelOrders));
   else params.delete("order");
   params.set("filters", JSON.stringify(state.filters));
@@ -391,6 +412,7 @@ function persistState() {
   params.set("prate", byId("particle-rate").value); params.set("trail", byId("trail-length").value);
   params.set("fspeed", byId("flow-speed").value); params.set("fvar", byId("flow-variability").value);
   if (state.ringEnabled) params.set("ring", "1"); else params.delete("ring");
+  if (state.ringContext) params.set("ringcontext", "1"); else params.set("ringcontext", "0");
   params.set("rings", JSON.stringify(rings)); params.set("ringmatch", state.ringMatch);
   history.replaceState(null, "", url);
 }
@@ -412,7 +434,7 @@ function restoreViewStateFromUrl() {
     "flow-speed": params.get("fspeed"), "flow-variability": params.get("fvar"),
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
-  setSpatialLens(params.get("lens") || "trajectory", false);
+  setDashboardView(params.get("view") || params.get("lens") || "trajectory", false);
   try {
     const restoredOrder = JSON.parse(params.get("order") || "{}");
     panelOrders = restoredOrder && typeof restoredOrder === "object" ? restoredOrder : {};
@@ -429,7 +451,9 @@ function restoreViewStateFromUrl() {
     const ids = {trial:["trial-min","trial-max"], step:["step-min","step-max"], peak:["peak-min","peak-max"], displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"]};
     for (const [key, valuesForRange] of Object.entries(ranges)) {
       if (!ids[key] || !Array.isArray(valuesForRange)) continue;
-      byId(ids[key][0]).value = valuesForRange[0]; byId(ids[key][1]).value = valuesForRange[1];
+      const integer = key === "trial" || key === "step";
+      byId(ids[key][0]).value = displayRangeBound(valuesForRange[0], integer, false);
+      byId(ids[key][1]).value = displayRangeBound(valuesForRange[1], integer, true);
       const control = rangeControls.get(key);
       if (control) { control.low.value = valuesForRange[0]; control.high.value = valuesForRange[1]; control.redraw(); }
     }
@@ -442,6 +466,7 @@ function restoreViewStateFromUrl() {
     for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim"})) if (quality[key] != null) byId(id).checked = !!quality[key];
   } catch (_) { /* malformed optional URL state is ignored */ }
   byId("ring-enabled").checked = params.get("ring") === "1";
+  byId("ring-context").checked = params.get("ringcontext") !== "0";
   byId("ring-match").value = params.get("ringmatch") || "any";
   try {
     const restored = JSON.parse(params.get("rings") || "null");
@@ -538,7 +563,7 @@ function populatePlaybackSegments() {
   const previous = Number(select.value);
   select.replaceChildren();
   for (const item of visibleSegmentOptions) {
-    select.add(new Option(`${item.label} · ${formatNumber(item.duration, 2)} s`, String(item.code)));
+    select.add(new Option(`${item.label} · ${formatNumber(item.duration, 1)} s`, String(item.code)));
   }
   const next = visibleSegmentOptions.some(item => item.code === previous)
     ? previous : visibleSegmentOptions[0]?.code;
@@ -604,7 +629,7 @@ function renderProducts(incoming, summary) {
   if (incoming.trajectory) {
     incoming.trajectory.columns = numberValue("panel-columns");
     trajectoryRenderer.setData(incoming.trajectory, preserve);
-    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.7), numberValue("trajectory-opacity", .34));
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 2.2), numberValue("trajectory-opacity", .28));
     updatePlaybackScope();
     if (!preserve) sharedView = {...trajectoryRenderer.view};
     syncView(sharedView, trajectoryRenderer);
@@ -665,7 +690,7 @@ function handleWorkerMessage(event) {
   if (message.type === "inspect-result") {
     const match = message.match;
     byId("segment-inspector").textContent = match
-      ? `${match.sourceFile} · trial ${formatNumber(match.trial, 0)} / step ${formatNumber(match.step, 0)} · ${match.config} · ${match.fly}@${match.vr} · path ${formatNumber(match.distance, 3)}, displacement ${formatNumber(match.displacement, 3)}, peak ${formatNumber(match.peakSpeed, 3)}, median ${formatNumber(match.medianSpeed, 3)}, tortuosity ${formatNumber(match.tortuosity, 3)}`
+      ? `${match.sourceFile} · trial ${formatNumber(match.trial, 0)} / step ${formatNumber(match.step, 0)} · ${match.config} · ${match.fly}@${match.vr} · path ${formatNumber(match.distance, 1)}, displacement ${formatNumber(match.displacement, 1)}, peak ${formatNumber(match.peakSpeed, 1)}, median ${formatNumber(match.medianSpeed, 1)}, tortuosity ${formatNumber(match.tortuosity, 1)}`
       : "No retained path was close enough; click nearer a visible line.";
     return;
   }
@@ -692,6 +717,7 @@ async function loadDataset(source) {
     const buffer = await response.arrayBuffer();
     const parsed = parseBinary(buffer);
     datasetHeader = parsed.header; sourceInput.value = source;
+    byId("source-popover").open = false;
     visibleSegmentOptions = []; currentDurationSummary = datasetHeader.playbackQuantiles || null;
     populateControls(); products = {}; sharedView = null; newDataset = true; sampleSeed = 0;
     if (worker) worker.terminate();
@@ -699,7 +725,7 @@ async function loadDataset(source) {
     worker = new Worker("/static/worker.js"); worker.onmessage = handleWorkerMessage;
     worker.onerror = event => setStatus("error", "Worker crashed", event.message);
     worker.postMessage({type: "init", header: datasetHeader, buffer, bodyOffset: parsed.bodyOffset}, [buffer]);
-    setStatus("working", "Data loaded", `${formatCount(datasetHeader.counts.retainedRows)} retained rows transferred once; building local views.`);
+    setStatus("working", "Data loaded", `${formatCount(datasetHeader.counts.retainedRows)} retained rows from ${formatCount(datasetHeader.counts.files)} files transferred once${datasetHeader.counts.duplicateFilesSkipped ? `; ${formatCount(datasetHeader.counts.duplicateFilesSkipped)} duplicate copies skipped` : ""}. Building local views.`);
   } catch (error) {
     setStatus("error", "Could not load data", error.message);
   } finally {
@@ -718,31 +744,51 @@ function compositePlot(hostId) {
   return output.toDataURL("image/png");
 }
 
-function setSpatialLens(lens, save = true) {
-  const allowed = new Set(["trajectory", "occupancy", "direction", "polar", "compare"]);
-  currentLens = allowed.has(lens) ? lens : "trajectory";
+function setDashboardView(view, save = true) {
+  const allowed = new Set([
+    "trajectory", "occupancy", "direction", "polar", "compare",
+    "roi", "heading", "metrics", "diagnostics",
+  ]);
+  currentView = allowed.has(view) ? view : "trajectory";
+  const spatial = new Set(["trajectory", "occupancy", "direction", "polar", "compare"]);
+  if (spatial.has(currentView)) currentLens = currentView;
   byId("explore-section").dataset.lens = currentLens;
-  for (const button of document.querySelectorAll("[data-lens-button]")) {
-    button.classList.toggle("active", button.dataset.lensButton === currentLens);
+  for (const button of document.querySelectorAll("[data-view-button]")) {
+    button.classList.toggle("active", button.dataset.viewButton === currentView);
+  }
+  const activeSection = spatial.has(currentView) ? "explore-section" : `${currentView}-section`;
+  for (const section of document.querySelectorAll(".plot-section")) {
+    section.classList.toggle("active-section", section.id === activeSection);
   }
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    const shown = currentLens === "compare"
+    const shown = currentView === "compare"
       ? new Set(["trajectory", "occupancy", "direction", "polar"])
-      : new Set([currentLens]);
+      : new Set([currentView]);
     if (shown.has("trajectory")) { trajectoryRenderer.resize(); trajectoryRenderer.draw(); }
     if (shown.has("occupancy")) { heatmapRenderer.resize(); heatmapRenderer.draw(); }
     if (shown.has("direction")) { directionRenderer.resize(); directionRenderer.draw(); }
     if (shown.has("polar")) { polarRenderer.chart.resize({animation: {duration: 0}}); polarRenderer.draw(); }
+    if (shown.has("heading")) { headingRenderer.chart.resize({animation: {duration: 0}}); headingRenderer.draw(); }
+    if (shown.has("metrics")) { metricsRenderer.chart.resize({animation: {duration: 0}}); metricsRenderer.draw(); }
+    if (shown.has("roi")) { roiRenderer.chart.resize({animation: {duration: 0}}); roiRenderer.draw(); }
+    if (shown.has("diagnostics")) {
+      velocityHistogram.chart.resize({animation: {duration: 0}}); velocityHistogram.draw();
+      displacementHistogram.chart.resize({animation: {duration: 0}}); displacementHistogram.draw();
+    }
     applyAnimalVisibility();
   }));
   if (save) persistState();
 }
 
+function setSpatialLens(lens, save = true) { setDashboardView(lens, save); }
+
 function downloadActivePlot() {
-  const lens = currentLens === "compare" ? "trajectory" : currentLens;
+  const lens = currentView === "compare" ? "trajectory" : currentView;
   const host = {
     trajectory: "trajectory-plot", occupancy: "heatmap-plot",
-    direction: "direction-plot", polar: "polar-plot",
+    direction: "direction-plot", polar: "polar-plot", roi: "roi-plot",
+    heading: "heading-plot", metrics: "metrics-plot",
+    diagnostics: "velocity-hist",
   }[lens];
   const url = compositePlot(host);
   if (!url) return;
@@ -792,7 +838,9 @@ function applyRecipeControls(recipe) {
   const rangeIds = {trial:["trial-min","trial-max"], step:["step-min","step-max"], peak:["peak-min","peak-max"], displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"]};
   for (const [key, ids] of Object.entries(rangeIds)) {
     const values = state.ranges?.[key]; if (!Array.isArray(values)) continue;
-    byId(ids[0]).value = values[0]; byId(ids[1]).value = values[1];
+    const integer = key === "trial" || key === "step";
+    byId(ids[0]).value = displayRangeBound(values[0], integer, false);
+    byId(ids[1]).value = displayRangeBound(values[1], integer, true);
     const control = rangeControls.get(key);
     if (control) { control.low.value = values[0]; control.high.value = values[1]; control.redraw(); }
   }
@@ -806,7 +854,7 @@ function applyRecipeControls(recipe) {
     headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
   };
   for (const [key, id] of Object.entries(valueIds)) if (state[key] != null) byId(id).value = state[key];
-  for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled"})) {
+  for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context"})) {
     if (state[key] != null) byId(id).checked = !!state[key];
   }
   if (Array.isArray(state.polarR)) { byId("polar-r-min").value = state.polarR[0]; byId("polar-r-max").value = state.polarR[1]; }
@@ -823,9 +871,9 @@ function applyRecipeControls(recipe) {
   if (Array.isArray(state.rings) && state.rings.length) rings = state.rings.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||.01)}));
   sampleSeed = Number(state.sampleSeed) || 0;
   for (const [id, value] of Object.entries(recipe.visuals || {})) if (byId(id) && value != null) byId(id).value = value;
-  setSpatialLens(state.lens || "trajectory", false);
+  setDashboardView(state.view || state.lens || "trajectory", false);
   renderRingControls(); renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
-  trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.7), numberValue("trajectory-opacity", .34));
+  trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 2.2), numberValue("trajectory-opacity", .28));
   applyHeatmapVisuals(); applyDirectionVisuals(); updateFraction(); updatePlaybackLimit(); applyLocalRingObserver(false);
 }
 
@@ -899,9 +947,9 @@ function renderRingControls() {
 
 function updateRingControlValues() {
   const ring = rings[activeRing] || {x: 0, z: 0, r: 3};
-  byId("ring-x").value = Number(ring.x.toFixed(3));
-  byId("ring-z").value = Number(ring.z.toFixed(3));
-  byId("ring-radius").value = Number(ring.r.toFixed(3));
+  byId("ring-x").value = Number(ring.x.toFixed(1));
+  byId("ring-z").value = Number(ring.z.toFixed(1));
+  byId("ring-radius").value = Number(ring.r.toFixed(1));
   const slider = byId("ring-radius-slider");
   slider.max = Math.max(30, ring.r * 2,
     Math.abs(datasetHeader?.ranges?.x?.[1] || 0), Math.abs(datasetHeader?.ranges?.z?.[1] || 0));
@@ -957,6 +1005,7 @@ function updateTrajectorySummary(ringStats = null) {
 function applyLocalRingObserver(save = false) {
   const stats = trajectoryRenderer.setRingObserver(
     byId("ring-enabled").checked, rings, byId("ring-match").value,
+    byId("ring-context").checked,
   );
   updateTrajectorySummary(stats);
   if (save) persistState();
@@ -993,7 +1042,7 @@ function updatePlaybackTime() {
   trajectoryRenderer.setPlaybackSegment(single ? Number(byId("playback-trial").value) : -1);
   trajectoryRenderer.setTime(enabled ? value : Number.POSITIVE_INFINITY);
   byId("time-output").textContent = enabled
-    ? `${formatNumber(value, 2)} / ${formatNumber(Number(byId("time-scrubber").max), 2)} s`
+    ? `${formatNumber(value, 1)} / ${formatNumber(Number(byId("time-scrubber").max), 1)} s`
     : (single ? "full segment" : "all time");
 }
 
@@ -1014,6 +1063,17 @@ function stopPlayback() {
 }
 
 byId("source-form").addEventListener("submit", event => { event.preventDefault(); loadDataset(sourceInput.value); });
+byId("controls-toggle").addEventListener("click", () => {
+  const collapsed = shell.classList.toggle("controls-collapsed");
+  byId("controls-toggle").setAttribute("aria-expanded", String(!collapsed));
+  setTimeout(() => {
+    for (const renderer of spatialRenderers) { renderer.resize(); renderer.draw(); }
+    for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer, velocityHistogram, displacementHistogram]) {
+      renderer.chart.resize({animation: {duration: 0}});
+      renderer.draw();
+    }
+  }, 220);
+});
 applyButton.addEventListener("click", () => scheduleCompute("full"));
 resetViewButton.addEventListener("click", () => trajectoryRenderer.resetView(true));
 function setCleanMode(enabled) {
@@ -1040,8 +1100,8 @@ byId("group-by").addEventListener("change", () => {
   }
   renderPanelOrder([]);
 });
-for (const button of document.querySelectorAll("[data-lens-button]")) {
-  button.addEventListener("click", () => setSpatialLens(button.dataset.lensButton));
+for (const button of document.querySelectorAll("[data-view-button]")) {
+  button.addEventListener("click", () => setDashboardView(button.dataset.viewButton));
 }
 byId("animals-all").addEventListener("click", () => {
   animalVisibility.fill(true); renderAnimalVisibility(); applyAnimalVisibility();
@@ -1055,6 +1115,7 @@ byId("roi-show").addEventListener("change", () => {
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
 });
 byId("ring-enabled").addEventListener("change", () => applyLocalRingObserver(true));
+byId("ring-context").addEventListener("change", () => applyLocalRingObserver(true));
 byId("ring-match").addEventListener("change", () => applyLocalRingObserver(true));
 byId("ring-active").addEventListener("change", () => { activeRing = Number(byId("ring-active").value) || 0; renderRingControls(); });
 for (const id of ["ring-x", "ring-z", "ring-radius"]) {
@@ -1086,7 +1147,7 @@ for (const id of ["flow-metric", "flow-range-mode", "flow-cmin", "flow-cmax",
 }
 for (const id of ["trajectory-width", "trajectory-opacity"]) {
   byId(id).addEventListener("input", () => {
-    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.7), numberValue("trajectory-opacity", .34));
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 2.2), numberValue("trajectory-opacity", .28));
     persistState();
   });
 }
@@ -1124,29 +1185,6 @@ for (const control of document.querySelectorAll("[data-scope]")) {
     else scheduleCompute(scope, scope === "full" ? 180 : 80);
   });
 }
-
-for (const button of document.querySelectorAll(".section-nav button")) {
-  button.addEventListener("click", () => {
-    for (const item of document.querySelectorAll(".section-nav button")) item.classList.toggle("active", item === button);
-    byId(button.dataset.target).scrollIntoView({behavior: "smooth", block: "start"});
-    setTimeout(() => ({
-      "polar-section": polarRenderer,
-      "heading-section": headingRenderer,
-      "metrics-section": metricsRenderer,
-      "roi-section": roiRenderer,
-    }[button.dataset.target]?.syncAnimalLegend?.()), 260);
-  });
-}
-const sectionRatios = new Map();
-const sectionObserver = new IntersectionObserver(entries => {
-  for (const entry of entries) sectionRatios.set(entry.target, entry.isIntersecting ? entry.intersectionRatio : 0);
-  const visible = [...sectionRatios.entries()]
-    .filter(([, ratio]) => ratio > 0)
-    .sort((a, b) => b[1] - a[1])[0]?.[0];
-  if (!visible) return;
-  for (const button of document.querySelectorAll(".section-nav button")) button.classList.toggle("active", button.dataset.target === visible.id);
-}, {root: byId("workspace"), threshold: [.15, .4, .7]});
-for (const section of document.querySelectorAll(".plot-section")) sectionObserver.observe(section);
 
 async function readDroppedEntry(entry, prefix, paths) {
   if (entry.isFile) {

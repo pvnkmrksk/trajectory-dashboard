@@ -9,30 +9,36 @@
   <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
-  <div class="app-shell" id="app-shell">
+  <div class="app-shell controls-collapsed" id="app-shell">
     <header class="topbar">
       <div class="brand-block">
         <div class="brand-mark" aria-hidden="true"><span></span></div>
         <div>
-          <div class="eyebrow">Trajectory workbench</div>
+          <div class="eyebrow">Trajectory explorer</div>
           <h1>Daari Deepa <span>Native</span></h1>
         </div>
       </div>
-      <form class="source-form" id="source-form">
-        <label for="source-input">Data source</label>
-        <div class="source-row">
-          <input id="source-input" name="source" autocomplete="off"
-                 placeholder="CSV, folder, or **/*_VR*.csv glob">
-          <button class="primary" id="load-button" type="submit">Load data</button>
+      <div class="topbar-tools">
+        <button class="toolbar-button" id="controls-toggle" type="button" aria-expanded="false" aria-controls="analysis-sidebar">Controls</button>
+        <details class="source-popover" id="source-popover">
+          <summary>Data source</summary>
+          <form class="source-form" id="source-form">
+            <label for="source-input">CSV, folder, or recursive glob</label>
+            <div class="source-row">
+              <input id="source-input" name="source" autocomplete="off"
+                     placeholder="Drop a folder, or enter its path">
+              <button class="primary" id="load-button" type="submit">Load</button>
+            </div>
+          </form>
+        </details>
+        <div class="status-dock" id="status-dock" aria-live="polite" title="Waiting for data">
+          <span class="status-light"></span>
+          <div><b id="status-title">Waiting for data</b><small id="status-detail">Drop a folder anywhere or choose a source.</small></div>
         </div>
-      </form>
-      <div class="status-dock" id="status-dock" aria-live="polite">
-        <span class="status-light"></span>
-        <div><b id="status-title">Waiting for data</b><small id="status-detail">Python loads once; the browser explores locally.</small></div>
       </div>
     </header>
 
-    <aside class="sidebar" aria-label="Analysis controls">
+    <aside class="sidebar" id="analysis-sidebar" aria-label="Analysis controls">
       <div class="sidebar-actions">
         <button class="primary wide" id="apply-button" type="button" disabled>Update analysis</button>
         <button class="quiet" id="reset-view-button" type="button" disabled>Reset view</button>
@@ -102,10 +108,10 @@
             <input id="point-budget" data-scope="trajectory" type="number" min="10000" step="10000" value="250000">
           </label>
           <label>Path width
-            <input id="trajectory-width" type="range" min="0.5" max="5" step="0.1" value="1.7">
+            <input id="trajectory-width" type="range" min="0.5" max="5" step="0.1" value="2.2">
           </label>
           <label>Path opacity
-            <input id="trajectory-opacity" type="range" min="0.03" max="1" step="0.01" value="0.34">
+            <input id="trajectory-opacity" type="range" min="0.03" max="1" step="0.01" value="0.28">
           </label>
           <label class="check"><input id="moving-only" data-scope="movement" type="checkbox"> Moving samples only</label>
           <label class="check"><input id="spatial-grid" type="checkbox" checked> Spatial grid</label>
@@ -147,6 +153,7 @@
         <summary>Curtain-ring observer</summary>
         <div class="control-body two-up">
           <label class="check"><input id="ring-enabled" type="checkbox"> Show matching paths</label>
+          <label class="check"><input id="ring-context" type="checkbox" checked> Faint context paths</label>
           <label>Match<select id="ring-match"><option value="any">Any ring</option><option value="all">All rings</option></select></label>
           <label>Active ring<select id="ring-active"></select></label>
           <div class="ring-buttons"><button class="compact" id="ring-add" type="button">Add</button><button class="compact" id="ring-delete" type="button">Delete</button></div>
@@ -215,30 +222,24 @@
     </aside>
 
     <main class="workspace" id="workspace">
-      <nav class="section-nav" aria-label="Plot sections">
-        <button data-target="explore-section" class="active">Explore</button>
-        <button data-target="roi-section">Targets</button>
-        <button data-target="heading-section">Heading time</button>
-        <button data-target="metrics-section">Trial metrics</button>
-        <button data-target="diagnostics-section">Diagnostics</button>
+      <nav class="view-rail" aria-label="Analysis views">
+        <div class="view-rail-track">
+          <button type="button" data-view-button="trajectory" class="active">Paths</button>
+          <button type="button" data-view-button="occupancy">Occupancy</button>
+          <button type="button" data-view-button="direction">Flow</button>
+          <button type="button" data-view-button="polar">Polar</button>
+          <span class="rail-divider" aria-hidden="true"></span>
+          <button type="button" data-view-button="roi">Targets</button>
+          <button type="button" data-view-button="heading">Heading</button>
+          <button type="button" data-view-button="metrics">Metrics</button>
+          <button type="button" data-view-button="diagnostics">Diagnostics</button>
+          <span class="rail-divider" aria-hidden="true"></span>
+          <button type="button" data-view-button="compare">Compare 2×2</button>
+        </div>
+        <button class="rail-action" id="download-plot-button" type="button">PNG</button>
       </nav>
 
-      <section class="plot-section explore-section" id="explore-section" data-lens="trajectory">
-        <div class="explore-heading">
-          <div>
-            <span class="section-kicker">Linked views · one spatial frame</span>
-            <h2>From paths to population structure</h2>
-            <p>Move through the same filtered data as raw paths, occupancy, local flow, or trial resultants. Spatial zoom is shared.</p>
-          </div>
-          <div class="lens-switch" role="group" aria-label="Exploration view">
-            <button class="active" type="button" data-lens-button="trajectory">Paths</button>
-            <button type="button" data-lens-button="occupancy">Occupancy</button>
-            <button type="button" data-lens-button="direction">Flow</button>
-            <button type="button" data-lens-button="polar">Polar</button>
-            <button type="button" data-lens-button="compare">Compare 2×2</button>
-            <button class="quiet" id="download-plot-button" type="button">Download PNG</button>
-          </div>
-        </div>
+      <section class="plot-section explore-section active-section" id="explore-section" data-lens="trajectory">
         <div class="explore-grid">
       <article class="lens-panel hero-section" id="trajectory-section" data-view="trajectory">
         <div class="section-heading">
@@ -298,10 +299,13 @@
           </div>
         </div>
         <div class="plot-card">
-          <div class="direction-key" aria-label="Direction colour legend">
-            <div class="direction-wheel"><span class="north">0°</span><span class="east">90°</span><span class="south">180°</span><span class="west">−90°</span></div>
-            <span>Hue = direction · angular spread = uncertainty from R · rate = abundance</span>
-          </div>
+          <details class="direction-key" aria-label="Direction colour legend">
+            <summary>Direction key</summary>
+            <div class="direction-key-body">
+              <div class="direction-wheel"><span class="north">0°</span><span class="east">90°</span><span class="south">180°</span><span class="west">−90°</span></div>
+              <span>Hue is direction. Spread follows uncertainty; particle rate follows abundance.</span>
+            </div>
+          </details>
           <div class="plot-host" id="direction-plot" aria-label="Local direction field"></div>
         </div>
       </article>

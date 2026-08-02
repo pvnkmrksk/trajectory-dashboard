@@ -67,14 +67,31 @@ The rendering boundary is deliberately hybrid:
   use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
   interactive legends, data zoom, reset, accessibility, and export;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
-- the linked-lens workspace can focus Paths, Occupancy, Flow, or Polar, or show
-  all four in a compact 2×2 comparison without changing the analysis state.
+- one compact view rail moves directly through Paths, Occupancy, Flow, Polar,
+  Targets, Heading, Metrics, and Diagnostics; all four spatial views can also
+  appear in a compact 2×2 comparison without changing analysis state; and
+- the source picker and complete analysis controls are drawers. They remain
+  available without permanently taking plot area, and the controls drawer
+  starts collapsed so data is the dominant visual element.
 
 Spatial panes use the available rectangular card area. Their world ranges are
 expanded to the pane's pixel aspect, so the WebGL shader and both Canvas
 transforms still make one X unit exactly the same screen length as one Z unit.
-Grid lines and a physical-unit scale bar provide reference in full and clean
-presentation modes.
+Grid ticks are generated in world coordinates at stable nice-number intervals,
+including a stronger zero line, so they pan and zoom with the data rather than
+relabelling fixed pixel subdivisions. A physical-unit scale bar provides an
+additional reference. Occupancy uses the standard Viridis palette and nearest-
+neighbour cells. Metric distributions combine density violins, box summaries,
+deterministically jittered observations, hover, and inside/box zoom.
+
+At the Python boundary, every timestamp is parsed once as UTC and stored as
+timezone-naive `datetime64[ns]`. This makes mixed Unity ISO strings (naive,
+`Z`, or explicit offsets) comparable without NumPy timezone warnings.
+Repeated export layouts can contain a root copy and a metadata-rich session
+copy of the same recording. Candidates sharing basename, exact size,
+nanosecond mtime, and sampled start/end digest are read once, preferring the
+copy beside JSON metadata. Counts report both discovered files and skipped
+copies.
 
 ## Measured reference workload
 
@@ -94,6 +111,29 @@ Browser smoke on 2026-08-02 used the exact `tests/SubScale` folder source:
 | Regroup to treatment, including every view | ready within 927 ms |
 | Default trajectory GPU links | 239,430 |
 | Browser console warnings/errors | 0 |
+
+The user-supplied `homing_filt/home` workload was profiled separately on
+2026-08-03 after timestamp normalization and duplicate-copy detection:
+
+| Measurement | Native result |
+|---|---:|
+| Discovered CSV files | 188 |
+| Confirmed duplicate copies skipped | 74 (about 2.52 GiB) |
+| CSV files parsed | 114 (about 3.85 GiB) |
+| Source rows parsed | 25,190,390 |
+| Retained rows packaged | 1,922,067 |
+| Segments | 4,725 |
+| Animals | 30 |
+| Uncompressed typed payload | 69.7 MB (66.5 MiB) |
+| Cold load + exact preprocessing + package | 67.4 s |
+| Timezone warnings | 0 |
+
+That profile identifies CSV decoding plus exact segment preprocessing over
+25.2 million rows as the initial-load cost. It is independent of Plotly and
+does not make the warm UI slower. Reimplementing the same CSV parse in
+JavaScript would still need to read and decode roughly 4 GB; a future static
+browser mode is valuable for deployment convenience and privacy, but is not by
+itself a load-time optimization.
 
 Pan/zoom and displayed-trial fraction are renderer-local. Playback advanced a
 GPU time uniform while the application status remained Ready; it created no
@@ -131,7 +171,7 @@ the trajectory product.
 | Trial/animal movement metrics | Complete |
 | ROI rings, first-reached counts, entered-only, tail trim | Complete |
 | ROI fraction/residence/time/error diagnostics | Complete |
-| Native filter mini-histograms with dual range and exact numeric controls | Complete |
+| Native filter mini-histograms with dual range and compact numeric controls | Complete |
 | Exact nearest-segment inspection | Complete |
 | Static self-contained native HTML report | Complete |
 | Shareable principal URL state and readable JSON view recipe | Complete |

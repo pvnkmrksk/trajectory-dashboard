@@ -1,5 +1,5 @@
-const PANEL_PAD_X = 0.055;
-const PANEL_PAD_Y = 0.09;
+const PANEL_PAD_X = 0.04;
+const PANEL_PAD_Y = 0.065;
 const CATEGORY_COLORS = 16;
 export const NEUTRAL_INDEX = 20;
 export const SEQUENTIAL_OFFSET = 24;
@@ -13,8 +13,9 @@ const CATEGORICAL = [
 
 function sequentialColor(t) {
   const stops = [
-    [0.00, [38, 37, 72]], [0.18, [44, 82, 126]], [0.38, [34, 132, 139]],
-    [0.58, [72, 166, 116]], [0.78, [173, 195, 75]], [1.00, [240, 190, 55]],
+    [0.00, [68, 1, 84]], [0.13, [71, 44, 122]], [0.25, [59, 82, 139]],
+    [0.38, [44, 113, 142]], [0.50, [33, 145, 140]], [0.63, [39, 173, 129]],
+    [0.75, [92, 200, 99]], [0.88, [170, 220, 50]], [1.00, [253, 231, 37]],
   ];
   t = Math.max(0, Math.min(1, t));
   let i = 1;
@@ -43,7 +44,7 @@ const PALETTE_FLOATS = new Float32Array(PALETTE.flatMap(color => {
   return [r / 255, g / 255, b / 255, color === "#7f8985" ? .32 : .46];
 }));
 
-export function formatNumber(value, digits = 2) {
+export function formatNumber(value, digits = 1) {
   if (!Number.isFinite(value)) return "—";
   const abs = Math.abs(value);
   if (abs >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
@@ -101,6 +102,30 @@ function niceScaleDistance(span) {
   return (unit >= 5 ? 5 : (unit >= 2 ? 2 : 1)) * power;
 }
 
+function niceTickStep(span, target = 5) {
+  const raw = Math.max(1e-12, Math.abs(span) / Math.max(2, target));
+  const power = 10 ** Math.floor(Math.log10(raw));
+  const scaled = raw / power;
+  const unit = scaled <= 1 ? 1 : (scaled <= 2 ? 2 : (scaled <= 5 ? 5 : 10));
+  return unit * power;
+}
+
+function niceTicks(minimum, maximum, target = 5) {
+  const step = niceTickStep(maximum - minimum, target);
+  const first = Math.ceil((minimum - step * 1e-9) / step) * step;
+  const values = [];
+  for (let value = first; value <= maximum + step * 1e-9 && values.length < 12; value += step) {
+    values.push(Math.abs(value) < step * 1e-9 ? 0 : value);
+  }
+  return {step, values};
+}
+
+function formatTick(value, step) {
+  if (!Number.isFinite(value)) return "—";
+  const digits = step >= 1 ? 0 : Math.min(3, Math.max(1, Math.ceil(-Math.log10(step))));
+  return value.toFixed(digits).replace(/\.0+$|(?<=\.[0-9])0+$/, "");
+}
+
 function circleEntryFraction(x0, z0, x1, z1, ring) {
   const rx = x0 - ring.x, rz = z0 - ring.z;
   const radius2 = ring.r * ring.r;
@@ -150,14 +175,20 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
     const pane = panelPane(layout, panel);
     const {left, right, top, bottom} = pane;
     const shown = equalScaleView(view, pane);
+    const xTicks = shown ? niceTicks(shown.xmin, shown.xmax, 5) : null;
+    const zTicks = shown ? niceTicks(shown.zmin, shown.zmax, 5) : null;
     if (shown && options.showGrid) {
       ctx.save();
-      ctx.strokeStyle = "rgba(34,63,57,.075)";
-      ctx.lineWidth = 1;
-      for (let tick = 1; tick < 5; tick += 1) {
-        const x = left + pane.width * tick / 5;
-        const y = top + pane.height * tick / 5;
+      for (const value of xTicks.values) {
+        const x = left + (value - shown.xmin) / (shown.xmax - shown.xmin) * pane.width;
+        ctx.strokeStyle = value === 0 ? "rgba(28,58,52,.22)" : "rgba(34,63,57,.075)";
+        ctx.lineWidth = value === 0 ? 1.25 : 1;
         ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
+      }
+      for (const value of zTicks.values) {
+        const y = bottom - (value - shown.zmin) / (shown.zmax - shown.zmin) * pane.height;
+        ctx.strokeStyle = value === 0 ? "rgba(28,58,52,.22)" : "rgba(34,63,57,.075)";
+        ctx.lineWidth = value === 0 ? 1.25 : 1;
         ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
       }
       ctx.restore();
@@ -171,16 +202,18 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
     if (view && !options.hideTicks) {
       ctx.font = "9px ui-monospace, SFMono-Regular, monospace";
       ctx.fillStyle = "#7a827e";
-      ctx.textBaseline = "bottom";
-      ctx.fillText(formatNumber(shown.xmin), left, bottom + 15);
-      const xr = formatNumber(shown.xmax);
-      ctx.fillText(xr, right - ctx.measureText(xr).width, bottom + 15);
-      ctx.save();
-      ctx.translate(left - 5, bottom);
-      ctx.rotate(-Math.PI / 2);
-      ctx.fillText(formatNumber(shown.zmin), 0, 0);
-      ctx.restore();
+      ctx.textAlign = "center"; ctx.textBaseline = "top";
+      for (const value of xTicks.values) {
+        const x = left + (value - shown.xmin) / (shown.xmax - shown.xmin) * pane.width;
+        ctx.fillText(formatTick(value, xTicks.step), x, bottom + 5);
+      }
+      ctx.textAlign = "right"; ctx.textBaseline = "middle";
+      for (const value of zTicks.values) {
+        const y = bottom - (value - shown.zmin) / (shown.zmax - shown.zmin) * pane.height;
+        ctx.fillText(formatTick(value, zTicks.step), left - 5, y);
+      }
       ctx.textBaseline = "top";
+      ctx.textAlign = "left";
       ctx.font = "600 11px Inter, system-ui, sans-serif";
     }
     if (shown && options.scaleBar) {
@@ -194,7 +227,7 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
       ctx.moveTo(x + pixels, y - 4); ctx.lineTo(x + pixels, y + 4); ctx.stroke();
       ctx.font = "700 9px Inter, system-ui, sans-serif";
       ctx.textBaseline = "bottom";
-      ctx.fillText(`${formatNumber(distance, 2)} cm`, x, y - 5);
+      ctx.fillText(`${formatNumber(distance, 1)} cm`, x, y - 5);
     }
   }
   ctx.restore();
@@ -360,7 +393,7 @@ function installSpatialInteraction(renderer, canvas) {
     tooltip.style.left = `${event.clientX - rect.left}px`;
     tooltip.style.top = `${event.clientY - rect.top}px`;
     tooltip.textContent = renderer.tooltipText?.(point)
-      || `${renderer.data.panelNames?.[point.panel] || "All"} · X ${formatNumber(point.x, 3)} · Z ${formatNumber(point.z, 3)}`;
+      || `${renderer.data.panelNames?.[point.panel] || "All"} · X ${formatNumber(point.x, 1)} · Z ${formatNumber(point.z, 1)}`;
   });
   canvas.addEventListener("pointerleave", () => { if (!drag) tooltip.hidden = true; });
   canvas.addEventListener("wheel", event => {
@@ -493,8 +526,8 @@ export class TrajectoryRenderer extends SpatialBase {
     this.fraction = 1;
     this.timeLimit = 1e30;
     this.selectedSegment = -1;
-    this.lineWidth = 1.65;
-    this.lineOpacity = .34;
+    this.lineWidth = 2.2;
+    this.lineOpacity = .28;
     this._initGl();
     installSpatialInteraction(this, this.overlay);
     installResize(this);
@@ -521,6 +554,7 @@ export class TrajectoryRenderer extends SpatialBase {
       uniform float u_opacity;
       uniform sampler2D u_ring_entries;
       uniform float u_ring_enabled;
+      uniform float u_ring_context;
       uniform float u_ring_texture_width;
       uniform vec4 u_palette[64];
       out vec4 v_color;
@@ -563,12 +597,14 @@ export class TrajectoryRenderer extends SpatialBase {
         float ringEntry = texelFetch(
           u_ring_entries, ivec2(segmentId % textureWidth, segmentId / textureWidth), 0
         ).r;
-        bool ringVisible = u_ring_enabled < .5 || ringEntry >= 0.0;
+        bool ringMatch = ringEntry >= 0.0;
+        bool contextPath = u_ring_enabled > .5 && !ringMatch && u_ring_context > .5;
+        bool ringVisible = u_ring_enabled < .5 || ringMatch || contextPath;
         float vertexTime = atEnd ? a_time.y : a_time.x;
-        bool beforeRing = u_ring_enabled > .5 && ringEntry >= 0.0 && vertexTime < ringEntry;
-        int colorIndex = beforeRing ? 20 : clamp(int(a_color + .5), 0, 63);
+        bool beforeRing = u_ring_enabled > .5 && ringMatch && vertexTime < ringEntry;
+        int colorIndex = (beforeRing || contextPath) ? 20 : clamp(int(a_color + .5), 0, 63);
         v_color = u_palette[colorIndex];
-        v_color.a = u_opacity * (colorIndex == 20 ? .72 : 1.0);
+        v_color.a = u_opacity * (contextPath ? .10 : (colorIndex == 20 ? .72 : 1.0));
         bool selected = u_selected_segment < 0.0 || abs(a_segment_id - u_selected_segment) < .5;
         v_inside = (a_sample <= u_fraction && a_time.x <= u_time && a_visible > .5
           && selected && ringVisible) ? 1.0 : 0.0;
@@ -591,6 +627,7 @@ export class TrajectoryRenderer extends SpatialBase {
     this.ringEntries = new Float32Array([-1]);
     this.ringTextureWidth = 1;
     this.ringEnabled = false;
+    this.ringContext = true;
     this._uploadRingEntries();
   }
   _attribute(index, data, size, type, normalized = false, stride = 0) {
@@ -638,7 +675,7 @@ export class TrajectoryRenderer extends SpatialBase {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, this.ringTextureWidth, height, 0, gl.RED, gl.FLOAT, packed);
   }
-  setRingObserver(enabled, rings, match = "any") {
+  setRingObserver(enabled, rings, match = "any", showContext = true) {
     if (!this.data) return {matches: 0, buildMs: 0};
     const started = performance.now();
     const active = (rings || []).filter(ring => Number(ring.r) > 0).map(ring => ({
@@ -646,6 +683,7 @@ export class TrajectoryRenderer extends SpatialBase {
     }));
     this.data.rings = active; this.data.ringEnabled = !!enabled; this.data.ringMatch = match;
     this.ringEnabled = !!enabled && active.length > 0;
+    this.ringContext = !!showContext;
     this.ringEntries.fill(-1);
     let matches = this.ringEnabled ? 0 : (this.data.visibleSegments || 0);
     if (this.ringEnabled) {
@@ -698,8 +736,8 @@ export class TrajectoryRenderer extends SpatialBase {
     this.drawGl();
   }
   setLineStyle(width, opacity) {
-    this.lineWidth = Math.max(.5, Math.min(8, Number(width) || 1.65));
-    this.lineOpacity = Math.max(.03, Math.min(1, Number(opacity) || .34));
+    this.lineWidth = Math.max(.5, Math.min(8, Number(width) || 2.2));
+    this.lineOpacity = Math.max(.03, Math.min(1, Number(opacity) || .28));
     this.drawGl();
   }
   resize() {
@@ -732,6 +770,7 @@ export class TrajectoryRenderer extends SpatialBase {
     gl.bindTexture(gl.TEXTURE_2D, this.ringTexture);
     gl.uniform1i(gl.getUniformLocation(this.program, "u_ring_entries"), 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_enabled"), this.ringEnabled ? 1 : 0);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_context"), this.ringContext ? 1 : 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_texture_width"), this.ringTextureWidth);
     gl.uniform4fv(gl.getUniformLocation(this.program, "u_palette[0]"), PALETTE_FLOATS);
     gl.bindVertexArray(this.vao);
@@ -829,7 +868,7 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
       value = total > 0 ? this.data.time[index] / total * 100 : 0;
       unit = "%";
     }
-    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(value, 3)} ${unit} · X ${formatNumber(point.x, 2)} · Z ${formatNumber(point.z, 2)}`;
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(value, 1)} ${unit} · X ${formatNumber(point.x, 1)} · Z ${formatNumber(point.z, 1)}`;
   }
   buildTextures() {
     this.textures = [];
@@ -912,19 +951,17 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
       }
       this.ctx.imageSmoothingEnabled = true;
       if (this.valueRange) {
-        const barW = 10, barH = Math.min(120, pane.height * .28);
-        const bx = pane.right - barW - 8, by = pane.top + 10;
+        const barW = 7, barH = Math.min(82, pane.height * .18);
+        const bx = pane.right - barW - 7, by = pane.top + 8;
         const gradient = this.ctx.createLinearGradient(0, by + barH, 0, by);
         for (let stop = 0; stop <= 1; stop += .2) gradient.addColorStop(stop, sequentialColor(stop));
-        this.ctx.fillStyle = "rgba(255,255,255,.82)";
-        this.ctx.fillRect(bx - 32, by - 6, barW + 40, barH + 22);
         this.ctx.fillStyle = gradient; this.ctx.fillRect(bx, by, barW, barH);
         this.ctx.strokeStyle = "rgba(25,45,40,.25)"; this.ctx.strokeRect(bx + .5, by + .5, barW - 1, barH - 1);
         this.ctx.fillStyle = "#44514d"; this.ctx.font = "700 8px Inter, system-ui";
         this.ctx.textAlign = "right"; this.ctx.textBaseline = "top";
-        this.ctx.fillText(formatNumber(this.valueRange.hi, 2), bx - 3, by);
+        this.ctx.fillText(formatNumber(this.valueRange.hi, 1), bx - 3, by);
         this.ctx.textBaseline = "bottom";
-        this.ctx.fillText(formatNumber(this.valueRange.lo, 2), bx - 3, by + barH);
+        this.ctx.fillText(formatNumber(this.valueRange.lo, 1), bx - 3, by + barH);
       }
       this.ctx.restore();
     }
@@ -1164,7 +1201,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     if (!Number.isFinite(this.data.angle[index])) return null;
     const unit = this.visualOptions.metric === "count" ? "samples"
       : (this.visualOptions.metric === "percent" ? "%" : "s");
-    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 2)} · ${formatNumber(this.abundanceValues[index], 2)} ${unit}`;
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 1)} · ${formatNumber(this.abundanceValues[index], 1)} ${unit}`;
   }
   draw() {
     const layout = this.begin();

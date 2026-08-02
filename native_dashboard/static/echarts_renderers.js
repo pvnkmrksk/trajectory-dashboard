@@ -27,6 +27,35 @@ function quantile(sorted, q) {
   return sorted[lo] * (1 - f) + sorted[hi] * f;
 }
 
+function deterministicJitter(index, trial, step, animal, width = 13) {
+  let hash = (index + 1) ^ ((Number(trial) || 0) * 2654435761)
+    ^ ((Number(step) || 0) * 2246822519) ^ ((Number(animal) || 0) * 3266489917);
+  hash = Math.imul(hash ^ (hash >>> 16), 2246822507) >>> 0;
+  return (hash / 4294967295 - .5) * width;
+}
+
+function densityProfile(sorted, bins = 27) {
+  if (!sorted.length) return null;
+  const lower = quantile(sorted, .01), upper = quantile(sorted, .99);
+  const span = Math.max(1e-9, upper - lower);
+  const bandwidth = Math.max(span / 10, Math.abs(quantile(sorted, .75) - quantile(sorted, .25)) * .28, 1e-9);
+  const stride = Math.max(1, Math.ceil(sorted.length / 2400));
+  const points = [];
+  let maximum = 0;
+  for (let bin = 0; bin < bins; bin += 1) {
+    const value = lower + span * bin / (bins - 1);
+    let density = 0;
+    for (let index = 0; index < sorted.length; index += stride) {
+      const distance = (sorted[index] - value) / bandwidth;
+      density += Math.exp(-.5 * distance * distance);
+    }
+    maximum = Math.max(maximum, density);
+    points.push([value, density]);
+  }
+  for (const point of points) point[1] = maximum > 0 ? point[1] / maximum : 0;
+  return {median: quantile(sorted, .5), points};
+}
+
 function animalColor(code) {
   return NATIVE_PALETTE[Number(code) % 16];
 }
@@ -157,7 +186,7 @@ export class EChartsPolarRenderer extends EChartRenderer {
       });
       radiusAxis.push({
         polarIndex: panel, type: "value", min: 0, max: this.radialMax, interval: this.radialMax / 4,
-        axisLabel: {color: MUTED, fontSize: 9, formatter: value => formatNumber(value, 2)},
+        axisLabel: {color: MUTED, fontSize: 9, formatter: value => formatNumber(value, 1)},
         axisLine: {show: false}, splitLine: {lineStyle: {color: GRID}},
       });
       titles.push({
@@ -227,15 +256,15 @@ export class EChartsPolarRenderer extends EChartRenderer {
         trigger: "item", confine: true,
         formatter: params => {
           const item = params.data || {};
-          if (item.population) return `<b>${escapeHtml(item.panel)}</b><br>Population mean<br>Angle ${formatNumber(item.value?.[1], 1)}° · R ${formatNumber(item.value?.[0], 3)}`;
+          if (item.population) return `<b>${escapeHtml(item.panel)}</b><br>Population mean<br>Angle ${formatNumber(item.value?.[1], 1)}° · R ${formatNumber(item.value?.[0], 1)}`;
           const trial = Number.isFinite(item.trial) ? `<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}` : "";
-          return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>Angle ${formatNumber(item.value?.[1], 1)}° · R ${formatNumber(item.value?.[0], 3)}`;
+          return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>Angle ${formatNumber(item.value?.[1], 1)}° · R ${formatNumber(item.value?.[0], 1)}`;
         },
       },
       polar, angleAxis, radiusAxis, series,
       graphic: [{
         type: "text", right: 92, top: 31, silent: true,
-        style: {text: this.radialMax < .999 ? `radial zoom 0–${formatNumber(this.radialMax, 2)} · double-click to reset` : "wheel to radial zoom",
+        style: {text: this.radialMax < .999 ? `radial zoom 0–${formatNumber(this.radialMax, 1)} · double-click to reset` : "wheel to radial zoom",
           fill: MUTED, font: "10px Inter, system-ui"},
       }],
     };
@@ -309,13 +338,13 @@ export class EChartsHeadingRenderer extends EChartRenderer {
         ...this.base("heading-density"), title: titles,
         tooltip: {trigger: "item", confine: true, formatter: params => {
           const value = params.data || [];
-          return `<b>${escapeHtml(params.seriesName)}</b><br>${formatNumber(timeLabels[value[0]], 2)} s · ${formatNumber(angleLabels[value[1]], 1)}°<br>${formatNumber(value[2], 2)}% of samples in this time bin`;
+          return `<b>${escapeHtml(params.seriesName)}</b><br>${formatNumber(timeLabels[value[0]], 1)} s · ${formatNumber(angleLabels[value[1]], 1)}°<br>${formatNumber(value[2], 1)}% of samples in this time bin`;
         }},
         visualMap: {
           min: 0, max: Math.max(1, maximum), calculable: true,
           orient: "horizontal", left: "center", top: 8, itemWidth: 12, itemHeight: 120,
           textStyle: {color: MUTED, fontSize: 9},
-          inRange: {color: ["#f4f7f6", "#2c768d", "#48a67a", "#f0be37"]},
+          inRange: {color: ["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"]},
         },
         grid, xAxis, yAxis, dataZoom, series,
       };
@@ -349,8 +378,8 @@ export class EChartsHeadingRenderer extends EChartRenderer {
       legend: {type: "scroll", left: 12, right: 100, top: 8, selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 16, itemHeight: 7},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {}, end = item.coords?.[1] || [];
-        if (data.mode === "mean") return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>${formatNumber(end[0], 2)} s · circular mean ${formatNumber(end[1], 1)}°<br>Across-trial R ${formatNumber(item.r, 3)}`;
-        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${formatNumber(end[0], 2)} s · ${formatNumber(end[1], 1)}°`;
+        if (data.mode === "mean") return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>${formatNumber(end[0], 1)} s · circular mean ${formatNumber(end[1], 1)}°<br>Across-trial R ${formatNumber(item.r, 1)}`;
+        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${formatNumber(end[0], 1)} s · ${formatNumber(end[1], 1)}°`;
       }},
       grid, xAxis, yAxis,
       dataZoom,
@@ -375,26 +404,56 @@ export class EChartsMetricsRenderer extends EChartRenderer {
       xAxis.push({gridIndex: metricIndex, type: "category", data: data.panelNames, axisLabel: {...axisBase().axisLabel, rotate: data.panelCount > 5 ? 28 : 0}, ...axisBase()});
       yAxis.push({gridIndex: metricIndex, type: "value", scale: true, ...axisBase()});
       titles.push({text: title, left: col * cellW + 52, top: 44 + row * cellH + 8, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
-      const boxes = [];
+      const boxes = [], profiles = [];
       for (let panel = 0; panel < data.panelCount; panel += 1) {
         const values = [];
         for (let i = 0; i < data[key].length; i += 1) if (data.panel[i] === panel && Number.isFinite(data[key][i])) values.push(data[key][i]);
         values.sort((a, b) => a - b);
         boxes.push(values.length ? [values[0], quantile(values, .25), quantile(values, .5), quantile(values, .75), values[values.length - 1]] : [NaN, NaN, NaN, NaN, NaN]);
+        const profile = densityProfile(values);
+        if (profile) profiles.push({...profile, panel});
       }
+      const halfWidth = Math.max(8, Math.min(25, cellW / Math.max(2, data.panelCount) * .26));
+      series.push({
+        type: "custom", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
+        data: profiles.map(profile => [profile.panel, profile.median]),
+        silent: true, z: 1,
+        renderItem: (params, api) => {
+          const profile = profiles[params.dataIndex];
+          if (!profile) return null;
+          const center = api.coord([profile.panel, profile.median])[0];
+          const right = profile.points.map(([value, density]) => [center + density * halfWidth, api.coord([profile.panel, value])[1]]);
+          const left = [...profile.points].reverse().map(([value, density]) => [center - density * halfWidth, api.coord([profile.panel, value])[1]]);
+          return {type: "polygon", shape: {points: [...right, ...left]}, style: {
+            fill: "rgba(14,124,115,.11)", stroke: "rgba(14,124,115,.42)", lineWidth: .8,
+          }};
+        },
+      });
       series.push({
         type: "boxplot", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
-        data: boxes, silent: false, itemStyle: {color: "rgba(14,124,115,.13)", borderColor: "#0e7c73", borderWidth: 1.2},
+        data: boxes, silent: false, z: 3,
+        boxWidth: [6, Math.max(10, halfWidth * .72)],
+        itemStyle: {color: "rgba(255,255,255,.72)", borderColor: "#0e7c73", borderWidth: 1.15},
       });
       for (let animal = 0; animal < (data.animalNames?.length || 0); animal += 1) {
         const points = [];
         for (let i = 0; i < data[key].length; i += 1) {
           if (data.animal[i] !== animal || !Number.isFinite(data[key][i])) continue;
-          points.push({value: [data.panel[i], data[key][i]], animal: data.animalNames[animal], panel: data.panelNames[data.panel[i]], trial: data.trial[i], step: data.step[i], metric: title});
+          points.push({
+            value: [data.panel[i], data[key][i], deterministicJitter(i, data.trial[i], data.step[i], animal)],
+            animal: data.animalNames[animal], panel: data.panelNames[data.panel[i]],
+            trial: data.trial[i], step: data.step[i], metric: title,
+          });
         }
         if (points.length) series.push({
-          name: data.animalNames[animal], type: "scatter", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
-          data: points, symbolSize: 4, itemStyle: {color: animalColor(animal), opacity: .42}, emphasis: {scale: 1.8},
+          name: data.animalNames[animal], type: "custom", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
+          data: points, encode: {x: 0, y: 1}, z: 4,
+          itemStyle: {color: animalColor(animal), opacity: .38},
+          renderItem: (_params, api) => {
+            const point = api.coord([api.value(0), api.value(1)]);
+            return {type: "circle", shape: {cx: point[0] + api.value(2), cy: point[1], r: 2.1},
+              style: {fill: animalColor(animal), opacity: .38}};
+          },
         });
       }
     });
@@ -403,9 +462,13 @@ export class EChartsMetricsRenderer extends EChartRenderer {
       legend: {type: "scroll", left: 12, right: 100, top: 8, selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 14, itemHeight: 7},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {};
-        if (params.seriesType === "boxplot") return `<b>${escapeHtml(params.name)}</b><br>min ${formatNumber(item[0], 3)} · Q1 ${formatNumber(item[1], 3)}<br>median ${formatNumber(item[2], 3)} · Q3 ${formatNumber(item[3], 3)} · max ${formatNumber(item[4], 3)}`;
-        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${escapeHtml(item.metric)} ${formatNumber(item.value?.[1], 3)}`;
+        if (params.seriesType === "boxplot") return `<b>${escapeHtml(params.name)}</b><br>min ${formatNumber(item[0], 1)} · Q1 ${formatNumber(item[1], 1)}<br>median ${formatNumber(item[2], 1)} · Q3 ${formatNumber(item[3], 1)} · max ${formatNumber(item[4], 1)}`;
+        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${escapeHtml(item.metric)} ${formatNumber(item.value?.[1], 1)}`;
       }},
+      dataZoom: metrics.map((_, index) => ({
+        type: "inside", yAxisIndex: index, filterMode: "none", throttle: 35,
+        zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false,
+      })),
       grid, xAxis, yAxis, series,
     };
   }
@@ -456,7 +519,7 @@ export class EChartsRoiRenderer extends EChartRenderer {
       legend: {type: "scroll", left: 12, right: 100, top: 8, selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 14, itemHeight: 7},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {}, trial = Number.isFinite(item.trial) ? `<br>Trial ${formatNumber(item.trial, 0)}` : "";
-        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>${escapeHtml(item.metric)} · ${escapeHtml(item.value?.[0])}: ${formatNumber(item.value?.[1], 3)}`;
+        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>${escapeHtml(item.metric)} · ${escapeHtml(item.value?.[0])}: ${formatNumber(item.value?.[1], 1)}`;
       }},
       grid, xAxis, yAxis, series,
     };
@@ -471,7 +534,7 @@ export class EChartsHistogramRenderer extends EChartRenderer {
     return {
       ...this.base(this.name),
       grid: {left: 52, right: 22, top: 34, bottom: 48},
-      tooltip: {trigger: "item", confine: true, formatter: params => `${formatNumber(params.data.lo, 3)} – ${formatNumber(params.data.hi, 3)}<br><b>${formatNumber(params.data.value[1], 0)}</b> samples`},
+      tooltip: {trigger: "item", confine: true, formatter: params => `${formatNumber(params.data.lo, 1)} – ${formatNumber(params.data.hi, 1)}<br><b>${formatNumber(params.data.value[1], 0)}</b> samples`},
       xAxis: {type: "value", ...axisBase()}, yAxis: {type: "value", ...axisBase()},
       dataZoom: [{type: "inside", xAxisIndex: 0, filterMode: "none"}, {type: "slider", xAxisIndex: 0, bottom: 7, height: 15}],
       series: [{type: "bar", data: bars, barWidth: "98%", itemStyle: {color: "rgba(49,95,140,.72)", borderRadius: [2, 2, 0, 0]}, large: true}],
