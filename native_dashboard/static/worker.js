@@ -10,11 +10,21 @@ let data = null;
 let starts = null;
 let ends = null;
 let medianDt = .01;
+let segmentMinX = null;
+let segmentMaxX = null;
+let segmentMinZ = null;
+let segmentMaxZ = null;
+let lastBaseAnalysis = null;
 let lastAnalysis = null;
 let lastAnalysisKey = "";
+let lastCurtainKey = "";
 let lastPanelKey = "";
 let lastOccupancy = null;
 let lastOccupancyKey = "";
+let lastOccupancyPlan = null;
+let lastOccupancyPlanKey = "";
+let lastDirectionPlan = null;
+let lastDirectionPlanKey = "";
 let lastTransitionGeometry = null;
 
 function typedArray(dtype, buffer, offset, length) {
@@ -47,6 +57,15 @@ function initDataset(message) {
   starts = Uint32Array.from(startList);
   ends = new Uint32Array(starts.length);
   for (let i = 0; i < starts.length; i += 1) ends[i] = i + 1 < starts.length ? starts[i + 1] : n;
+  segmentMinX = new Float32Array(starts.length); segmentMinX.fill(Infinity);
+  segmentMaxX = new Float32Array(starts.length); segmentMaxX.fill(-Infinity);
+  segmentMinZ = new Float32Array(starts.length); segmentMinZ.fill(Infinity);
+  segmentMaxZ = new Float32Array(starts.length); segmentMaxZ.fill(-Infinity);
+  for (let row = 0; row < n; row += 1) {
+    const seg = data.segment[row], x = data.x[row], z = data.z[row];
+    if (Number.isFinite(x)) { segmentMinX[seg] = Math.min(segmentMinX[seg], x); segmentMaxX[seg] = Math.max(segmentMaxX[seg], x); }
+    if (Number.isFinite(z)) { segmentMinZ[seg] = Math.min(segmentMinZ[seg], z); segmentMaxZ[seg] = Math.max(segmentMaxZ[seg], z); }
+  }
   const dtSample = [];
   const stride = Math.max(1, Math.floor(n / 100000));
   for (let i = 1; i < n; i += stride) {
@@ -75,9 +94,11 @@ function analysisKey(state) {
     jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
     minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
     roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
-    ringEnabled: state.ringEnabled, ringMatch: state.ringMatch,
-    rings: state.rings,
   });
+}
+
+function curtainKey(state) {
+  return JSON.stringify({enabled: state.ringEnabled, match: state.ringMatch, rings: state.rings});
 }
 
 function panelKey(state) {
@@ -172,44 +193,6 @@ function buildAnalysis(state) {
       for (let i = starts[seg]; i < ends[seg] && removed < trim; i += 1) if (rowKeep[i]) { rowKeep[i] = 0; removed += 1; }
       removed = 0;
       for (let i = ends[seg] - 1; i >= starts[seg] && removed < trim; i -= 1) if (rowKeep[i]) { rowKeep[i] = 0; removed += 1; }
-    }
-  }
-
-  // Curtain rings are an analytical subset, not a trajectory-only styling
-  // effect. Apply the same exact path-intersection rule before every derived
-  // view so occupancy, flow, transitions, polar, heading, and statistics all
-  // describe the same retained segments.
-  const activeRings = state.ringEnabled && Array.isArray(state.rings)
-    ? state.rings.map(ring => ({
-      x: Number(ring.x) || 0, z: Number(ring.z) || 0,
-      r: Math.max(.000001, Number(ring.r) || .000001),
-    })) : [];
-  if (activeRings.length) {
-    const requireAll = state.ringMatch === "all";
-    for (let seg = 0; seg < ns; seg += 1) {
-      if (!segmentKeep[seg]) continue;
-      const hits = new Uint8Array(activeRings.length);
-      let hitCount = 0, previous = -1;
-      for (let row = starts[seg]; row < ends[seg]; row += 1) {
-        if (!rowKeep[row]) continue;
-        for (let index = 0; index < activeRings.length; index += 1) {
-          if (hits[index]) continue;
-          const ring = activeRings[index];
-          const inside = (data.x[row] - ring.x) ** 2 + (data.z[row] - ring.z) ** 2 <= ring.r ** 2;
-          if (inside || (previous >= 0 && linkHitsRing(
-            data.x[previous], data.z[previous], data.x[row], data.z[row], ring,
-          ))) {
-            hits[index] = 1; hitCount += 1;
-          }
-        }
-        previous = row;
-        if ((requireAll && hitCount === activeRings.length) || (!requireAll && hitCount > 0)) break;
-      }
-      const qualifies = requireAll ? hitCount === activeRings.length : hitCount > 0;
-      if (!qualifies) {
-        segmentKeep[seg] = 0;
-        rowKeep.fill(0, starts[seg], ends[seg]);
-      }
     }
   }
 
@@ -322,7 +305,7 @@ function buildAnalysis(state) {
       panelRois.push({panel, x: Number(target.x), z: Number(target.z), side: target.side, reach: roiReach});
     }
   }
-  return {
+  const result = {
     rowKeep, segmentKeep, visibleSegments, segmentPanel, panelNames, panelKeys,
     panelCount: panelNames.length, visibleRows, animals: animals.size,
     roiStats, roiBaseSegments, segmentOutcome, panelRois,
@@ -330,6 +313,94 @@ function buildAnalysis(state) {
     durationSummary,
     filterMs: performance.now() - started,
   };
+  result.boundsSource = result;
+  return result;
+}
+
+function applyCurtain(state, base) {
+  const activeRings = state.ringEnabled && Array.isArray(state.rings)
+    ? state.rings.map(ring => ({
+      x: Number(ring.x) || 0, z: Number(ring.z) || 0,
+      r: Math.max(.000001, Number(ring.r) || .000001),
+    })) : [];
+  if (!activeRings.length) return base;
+  const started = performance.now(), requireAll = state.ringMatch === "all";
+  const rowKeep = base.rowKeep.slice(), segmentKeep = base.segmentKeep.slice();
+  const visibleSegments = [];
+  let visibleRows = 0;
+  for (const seg of base.visibleSegments) {
+    const hits = new Uint8Array(activeRings.length);
+    let hitCount = 0, previous = -1;
+    for (let index = 0; index < activeRings.length; index += 1) {
+      const ring = activeRings[index];
+      if (segmentMaxX[seg] < ring.x - ring.r || segmentMinX[seg] > ring.x + ring.r
+          || segmentMaxZ[seg] < ring.z - ring.r || segmentMinZ[seg] > ring.z + ring.r) hits[index] = 2;
+    }
+    for (let row = starts[seg]; row < ends[seg]; row += 1) {
+      if (!rowKeep[row]) continue;
+      for (let index = 0; index < activeRings.length; index += 1) {
+        if (hits[index]) continue;
+        const ring = activeRings[index];
+        const inside = (data.x[row] - ring.x) ** 2 + (data.z[row] - ring.z) ** 2 <= ring.r ** 2;
+        if (inside || (previous >= 0 && linkHitsRing(
+          data.x[previous], data.z[previous], data.x[row], data.z[row], ring,
+        ))) { hits[index] = 1; hitCount += 1; }
+      }
+      previous = row;
+      if ((requireAll && hitCount === activeRings.length) || (!requireAll && hitCount > 0)) break;
+    }
+    const qualifies = requireAll ? hitCount === activeRings.length : hitCount > 0;
+    if (!qualifies) {
+      segmentKeep[seg] = 0; rowKeep.fill(0, starts[seg], ends[seg]);
+      continue;
+    }
+    visibleSegments.push(seg);
+    for (let row = starts[seg]; row < ends[seg]; row += 1) visibleRows += rowKeep[row];
+  }
+  const animals = new Set();
+  for (const seg of visibleSegments) animals.add(`${data.segmentFly[seg]}@${data.segmentVr[seg]}`);
+  const durations = visibleSegments.map(seg => data.segmentDuration[seg]).filter(Number.isFinite).sort((a, b) => a - b);
+  const left = new Uint32Array(base.panelCount), right = new Uint32Array(base.panelCount);
+  for (const seg of visibleSegments) {
+    const panel = base.segmentPanel[seg];
+    if (base.segmentOutcome[seg] === 1) left[panel] += 1;
+    else if (base.segmentOutcome[seg] === 2) right[panel] += 1;
+  }
+  return {
+    ...base, rowKeep, segmentKeep, visibleSegments, visibleRows, animals: animals.size,
+    roiCounts: {left, right},
+    durationSummary: {
+      median: percentile(durations, .5), p95: percentile(durations, .95),
+      p99: percentile(durations, .99), max: durations.length ? durations[durations.length - 1] : 0,
+    },
+    boundsSource: base,
+    filterMs: base.filterMs + performance.now() - started,
+  };
+}
+
+function pooledAnalysis(analysis) {
+  const sourceBase = analysis.boundsSource || analysis;
+  const pool = (source, pooledBounds = null) => {
+    const segmentPanel = new Int32Array(starts.length); segmentPanel.fill(-1);
+    for (const segment of source.visibleSegments) segmentPanel[segment] = 0;
+    const panelRois = [], seen = new Set();
+    for (const roi of source.panelRois || []) {
+      const key = `${Number(roi.x).toFixed(4)}|${Number(roi.z).toFixed(4)}|${roi.side}`;
+      if (seen.has(key)) continue;
+      seen.add(key); panelRois.push({...roi, panel: 0});
+    }
+    const left = Array.from(source.roiCounts?.left || []).reduce((sum, value) => sum + value, 0);
+    const right = Array.from(source.roiCounts?.right || []).reduce((sum, value) => sum + value, 0);
+    const result = {
+      ...source, segmentPanel, panelNames: ["All visible panels"], panelKeys: [0],
+      panelCount: 1, panelRois, roiCounts: {left: Uint32Array.of(left), right: Uint32Array.of(right)},
+      overviewPooled: true,
+    };
+    result.boundsSource = pooledBounds || result;
+    return result;
+  };
+  const pooledBase = pool(sourceBase);
+  return analysis === sourceBase ? pooledBase : pool(analysis, pooledBase);
 }
 
 function percentile(sorted, q) {
@@ -388,11 +459,12 @@ function applyPanelMapping(state, analysis) {
 }
 
 function spatialBounds(analysis, pct = 98) {
+  const source = analysis?.boundsSource || analysis;
   const sampleX = [], sampleZ = [];
-  const stride = Math.max(1, Math.floor(Math.max(1, analysis.visibleRows) / 60000));
+  const stride = Math.max(1, Math.floor(Math.max(1, source.visibleRows) / 60000));
   let seen = 0;
   for (let i = 0; i < data.x.length; i += 1) {
-    if (!analysis.rowKeep[i]) continue;
+    if (!source.rowKeep[i]) continue;
     if ((seen++ % stride) !== 0) continue;
     if (Number.isFinite(data.x[i]) && Number.isFinite(data.z[i])) { sampleX.push(data.x[i]); sampleZ.push(data.z[i]); }
   }
@@ -456,7 +528,7 @@ function buildTrajectory(state, analysis) {
     eligibleCount[seg] = count;
     if (count > 1) totalLinks += count - 1;
   }
-  const budget = Math.max(1000, Math.floor(Number(state.pointBudget) || 250000));
+  const budget = Math.max(1000, Math.floor(Number(state.pointBudget) || 150000));
   const stride = Math.max(1, Math.ceil(totalLinks / budget));
   let selectedLinks = 0;
   for (const seg of trajectorySegments) {
@@ -548,29 +620,53 @@ function spatialCommon(state, analysis, grid) {
   };
 }
 
+function occupancyPlanFor(state, analysis) {
+  const base = analysis.boundsSource || analysis;
+  const key = `${lastAnalysisKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${base.overviewPooled ? "pooled" : "panels"}`;
+  if (lastOccupancyPlan && lastOccupancyPlanKey === key) return lastOccupancyPlan;
+  const grid = gridGeometry(state, base), cells = grid.nx * grid.nz;
+  const contributions = new Array(starts.length);
+  for (const segment of base.visibleSegments) {
+    const panel = base.segmentPanel[segment];
+    if (panel < 0) continue;
+    const map = new Map();
+    for (let row = starts[segment]; row < ends[segment]; row += 1) {
+      if (!base.rowKeep[row]) continue;
+      const ix = Math.floor((data.x[row] - grid.x0) / grid.bin);
+      const iz = Math.floor((data.z[row] - grid.z0) / grid.bin);
+      if (ix < 0 || ix >= grid.nx || iz < 0 || iz >= grid.nz) continue;
+      const index = panel * cells + iz * grid.nx + ix;
+      map.set(index, (map.get(index) || 0) + 1);
+    }
+    contributions[segment] = {
+      indices: Uint32Array.from(map.keys()), counts: Uint32Array.from(map.values()),
+    };
+  }
+  lastOccupancyPlan = {key, grid, cells, contributions}; lastOccupancyPlanKey = key;
+  return lastOccupancyPlan;
+}
+
 function buildOccupancy(state, analysis) {
-  const started = performance.now();
-  const grid = gridGeometry(state, analysis);
-  const cells = grid.nx * grid.nz;
+  const started = performance.now(), plan = occupancyPlanFor(state, analysis);
+  const {grid, cells, contributions} = plan;
   const count = new Float32Array(analysis.panelCount * cells);
-  for (let row = 0; row < data.x.length; row += 1) {
-    if (!analysis.rowKeep[row]) continue;
-    const seg = data.segment[row], panel = analysis.segmentPanel[seg];
-    const ix = Math.floor((data.x[row] - grid.x0) / grid.bin);
-    const iz = Math.floor((data.z[row] - grid.z0) / grid.bin);
-    if (ix < 0 || ix >= grid.nx || iz < 0 || iz >= grid.nz || panel < 0) continue;
-    count[panel * cells + iz * grid.nx + ix] += 1;
+  for (const segment of analysis.visibleSegments) {
+    const contribution = contributions[segment];
+    if (!contribution) continue;
+    for (let index = 0; index < contribution.indices.length; index += 1) {
+      count[contribution.indices[index]] += contribution.counts[index];
+    }
   }
   const time = new Float32Array(count.length);
   for (let i = 0; i < count.length; i += 1) time[i] = count[i] * medianDt;
   const common = spatialCommon(state, analysis, grid);
   lastOccupancy = {common, count, time};
-  lastOccupancyKey = `${lastAnalysisKey}|${state.binSize}|${state.boundPercent}`;
+  lastOccupancyKey = `${lastAnalysisKey}|${lastCurtainKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${analysis.overviewPooled ? "pooled" : "panels"}`;
   return {...common, count: count.slice(), time: time.slice(), buildMs: performance.now() - started};
 }
 
 function occupancyFor(state, analysis) {
-  const key = `${lastAnalysisKey}|${state.binSize}|${state.boundPercent}`;
+  const key = `${lastAnalysisKey}|${lastCurtainKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${analysis.overviewPooled ? "pooled" : "panels"}`;
   if (lastOccupancy && lastOccupancyKey === key) return lastOccupancy;
   buildOccupancy(state, analysis);
   return lastOccupancy;
@@ -582,29 +678,52 @@ function buildDirection(state, analysis) {
   const {common, count, time} = occupancy;
   const cells = common.nx * common.nz;
   const sumSin = new Float64Array(count.length), sumCos = new Float64Array(count.length);
+  const sumSpeed = new Float64Array(count.length), validSpeed = new Uint32Array(count.length);
   const validDirection = new Uint32Array(count.length);
-  const heading = state.angleSource === "movement" ? data.movement : data.orientation;
-  for (let row = 0; row < data.x.length; row += 1) {
-    if (!analysis.rowKeep[row]) continue;
-    const seg = data.segment[row], panel = analysis.segmentPanel[seg];
-    const ix = Math.floor((data.x[row] - common.x0) / common.bin);
-    const iz = Math.floor((data.z[row] - common.z0) / common.bin);
-    if (ix < 0 || ix >= common.nx || iz < 0 || iz >= common.nz || panel < 0) continue;
-    const angle = heading[row];
-    if (!Number.isFinite(angle) || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
-    const index = panel * cells + iz * common.nx + ix;
-    const radians = angle * Math.PI / 180;
-    sumSin[index] += Math.sin(radians); sumCos[index] += Math.cos(radians); validDirection[index] += 1;
+  const base = analysis.boundsSource || analysis;
+  const planKey = `${lastOccupancyPlanKey}|${state.angleSource}|${!!state.movingOnly}|${Number(state.walkThreshold) || 0}`;
+  if (!lastDirectionPlan || lastDirectionPlanKey !== planKey) {
+    const heading = state.angleSource === "movement" ? data.movement : data.orientation;
+    const contributions = new Array(starts.length);
+    for (const segment of base.visibleSegments) {
+      const panel = base.segmentPanel[segment];
+      if (panel < 0) continue;
+      const map = new Map();
+      for (let row = starts[segment]; row < ends[segment]; row += 1) {
+        if (!base.rowKeep[row]) continue;
+        const angle = heading[row];
+        if (!Number.isFinite(angle) || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
+        const ix = Math.floor((data.x[row] - common.x0) / common.bin);
+        const iz = Math.floor((data.z[row] - common.z0) / common.bin);
+        if (ix < 0 || ix >= common.nx || iz < 0 || iz >= common.nz) continue;
+        const index = panel * cells + iz * common.nx + ix;
+        const value = map.get(index) || {sin: 0, cos: 0, n: 0, speed: 0, speedN: 0};
+        const radians = angle * Math.PI / 180;
+        value.sin += Math.sin(radians); value.cos += Math.cos(radians); value.n += 1;
+        if (Number.isFinite(data.speed[row]) && data.speed[row] >= 0) { value.speed += data.speed[row]; value.speedN += 1; }
+        map.set(index, value);
+      }
+      contributions[segment] = [...map].map(([index, value]) => ({index, ...value}));
+    }
+    lastDirectionPlan = {contributions}; lastDirectionPlanKey = planKey;
+  }
+  for (const segment of analysis.visibleSegments) {
+    for (const value of lastDirectionPlan.contributions[segment] || []) {
+      sumSin[value.index] += value.sin; sumCos[value.index] += value.cos;
+      validDirection[value.index] += value.n; sumSpeed[value.index] += value.speed; validSpeed[value.index] += value.speedN;
+    }
   }
   const angle = new Float32Array(count.length), strength = new Float32Array(count.length);
+  const meanSpeed = new Float32Array(count.length);
   angle.fill(NaN);
   for (let i = 0; i < count.length; i += 1) {
     if (validDirection[i]) {
       angle[i] = Math.atan2(sumSin[i], sumCos[i]) * 180 / Math.PI;
       strength[i] = Math.hypot(sumSin[i], sumCos[i]) / validDirection[i];
+      meanSpeed[i] = validSpeed[i] ? sumSpeed[i] / validSpeed[i] : 0;
     }
   }
-  return {...common, angle, strength, abundance: count.slice(), time: time.slice(),
+  return {...common, angle, strength, meanSpeed, abundance: count.slice(), time: time.slice(),
     buildMs: performance.now() - started};
 }
 
@@ -625,7 +744,8 @@ function buildTransition(state, analysis) {
   for (const [bin, count] of startsByBin) if (count > modalCount || (count === modalCount && Math.abs(bin) < Math.abs(modalBin))) {
     modalBin = bin; modalCount = count;
   }
-  const split = modalBin * grid.bin;
+  const split = state.transitionSplit != null && Number.isFinite(Number(state.transitionSplit))
+    ? Number(state.transitionSplit) : modalBin * grid.bin;
   for (const seg of analysis.visibleSegments) {
     const start = starts[seg], end = ends[seg], length = end - start;
     const suffixMin = new Float32Array(length + 1), suffixMax = new Float32Array(length + 1);
@@ -740,7 +860,7 @@ function buildHeading(state, analysis) {
   const heading = state.angleSource === "movement" ? data.movement : data.orientation;
   const maxTime = Math.max(.001, playbackLimit(state, analysis));
   const mode = state.headingMode || "trial";
-  const timeBin = Math.max(.05, Number(state.headingBin) || Math.max(.1, maxTime / 120));
+  const timeBin = Math.max(.05, Number(state.headingBin) || 2);
   const sectors = Math.max(12, Math.min(72, Math.round(Number(state.headingSectors) || 36)));
 
   if (mode === "density") {
@@ -998,6 +1118,51 @@ function rayleigh(values) {
   return {n, angle: Math.atan2(sine, cosine) * 180 / Math.PI, r, z, p: Math.max(0, Math.min(1, p))};
 }
 
+function circularMean(values) {
+  let sine = 0, cosine = 0;
+  for (const value of values) {
+    const radians = value * Math.PI / 180;
+    sine += Math.sin(radians); cosine += Math.cos(radians);
+  }
+  return Math.atan2(sine, cosine) * 180 / Math.PI;
+}
+
+function circularDistance(first, second) {
+  return Math.abs(wrapAngle(first - second));
+}
+
+function circularMeanPermutation(firstValues, secondValues, seed = 1, permutations = 399) {
+  const first = firstValues.filter(Number.isFinite), second = secondValues.filter(Number.isFinite);
+  if (first.length < 3 || second.length < 3) return {difference: NaN, p: NaN, permutations: 0};
+  const rayFirst = rayleigh(first), raySecond = rayleigh(second);
+  const difference = circularDistance(rayFirst.angle, raySecond.angle);
+  if (!(rayFirst.p < .05) || !(raySecond.p < .05)) {
+    return {difference, p: NaN, permutations: 0, comparable: false};
+  }
+  const cap = 2000;
+  const sample = values => values.length <= cap ? values
+    : Array.from({length: cap}, (_, index) => values[Math.floor(index * values.length / cap)]);
+  const a = sample(first), b = sample(second), combined = [...a, ...b];
+  const indices = Uint32Array.from({length: combined.length}, (_, index) => index);
+  let random = (seed ^ 0x9e3779b9) >>> 0, extreme = 0;
+  const nextRandom = () => {
+    random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
+    return random / 4294967296;
+  };
+  for (let iteration = 0; iteration < permutations; iteration += 1) {
+    for (let index = indices.length - 1; index > 0; index -= 1) {
+      const other = Math.floor(nextRandom() * (index + 1));
+      const temporary = indices[index]; indices[index] = indices[other]; indices[other] = temporary;
+    }
+    const permutedFirst = [], permutedSecond = [];
+    for (let index = 0; index < indices.length; index += 1) {
+      (index < a.length ? permutedFirst : permutedSecond).push(combined[indices[index]]);
+    }
+    if (circularDistance(circularMean(permutedFirst), circularMean(permutedSecond)) >= difference - 1e-9) extreme += 1;
+  }
+  return {difference, p: (extreme + 1) / (permutations + 1), permutations, comparable: true};
+}
+
 function buildStatistics(metrics, polar) {
   const metricNames = ["distance", "displacement", "speed", "tortuosity"];
   const metricResults = metricNames.map(metric => {
@@ -1012,11 +1177,18 @@ function buildStatistics(metrics, polar) {
   });
   const polarGroups = Array.from({length: polar.panelCount}, () => []);
   for (let index = 0; index < polar.angle.length; index += 1) polarGroups[polar.panel[index]]?.push(polar.angle[index]);
+  const circularPairwise = [];
+  for (let first = 0; first < polarGroups.length; first += 1) for (let second = first + 1; second < polarGroups.length; second += 1) {
+    circularPairwise.push({first, second,
+      ...circularMeanPermutation(polarGroups[first], polarGroups[second], (first + 1) * 8191 + (second + 1) * 131071)});
+  }
+  holmAdjust(circularPairwise);
   return {
     panels: metrics.panelNames,
     metrics: metricResults,
     rayleigh: polarGroups.map((values, panel) => ({panel, ...rayleigh(values)})),
-    method: "Kruskal–Wallis omnibus tests with two-sided Mann–Whitney pairwise comparisons and Holm family-wise correction. Rayleigh tests assess circular non-uniformity.",
+    circularPairwise,
+    method: "Kruskal–Wallis omnibus tests use two-sided Mann–Whitney pairwise comparisons with Holm family-wise correction. Rayleigh tests assess circular non-uniformity. Mean-angle comparisons use deterministic label permutation only when both groups have a non-uniform direction, then apply Holm correction.",
   };
 }
 
@@ -1203,6 +1375,31 @@ function buildDiagnostics() {
   return {velocity: histogram(data.speed), displacement: histogram(data.segmentDisplacement)};
 }
 
+function buildFilterHistograms(analysis) {
+  const fields = {
+    trial: data.segmentTrial, step: data.segmentStep, peak: data.segmentPeakSpeed,
+    displacement: data.segmentDisplacement, distance: data.segmentDistance,
+  };
+  const result = {};
+  for (const [key, field] of Object.entries(fields)) {
+    const descriptor = header.filterHistograms?.[key];
+    if (!descriptor?.edges?.length) continue;
+    const edges = descriptor.edges.map(Number), counts = new Uint32Array(edges.length - 1);
+    const lo = edges[0], hi = edges[edges.length - 1], span = Math.max(1e-12, hi - lo);
+    let overflow = 0;
+    for (const segment of analysis.visibleSegments) {
+      const value = field[segment];
+      if (!Number.isFinite(value) || value < lo) continue;
+      if (value > hi) { overflow += 1; continue; }
+      const index = Math.max(0, Math.min(counts.length - 1,
+        Math.floor((value - lo) / span * counts.length)));
+      counts[index] += 1;
+    }
+    result[key] = {edges, counts, overflow, visible: analysis.visibleSegments.length};
+  }
+  return result;
+}
+
 function buffers(value, into = []) {
   if (!value || typeof value !== "object") return into;
   if (ArrayBuffer.isView(value)) { into.push(value.buffer); return into; }
@@ -1213,26 +1410,35 @@ function buffers(value, into = []) {
 function compute(message) {
   const {state, requestId} = message;
   const key = analysisKey(state);
+  const ringKey = curtainKey(state);
   const layoutKey = panelKey(state);
   const analysisChanged = key !== lastAnalysisKey;
+  const curtainChanged = ringKey !== lastCurtainKey;
   const panelChanged = layoutKey !== lastPanelKey;
-  if (analysisChanged || !lastAnalysis) {
-    lastAnalysis = buildAnalysis(state); lastAnalysisKey = key;
+  if (analysisChanged || !lastBaseAnalysis) {
+    lastBaseAnalysis = buildAnalysis(state); lastAnalysisKey = key;
     lastPanelKey = layoutKey;
-    lastOccupancy = null; lastOccupancyKey = "";
   } else if (panelChanged) {
-    applyPanelMapping(state, lastAnalysis); lastPanelKey = layoutKey;
+    applyPanelMapping(state, lastBaseAnalysis); lastPanelKey = layoutKey;
+  }
+  if (analysisChanged || curtainChanged || panelChanged || !lastAnalysis) {
+    lastAnalysis = applyCurtain(state, lastBaseAnalysis);
+    lastCurtainKey = ringKey;
     lastOccupancy = null; lastOccupancyKey = "";
   }
   let scope = message.scope || "full";
   if (analysisChanged || panelChanged) scope = "full";
+  const productAnalysis = ["overview", "overviewPreview"].includes(scope) && state.overviewGrouping !== "panels"
+    ? pooledAnalysis(lastAnalysis) : lastAnalysis;
   const products = {};
-  if (["full", "trajectory", "movement", "color", "sample"].includes(scope)) {
-    products.trajectory = buildTrajectory(state, lastAnalysis);
+  if (["full", "trajectory", "movement", "color", "sample", "overview"].includes(scope)) {
+    products.trajectory = buildTrajectory(state, productAnalysis);
   }
-  if (scope === "full" || scope === "spatial") {
-    products.heatmap = buildOccupancy(state, lastAnalysis);
-    products.direction = buildDirection(state, lastAnalysis);
+  if (["full", "spatial", "heatmap", "overview", "overviewPreview"].includes(scope)) {
+    products.heatmap = buildOccupancy(state, productAnalysis);
+  }
+  if (["full", "spatial", "direction", "overview", "overviewPreview"].includes(scope)) {
+    products.direction = buildDirection(state, productAnalysis);
     if (scope === "spatial") {
       products.transition = buildTransition(state, lastAnalysis);
       lastTransitionGeometry = {
@@ -1241,21 +1447,24 @@ function compute(message) {
       };
     }
   } else if (scope === "movement") {
-    products.direction = buildDirection(state, lastAnalysis);
+    products.direction = buildDirection(state, productAnalysis);
   }
-  if (["full", "movement", "color", "sample", "statistics", "polar"].includes(scope)) {
-    products.polar = buildPolar(state, lastAnalysis);
+  if (["full", "movement", "color", "sample", "statistics", "polar", "overview"].includes(scope)) {
+    products.polar = buildPolar(state, productAnalysis);
   }
   if (["full", "movement", "color", "sample", "heading", "playback"].includes(scope)) {
-    products.heading = buildHeading(state, lastAnalysis);
+    products.heading = buildHeading(state, productAnalysis);
   }
   if (["full", "statistics"].includes(scope)) {
-    products.metrics = buildMetrics(state, lastAnalysis);
+    products.metrics = buildMetrics(state, productAnalysis);
   }
   if (["full", "statistics", "movement"].includes(scope)) {
-    products.roi = buildRoi(state, lastAnalysis);
+    products.roi = buildRoi(state, productAnalysis);
   }
-  if (scope === "full") products.diagnostics = buildDiagnostics();
+  if (scope === "full") {
+    products.diagnostics = buildDiagnostics();
+    products.filterHistograms = buildFilterHistograms(lastAnalysis);
+  }
   if (scope === "statistics") {
     products.statistics = buildStatistics(products.metrics, products.polar);
   }
@@ -1276,7 +1485,7 @@ function compute(message) {
     }))
     : null;
   const result = {
-    type: "result", requestId, scope, products,
+    type: "result", requestId, scope, quiet: !!message.quiet, products,
     summary: {
       visibleRows: lastAnalysis.visibleRows,
       visibleSegments: lastAnalysis.visibleSegments.length,

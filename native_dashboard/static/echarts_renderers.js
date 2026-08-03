@@ -13,7 +13,7 @@ function escapeHtml(value) {
 }
 
 function autoColumns(count, requested = 0) {
-  if (requested > 0) return Math.max(1, Math.min(4, requested));
+  if (requested > 0) return Math.max(1, Math.min(4, Math.max(1, count), requested));
   if (count <= 1) return 1;
   if (count <= 4) return 2;
   if (count <= 9) return 3;
@@ -87,6 +87,28 @@ function selectedMap(data, visible) {
   return result;
 }
 
+function compactLetters(count, tests = []) {
+  let columns = [new Set(Array.from({length: count}, (_, index) => index))];
+  for (const test of tests.filter(test => Number(test.adjustedP) < .05)) {
+    const next = [];
+    for (const column of columns) {
+      if (column.has(test.first) && column.has(test.second)) {
+        const a = new Set(column); a.delete(test.first);
+        const b = new Set(column); b.delete(test.second);
+        if (a.size) next.push(a); if (b.size) next.push(b);
+      } else next.push(column);
+    }
+    columns = next.filter((column, index, all) => !all.some((other, otherIndex) =>
+      otherIndex !== index && column.size < other.size && [...column].every(value => other.has(value))));
+  }
+  return Array.from({length: count}, (_, panel) => columns.map((column, index) =>
+    column.has(panel) ? String.fromCharCode(65 + index) : "").join(""));
+}
+
+function significanceStars(value) {
+  return value < .001 ? "***" : value < .01 ? "**" : value < .05 ? "*" : "";
+}
+
 class EChartRenderer {
   constructor(host) {
     if (!ECHARTS) throw new Error("Apache ECharts did not load.");
@@ -107,6 +129,7 @@ class EChartRenderer {
     this.visibilityObserver.observe(host);
   }
   setData(data) { this.data = data; this.draw(); }
+  setStatistics(data) { this.statistics = data; this.draw(); }
   setColumns(value) {
     if (!this.data) return;
     this.data.columns = Number(value) || 0;
@@ -172,6 +195,7 @@ export class EChartsPolarRenderer extends EChartRenderer {
     const width = Math.max(320, this.host.clientWidth), height = Math.max(320, this.host.clientHeight);
     const top = 54, cellW = width / cols, cellH = (height - top) / rows;
     const polar = [], angleAxis = [], radiusAxis = [], titles = [];
+    const circularLetters = compactLetters(count, this.statistics?.circularPairwise || []);
     for (let panel = 0; panel < count; panel += 1) {
       const col = panel % cols, row = Math.floor(panel / cols);
       polar.push({
@@ -189,8 +213,11 @@ export class EChartsPolarRenderer extends EChartRenderer {
         axisLabel: {color: MUTED, fontSize: 9, formatter: value => formatNumber(value, 1)},
         axisLine: {show: false}, splitLine: {lineStyle: {color: GRID}},
       });
+      const rayleigh = this.statistics?.rayleigh?.find(result => result.panel === panel);
+      const annotation = rayleigh?.p < .05
+        ? `  ${circularLetters[panel] || ""}${significanceStars(rayleigh.p)}` : "";
       titles.push({
-        text: data.panelNames?.[panel] || "All data",
+        text: `${data.panelNames?.[panel] || "All data"}${annotation}`,
         left: col * cellW + 12, top: top + row * cellH + 2,
         textStyle: {fontSize: 11, fontWeight: 650, color: INK},
       });
@@ -401,7 +428,11 @@ export class EChartsMetricsRenderer extends EChartRenderer {
     metrics.forEach(([key, title], metricIndex) => {
       const col = metricIndex % 2, row = Math.floor(metricIndex / 2);
       grid.push({left: col * cellW + 52, top: 44 + row * cellH + 35, width: Math.max(60, cellW - 76), height: Math.max(70, cellH - 66)});
-      xAxis.push({gridIndex: metricIndex, type: "category", data: data.panelNames, axisLabel: {...axisBase().axisLabel, rotate: data.panelCount > 5 ? 28 : 0}, ...axisBase()});
+      const metricStatistics = this.statistics?.metrics?.find(result => result.metric === key);
+      const letters = compactLetters(data.panelCount, metricStatistics?.pairwise || []);
+      xAxis.push({gridIndex: metricIndex, type: "category", data: data.panelNames,
+        axisLabel: {...axisBase().axisLabel, rotate: data.panelCount > 5 ? 28 : 0,
+          formatter: (value, index) => `${value}${metricStatistics ? `\n${letters[index] || ""}` : ""}`}, ...axisBase()});
       yAxis.push({gridIndex: metricIndex, type: "value", scale: true, ...axisBase()});
       titles.push({text: title, left: col * cellW + 52, top: 44 + row * cellH + 8, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
       const boxes = [], profiles = [];
@@ -459,7 +490,10 @@ export class EChartsMetricsRenderer extends EChartRenderer {
     });
     return {
       ...this.base("trial-metrics"), title: titles,
-      legend: {type: "scroll", left: 12, right: 100, top: 8, selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 14, itemHeight: 7},
+      legend: {type: "scroll", orient: "horizontal", left: 12, right: 46, top: 7, height: 28,
+        pageButtonPosition: "end", pageIconSize: 9, pageTextStyle: {fontSize: 9, color: MUTED},
+        selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 9, color: MUTED}, itemWidth: 12, itemHeight: 6, itemGap: 11,
+        tooltip: {show: true}},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {};
         if (params.seriesType === "boxplot") return `<b>${escapeHtml(params.name)}</b><br>min ${formatNumber(item[0], 1)} · Q1 ${formatNumber(item[1], 1)}<br>median ${formatNumber(item[2], 1)} · Q3 ${formatNumber(item[3], 1)} · max ${formatNumber(item[4], 1)}`;

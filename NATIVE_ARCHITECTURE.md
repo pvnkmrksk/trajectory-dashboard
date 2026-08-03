@@ -50,9 +50,11 @@ table off the main thread and prepares narrow drawing products:
 Newer UI requests replace a pending request instead of accumulating a callback
 queue. Results from an obsolete request are ignored. Filtering changes run a
 full worker pass. Panel labels/order remap the cached visible segments without
-rerunning the filter, occupancy is cached separately from direction, and
-colour, movement, heading, polar, playback, statistics, and layout changes
-rebuild only their dependent products.
+rerunning the filter. The worker also caches sparse per-segment occupancy and
+direction-cell contributions, so curtain-only previews add matched segments'
+existing cells instead of rescanning every retained row. Occupancy remains
+cached separately from direction, and colour, movement, heading, polar,
+playback, statistics, and layout changes rebuild only their dependent products.
 
 The rendering boundary is deliberately hybrid:
 
@@ -60,22 +62,26 @@ The rendering boundary is deliberately hybrid:
   pixel width/opacity, colour, displayed-trial fraction, animal visibility,
   selected-segment visibility, and playback time handled by shaders/buffers;
 - occupancy is a crisp nearest-neighbour per-panel raster with a visible colour
-  bar and absolute or percentile colour clipping;
+  bar, compact value-density profile, and absolute or percentile colour clipping;
 - transition probability is a second native raster layer on the same grid,
   viewport, and interaction transform as paths/occupancy/flow; supported cells
   drill into their exact raw segments and blank space clears that observer;
 - the direction field uses a lightweight Canvas particle layer because its
   spatial transform must remain exactly synchronized with trajectory/occupancy;
-  abundance drives spawning, R drives mean alignment/angular spread, and the
-  layer sleeps when off-screen or while a viewport gesture is active;
+  abundance drives spawning, R drives mean alignment/angular spread, measured
+  cell velocity can drive particle motion, and trails stay in the originating
+  cell neighbourhood. A constant-lightness/chroma cyclic border is the
+  unobtrusive direction key; the layer sleeps when off-screen or while a
+  viewport gesture is active;
 - polar, heading time, ROI diagnostics, metrics, and histograms
   use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
   interactive legends, data zoom, reset, accessibility, and export;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
 - one compact, wheel/keyboard/arrow-snapping view rail moves through the
-  spatial workspace, Polar, Targets, Windows, Heading, Metrics, Statistics,
-  and Diagnostics. Paths, Occupancy, Flow, and Transitions are layers of that
-  one spatial workspace, with a compact 2×2 overview; and
+  spatial workspace, Targets, Windows, Heading, Metrics, Statistics, and
+  Diagnostics. Paths, Occupancy, Flow, Polar, and Transitions are layers of
+  that workspace. Its compact 2×2 overview defaults to four pooled
+  representations, with an explicit all-panels comparison when needed; and
 - the source picker and complete analysis controls are drawers. They remain
   available without permanently taking plot area, and the controls drawer
   starts collapsed so data is the dominant visual element.
@@ -143,11 +149,13 @@ itself a load-time optimization.
 
 Pan/zoom and displayed-trial fraction are renderer-local. Playback advances a
 GPU time uniform while the application status remains Ready; it creates no
-worker request or server request. Curtain geometry is updated locally during a
-drag for immediate feedback. On release, the worker applies an exact retained
-path/circle intersection rule once, making the ring an analytical subset shared
-by paths, occupancy, flow, transitions, polar, heading, ROI, metrics, windows,
-and statistics rather than a trajectory-only highlight.
+worker request or server request. Curtain geometry and the raw WebGL mask are
+updated locally during a drag. At a bounded cadence, the worker applies the
+exact retained path/circle intersection but rebuilds only the visible occupancy
+or direction product from cached segment contributions. A settled change then
+refreshes the slower analytical products, making the ring a subset shared by
+paths, occupancy, flow, transitions, polar, heading, ROI, metrics, windows, and
+statistics rather than a trajectory-only highlight.
 
 ## Analytical invariants preserved
 
@@ -178,7 +186,7 @@ and statistics rather than a trajectory-only highlight.
 | Trial/animal movement metrics | Complete |
 | ROI rings, first-reached counts, entered-only, tail trim | Complete |
 | ROI fraction/residence/time/error diagnostics | Complete |
-| Native filter mini-histograms with dual range and compact numeric controls | Complete |
+| Native filter mini-histograms with dual range and compact numeric controls | Complete (histograms refresh to the current AND subset) |
 | Exact nearest-segment inspection | Complete |
 | Static self-contained native HTML report | Complete |
 | Shareable principal URL state and readable JSON view recipe | Complete |
@@ -189,10 +197,10 @@ and statistics rather than a trajectory-only highlight.
 | ECharts hover/legend/zoom/export for analytical charts | Complete |
 | Device-local human-readable labels for every grouping axis | Complete |
 | Draggable/keyboard panel ordering across linked views | Complete |
-| Shared spatial layers and compact 2×2 overview | Complete (one viewport/subset/curtain across paths, occupancy, flow, and transitions) |
+| Shared spatial layers and compact 2×2 overview | Complete (one viewport/subset/curtain across paths, occupancy, flow, polar, and transitions; pooled or all-panel overview) |
 | Editable observation windows and paired window inference | Complete (shared spatial transform; on-demand worker-side Wilcoxon summaries) |
 | Transition-probability cell observer | Complete (native shared-grid layer; unique segment/cell entry, crossed/ended outcomes, support/fraction/count controls, raw-path drill-down and blank reset) |
-| Delayed Holm/Rayleigh annotation layer | Complete (on-demand worker pass; Holm-adjusted metric comparisons and Rayleigh panel summaries) |
+| Delayed Holm/Rayleigh annotation layer | Complete (on-demand worker pass; compact-letter metric comparisons, Rayleigh stars, and Holm-adjusted directional mean permutation tests) |
 
 The old Dash app stays runnable on this branch as a reference implementation;
 no Plotly code is loaded by the native process.

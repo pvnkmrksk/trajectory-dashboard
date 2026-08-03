@@ -866,7 +866,7 @@ button, input, select { letter-spacing: -.004em; }
   gap: 5px;
 }
 .explore-section[data-lens="compare"] .lens-panel { display: flex; min-height: 0; padding: 0; }
-.explore-section[data-lens="compare"] .lens-panel[data-view="polar"] { display: none; }
+.explore-section[data-lens="compare"] .lens-panel[data-view="transitions"] { display: none; }
 .explore-section[data-lens="compare"] .plot-host,
 .explore-section[data-lens="compare"] .plot-host.large { height: 100%; min-height: 0; }
 .explore-section[data-lens="compare"] .context-settings,
@@ -877,4 +877,134 @@ button, input, select { letter-spacing: -.004em; }
   .explore-section > .spatial-hud { left: 10px; max-width: calc(100% - 20px); transform: none; }
   .curtain-state { display: none; }
   .layer-switch { overflow-x: auto; }
+}
+
+/* Refined plot-first shell ------------------------------------------------ */
+.app-shell,
+.app-shell.controls-collapsed {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+.sidebar {
+  position: fixed;
+  z-index: 70;
+  inset: 0 auto 0 0;
+  width: 270px;
+  height: 100vh;
+  padding-inline: 8px;
+  border-right: 1px solid #d6dfdd;
+  box-shadow: 14px 0 38px rgba(19,42,36,.13);
+  transform: translateX(0);
+  transition: transform .18s cubic-bezier(.2,.75,.25,1), visibility .18s;
+}
+.controls-collapsed .sidebar {
+  visibility: hidden;
+  overflow-y: auto;
+  padding-inline: 8px;
+  border-right: 1px solid #d6dfdd;
+  opacity: 1;
+  transform: translateX(-102%);
+}
+.workspace { height: 100vh; }
+.rail-brand {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  padding-right: 7px;
+  color: #31413c;
+  border-right: 1px solid #d8e1df;
+  white-space: nowrap;
+}
+.rail-brand b { font-size: 9px; font-weight: 760; letter-spacing: -.015em; }
+.rail-brand-lamp {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  border: 1px solid #c7d7d3;
+  border-radius: 6px;
+  background: #fff;
+}
+.rail-brand-lamp::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 4px;
+  width: 5px;
+  height: 9px;
+  border-radius: 55% 55% 45% 45%;
+  background: linear-gradient(155deg, #e67855, #b84c37);
+  box-shadow: 0 0 0 3px rgba(221,101,72,.09);
+}
+.explore-section > .spatial-hud { top: 7px; gap: 5px; }
+.spatial-columns {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 3px 5px 3px 8px;
+  color: #697570;
+  border: 1px solid rgba(197,211,207,.92);
+  border-radius: 10px;
+  background: rgba(250,252,251,.94);
+  box-shadow: 0 6px 18px rgba(19,43,37,.06);
+  font-size: 8px;
+  font-weight: 680;
+  pointer-events: auto;
+}
+.spatial-columns select { width: 42px; min-height: 24px; padding: 2px 4px; border-radius: 6px; font-size: 9px; }
+.overview-mode {
+  display: none;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 3px 5px 3px 8px;
+  color: #697570;
+  border: 1px solid rgba(197,211,207,.92);
+  border-radius: 10px;
+  background: rgba(250,252,251,.94);
+  font-size: 8px;
+  font-weight: 680;
+  pointer-events: auto;
+}
+.overview-mode select { width: 112px; min-height: 24px; padding: 2px 4px; border-radius: 6px; font-size: 8px; }
+.explore-section[data-lens="compare"] .overview-mode { display: flex; }
+.explore-section[data-lens="compare"] .spatial-columns { display: none; }
+.primary-toolbar .path-settings { margin-left: 0; }
+.primary-toolbar .path-settings .context-settings-panel { left: 0; right: auto; width: 310px; }
+.context-settings-panel small { align-self: center; color: #71807b; font-size: 8px; line-height: 1.35; }
+.view-rail { gap: 4px; }
+.view-rail-track { max-width: none; }
+.tool-palette { top: 48px; right: 78px; }
+.control-card summary, .control-heading { letter-spacing: .025em; }
+.control-body label { line-height: 1.25; }
+.plot-card { box-shadow: 0 1px 4px rgba(25,52,46,.025); }
+.plot-host canvas { image-rendering: auto; }
+
+/* Clean mode keeps navigation and branding usable while removing chrome. */
+.clean-mode.app-shell { display: grid; }
+.clean-mode .sidebar { display: none; }
+.clean-mode .workspace { height: 100vh; overflow: hidden; }
+.clean-mode .view-rail { display: flex; flex-basis: 36px; min-height: 36px; padding-block: 3px; }
+.clean-mode .view-rail-track,
+.clean-mode .rail-step,
+.clean-mode .rail-context,
+.clean-mode .curtain-action,
+.clean-mode .source-popover,
+.clean-mode .status-dock,
+.clean-mode #download-plot-button,
+.clean-mode .rail-menu { display: none; }
+.clean-mode .rail-brand { border-right: 0; }
+.clean-mode .plot-section { padding: 3px 4px 4px; }
+.clean-mode .plot-card { padding: 0; border-color: transparent; border-radius: 0; box-shadow: none; }
+.clean-mode .explore-section > .spatial-hud { top: 4px; }
+.clean-mode .spatial-columns { display: none; }
+.clean-mode .context-settings,
+.clean-mode .primary-toolbar,
+.clean-mode .segment-inspector { display: none !important; }
+.app-shell.clean-mode + .clean-exit { top: 5px; right: 7px; min-height: 27px; padding: 4px 8px; font-size: 9px; }
+
+@media (max-width: 980px) {
+  .rail-brand b { display: none; }
+  .rail-brand { padding-right: 4px; }
 }

@@ -100,9 +100,9 @@ function handleRingMove(source, index, x, z, final, radius = null) {
   updateRingControlValues();
   for (const renderer of spatialRenderers) {
     if (renderer === source || !renderer.data) continue;
-    renderer.setRings(rings, byId("ring-enabled").checked, byId("ring-match").value);
+    renderer.setRings(rings, byId("ring-enabled").checked, byId("ring-match").value, false);
   }
-  scheduleLocalRingObserver(final);
+  scheduleLocalRingObserver(final, source);
 }
 
 function selectRing(index) {
@@ -245,7 +245,7 @@ function drawMiniHistogram(canvas, histogram, selected) {
 }
 
 function createRangeControl(key, label, idMin, idMax) {
-  const histogram = datasetHeader.filterHistograms[key];
+  let histogram = datasetHeader.filterHistograms[key];
   const exact = histogram.range, display = histogram.displayRange;
   const integer = key === "trial" || key === "step";
   const step = integer ? 1 : Math.max(1e-6, (display[1] - display[0]) / 500);
@@ -268,6 +268,7 @@ function createRangeControl(key, label, idMin, idMax) {
     </div>`;
   byId("range-filters").appendChild(host);
   const canvas = host.querySelector("canvas"), low = host.querySelector(".range-low"), high = host.querySelector(".range-high");
+  const distributionNote = host.querySelector(".range-filter-head small");
   const loInput = byId(idMin), hiInput = byId(idMax);
   const redraw = () => drawMiniHistogram(canvas, histogram, [Number(loInput.value), Number(hiInput.value)]);
   const fromSlider = changed => {
@@ -288,7 +289,13 @@ function createRangeControl(key, label, idMin, idMax) {
   });
   new ResizeObserver(redraw).observe(canvas);
   redraw();
-  rangeControls.set(key, {host, redraw, low, high, loInput, hiInput});
+  const setHistogram = next => {
+    if (!next) return;
+    histogram = {...histogram, ...next};
+    distributionNote.textContent = `${formatCount(next.visible)} in current AND subset${next.overflow ? ` · ${formatCount(next.overflow)} above chart` : ""}`;
+    redraw();
+  };
+  rangeControls.set(key, {host, redraw, setHistogram, low, high, loInput, hiInput});
 }
 
 function loadDisplayNames() {
@@ -410,8 +417,9 @@ function collectState() {
     edgeTrim: numberValue("edge-trim"),
     groupBy: byId("group-by").value,
     panelColumns: numberValue("panel-columns"),
+    overviewGrouping: byId("overview-grouping").value,
     colorBy: byId("color-by").value,
-    pointBudget: numberValue("point-budget", 250000),
+    pointBudget: numberValue("point-budget", 150000),
     movingOnly: byId("moving-only").checked,
     walkThreshold: numberValue("walk-threshold"),
     binSize: numberValue("bin-size", 0),
@@ -430,7 +438,8 @@ function collectState() {
     labels: displayNames,
     playbackPercentile: byId("playback-cap").value,
     headingMode: byId("heading-mode").value,
-    headingBin: numberValue("heading-bin", .25),
+    headingBin: numberValue("heading-bin", 2),
+    transitionSplit: optionalNumber("transition-split"),
     headingSectors: numberValue("heading-sectors", 36),
     windows: observationWindows(),
     windowsVisible: byId("window-show").checked,
@@ -457,6 +466,7 @@ function persistState() {
   if (state.windowsVisible) params.set("wshow", "1"); else params.delete("wshow");
   params.set("lens", currentLens);
   params.set("view", currentView);
+  params.set("overview", state.overviewGrouping);
   if (Object.keys(panelOrders).length) params.set("order", JSON.stringify(panelOrders));
   else params.delete("order");
   params.set("filters", JSON.stringify(state.filters));
@@ -469,11 +479,16 @@ function persistState() {
     polarR: state.polarR, polarValidMin: state.polarValidMin,
   }));
   params.set("tw", byId("trajectory-width").value); params.set("topacity", byId("trajectory-opacity").value);
+  params.set("hmetric", byId("heat-metric").value); params.set("hscale", byId("heat-scale").value);
   params.set("hrange", byId("heat-range-mode").value); params.set("hcmin", byId("heat-cmin").value); params.set("hcmax", byId("heat-cmax").value);
   params.set("fmetric", byId("flow-metric").value); params.set("frange", byId("flow-range-mode").value);
   params.set("fcmin", byId("flow-cmin").value); params.set("fcmax", byId("flow-cmax").value);
   params.set("prate", byId("particle-rate").value); params.set("trail", byId("trail-length").value);
   params.set("fspeed", byId("flow-speed").value); params.set("fvar", byId("flow-variability").value);
+  params.set("fcolor", byId("flow-color-mode").value); params.set("fvelocity", byId("flow-velocity-mode").value);
+  if (state.transitionSplit == null) params.delete("tsplit"); else params.set("tsplit", state.transitionSplit);
+  params.set("toutcome", byId("transition-outcome").value); params.set("tdisplay", byId("transition-display").value);
+  params.set("tsupport", byId("transition-support").value);
   if (state.ringEnabled) params.set("ring", "1"); else params.delete("ring");
   if (state.ringContext) params.set("ringcontext", "1"); else params.set("ringcontext", "0");
   params.set("rings", JSON.stringify(rings)); params.set("ringmatch", state.ringMatch);
@@ -484,17 +499,23 @@ function restoreViewStateFromUrl() {
   const params = new URLSearchParams(location.search);
   const values = {
     "group-by": params.get("group"), "color-by": params.get("color"),
+    "overview-grouping": params.get("overview"),
     "panel-columns": params.get("cols"), "bin-size": params.get("bin"),
     "bound-percent": params.get("bound"), "angle-source": params.get("angle"),
     "stats-unit": params.get("unit"), "playback-cap": params.get("pcap"),
     "heading-mode": params.get("hmode"), "heading-bin": params.get("hbin"),
     "heading-sectors": params.get("hsec"), "trajectory-width": params.get("tw"),
-    "trajectory-opacity": params.get("topacity"), "heat-range-mode": params.get("hrange"),
+    "trajectory-opacity": params.get("topacity"), "heat-metric": params.get("hmetric"),
+    "heat-scale": params.get("hscale"), "heat-range-mode": params.get("hrange"),
     "heat-cmin": params.get("hcmin"), "heat-cmax": params.get("hcmax"),
     "flow-metric": params.get("fmetric"), "flow-range-mode": params.get("frange"),
     "flow-cmin": params.get("fcmin"), "flow-cmax": params.get("fcmax"),
     "particle-rate": params.get("prate"), "trail-length": params.get("trail"),
     "flow-speed": params.get("fspeed"), "flow-variability": params.get("fvar"),
+    "flow-color-mode": params.get("fcolor"), "flow-velocity-mode": params.get("fvelocity"),
+    "transition-split": params.get("tsplit"),
+    "transition-outcome": params.get("toutcome"), "transition-display": params.get("tdisplay"),
+    "transition-support": params.get("tsupport"),
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
   byId("window-show").checked = params.get("wshow") === "1";
@@ -548,6 +569,8 @@ function restoreViewStateFromUrl() {
 const scopeProducts = {
   layout: [], trajectory: ["trajectory"], playback: ["heading"], heading: ["heading"],
   polar: ["polar"], spatial: ["heatmap", "direction", "transition"],
+  heatmap: ["heatmap"], direction: ["direction"], overview: ["trajectory", "heatmap", "direction", "polar"],
+  overviewPreview: ["heatmap", "direction"],
   color: ["trajectory", "polar", "heading"], sample: ["trajectory", "polar", "heading"],
   statistics: ["polar", "metrics", "roi", "statistics"],
   transition: ["transition"],
@@ -585,7 +608,7 @@ function queueCompute(scope, extra = {}) {
   const requestId = ++latestRequest;
   pendingCompute = {type: "compute", requestId, state: collectState(), scope, ...extra};
   persistState();
-  setStatus("working", scope === "full" ? "Updating analysis" : "Refreshing view", "The retained table is running in a browser worker; the page remains interactive.");
+  if (!extra.quiet) setStatus("working", scope === "full" ? "Updating analysis" : "Refreshing view", "The retained table is running in a browser worker; the page remains interactive.");
   flushCompute();
 }
 
@@ -628,6 +651,8 @@ function applyDirectionVisuals() {
     trailLength: numberValue("trail-length", 1),
     speed: numberValue("flow-speed", 1),
     variability: numberValue("flow-variability", 1),
+    colorMode: byId("flow-color-mode").value,
+    velocityMode: byId("flow-velocity-mode").value,
   });
 }
 
@@ -637,6 +662,7 @@ function applyTransitionVisuals() {
     outcome: byId("transition-outcome").value,
     display: byId("transition-display").value,
     minimumSupport: numberValue("transition-support", 5),
+    split: optionalNumber("transition-split"),
   });
 }
 
@@ -647,6 +673,27 @@ function formatP(value) {
   return number.toFixed(3).replace(/^0/, "");
 }
 
+function compactLetters(count, tests = []) {
+  let columns = [new Set(Array.from({length: count}, (_, index) => index))];
+  for (const test of tests.filter(test => Number(test.adjustedP) < .05)) {
+    const next = [];
+    for (const column of columns) {
+      if (column.has(test.first) && column.has(test.second)) {
+        const withoutFirst = new Set(column); withoutFirst.delete(test.first);
+        const withoutSecond = new Set(column); withoutSecond.delete(test.second);
+        if (withoutFirst.size) next.push(withoutFirst);
+        if (withoutSecond.size) next.push(withoutSecond);
+      } else next.push(column);
+    }
+    columns = next.filter((column, index, all) => !all.some((other, otherIndex) =>
+      otherIndex !== index && column.size < other.size && [...column].every(value => other.has(value))));
+  }
+  const letter = index => index < 26 ? String.fromCharCode(65 + index)
+    : `${String.fromCharCode(65 + Math.floor(index / 26) - 1)}${String.fromCharCode(65 + index % 26)}`;
+  return Array.from({length: count}, (_, panel) => columns
+    .map((column, index) => column.has(panel) ? letter(index) : "").join(""));
+}
+
 function renderStatistics(data) {
   const host = byId("statistics-content");
   const metricLabels = {
@@ -654,19 +701,23 @@ function renderStatistics(data) {
     speed: "Median velocity", tortuosity: "Local tortuosity",
   };
   const metricCards = data.metrics.map(result => {
+    const letters = compactLetters(data.panels.length, result.pairwise);
     const significant = result.pairwise.filter(test => Number(test.adjustedP) < .05);
     const rows = significant.length ? significant.map(test => `
       <tr><td>${escapeHtml(data.panels[test.first])}</td><td>${escapeHtml(data.panels[test.second])}</td>
       <td><span class="stat-pill significant">${formatP(test.adjustedP)}</span></td></tr>`).join("")
       : `<tr><td colspan="3">No Holm-adjusted pairwise differences at α = .05.</td></tr>`;
     return `<article class="statistics-card"><h3>${escapeHtml(metricLabels[result.metric] || result.metric)}</h3>
-      <small>Kruskal–Wallis H(${result.omnibus.df}) = ${formatNumber(result.omnibus.h, 1)} · p ${formatP(result.omnibus.p)} · n ${result.counts.join(" / ")}</small>
+      <small>Kruskal–Wallis H(${result.omnibus.df}) = ${formatNumber(result.omnibus.h, 1)} · p ${formatP(result.omnibus.p)} · groups ${letters.join(" / ")} · n ${result.counts.join(" / ")}</small>
       <table><thead><tr><th>Panel</th><th>Panel</th><th>Holm p</th></tr></thead><tbody>${rows}</tbody></table></article>`;
   }).join("");
-  const rayleighRows = data.rayleigh.map(result => `<tr><td>${escapeHtml(data.panels[result.panel])}</td><td>${formatNumber(result.n, 0)}</td><td>${formatNumber(result.angle, 1)}°</td><td>${formatNumber(result.r, 1)}</td><td><span class="stat-pill ${result.p < .05 ? "significant" : ""}">${formatP(result.p)}</span></td></tr>`).join("");
+  const circularLetters = compactLetters(data.panels.length, data.circularPairwise);
+  const rayleighRows = data.rayleigh.map(result => `<tr><td>${escapeHtml(data.panels[result.panel])}</td><td>${result.p < .05 ? escapeHtml(circularLetters[result.panel]) : "—"}</td><td>${formatNumber(result.n, 0)}</td><td>${formatNumber(result.angle, 1)}°</td><td>${formatNumber(result.r, 1)}</td><td><span class="stat-pill ${result.p < .05 ? "significant" : ""}">${formatP(result.p)}${result.p < .001 ? " ***" : result.p < .01 ? " **" : result.p < .05 ? " *" : ""}</span></td></tr>`).join("");
+  const circularRows = (data.circularPairwise || []).map(test => `<tr><td>${escapeHtml(data.panels[test.first])}</td><td>${escapeHtml(data.panels[test.second])}</td><td>${formatNumber(test.difference, 1)}°</td><td><span class="stat-pill ${test.adjustedP < .05 ? "significant" : ""}">${test.comparable === false ? "not directional" : formatP(test.adjustedP)}</span></td></tr>`).join("");
   host.innerHTML = `<div class="statistics-grid">${metricCards}<article class="statistics-card"><h3>Circular direction</h3>
-    <small>Rayleigh test of uniformity on independent-unit resultant angles.</small>
-    <table><thead><tr><th>Panel</th><th>n</th><th>Mean</th><th>R</th><th>p</th></tr></thead><tbody>${rayleighRows}</tbody></table></article>
+    <small>Rayleigh stars show non-uniformity; letters summarize Holm-adjusted mean-angle comparisons among directional groups.</small>
+    <table><thead><tr><th>Panel</th><th>Group</th><th>n</th><th>Mean</th><th>R</th><th>Rayleigh p</th></tr></thead><tbody>${rayleighRows}</tbody></table>
+    <table><thead><tr><th>Panel</th><th>Panel</th><th>Δ mean</th><th>Holm p</th></tr></thead><tbody>${circularRows || '<tr><td colspan="4">At least two directional panels are needed.</td></tr>'}</tbody></table></article>
     <article class="statistics-card"><h3>Method</h3><small>${escapeHtml(data.method)}</small><p class="control-note">Inferential work is calculated on demand in the browser worker, so trajectory interaction and playback remain responsive.</p></article></div>`;
 }
 
@@ -741,21 +792,23 @@ function stepPlaybackSegment(delta) {
   updatePlaybackScope();
 }
 
-function renderProducts(incoming, summary) {
+function renderProducts(incoming, summary, quiet = false) {
   lastSummary = summary;
   Object.assign(products, incoming);
-  datasetSummary(summary);
-  if (summary.segmentOptions) {
-    visibleSegmentOptions = summary.segmentOptions;
-    populatePlaybackSegments();
+  if (!quiet) {
+    datasetSummary(summary);
+    if (summary.segmentOptions) {
+      visibleSegmentOptions = summary.segmentOptions;
+      populatePlaybackSegments();
+    }
+    updatePlaybackLimit(summary.durationSummary);
+    if (summary.panelKeys) renderPanelOrder(summary.panelKeys);
   }
-  updatePlaybackLimit(summary.durationSummary);
-  if (summary.panelKeys) renderPanelOrder(summary.panelKeys);
   const preserve = !newDataset && !!sharedView;
   if (incoming.trajectory) {
     incoming.trajectory.columns = numberValue("panel-columns");
     trajectoryRenderer.setData(incoming.trajectory, preserve);
-    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.5), numberValue("trajectory-opacity", .58));
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.1), numberValue("trajectory-opacity", .5));
     trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
     updatePlaybackScope();
     if (!preserve) sharedView = {...trajectoryRenderer.view};
@@ -780,7 +833,11 @@ function renderProducts(incoming, summary) {
   }
   if (incoming.heading) { incoming.heading.columns = numberValue("panel-columns"); headingRenderer.setData(incoming.heading); }
   if (incoming.metrics) metricsRenderer.setData(incoming.metrics);
-  if (incoming.statistics) renderStatistics(incoming.statistics);
+  if (incoming.statistics) {
+    renderStatistics(incoming.statistics);
+    polarRenderer.setStatistics?.(incoming.statistics);
+    metricsRenderer.setStatistics?.(incoming.statistics);
+  }
   if (incoming.windows) renderWindows(incoming.windows);
   if (incoming.transition) {
     incoming.transition.columns = numberValue("panel-columns");
@@ -795,6 +852,9 @@ function renderProducts(incoming, summary) {
   if (incoming.diagnostics) {
     velocityHistogram.setData(incoming.diagnostics.velocity);
     displacementHistogram.setData(incoming.diagnostics.displacement);
+  }
+  if (incoming.filterHistograms) for (const [key, histogram] of Object.entries(incoming.filterHistograms)) {
+    rangeControls.get(key)?.setHistogram(histogram);
   }
   const fraction = numberValue("trial-fraction", 100) / 100;
   trajectoryRenderer.setFraction(fraction); polarRenderer.setFraction(fraction); headingRenderer.setFraction(fraction);
@@ -821,9 +881,10 @@ function handleWorkerMessage(event) {
         byId("statistics-content").innerHTML = '<div class="analysis-empty">Open this view to calculate inferential statistics for the current filters.</div>';
         byId("windows-content").innerHTML = '<div class="analysis-empty">Open this view to compare the current spatial windows.</div>';
       }
-      renderProducts(message.products, message.summary);
-      setStatus("ready", "Ready for exploration", `${formatCount(message.summary.visibleRows)} points · ${formatCount(message.summary.visibleSegments)} segments · worker filter ${message.summary.filterMs.toFixed(0)} ms`);
-      if (message.scope === "full" && currentView === "statistics") scheduleCompute("statistics", 0);
+      renderProducts(message.products, message.summary, message.quiet);
+      if (!message.quiet) setStatus("ready", "Ready for exploration", `${formatCount(message.summary.visibleRows)} points · ${formatCount(message.summary.visibleSegments)} segments · worker filter ${message.summary.filterMs.toFixed(0)} ms`);
+      if (message.scope === "full" && ["statistics", "metrics", "polar"].includes(currentView)) scheduleCompute("statistics", 0);
+      if (message.scope === "full" && currentView === "compare") scheduleCompute("overview", 0);
       if (message.scope === "full" && currentView === "transitions") scheduleCompute("transition", 0);
       if (message.scope === "full" && currentView === "windows") scheduleCompute("windows", 0);
     }
@@ -890,13 +951,34 @@ async function loadDataset(source) {
 }
 
 function compositePlot(hostId) {
-  const canvases = [...byId(hostId).querySelectorAll("canvas")];
-  if (!canvases.length || !canvases[0].width) return null;
+  const canvases = [...byId(hostId).querySelectorAll("canvas")]
+    .filter(canvas => canvas.width > 0 && canvas.height > 0);
+  if (!canvases.length) return null;
   const output = document.createElement("canvas");
   output.width = canvases[0].width; output.height = canvases[0].height;
   const context = output.getContext("2d");
   for (const canvas of canvases) context.drawImage(canvas, 0, 0, output.width, output.height);
   return output.toDataURL("image/png");
+}
+
+function snapshotChart(renderer, height = 700) {
+  if (!renderer?.data || !globalThis.echarts) return null;
+  const staging = document.createElement("div");
+  staging.style.cssText = `position:fixed;left:-20000px;top:0;width:1200px;height:${height}px;background:white`;
+  document.body.appendChild(staging);
+  const originalHost = renderer.host;
+  let chart = null;
+  try {
+    renderer.host = staging;
+    const option = renderer.option();
+    renderer.host = originalHost;
+    chart = globalThis.echarts.init(staging, null, {renderer: "canvas"});
+    chart.setOption(option, {notMerge: true, lazyUpdate: false});
+    return chart.getDataURL({type: "png", pixelRatio: 2, backgroundColor: "#ffffff"});
+  } finally {
+    renderer.host = originalHost;
+    chart?.dispose(); staging.remove();
+  }
 }
 
 function setDashboardView(view, save = true) {
@@ -906,8 +988,8 @@ function setDashboardView(view, save = true) {
   ]);
   const previousView = currentView;
   currentView = allowed.has(view) ? view : "trajectory";
-  const spatial = new Set(["trajectory", "occupancy", "direction", "transitions", "compare"]);
-  const exploreViews = new Set([...spatial, "polar"]);
+  const spatial = new Set(["trajectory", "occupancy", "direction", "polar", "transitions", "compare"]);
+  const exploreViews = new Set(spatial);
   if (exploreViews.has(currentView)) currentLens = currentView;
   byId("explore-section").dataset.lens = currentLens;
   for (const button of document.querySelectorAll("[data-view-button]")) {
@@ -940,12 +1022,14 @@ function setDashboardView(view, save = true) {
     section.classList.remove("nav-forward", "nav-back");
     if (section.id === activeSection && previousView !== currentView) section.classList.add(direction);
   }
-  if (datasetHeader && currentView === "statistics" && !products.statistics) scheduleCompute("statistics", 0);
+  if (datasetHeader && ["statistics", "metrics", "polar"].includes(currentView) && !products.statistics) scheduleCompute("statistics", 0);
   if (datasetHeader && currentView === "transitions" && !products.transition) scheduleCompute("transition", 0);
   if (datasetHeader && currentView === "windows" && !products.windows) scheduleCompute("windows", 0);
+  if (datasetHeader && currentView === "compare") scheduleCompute("overview", 0);
+  else if (datasetHeader && previousView === "compare" && currentView !== "compare") scheduleCompute("full", 0);
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const shown = currentView === "compare"
-      ? new Set(["trajectory", "occupancy", "direction", "transitions"])
+      ? new Set(["trajectory", "occupancy", "direction", "polar"])
       : new Set([currentView]);
     if (shown.has("trajectory")) { trajectoryRenderer.resize(); trajectoryRenderer.draw(); }
     if (shown.has("occupancy")) { heatmapRenderer.resize(); heatmapRenderer.draw(); }
@@ -986,7 +1070,9 @@ const recipeVisualIds = [
   "trajectory-width", "trajectory-opacity", "heat-metric", "heat-scale",
   "heat-range-mode", "heat-cmin", "heat-cmax", "flow-metric",
   "flow-range-mode", "flow-cmin", "flow-cmax", "particle-rate",
-  "trail-length", "flow-speed", "flow-variability", "trial-fraction",
+  "trail-length", "flow-speed", "flow-variability", "flow-color-mode",
+  "flow-velocity-mode", "transition-split", "trial-fraction",
+  "transition-outcome", "transition-display", "transition-support",
 ];
 
 function currentRecipe() {
@@ -1032,6 +1118,7 @@ function applyRecipeControls(recipe) {
     jumpThreshold:"jump-threshold", jumpBufferMs:"jump-buffer",
     minDisplacement:"min-displacement", edgeTrim:"edge-trim", groupBy:"group-by",
     panelColumns:"panel-columns", colorBy:"color-by", pointBudget:"point-budget",
+    overviewGrouping:"overview-grouping",
     walkThreshold:"walk-threshold", binSize:"bin-size", boundPercent:"bound-percent",
     angleSource:"angle-source", statsUnit:"stats-unit", polarValidMin:"polar-valid-min",
     roiReach:"roi-reach", ringMatch:"ring-match", playbackPercentile:"playback-cap",
@@ -1061,7 +1148,7 @@ function applyRecipeControls(recipe) {
   for (const [id, value] of Object.entries(recipe.visuals || {})) if (byId(id) && value != null) byId(id).value = value;
   setDashboardView(state.view || state.lens || "trajectory", false);
   renderRingControls(); renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
-  trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.5), numberValue("trajectory-opacity", .58));
+  trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.1), numberValue("trajectory-opacity", .5));
   trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
   applyHeatmapVisuals(); applyDirectionVisuals(); updateFraction(); updatePlaybackLimit(); applyLocalRingObserver(false);
 }
@@ -1097,16 +1184,26 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>\"]/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[character]));
 }
 
-function exportNativeReport() {
+async function exportNativeReport() {
   if (!datasetHeader) return;
+  const exportButton = byId("export-button");
+  exportButton.disabled = true; exportButton.textContent = "Preparing report…";
+  setStatus("working", "Preparing native report", "Capturing the current linked views and analytical tables locally in your browser.");
+  await new Promise(resolve => requestAnimationFrame(() => resolve()));
+  try {
   const sections = [
-    ["Trajectory field", "trajectory-plot"], ["Occupancy", "heatmap-plot"],
-    ["Local direction", "direction-plot"], ["Polar direction", "polar-plot"],
-    ["ROI outcomes", "roi-plot"], ["Heading over time", "heading-plot"],
-    ["Trial metrics", "metrics-plot"], ["Velocity", "velocity-hist"],
-    ["Displacement", "displacement-hist"], ["Transition probability", "transition-plot"],
+    ["Trajectory field", () => compositePlot("trajectory-plot")],
+    ["Occupancy", () => compositePlot("heatmap-plot")],
+    ["Local direction", () => compositePlot("direction-plot")],
+    ["Polar direction", () => snapshotChart(polarRenderer)],
+    ["ROI outcomes", () => snapshotChart(roiRenderer)],
+    ["Heading over time", () => snapshotChart(headingRenderer)],
+    ["Trial metrics", () => snapshotChart(metricsRenderer)],
+    ["Velocity", () => snapshotChart(velocityHistogram, 430)],
+    ["Displacement", () => snapshotChart(displacementHistogram, 430)],
+    ["Transition probability", () => products.transition ? compositePlot("transition-plot") : null],
   ];
-  const figures = sections.map(([title, id]) => [title, compositePlot(id)]).filter(([, image]) => image);
+  const figures = sections.map(([title, capture]) => [title, capture()]).filter(([, image]) => image);
   const tableSections = [
     ["Observation windows", products.windows ? byId("windows-content").innerHTML : ""],
     ["Inferential statistics", products.statistics ? byId("statistics-content").innerHTML : ""],
@@ -1120,8 +1217,14 @@ function exportNativeReport() {
     <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Figures are a static record of the current native browser state.</small></footer>`;
   const blob = new Blob([html], {type: "text/html"});
   const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
-  anchor.href = url; anchor.download = `dari-deepa-native-${new Date().toISOString().slice(0,10)}.html`;
+  anchor.href = url; anchor.download = `daari-deepa-native-${new Date().toISOString().slice(0,10)}.html`;
   anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setStatus("ready", "Report exported", "The self-contained HTML report was downloaded from the current local browser state.");
+  } catch (error) {
+    setStatus("error", "Report export failed", error.message || String(error));
+  } finally {
+    exportButton.disabled = false; exportButton.textContent = "Export native report";
+  }
 }
 
 function updateFraction() {
@@ -1142,6 +1245,8 @@ function renderRingControls() {
   byId("ring-quick-delete").disabled = !rings.length;
   byId("curtain-state").textContent = byId("ring-enabled").checked && rings.length
     ? `${rings.length} curtain ${rings.length === 1 ? "ring" : "rings"}` : "Curtain off";
+  byId("curtain-toggle").textContent = byId("ring-enabled").checked && rings.length
+    ? `Curtain · ${rings.length}` : "Curtain";
 }
 
 function updateRingControlValues() {
@@ -1207,29 +1312,64 @@ function applyLocalRingObserver(save = false) {
     enabled, rings, byId("ring-match").value,
     byId("ring-context").checked,
   );
+  const activeRenderer = {
+    occupancy: heatmapRenderer, direction: directionRenderer, transitions: transitionRenderer,
+  }[currentView];
   for (const renderer of [heatmapRenderer, directionRenderer, transitionRenderer]) {
-    renderer.setRings(rings, enabled, byId("ring-match").value);
+    renderer.setRings(rings, enabled, byId("ring-match").value,
+      currentView === "compare" || renderer === activeRenderer);
   }
   byId("curtain-state").textContent = enabled
     ? `${rings.length} curtain ${rings.length === 1 ? "ring" : "rings"}` : "Curtain off";
+  byId("curtain-toggle").textContent = enabled ? `Curtain · ${rings.length}` : "Curtain";
   updateTrajectorySummary(stats);
   if (save) persistState();
   return stats;
 }
 
-function scheduleLocalRingObserver(final = false) {
+let curtainPreviewTimer = null;
+let curtainPreviewAt = 0;
+function curtainPreviewScope() {
+  return {
+    occupancy: "heatmap", direction: "direction", transitions: "transition",
+    polar: "polar", heading: "heading", compare: "overviewPreview",
+  }[currentView] || null;
+}
+function scheduleCurtainPreview() {
+  const scope = curtainPreviewScope();
+  if (!scope || curtainPreviewTimer) return;
+  const wait = Math.max(0, 125 - (performance.now() - curtainPreviewAt));
+  curtainPreviewTimer = setTimeout(() => {
+    curtainPreviewTimer = null; curtainPreviewAt = performance.now();
+    scheduleCompute(scope, 0, {quiet: true});
+  }, wait);
+}
+
+function scheduleLocalRingObserver(final = false, source = null) {
   if (final && ringFrame) cancelAnimationFrame(ringFrame);
   if (final) {
+    if (curtainPreviewTimer) clearTimeout(curtainPreviewTimer);
+    curtainPreviewTimer = null;
     ringFrame = null;
     applyLocalRingObserver(true);
     transitionSelectionActive = false;
-    scheduleCompute("full", 120);
+    scheduleCompute("full", 180);
     return;
   }
   if (ringFrame) return;
   ringFrame = requestAnimationFrame(() => {
     ringFrame = null;
-    applyLocalRingObserver(false);
+    const enabled = byId("ring-enabled").checked && rings.length > 0;
+    if (currentView === "trajectory" || currentView === "compare" || source === trajectoryRenderer) {
+      const stats = trajectoryRenderer.setRingObserver(
+        enabled, rings, byId("ring-match").value, byId("ring-context").checked,
+      );
+      updateTrajectorySummary(stats);
+    }
+    for (const renderer of [heatmapRenderer, directionRenderer, transitionRenderer]) {
+      if (renderer !== source) renderer.setRings(rings, enabled, byId("ring-match").value, false);
+    }
+    scheduleCurtainPreview();
   });
 }
 
@@ -1274,13 +1414,6 @@ byId("source-form").addEventListener("submit", event => { event.preventDefault()
 byId("controls-toggle").addEventListener("click", () => {
   const collapsed = shell.classList.toggle("controls-collapsed");
   byId("controls-toggle").setAttribute("aria-expanded", String(!collapsed));
-  setTimeout(() => {
-    for (const renderer of spatialRenderers) { renderer.resize(); renderer.draw(); }
-    for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer, velocityHistogram, displacementHistogram]) {
-      renderer.chart.resize({animation: {duration: 0}});
-      renderer.draw();
-    }
-  }, 220);
 });
 byId("sidebar-close").addEventListener("click", () => byId("controls-toggle").click());
 
@@ -1330,13 +1463,14 @@ for (const button of document.querySelectorAll("[data-layer-button]")) {
 }
 function stepDashboardView(delta) {
   const views = [...document.querySelectorAll("[data-view-button]")].map(button => button.dataset.viewButton);
-  const currentRailView = ["trajectory", "occupancy", "direction", "transitions", "compare"].includes(currentView)
+  const currentRailView = ["trajectory", "occupancy", "direction", "polar", "transitions", "compare"].includes(currentView)
     ? "trajectory" : currentView;
   const index = Math.max(0, views.indexOf(currentRailView));
   setDashboardView(views[(index + delta + views.length) % views.length]);
 }
 byId("view-prev").addEventListener("click", () => stepDashboardView(-1));
 byId("view-next").addEventListener("click", () => stepDashboardView(1));
+byId("overview-grouping").addEventListener("change", () => scheduleCompute("overview", 0));
 let railWheelLocked = false;
 byId("workspace").addEventListener("wheel", event => {
   const onRail = event.target.closest(".view-rail-track, .rail-context");
@@ -1350,8 +1484,9 @@ byId("workspace").addEventListener("wheel", event => {
 }, {passive: false});
 document.addEventListener("keydown", event => {
   if (event.target.closest("input, select, textarea") || event.metaKey || event.ctrlKey) return;
-  if (event.key === "ArrowRight") stepDashboardView(1);
-  else if (event.key === "ArrowLeft") stepDashboardView(-1);
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") stepDashboardView(1);
+  else if (event.key === "ArrowLeft" || event.key === "ArrowUp") stepDashboardView(-1);
+  else if (event.key.toLowerCase() === "c") setCurtainPalette(byId("curtain-palette").hidden);
 });
 for (const details of document.querySelectorAll(".context-settings")) details.addEventListener("toggle", () => {
   if (!details.open) return;
@@ -1381,6 +1516,9 @@ byId("ring-active").addEventListener("change", () => { activeRing = Number(byId(
 for (const id of ["ring-x", "ring-z", "ring-radius"]) {
   byId(id).addEventListener("input", updateActiveRing);
   byId(id).addEventListener("change", () => scheduleLocalRingObserver(true));
+  byId(id).addEventListener("keydown", event => {
+    if (event.key === "Enter") { event.preventDefault(); scheduleLocalRingObserver(true); byId(id).blur(); }
+  });
 }
 byId("ring-radius-slider").addEventListener("input", () => {
   byId("ring-radius").value = byId("ring-radius-slider").value;
@@ -1401,20 +1539,21 @@ for (const id of ["heat-metric", "heat-scale", "heat-range-mode", "heat-cmin", "
     applyHeatmapVisuals(); persistState();
   });
 }
-for (const id of ["flow-metric", "flow-range-mode", "flow-cmin", "flow-cmax",
+for (const id of ["flow-metric", "flow-color-mode", "flow-velocity-mode", "flow-range-mode", "flow-cmin", "flow-cmax",
   "particle-rate", "trail-length", "flow-speed", "flow-variability"]) {
-  const event = id === "flow-metric" || id === "flow-range-mode" ? "change" : "input";
+  const event = ["flow-metric", "flow-color-mode", "flow-velocity-mode", "flow-range-mode"].includes(id) ? "change" : "input";
   byId(id).addEventListener(event, () => { applyDirectionVisuals(); persistState(); });
 }
 for (const id of ["trajectory-width", "trajectory-opacity"]) {
   byId(id).addEventListener("input", () => {
-    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.5), numberValue("trajectory-opacity", .58));
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.1), numberValue("trajectory-opacity", .5));
     persistState();
   });
 }
 for (const id of ["transition-outcome", "transition-display", "transition-support"]) {
   byId(id).addEventListener(id === "transition-support" ? "input" : "change", applyTransitionVisuals);
 }
+byId("transition-split").addEventListener("change", () => scheduleCompute("transition", 20));
 byId("window-show").addEventListener("change", () => {
   trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
   persistState();

@@ -31,8 +31,10 @@ probability use linked Canvas renderers; polar, ROI, heading-time, metrics, and 
 Apache ECharts for mature hover, zoom, legend, and export interactions. Pan and
 zoom are shared locally between all Cartesian spatial layers. Curtain rings can
 be moved or resized directly on any of them and become one exact analytical
-subset for every downstream view. The generic raw-channel explorer has been
-removed.
+subset for every downstream view. Sparse per-segment occupancy/direction
+contributions keep live curtain previews incremental; the compact overview can
+show four pooled representations or every treatment panel. The generic
+raw-channel explorer has been removed.
 
 The behavioral contract and the distinction between scientific requirements
 and old framework artifacts are in

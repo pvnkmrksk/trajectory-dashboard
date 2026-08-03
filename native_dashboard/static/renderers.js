@@ -54,7 +54,7 @@ export function formatNumber(value, digits = 1) {
 }
 
 function autoColumns(count, requested = 0) {
-  if (requested > 0) return Math.max(1, Math.min(4, requested));
+  if (requested > 0) return Math.max(1, Math.min(4, Math.max(1, count), requested));
   if (count <= 1) return 1;
   if (count <= 4) return 2;
   if (count <= 9) return 3;
@@ -345,6 +345,7 @@ function installSpatialInteraction(renderer, canvas) {
   canvas.addEventListener("pointerdown", event => {
     if (!renderer.data || !renderer.view) return;
     const rect = canvas.getBoundingClientRect();
+    if (renderer.isControlOverlay?.(event.clientX - rect.left, event.clientY - rect.top)) return;
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
     if (!point) {
       if (renderer.backgroundHandler) drag = {mode: "background", moved: false, x: event.clientX, y: event.clientY};
@@ -445,6 +446,9 @@ function installSpatialInteraction(renderer, canvas) {
       tooltip.hidden = true;
       return;
     }
+    if (renderer.isControlOverlay?.(event.clientX - rect.left, event.clientY - rect.top)) {
+      tooltip.hidden = true; canvas.style.cursor = "default"; return;
+    }
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
     if (!point) { tooltip.hidden = true; return; }
     const hit = renderer.hitRing?.(point);
@@ -460,6 +464,7 @@ function installSpatialInteraction(renderer, canvas) {
     if (!renderer.data || !renderer.view) return;
     event.preventDefault();
     const rect = canvas.getBoundingClientRect();
+    if (renderer.isControlOverlay?.(event.clientX - rect.left, event.clientY - rect.top)) return;
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
     if (!point) return;
     const factor = Math.exp(Math.max(-700, Math.min(700, event.deltaY)) * .0011);
@@ -497,9 +502,24 @@ class SpatialBase {
     this.gridVisible = true;
     this.cleanMode = false;
   }
-  setRoisVisible(value) { this.roisVisible = !!value; this.draw(); }
-  setGridVisible(value) { this.gridVisible = !!value; this.draw(); }
-  setCleanMode(value) { this.cleanMode = !!value; this.draw(); }
+  setRoisVisible(value) {
+    const next = !!value;
+    if (next === this.roisVisible) return;
+    this.roisVisible = next;
+    this.draw();
+  }
+  setGridVisible(value) {
+    const next = !!value;
+    if (next === this.gridVisible) return;
+    this.gridVisible = next;
+    this.draw();
+  }
+  setCleanMode(value) {
+    const next = !!value;
+    if (next === this.cleanMode) return;
+    this.cleanMode = next;
+    this.draw();
+  }
   setColumns(columns) {
     if (!this.data) return;
     this.data.columns = Number(columns) || 0;
@@ -510,13 +530,13 @@ class SpatialBase {
   setRingMoveHandler(handler) { this.ringMoveHandler = handler; }
   setRingDeleteHandler(handler) { this.ringDeleteHandler = handler; }
   setRingSelectHandler(handler) { this.ringSelectHandler = handler; }
-  setRings(rings, enabled = true, match = "any") {
+  setRings(rings, enabled = true, match = "any", redraw = true) {
     if (!this.data) return;
     this.data.rings = (rings || []).map(ring => ({...ring}));
     this.data.ringEnabled = !!enabled && this.data.rings.length > 0;
     this.data.ringMatch = match;
     this.activeRing = Math.max(0, Math.min(this.data.rings.length - 1, this.activeRing || 0));
-    this.draw();
+    if (redraw) this.draw();
   }
   hitRing(point) {
     if (!this.data?.ringEnabled || !this.data?.rings?.length || !this.view) return null;
@@ -606,8 +626,8 @@ export class TrajectoryRenderer extends SpatialBase {
     this.fraction = 1;
     this.timeLimit = 1e30;
     this.selectedSegment = -1;
-    this.lineWidth = 1.5;
-    this.lineOpacity = .58;
+    this.lineWidth = 1.1;
+    this.lineOpacity = .5;
     this._initGl();
     installSpatialInteraction(this, this.overlay);
     installResize(this);
@@ -735,6 +755,23 @@ export class TrajectoryRenderer extends SpatialBase {
     this.instanceCount = data.links;
     this.ringEntries = new Float32Array(Math.max(1, data.segmentCount || 1));
     this.ringEntries.fill(-1);
+    this.segmentLinkStart = new Int32Array(this.ringEntries.length); this.segmentLinkStart.fill(-1);
+    this.segmentLinkEnd = new Int32Array(this.ringEntries.length); this.segmentLinkEnd.fill(-1);
+    this.segmentMinX = new Float32Array(this.ringEntries.length); this.segmentMinX.fill(Infinity);
+    this.segmentMaxX = new Float32Array(this.ringEntries.length); this.segmentMaxX.fill(-Infinity);
+    this.segmentMinZ = new Float32Array(this.ringEntries.length); this.segmentMinZ.fill(Infinity);
+    this.segmentMaxZ = new Float32Array(this.ringEntries.length); this.segmentMaxZ.fill(-Infinity);
+    for (let link = 0; link < data.links; link += 1) {
+      const segment = data.segments[link * 2], vertex = link * 4;
+      if (this.segmentLinkStart[segment] < 0) this.segmentLinkStart[segment] = link;
+      this.segmentLinkEnd[segment] = link + 1;
+      const x0 = data.vertices[vertex], z0 = data.vertices[vertex + 1];
+      const x1 = data.vertices[vertex + 2], z1 = data.vertices[vertex + 3];
+      this.segmentMinX[segment] = Math.min(this.segmentMinX[segment], x0, x1);
+      this.segmentMaxX[segment] = Math.max(this.segmentMaxX[segment], x0, x1);
+      this.segmentMinZ[segment] = Math.min(this.segmentMinZ[segment], z0, z1);
+      this.segmentMaxZ[segment] = Math.max(this.segmentMaxZ[segment], z0, z1);
+    }
     this.ringEnabled = false;
     this._uploadRingEntries();
     if (!preserveView || !this.view) this.view = squareBounds(data.bounds);
@@ -770,17 +807,24 @@ export class TrajectoryRenderer extends SpatialBase {
       const hitTimes = active.map(() => {
         const values = new Float32Array(this.ringEntries.length); values.fill(-1); return values;
       });
-      for (let link = 0; link < this.data.links; link += 1) {
-        const segment = this.data.segments[link * 2];
-        const vertex = link * 4, time = link * 2;
+      for (let segment = 0; segment < this.ringEntries.length; segment += 1) {
+        const first = this.segmentLinkStart[segment], end = this.segmentLinkEnd[segment];
+        if (first < 0 || end <= first) continue;
         for (let index = 0; index < active.length; index += 1) {
-          if (hitTimes[index][segment] >= 0) continue;
-          const fraction = circleEntryFraction(
-            this.data.vertices[vertex], this.data.vertices[vertex + 1],
-            this.data.vertices[vertex + 2], this.data.vertices[vertex + 3], active[index],
-          );
-          if (fraction != null) hitTimes[index][segment] = this.data.times[time]
-            + fraction * (this.data.times[time + 1] - this.data.times[time]);
+          const ring = active[index];
+          if (this.segmentMaxX[segment] < ring.x - ring.r || this.segmentMinX[segment] > ring.x + ring.r
+              || this.segmentMaxZ[segment] < ring.z - ring.r || this.segmentMinZ[segment] > ring.z + ring.r) continue;
+          for (let link = first; link < end; link += 1) {
+            const vertex = link * 4, time = link * 2;
+            const fraction = circleEntryFraction(
+              this.data.vertices[vertex], this.data.vertices[vertex + 1],
+              this.data.vertices[vertex + 2], this.data.vertices[vertex + 3], ring,
+            );
+            if (fraction == null) continue;
+            hitTimes[index][segment] = this.data.times[time]
+              + fraction * (this.data.times[time + 1] - this.data.times[time]);
+            break;
+          }
         }
       }
       for (let segment = 0; segment < this.ringEntries.length; segment += 1) {
@@ -816,8 +860,8 @@ export class TrajectoryRenderer extends SpatialBase {
     this.drawGl();
   }
   setLineStyle(width, opacity) {
-    this.lineWidth = Math.max(.5, Math.min(8, Number(width) || 1.5));
-    this.lineOpacity = Math.max(.03, Math.min(1, Number(opacity) || .58));
+    this.lineWidth = Math.max(.5, Math.min(8, Number(width) || 1.1));
+    this.lineOpacity = Math.max(.03, Math.min(1, Number(opacity) || .5));
     this.drawGl();
   }
   setObservationWindows(windows) {
@@ -946,6 +990,7 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
     this.clipMin = 0;
     this.clipMax = 99;
     this.textures = [];
+    this.valueDensity = [];
   }
   setMetricScale(metric, scale, clipMode = this.clipMode,
                  clipMin = this.clipMin, clipMax = this.clipMax) {
@@ -1009,6 +1054,21 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
     this.valueRange = {lo, hi};
     const transform = value => this.scale === "log" ? Math.log1p(Math.max(0, value)) : value;
     const scaledLo = transform(lo), scaledHi = transform(hi);
+    const density = new Float32Array(28);
+    for (const value of positive) {
+      const norm = (transform(value) - scaledLo) / Math.max(1e-12, scaledHi - scaledLo);
+      const bin = Math.max(0, Math.min(density.length - 1, Math.floor(norm * density.length)));
+      density[bin] += 1;
+    }
+    const smooth = new Float32Array(density.length);
+    for (let index = 0; index < density.length; index += 1) {
+      for (let offset = -2; offset <= 2; offset += 1) {
+        const source = index + offset;
+        if (source >= 0 && source < density.length) smooth[index] += density[source] * (3 - Math.abs(offset));
+      }
+    }
+    const densityMax = Math.max(1, ...smooth);
+    this.valueDensity = Array.from(smooth, value => value / densityMax);
     for (let panel = 0; panel < panelCount; panel += 1) {
       const values = panelValues[panel];
       const canvas = document.createElement("canvas");
@@ -1030,6 +1090,16 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
       context.putImageData(image, 0, 0);
       this.textures.push(canvas);
     }
+  }
+  isControlOverlay(px, py) {
+    if (!this.data || !this.valueRange) return false;
+    const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+    for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+      const pane = this.pane(panel, layout), barH = Math.min(82, pane.height * .18);
+      const bx = pane.right - 27, by = pane.top + 8;
+      if (px >= bx - 34 && px <= pane.right && py >= by - 4 && py <= by + barH + 4) return true;
+    }
+    return false;
   }
   draw() {
     const layout = this.begin();
@@ -1056,7 +1126,7 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
       this.ctx.imageSmoothingEnabled = true;
       if (this.valueRange) {
         const barW = 7, barH = Math.min(82, pane.height * .18);
-        const bx = pane.right - barW - 7, by = pane.top + 8;
+        const bx = pane.right - 27, by = pane.top + 8;
         const gradient = this.ctx.createLinearGradient(0, by + barH, 0, by);
         for (let stop = 0; stop <= 1; stop += .2) gradient.addColorStop(stop, sequentialColor(stop));
         this.ctx.fillStyle = gradient; this.ctx.fillRect(bx, by, barW, barH);
@@ -1066,6 +1136,17 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
         this.ctx.fillText(formatNumber(this.valueRange.hi, 1), bx - 3, by);
         this.ctx.textBaseline = "bottom";
         this.ctx.fillText(formatNumber(this.valueRange.lo, 1), bx - 3, by + barH);
+        if (this.valueDensity?.length) {
+          const profileX = bx + barW + 2, profileW = 15;
+          this.ctx.beginPath(); this.ctx.moveTo(profileX, by + barH);
+          for (let index = 0; index < this.valueDensity.length; index += 1) {
+            const y = by + barH * (1 - index / Math.max(1, this.valueDensity.length - 1));
+            this.ctx.lineTo(profileX + profileW * this.valueDensity[index], y);
+          }
+          this.ctx.lineTo(profileX, by); this.ctx.closePath();
+          this.ctx.fillStyle = "rgba(13,116,106,.18)"; this.ctx.fill();
+          this.ctx.strokeStyle = "rgba(13,116,106,.42)"; this.ctx.lineWidth = .75; this.ctx.stroke();
+        }
       }
       this.ctx.restore();
     }
@@ -1104,6 +1185,22 @@ export class TransitionRenderer extends HeatmapRenderer {
       ? `${formatNumber(cell.value, 0)} paths`
       : `${formatNumber(cell.value * 100, 1)}%`;
     return `${this.data.panelNames?.[point.panel] || "All"} · ${shown} · ${formatNumber(cell.entered, 0)} entered · click for raw paths`;
+  }
+  draw() {
+    super.draw();
+    if (!this.data || !this.view || !Number.isFinite(this.data.split)) return;
+    const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+    this.ctx.save(); this.ctx.strokeStyle = "rgba(31,49,44,.72)";
+    this.ctx.lineWidth = 1.25; this.ctx.setLineDash([5, 4]);
+    this.ctx.font = "700 8px Inter, system-ui"; this.ctx.fillStyle = "rgba(31,49,44,.76)";
+    for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+      const pane = this.pane(panel, layout);
+      const [, y] = this.worldToPixel((this.view.xmin + this.view.xmax) / 2, this.data.split, pane);
+      if (y < pane.top || y > pane.bottom) continue;
+      this.ctx.beginPath(); this.ctx.moveTo(pane.left, y); this.ctx.lineTo(pane.right, y); this.ctx.stroke();
+      this.ctx.fillText(`split Z ${formatNumber(this.data.split, 1)}`, pane.left + 5, y - 5);
+    }
+    this.ctx.restore();
   }
   buildTextures() {
     this.textures = [];
@@ -1146,9 +1243,60 @@ export class TransitionRenderer extends HeatmapRenderer {
   }
 }
 
-function angleColor(angle, alpha = 1) {
-  const hue = ((angle % 360) + 360) % 360;
-  return `hsla(${hue}, 62%, 43%, ${alpha})`;
+function oklchRgb(angle) {
+  const hue = (((angle % 360) + 360) % 360) * Math.PI / 180;
+  const lightness = .66, chroma = .135;
+  const a = chroma * Math.cos(hue), b = chroma * Math.sin(hue);
+  const l0 = lightness + .3963377774 * a + .2158037573 * b;
+  const m0 = lightness - .1055613458 * a - .0638541728 * b;
+  const s0 = lightness - .0894841775 * a - 1.291485548 * b;
+  const l = l0 ** 3, m = m0 ** 3, s = s0 ** 3;
+  const linear = [
+    4.0767416621 * l - 3.3077115913 * m + .2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - .3413193965 * s,
+    -.0041960863 * l - .7034186147 * m + 1.707614701 * s,
+  ];
+  return linear.map(value => {
+    const encoded = value <= .0031308 ? 12.92 * value : 1.055 * Math.max(0, value) ** (1 / 2.4) - .055;
+    return Math.round(255 * Math.max(0, Math.min(1, encoded)));
+  });
+}
+
+function angleColor(angle, alpha = 1, mode = "direction") {
+  if (mode !== "direction") return `rgba(31,111,102,${alpha})`;
+  const [r, g, b] = oklchRgb(angle);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function drawDirectionFrame(ctx, pane, mode) {
+  if (mode !== "direction") return;
+  const {left, right, top, bottom} = pane;
+  const cx = (left + right) / 2, cy = (top + bottom) / 2;
+  const points = [];
+  const segments = 96;
+  const perimeter = 2 * ((right - left) + (bottom - top));
+  for (let index = 0; index <= segments; index += 1) {
+    let d = perimeter * index / segments;
+    let x, y;
+    if (d <= right - left) { x = left + d; y = top; }
+    else if ((d -= right - left) <= bottom - top) { x = right; y = top + d; }
+    else if ((d -= bottom - top) <= right - left) { x = right - d; y = bottom; }
+    else { d -= right - left; x = left; y = bottom - d; }
+    points.push({x, y, angle: Math.atan2(x - cx, cy - y) * 180 / Math.PI});
+  }
+  ctx.save(); ctx.lineWidth = 2.2; ctx.lineCap = "butt";
+  for (let index = 1; index < points.length; index += 1) {
+    ctx.strokeStyle = angleColor((points[index - 1].angle + points[index].angle) / 2, .82);
+    ctx.beginPath(); ctx.moveTo(points[index - 1].x, points[index - 1].y);
+    ctx.lineTo(points[index].x, points[index].y); ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(56,69,65,.62)";
+  ctx.font = "700 7px ui-monospace, SFMono-Regular, monospace";
+  ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillText("0°", cx, top + 4);
+  ctx.textBaseline = "bottom"; ctx.fillText("180°", cx, bottom - 4);
+  ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillText("90°", right - 4, cy);
+  ctx.textAlign = "left"; ctx.fillText("−90°", left + 4, cy);
+  ctx.restore();
 }
 
 export class DirectionRenderer extends CanvasSpatialRenderer {
@@ -1163,6 +1311,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     this.visualOptions = {
       particleRate: 1, trailLength: 1, speed: 1, variability: 1,
       metric: "time", clipMode: "percentile", clipMin: 0, clipMax: 99,
+      colorMode: "direction", velocityMode: "measured",
     };
     this._rng = 0x6d2b79f5;
     this._pausedUntil = 0;
@@ -1302,6 +1451,9 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     particle.panel = panel;
     particle.x = this.data.x0 + (ix + .08 + this._random() * .84) * this.data.bin;
     particle.z = this.data.z0 + (iz + .08 + this._random() * .84) * this.data.bin;
+    particle.originX = particle.x; particle.originZ = particle.z; particle.travel = 0;
+    particle.maxTravel = this.data.bin * Math.min(1.8,
+      .55 + .48 * Math.max(.25, this.visualOptions.trailLength));
     particle.age = 0;
     particle.bias = this._normalRandom() * circularSigma * this.visualOptions.variability;
     const directedMass = abundanceScale * strength;
@@ -1312,13 +1464,15 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
   }
   _resetParticles() {
     if (!this.data?.panelCount || !this.spawnTables.length) return;
-    const perPanel = Math.max(18, Math.min(420, Math.floor(
-      900 / this.data.panelCount * this.visualOptions.particleRate
-    )));
+    const maximumTable = Math.max(1, ...this.spawnTables.map(table => table.total || 0));
     this.particles = [];
     for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+      const relativeMass = Math.sqrt((this.spawnTables[panel]?.total || 0) / maximumTable);
+      const perPanel = Math.max(12, Math.min(420, Math.floor(
+        900 / this.data.panelCount * this.visualOptions.particleRate * (.35 + .65 * relativeMass)
+      )));
       for (let i = 0; i < perPanel; i += 1) {
-        const particle = {panel, x: 0, z: 0, age: -1, maxAge: 1, bias: 0};
+        const particle = {panel, x: 0, z: 0, originX: 0, originZ: 0, travel: 0, maxTravel: 1, age: -1, maxAge: 1, bias: 0};
         this._respawn(particle, panel);
         particle.age = Math.floor(this._random() * particle.maxAge);
         this.particles.push(particle);
@@ -1334,7 +1488,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     const gz = (z - this.data.z0) / this.data.bin - .5;
     const ix0 = Math.floor(gx), iz0 = Math.floor(gz);
     const fx = gx - ix0, fz = gz - iz0;
-    let vx = 0, vz = 0, abundance = 0, weight = 0;
+    let vx = 0, vz = 0, abundance = 0, meanSpeed = 0, weight = 0;
     let strongestWeight = -1, fallbackAngle = NaN, fallbackStrength = 0;
     const cells = this.data.nx * this.data.nz;
     for (let dz = 0; dz <= 1; dz += 1) for (let dx = 0; dx <= 1; dx += 1) {
@@ -1348,6 +1502,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       vx += Math.sin(radians) * strength * w;
       vz += Math.cos(radians) * strength * w;
       abundance += this.abundanceValues[index] * w;
+      meanSpeed += (this.data.meanSpeed?.[index] || 0) * w;
       weight += w;
       const candidate = this.abundanceValues[index] * w;
       if (candidate > strongestWeight) {
@@ -1355,7 +1510,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       }
     }
     if (!(weight > .08)) return null;
-    vx /= weight; vz /= weight; abundance /= weight;
+    vx /= weight; vz /= weight; abundance /= weight; meanSpeed /= weight;
     const vectorStrength = Math.hypot(vx, vz);
     const angle = vectorStrength > .005
       ? Math.atan2(vx, vz) * 180 / Math.PI
@@ -1363,7 +1518,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     if (!Number.isFinite(angle)) return null;
     return {
       strength: Math.max(.001, Math.min(1, vectorStrength > .005 ? vectorStrength : fallbackStrength)),
-      abundance, angle,
+      abundance, angle, meanSpeed,
     };
   }
   tooltipText(point) {
@@ -1374,7 +1529,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     if (!Number.isFinite(this.data.angle[index])) return null;
     const unit = this.visualOptions.metric === "count" ? "samples"
       : (this.visualOptions.metric === "percent" ? "%" : "s");
-    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 1)} · ${formatNumber(this.abundanceValues[index], 1)} ${unit}`;
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 1)} · ${formatNumber(this.data.meanSpeed?.[index], 1)} cm/s · ${formatNumber(this.abundanceValues[index], 1)} ${unit}`;
   }
   draw() {
     const layout = this.begin();
@@ -1407,7 +1562,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
           const dx = Math.sin(radians) * len * .5;
           const dy = -Math.cos(radians) * len * .5;
           this.ctx.lineCap = "round";
-          this.ctx.strokeStyle = angleColor(angle[index], .035 + .11 * abundanceScale);
+          this.ctx.strokeStyle = angleColor(angle[index], .035 + .11 * abundanceScale, this.visualOptions.colorMode);
           this.ctx.lineWidth = .35 + .5 * abundanceScale;
           this.ctx.beginPath();
           this.ctx.moveTo(cx - dx, cy - dy);
@@ -1418,6 +1573,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       this.ctx.restore();
     }
     this.drawSharedOverlays();
+    for (let panel = 0; panel < panelCount; panel += 1) drawDirectionFrame(this.ctx, this.pane(panel, layout), this.visualOptions.colorMode);
   }
   drawParticles(now) {
     if (!this.data || !this.view || !this.particleCtx || !this.particles.length) return;
@@ -1444,24 +1600,28 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
         * this.visualOptions.variability;
       particle.bias += (this._normalRandom() * sigma - particle.bias) * .035;
       const radians = (vector.angle + particle.bias * 180 / Math.PI) * Math.PI / 180;
-      const speed = this.data.bin * this.visualOptions.speed
-        * (.45 + 3.9 * Math.min(1, vector.strength))
+      const illustrativeSpeed = this.data.bin * (.45 + 3.9 * Math.min(1, vector.strength))
         * (.72 + .55 * abundanceScale);
+      const measuredSpeed = Math.max(this.data.bin * .04, Math.min(this.data.bin * 12, vector.meanSpeed || 0));
+      const speed = (this.visualOptions.velocityMode === "measured" ? measuredSpeed : illustrativeSpeed)
+        * this.visualOptions.speed;
       const nx = particle.x + Math.sin(radians) * speed * dt;
       const nz = particle.z + Math.cos(radians) * speed * dt;
       const pane = this.pane(particle.panel, layout);
       const shown = equalScaleView(this.view, pane);
-      if (nx < shown.xmin || nx > shown.xmax || nz < shown.zmin || nz > shown.zmax) {
+      const travel = particle.travel + Math.hypot(nx - particle.x, nz - particle.z);
+      if (nx < shown.xmin || nx > shown.xmax || nz < shown.zmin || nz > shown.zmax
+          || travel > particle.maxTravel) {
         this._respawn(particle);
         continue;
       }
       const [x0, y0] = this.worldToPixel(particle.x, particle.z, pane);
       const [x1, y1] = this.worldToPixel(nx, nz, pane);
       const life = Math.sin(Math.PI * particle.age / Math.max(1, particle.maxAge));
-      ctx.strokeStyle = angleColor(vector.angle, (.12 + .58 * abundanceScale) * (.3 + .7 * life));
+      ctx.strokeStyle = angleColor(vector.angle, (.12 + .58 * abundanceScale) * (.3 + .7 * life), this.visualOptions.colorMode);
       ctx.lineWidth = .5 + 1.55 * abundanceScale;
       ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
-      particle.x = nx; particle.z = nz; particle.age += 1;
+      particle.x = nx; particle.z = nz; particle.travel = travel; particle.age += 1;
     }
     drawPanelRings(ctx, this.width, this.height, this.data, this.view);
   }
