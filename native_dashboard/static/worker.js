@@ -15,6 +15,7 @@ let lastAnalysisKey = "";
 let lastPanelKey = "";
 let lastOccupancy = null;
 let lastOccupancyKey = "";
+let lastTransitionGeometry = null;
 
 function typedArray(dtype, buffer, offset, length) {
   const byteOffset = bodyOffset + offset;
@@ -555,6 +556,57 @@ function buildDirection(state, analysis) {
     buildMs: performance.now() - started};
 }
 
+function buildTransition(state, analysis) {
+  const started = performance.now();
+  const grid = gridGeometry(state, analysis), cells = grid.nx * grid.nz;
+  const entered = new Uint32Array(analysis.panelCount * cells);
+  const crossed = new Uint32Array(entered.length), ended = new Uint32Array(entered.length);
+  const startsByBin = new Map();
+  for (const seg of analysis.visibleSegments) {
+    let first = -1;
+    for (let row = starts[seg]; row < ends[seg]; row += 1) if (analysis.rowKeep[row]) { first = row; break; }
+    if (first < 0) continue;
+    const bin = Math.round(data.z[first] / Math.max(grid.bin, 1e-9));
+    startsByBin.set(bin, (startsByBin.get(bin) || 0) + 1);
+  }
+  let modalBin = 0, modalCount = -1;
+  for (const [bin, count] of startsByBin) if (count > modalCount || (count === modalCount && Math.abs(bin) < Math.abs(modalBin))) {
+    modalBin = bin; modalCount = count;
+  }
+  const split = modalBin * grid.bin;
+  for (const seg of analysis.visibleSegments) {
+    const start = starts[seg], end = ends[seg], length = end - start;
+    const suffixMin = new Float32Array(length + 1), suffixMax = new Float32Array(length + 1);
+    suffixMin[length] = Infinity; suffixMax[length] = -Infinity;
+    let minimum = Infinity, maximum = -Infinity, finalZ = NaN;
+    for (let offset = length - 1; offset >= 0; offset -= 1) {
+      const row = start + offset;
+      if (analysis.rowKeep[row] && Number.isFinite(data.z[row])) {
+        minimum = Math.min(minimum, data.z[row]); maximum = Math.max(maximum, data.z[row]);
+        if (!Number.isFinite(finalZ)) finalZ = data.z[row];
+      }
+      suffixMin[offset] = minimum; suffixMax[offset] = maximum;
+    }
+    const seen = new Set(), panel = analysis.segmentPanel[seg];
+    for (let offset = 0; offset < length; offset += 1) {
+      const row = start + offset;
+      if (!analysis.rowKeep[row]) continue;
+      const ix = Math.floor((data.x[row] - grid.x0) / grid.bin);
+      const iz = Math.floor((data.z[row] - grid.z0) / grid.bin);
+      if (ix < 0 || ix >= grid.nx || iz < 0 || iz >= grid.nz || panel < 0) continue;
+      const local = iz * grid.nx + ix;
+      if (seen.has(local)) continue;
+      seen.add(local);
+      const index = panel * cells + local, upper = data.z[row] >= split;
+      entered[index] += 1;
+      if (upper ? suffixMin[Math.min(length, offset + 1)] < split : suffixMax[Math.min(length, offset + 1)] > split) crossed[index] += 1;
+      if (Number.isFinite(finalZ) && (upper ? finalZ < split : finalZ > split)) ended[index] += 1;
+    }
+  }
+  return {...spatialCommon(state, analysis, grid), entered, crossed, ended, split,
+    buildMs: performance.now() - started};
+}
+
 function unitColor(seg, state, analysis) {
   return rowColor(starts[seg], seg, state, analysis);
 }
@@ -817,6 +869,185 @@ function buildMetrics(state, analysis) {
   };
 }
 
+function errorFunction(value) {
+  const sign = value < 0 ? -1 : 1, x = Math.abs(value);
+  const t = 1 / (1 + .3275911 * x);
+  const polynomial = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - .284496736) * t + .254829592) * t;
+  return sign * (1 - polynomial * Math.exp(-x * x));
+}
+
+function normalCdf(value) { return .5 * (1 + errorFunction(value / Math.SQRT2)); }
+
+function rankCombined(groups) {
+  const combined = [];
+  groups.forEach((values, group) => values.forEach(value => {
+    if (Number.isFinite(value)) combined.push({value, group, rank: 0});
+  }));
+  combined.sort((a, b) => a.value - b.value);
+  let tieCorrection = 0;
+  for (let start = 0; start < combined.length;) {
+    let end = start + 1;
+    while (end < combined.length && combined[end].value === combined[start].value) end += 1;
+    const rank = (start + 1 + end) / 2;
+    for (let index = start; index < end; index += 1) combined[index].rank = rank;
+    const tie = end - start; tieCorrection += tie * tie * tie - tie; start = end;
+  }
+  return {combined, tieCorrection};
+}
+
+function mannWhitney(first, second) {
+  const groups = [first.filter(Number.isFinite), second.filter(Number.isFinite)];
+  const n1 = groups[0].length, n2 = groups[1].length, n = n1 + n2;
+  if (!n1 || !n2) return {u: NaN, z: NaN, p: NaN};
+  const ranked = rankCombined(groups); let r1 = 0;
+  for (const item of ranked.combined) if (item.group === 0) r1 += item.rank;
+  const u1 = r1 - n1 * (n1 + 1) / 2, u2 = n1 * n2 - u1, u = Math.min(u1, u2);
+  const tieFactor = n > 1 ? ranked.tieCorrection / (n * (n - 1)) : 0;
+  const variance = n1 * n2 / 12 * ((n + 1) - tieFactor);
+  const z = variance > 0 ? (Math.abs(u1 - n1 * n2 / 2) - .5) / Math.sqrt(variance) : 0;
+  return {u, z, p: Math.max(0, Math.min(1, 2 * (1 - normalCdf(Math.abs(z)))))};
+}
+
+function kruskalWallis(groups) {
+  const usable = groups.map(values => values.filter(Number.isFinite));
+  const ranked = rankCombined(usable), n = ranked.combined.length;
+  if (n < 2 || usable.filter(values => values.length).length < 2) return {h: NaN, df: 0, p: NaN};
+  const sums = new Float64Array(usable.length);
+  for (const item of ranked.combined) sums[item.group] += item.rank;
+  let h = 0;
+  for (let group = 0; group < usable.length; group += 1) if (usable[group].length) h += sums[group] * sums[group] / usable[group].length;
+  h = 12 * h / (n * (n + 1)) - 3 * (n + 1);
+  const correction = 1 - ranked.tieCorrection / Math.max(1, n * n * n - n);
+  h = correction > 0 ? h / correction : h;
+  const df = usable.filter(values => values.length).length - 1;
+  const cube = Math.pow(Math.max(0, h) / Math.max(1, df), 1 / 3);
+  const z = (cube - (1 - 2 / (9 * Math.max(1, df)))) / Math.sqrt(2 / (9 * Math.max(1, df)));
+  return {h, df, p: Math.max(0, Math.min(1, 1 - normalCdf(z)))};
+}
+
+function holmAdjust(tests) {
+  const ordered = tests.map((test, index) => ({index, p: test.p})).filter(item => Number.isFinite(item.p)).sort((a, b) => a.p - b.p);
+  let previous = 0;
+  for (let rank = 0; rank < ordered.length; rank += 1) {
+    const adjusted = Math.min(1, Math.max(previous, ordered[rank].p * (ordered.length - rank)));
+    tests[ordered[rank].index].adjustedP = adjusted; previous = adjusted;
+  }
+  return tests;
+}
+
+function rayleigh(values) {
+  const finite = values.filter(Number.isFinite), n = finite.length;
+  if (!n) return {n: 0, angle: NaN, r: NaN, z: NaN, p: NaN};
+  let sine = 0, cosine = 0;
+  for (const value of finite) { const radians = value * Math.PI / 180; sine += Math.sin(radians); cosine += Math.cos(radians); }
+  const r = Math.hypot(sine, cosine) / n, z = n * r * r;
+  let p = Math.exp(-z);
+  if (n < 50) p *= 1 + (2 * z - z * z) / (4 * n) - (24 * z - 132 * z * z + 76 * z ** 3 - 9 * z ** 4) / (288 * n * n);
+  return {n, angle: Math.atan2(sine, cosine) * 180 / Math.PI, r, z, p: Math.max(0, Math.min(1, p))};
+}
+
+function buildStatistics(metrics, polar) {
+  const metricNames = ["distance", "displacement", "speed", "tortuosity"];
+  const metricResults = metricNames.map(metric => {
+    const groups = Array.from({length: metrics.panelCount}, () => []);
+    for (let index = 0; index < metrics[metric].length; index += 1) groups[metrics.panel[index]]?.push(metrics[metric][index]);
+    const omnibus = kruskalWallis(groups), pairwise = [];
+    for (let first = 0; first < groups.length; first += 1) for (let second = first + 1; second < groups.length; second += 1) {
+      pairwise.push({first, second, ...mannWhitney(groups[first], groups[second])});
+    }
+    holmAdjust(pairwise);
+    return {metric, omnibus, counts: groups.map(group => group.length), pairwise};
+  });
+  const polarGroups = Array.from({length: polar.panelCount}, () => []);
+  for (let index = 0; index < polar.angle.length; index += 1) polarGroups[polar.panel[index]]?.push(polar.angle[index]);
+  return {
+    panels: metrics.panelNames,
+    metrics: metricResults,
+    rayleigh: polarGroups.map((values, panel) => ({panel, ...rayleigh(values)})),
+    method: "Kruskal–Wallis omnibus tests with two-sided Mann–Whitney pairwise comparisons and Holm family-wise correction. Rayleigh tests assess circular non-uniformity.",
+  };
+}
+
+function wilcoxonPaired(first, second) {
+  const differences = [];
+  for (let index = 0; index < Math.min(first.length, second.length); index += 1) {
+    const difference = Number(first[index]) - Number(second[index]);
+    if (Number.isFinite(difference) && Math.abs(difference) > 1e-12) differences.push({difference, magnitude: Math.abs(difference), rank: 0});
+  }
+  differences.sort((a, b) => a.magnitude - b.magnitude);
+  for (let start = 0; start < differences.length;) {
+    let end = start + 1;
+    while (end < differences.length && differences[end].magnitude === differences[start].magnitude) end += 1;
+    const rank = (start + 1 + end) / 2;
+    for (let index = start; index < end; index += 1) differences[index].rank = rank;
+    start = end;
+  }
+  let positive = 0, negative = 0;
+  for (const item of differences) if (item.difference > 0) positive += item.rank; else negative += item.rank;
+  const n = differences.length, mean = n * (n + 1) / 4, variance = n * (n + 1) * (2 * n + 1) / 24;
+  const z = variance > 0 ? (Math.abs(positive - mean) - .5) / Math.sqrt(variance) : 0;
+  return {n, w: Math.min(positive, negative), p: n ? Math.max(0, Math.min(1, 2 * (1 - normalCdf(Math.abs(z))))) : NaN};
+}
+
+function buildWindows(state, analysis) {
+  const requested = Array.isArray(state.windows) && state.windows.length >= 2 ? state.windows.slice(0, 2) : [
+    {name: "Window A", xmin: -10, xmax: 0, zmin: -5, zmax: 5},
+    {name: "Window B", xmin: 0, xmax: 10, zmin: -5, zmax: 5},
+  ];
+  const windows = requested.map((window, index) => ({
+    name: String(window.name || `Window ${index + 1}`),
+    xmin: Math.min(Number(window.xmin), Number(window.xmax)), xmax: Math.max(Number(window.xmin), Number(window.xmax)),
+    zmin: Math.min(Number(window.zmin), Number(window.zmax)), zmax: Math.max(Number(window.zmin), Number(window.zmax)),
+  }));
+  const heading = state.angleSource === "movement" ? data.movement : data.orientation;
+  const summaries = Array.from({length: analysis.panelCount * 2}, (_, index) => ({
+    panel: Math.floor(index / 2), window: index % 2, rows: 0, segments: 0, distance: 0, sine: 0, cosine: 0, valid: 0,
+  }));
+  const paired = Array.from({length: analysis.panelCount}, () => ({residence: [[], []], distance: [[], []]}));
+  for (const seg of analysis.visibleSegments) {
+    const panel = analysis.segmentPanel[seg], segmentValues = [{rows: 0, distance: 0, previous: -1}, {rows: 0, distance: 0, previous: -1}];
+    for (let row = starts[seg]; row < ends[seg]; row += 1) {
+      if (!analysis.rowKeep[row]) continue;
+      for (let index = 0; index < 2; index += 1) {
+        const window = windows[index];
+        if (data.x[row] < window.xmin || data.x[row] > window.xmax || data.z[row] < window.zmin || data.z[row] > window.zmax) {
+          segmentValues[index].previous = -1; continue;
+        }
+        const local = segmentValues[index], summary = summaries[panel * 2 + index];
+        local.rows += 1; summary.rows += 1;
+        if (local.previous >= 0) {
+          const distance = Math.hypot(data.x[row] - data.x[local.previous], data.z[row] - data.z[local.previous]);
+          if (Number.isFinite(distance)) { local.distance += distance; summary.distance += distance; }
+        }
+        local.previous = row;
+        if (Number.isFinite(heading[row])) {
+          const radians = heading[row] * Math.PI / 180;
+          summary.sine += Math.sin(radians); summary.cosine += Math.cos(radians); summary.valid += 1;
+        }
+      }
+    }
+    for (let index = 0; index < 2; index += 1) {
+      if (segmentValues[index].rows) summaries[panel * 2 + index].segments += 1;
+      paired[panel].residence[index].push(segmentValues[index].rows * medianDt);
+      paired[panel].distance[index].push(segmentValues[index].distance);
+    }
+  }
+  return {
+    windows, panels: analysis.panelNames,
+    summaries: summaries.map(summary => ({
+      panel: summary.panel, window: summary.window, rows: summary.rows, segments: summary.segments,
+      seconds: summary.rows * medianDt, distance: summary.distance,
+      angle: summary.valid ? Math.atan2(summary.sine, summary.cosine) * 180 / Math.PI : NaN,
+      r: summary.valid ? Math.hypot(summary.sine, summary.cosine) / summary.valid : NaN,
+    })),
+    paired: paired.map((values, panel) => ({
+      panel, residence: wilcoxonPaired(values.residence[0], values.residence[1]),
+      distance: wilcoxonPaired(values.distance[0], values.distance[1]),
+    })),
+    method: "Within-segment Wilcoxon signed-rank comparisons between the two editable rectangles. Residence uses retained local sample time; path length only joins consecutive retained samples inside the same rectangle.",
+  };
+}
+
 function buildRoi(state, analysis) {
   const animals = new Map();
   for (const seg of analysis.roiBaseSegments) {
@@ -966,6 +1197,17 @@ function compute(message) {
     products.roi = buildRoi(state, lastAnalysis);
   }
   if (scope === "full") products.diagnostics = buildDiagnostics();
+  if (scope === "statistics") {
+    products.statistics = buildStatistics(products.metrics, products.polar);
+  }
+  if (scope === "transition") {
+    products.transition = buildTransition(state, lastAnalysis);
+    lastTransitionGeometry = {
+      nx: products.transition.nx, nz: products.transition.nz,
+      x0: products.transition.x0, z0: products.transition.z0, bin: products.transition.bin,
+    };
+  }
+  if (scope === "windows") products.windows = buildWindows(state, lastAnalysis);
   const segmentOptions = scope === "full"
     ? lastAnalysis.visibleSegments.map(seg => ({
       code: seg,
@@ -1025,12 +1267,31 @@ function inspectPoint(message) {
   });
 }
 
+function inspectTransition(message) {
+  if (!lastAnalysis || !lastTransitionGeometry) return;
+  const panel = Number(message.panel), wantedX = Number(message.ix), wantedZ = Number(message.iz), matches = [];
+  for (const seg of lastAnalysis.visibleSegments) {
+    if (lastAnalysis.segmentPanel[seg] !== panel) continue;
+    let matched = false;
+    for (let row = starts[seg]; row < ends[seg]; row += 1) {
+      if (!lastAnalysis.rowKeep[row]) continue;
+      const ix = Math.floor((data.x[row] - lastTransitionGeometry.x0) / lastTransitionGeometry.bin);
+      const iz = Math.floor((data.z[row] - lastTransitionGeometry.z0) / lastTransitionGeometry.bin);
+      if (ix === wantedX && iz === wantedZ) { matched = true; break; }
+    }
+    if (matched) matches.push(seg);
+  }
+  postMessage({type: "transition-inspect-result", requestId: message.requestId, segments: matches,
+    panel, x: message.x, z: message.z});
+}
+
 self.onmessage = event => {
   try {
     const message = event.data;
     if (message.type === "init") initDataset(message);
     else if (message.type === "compute") compute(message);
     else if (message.type === "inspect") inspectPoint(message);
+    else if (message.type === "transition-inspect") inspectTransition(message);
   } catch (error) {
     postMessage({type: "error", requestId: event.data?.requestId, error: error?.stack || String(error)});
   }

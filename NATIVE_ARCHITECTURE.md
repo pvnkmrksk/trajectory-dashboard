@@ -43,6 +43,8 @@ table off the main thread and prepares narrow drawing products:
 - trial/animal polar resultants and signed heading-time pairs;
 - exact per-segment or per-animal movement metrics;
 - target reach, residence, time-to-target, and heading-error products; and
+- editable observation-window summaries with within-segment paired inference;
+- cell-entry transition probability and on-demand Holm/Rayleigh inference; and
 - load-time velocity/displacement histograms.
 
 Newer UI requests replace a pending request instead of accumulating a callback
@@ -67,8 +69,9 @@ The rendering boundary is deliberately hybrid:
   use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
   interactive legends, data zoom, reset, accessibility, and export;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
-- one compact view rail moves directly through Paths, Occupancy, Flow, Polar,
-  Targets, Heading, Metrics, and Diagnostics; all four spatial views can also
+- one compact, wheel/keyboard/arrow-snapping view rail moves directly through
+  Paths, Occupancy, Flow, Polar, Targets, Windows, Heading, Metrics, Statistics,
+  Transitions, and Diagnostics; all four spatial views can also
   appear in a compact 2×2 comparison without changing analysis state; and
 - the source picker and complete analysis controls are drawers. They remain
   available without permanently taking plot area, and the controls drawer
@@ -183,14 +186,12 @@ the trajectory product.
 | Device-local human-readable labels for every grouping axis | Complete |
 | Draggable/keyboard panel ordering across linked views | Complete |
 | Focused spatial lens and compact 2×2 comparison workspace | Complete |
-| Editable observation windows and paired window inference | Compatibility work |
-| Transition-probability cell observer | Compatibility work |
-| Delayed Holm/Rayleigh annotation layer | Compatibility work |
+| Editable observation windows and paired window inference | Complete (shared spatial transform; on-demand worker-side Wilcoxon summaries) |
+| Transition-probability cell observer | Complete (unique segment/cell entry, crossed/ended outcomes, support and fraction/count controls) |
+| Delayed Holm/Rayleigh annotation layer | Complete (on-demand worker pass; Holm-adjusted metric comparisons and Rayleigh panel summaries) |
 
-The compatibility rows are not considered superfluous and remain in the
-requirements. The old Dash app stays runnable on this branch for those
-workflows until their native equivalents land; no Plotly code is loaded by the
-native process.
+The old Dash app stays runnable on this branch as a reference implementation;
+no Plotly code is loaded by the native process.
 
 ## Streaming roadmap (not implemented on this branch)
 

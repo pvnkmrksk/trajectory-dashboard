@@ -10,7 +10,8 @@
 </head>
 <body>
   <div class="app-shell controls-collapsed" id="app-shell">
-    <header class="topbar">
+    <aside class="sidebar" id="analysis-sidebar" aria-label="Analysis controls">
+      <header class="sidebar-brand">
       <div class="brand-block">
         <div class="brand-mark" aria-hidden="true"><span></span></div>
         <div>
@@ -18,27 +19,8 @@
           <h1>Daari Deepa <span>Native</span></h1>
         </div>
       </div>
-      <div class="topbar-tools">
-        <button class="toolbar-button" id="controls-toggle" type="button" aria-expanded="false" aria-controls="analysis-sidebar">Controls</button>
-        <details class="source-popover" id="source-popover">
-          <summary>Data source</summary>
-          <form class="source-form" id="source-form">
-            <label for="source-input">CSV, folder, or recursive glob</label>
-            <div class="source-row">
-              <input id="source-input" name="source" autocomplete="off"
-                     placeholder="Drop a folder, or enter its path">
-              <button class="primary" id="load-button" type="submit">Load</button>
-            </div>
-          </form>
-        </details>
-        <div class="status-dock" id="status-dock" aria-live="polite" title="Waiting for data">
-          <span class="status-light"></span>
-          <div><b id="status-title">Waiting for data</b><small id="status-detail">Drop a folder anywhere or choose a source.</small></div>
-        </div>
-      </div>
-    </header>
-
-    <aside class="sidebar" id="analysis-sidebar" aria-label="Analysis controls">
+        <button class="icon-button sidebar-close" id="sidebar-close" type="button" aria-label="Close controls">‹</button>
+      </header>
       <div class="sidebar-actions">
         <button class="primary wide" id="apply-button" type="button" disabled>Update analysis</button>
         <button class="quiet" id="reset-view-button" type="button" disabled>Reset view</button>
@@ -108,10 +90,10 @@
             <input id="point-budget" data-scope="trajectory" type="number" min="10000" step="10000" value="250000">
           </label>
           <label>Path width
-            <input id="trajectory-width" type="range" min="0.5" max="5" step="0.1" value="2.2">
+            <input id="trajectory-width" type="range" min="0.5" max="5" step="0.1" value="1.5">
           </label>
           <label>Path opacity
-            <input id="trajectory-opacity" type="range" min="0.03" max="1" step="0.01" value="0.28">
+            <input id="trajectory-opacity" type="range" min="0.03" max="1" step="0.01" value="0.58">
           </label>
           <label class="check"><input id="moving-only" data-scope="movement" type="checkbox"> Moving samples only</label>
           <label class="check"><input id="spatial-grid" type="checkbox" checked> Spatial grid</label>
@@ -146,21 +128,6 @@
           <label>Reach radius<input id="roi-reach" data-scope="full" type="number" min="0.01" step="0.1" value="3"></label>
           <label class="check"><input id="roi-entered" data-scope="full" type="checkbox"> Reached trials only</label>
           <label class="check"><input id="roi-trim" data-scope="full" type="checkbox"> Trim after ROI exit</label>
-        </div>
-      </details>
-
-      <details class="control-card">
-        <summary>Curtain-ring observer</summary>
-        <div class="control-body two-up">
-          <label class="check"><input id="ring-enabled" type="checkbox"> Show matching paths</label>
-          <label class="check"><input id="ring-context" type="checkbox" checked> Faint context paths</label>
-          <label>Match<select id="ring-match"><option value="any">Any ring</option><option value="all">All rings</option></select></label>
-          <label>Active ring<select id="ring-active"></select></label>
-          <div class="ring-buttons"><button class="compact" id="ring-add" type="button">Add</button><button class="compact" id="ring-delete" type="button">Delete</button></div>
-          <label>Centre X<input id="ring-x" type="number" step="0.1" value="0"></label>
-          <label>Centre Z<input id="ring-z" type="number" step="0.1" value="0"></label>
-          <label>Radius<input id="ring-radius" type="number" min="0.01" step="0.1" value="3"></label>
-          <label class="ring-radius-control">Radius slider<input id="ring-radius-slider" type="range" min="0.05" max="30" step="0.05" value="3"></label>
         </div>
       </details>
 
@@ -223,6 +190,8 @@
 
     <main class="workspace" id="workspace">
       <nav class="view-rail" aria-label="Analysis views">
+        <button class="icon-button rail-menu" id="controls-toggle" type="button" aria-expanded="false" aria-controls="analysis-sidebar" aria-label="Open analysis controls">☰</button>
+        <button class="icon-button rail-step" id="view-prev" type="button" aria-label="Previous view">‹</button>
         <div class="view-rail-track">
           <button type="button" data-view-button="trajectory" class="active">Paths</button>
           <button type="button" data-view-button="occupancy">Occupancy</button>
@@ -230,14 +199,49 @@
           <button type="button" data-view-button="polar">Polar</button>
           <span class="rail-divider" aria-hidden="true"></span>
           <button type="button" data-view-button="roi">Targets</button>
+          <button type="button" data-view-button="windows">Windows</button>
           <button type="button" data-view-button="heading">Heading</button>
           <button type="button" data-view-button="metrics">Metrics</button>
+          <button type="button" data-view-button="statistics">Statistics</button>
+          <button type="button" data-view-button="transitions">Transitions</button>
           <button type="button" data-view-button="diagnostics">Diagnostics</button>
           <span class="rail-divider" aria-hidden="true"></span>
           <button type="button" data-view-button="compare">Compare 2×2</button>
         </div>
+        <button class="icon-button rail-step" id="view-next" type="button" aria-label="Next view">›</button>
+        <div class="rail-context" aria-live="polite"><b id="view-title">Paths</b><span id="view-subtitle">Spatial trajectories</span></div>
+        <button class="rail-action curtain-action" id="curtain-toggle" type="button" aria-expanded="false" aria-controls="curtain-palette">Curtain</button>
+        <details class="source-popover" id="source-popover">
+          <summary>Source</summary>
+          <form class="source-form" id="source-form">
+            <label for="source-input">CSV, folder, or recursive glob</label>
+            <div class="source-row">
+              <input id="source-input" name="source" autocomplete="off" placeholder="Drop a folder, or enter its path">
+              <button class="primary" id="load-button" type="submit">Load</button>
+            </div>
+          </form>
+        </details>
+        <div class="status-dock" id="status-dock" aria-live="polite" title="Waiting for data">
+          <span class="status-light"></span><b id="status-title">Waiting for data</b>
+          <small id="status-detail">Drop a folder anywhere or choose a source.</small>
+        </div>
         <button class="rail-action" id="download-plot-button" type="button">PNG</button>
       </nav>
+
+      <section class="tool-palette curtain-palette" id="curtain-palette" hidden aria-label="Curtain-ring observer">
+        <header><div><b>Curtain observer</b><small>Drag a centre or edge directly on the path view.</small></div><button class="icon-button" id="curtain-close" type="button" aria-label="Close curtain controls">×</button></header>
+        <div class="palette-grid">
+          <label class="check"><input id="ring-enabled" type="checkbox"> Match paths</label>
+          <label class="check"><input id="ring-context" type="checkbox" checked> Faint context</label>
+          <label>Rule<select id="ring-match"><option value="any">Any ring</option><option value="all">All rings</option></select></label>
+          <label>Active ring<select id="ring-active"></select></label>
+          <label>Centre X<input id="ring-x" type="number" step="0.1" value="0"></label>
+          <label>Centre Z<input id="ring-z" type="number" step="0.1" value="0"></label>
+          <label>Radius<input id="ring-radius" type="number" min="0.01" step="0.1" value="3"></label>
+          <label class="span-two">Radius slider<input id="ring-radius-slider" type="range" min="0.05" max="30" step="0.05" value="3"></label>
+        </div>
+        <footer><button class="compact" id="ring-add" type="button">Add ring</button><button class="compact" id="ring-delete" type="button">Delete ring</button></footer>
+      </section>
 
       <section class="plot-section explore-section active-section" id="explore-section" data-lens="trajectory">
         <div class="explore-grid">
@@ -247,20 +251,22 @@
           <div class="section-summary" id="trajectory-summary">Load data to begin.</div>
         </div>
         <div class="plot-card spatial-card">
-          <div class="plot-toolbar">
+          <div class="plot-toolbar primary-toolbar">
             <label class="check"><input id="playback-enabled" type="checkbox"> Playback</label>
-            <button class="compact" id="play-button" type="button" disabled>Play</button>
-            <label>Mode<select id="playback-scope"><option value="all">All segments together</option><option value="single">One segment</option></select></label>
-            <button class="compact trial-stepper" id="trial-prev" type="button" disabled aria-label="Previous segment">←</button>
-            <label class="trial-picker">Segment<select id="playback-trial" disabled><option value="">Choose a segment</option></select></label>
-            <button class="compact trial-stepper" id="trial-next" type="button" disabled aria-label="Next segment">→</button>
-            <label>All-segment cap<select id="playback-cap"><option value="95">p95 duration</option><option value="99">p99 duration</option><option value="max">Maximum</option></select></label>
-            <label>Speed<select id="playback-speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
-            <input class="scrubber" id="time-scrubber" type="range" min="0" max="1" value="1" step="0.001" disabled aria-label="Playback position">
-            <output id="time-output">all time</output>
             <label>Displayed trials <input id="trial-fraction" type="range" min="1" max="100" value="100"></label>
             <output id="fraction-output">100%</output>
             <button class="compact" id="resample-button" type="button" disabled>New sample</button>
+            <details class="context-settings playback-settings"><summary>Playback settings</summary><div class="context-settings-panel">
+              <button class="compact" id="play-button" type="button" disabled>Play</button>
+              <label>Mode<select id="playback-scope"><option value="all">All segments together</option><option value="single">One segment</option></select></label>
+              <button class="compact trial-stepper" id="trial-prev" type="button" disabled aria-label="Previous segment">←</button>
+              <label class="trial-picker">Segment<select id="playback-trial" disabled><option value="">Choose a segment</option></select></label>
+              <button class="compact trial-stepper" id="trial-next" type="button" disabled aria-label="Next segment">→</button>
+              <label>All-segment cap<select id="playback-cap"><option value="95">p95 duration</option><option value="99">p99 duration</option><option value="max">Maximum</option></select></label>
+              <label>Speed<select id="playback-speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+              <input class="scrubber" id="time-scrubber" type="range" min="0" max="1" value="1" step="0.001" disabled aria-label="Playback position">
+              <output id="time-output">all time</output>
+            </div></details>
             <span class="segment-inspector" id="segment-inspector">Click near a path to inspect its exact segment.</span>
           </div>
           <div class="plot-host large" id="trajectory-plot" aria-label="Trajectory plot"></div>
@@ -271,7 +277,7 @@
       <article class="lens-panel" id="occupancy-section" data-view="occupancy">
         <div class="section-heading">
           <div><span class="section-kicker">Spatial density</span><h2>Occupancy</h2></div>
-          <div class="inline-controls">
+          <details class="context-settings"><summary>Heatmap settings</summary><div class="context-settings-panel inline-controls">
             <label>Metric<select id="heat-metric"><option value="time">Seconds</option><option value="count">Samples</option><option value="percent">Percent</option></select></label>
             <label>Scale<select id="heat-scale"><option value="linear">Linear</option><option value="log">Log</option></select></label>
             <label>Colour limits<select id="heat-range-mode"><option value="percentile">Percentiles</option><option value="absolute">Values</option></select></label>
@@ -279,7 +285,7 @@
             <label>Colour max<input id="heat-cmax" type="number" step="0.1" value="99"></label>
             <label>Grid size<input id="bin-size" data-scope="spatial" type="number" min="0" step="0.01" placeholder="Auto"></label>
             <label>Central %<input id="bound-percent" data-scope="spatial" type="number" min="50" max="100" value="98"></label>
-          </div>
+          </div></details>
         </div>
         <div class="plot-card"><div class="plot-host" id="heatmap-plot" aria-label="Occupancy heatmap"></div></div>
       </article>
@@ -287,7 +293,7 @@
       <article class="lens-panel" id="direction-section" data-view="direction">
         <div class="section-heading">
           <div><span class="section-kicker">Circular mean by cell</span><h2>Local direction field</h2></div>
-          <div class="inline-controls flow-controls">
+          <details class="context-settings"><summary>Flow settings</summary><div class="context-settings-panel inline-controls flow-controls">
             <label>Abundance<select id="flow-metric"><option value="count">Samples</option><option value="time">Seconds</option></select></label>
             <label>Limits<select id="flow-range-mode"><option value="percentile">Percentiles</option><option value="absolute">Values</option></select></label>
             <label>Minimum<input id="flow-cmin" type="number" step="0.1" value="0"></label>
@@ -296,7 +302,7 @@
             <label>Trail lifetime<input id="trail-length" type="range" min="0.25" max="3" step="0.05" value="1"></label>
             <label>Flow speed<input id="flow-speed" type="range" min="0.25" max="3" step="0.05" value="1"></label>
             <label>R variability<input id="flow-variability" type="range" min="0" max="2" step="0.05" value="1"></label>
-          </div>
+          </div></details>
         </div>
         <div class="plot-card">
           <details class="direction-key" aria-label="Direction colour legend">
@@ -323,11 +329,11 @@
       <section class="plot-section" id="heading-section">
         <div class="section-heading">
           <div><span class="section-kicker">Signed angle</span><h2>Heading over local time</h2></div>
-          <div class="inline-controls">
+          <details class="context-settings"><summary>Heading settings</summary><div class="context-settings-panel inline-controls">
             <label>Representation<select id="heading-mode" data-scope="heading"><option value="trial">Trial traces</option><option value="mean">Animal circular mean</option><option value="density">Time × heading heatmap</option></select></label>
             <label>Time bin (s)<input id="heading-bin" data-scope="heading" type="number" min="0.05" step="0.05" value="0.25"></label>
             <label>Angle sectors<input id="heading-sectors" data-scope="heading" type="number" min="12" max="72" step="4" value="36"></label>
-          </div>
+          </div></details>
         </div>
         <div class="plot-card"><div class="plot-host" id="heading-plot" aria-label="Heading over time"></div></div>
       </section>
@@ -340,12 +346,43 @@
         <div class="plot-card"><div class="plot-host tall" id="roi-plot" aria-label="ROI outcome diagnostics"></div></div>
       </section>
 
+      <section class="plot-section" id="windows-section">
+        <div class="section-heading"><div><span class="section-kicker">Spatial subsets</span><h2>Observation windows</h2></div>
+          <details class="context-settings"><summary>Edit windows</summary><div class="context-settings-panel window-controls">
+            <label class="check span-two"><input id="window-show" type="checkbox"> Show rectangles on Paths</label>
+            <b class="span-two">Window A</b>
+            <label>X minimum<input id="window-a-xmin" data-scope="windows" type="number" step="0.1" value="-10"></label>
+            <label>X maximum<input id="window-a-xmax" data-scope="windows" type="number" step="0.1" value="0"></label>
+            <label>Z minimum<input id="window-a-zmin" data-scope="windows" type="number" step="0.1" value="-5"></label>
+            <label>Z maximum<input id="window-a-zmax" data-scope="windows" type="number" step="0.1" value="5"></label>
+            <b class="span-two">Window B</b>
+            <label>X minimum<input id="window-b-xmin" data-scope="windows" type="number" step="0.1" value="0"></label>
+            <label>X maximum<input id="window-b-xmax" data-scope="windows" type="number" step="0.1" value="10"></label>
+            <label>Z minimum<input id="window-b-zmin" data-scope="windows" type="number" step="0.1" value="-5"></label>
+            <label>Z maximum<input id="window-b-zmax" data-scope="windows" type="number" step="0.1" value="5"></label>
+          </div></details>
+        </div>
+        <div class="statistics-workspace" id="windows-content"><div class="analysis-empty">Edit the two spatial windows to compare residence, local path length, and direction.</div></div>
+      </section>
+
       <section class="plot-section" id="metrics-section">
         <div class="section-heading">
           <div><span class="section-kicker">Exact segment summaries</span><h2>Trial metrics</h2></div>
           <div class="legend-note">Distance · displacement · speed · tortuosity</div>
         </div>
         <div class="plot-card"><div class="plot-host tall" id="metrics-plot" aria-label="Trial metric distributions"></div></div>
+      </section>
+
+      <section class="plot-section" id="statistics-section">
+        <div class="section-heading"><div><span class="section-kicker">Worker-side inference</span><h2>Statistics</h2></div><div class="legend-note">Kruskal–Wallis · Holm-adjusted pairwise tests · Rayleigh uniformity</div></div>
+        <div class="statistics-workspace" id="statistics-content"><div class="analysis-empty">Open this view after loading data to calculate inferential statistics without blocking the plots.</div></div>
+      </section>
+
+      <section class="plot-section" id="transitions-section">
+        <div class="section-heading"><div><span class="section-kicker">Cell entry outcomes</span><h2>Transition observer</h2></div>
+          <div class="inline-controls transition-controls"><label>Outcome<select id="transition-outcome"><option value="crossed">Crossed opposite half</option><option value="ended">Ended opposite half</option></select></label><label>Display<select id="transition-display"><option value="fraction">Fraction</option><option value="count">Count</option></select></label><label>Minimum support<input id="transition-support" type="number" min="1" step="1" value="5"></label></div>
+        </div>
+        <div class="plot-card"><div class="plot-host" id="transition-plot" aria-label="Transition probability observer"></div></div>
       </section>
 
       <section class="plot-section" id="diagnostics-section">

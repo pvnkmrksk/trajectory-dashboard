@@ -285,6 +285,29 @@ function drawPanelRings(ctx, width, height, data, view) {
   ctx.restore();
 }
 
+function drawPanelWindows(ctx, width, height, data, view) {
+  if (!data?.windows?.length || !view) return;
+  const layout = panelLayout(width, height, data.panelCount, data.columns);
+  const colors = ["49,95,140", "201,91,63", "14,124,115", "197,139,47"];
+  ctx.save(); ctx.font = "700 9px Inter, system-ui, sans-serif";
+  for (let panel = 0; panel < data.panelCount; panel += 1) {
+    const pane = panelPane(layout, panel), shown = equalScaleView(view, pane);
+    for (let index = 0; index < data.windows.length; index += 1) {
+      const window = data.windows[index], color = colors[index % colors.length];
+      const left = pane.left + (window.xmin - shown.xmin) / (shown.xmax - shown.xmin) * pane.width;
+      const right = pane.left + (window.xmax - shown.xmin) / (shown.xmax - shown.xmin) * pane.width;
+      const top = pane.bottom - (window.zmax - shown.zmin) / (shown.zmax - shown.zmin) * pane.height;
+      const bottom = pane.bottom - (window.zmin - shown.zmin) / (shown.zmax - shown.zmin) * pane.height;
+      ctx.fillStyle = `rgba(${color},.035)`; ctx.strokeStyle = `rgba(${color},.58)`;
+      ctx.setLineDash([5, 3]); ctx.lineWidth = 1;
+      ctx.fillRect(left, top, right - left, bottom - top); ctx.strokeRect(left, top, right - left, bottom - top);
+      ctx.setLineDash([]); ctx.fillStyle = `rgb(${color})`;
+      ctx.fillText(String.fromCharCode(65 + index), left + 4, top + 4);
+    }
+  }
+  ctx.restore();
+}
+
 function installResize(renderer) {
   renderer._resizeObserver = new ResizeObserver(entries => {
     const rect = entries[0]?.contentRect;
@@ -526,8 +549,8 @@ export class TrajectoryRenderer extends SpatialBase {
     this.fraction = 1;
     this.timeLimit = 1e30;
     this.selectedSegment = -1;
-    this.lineWidth = 2.2;
-    this.lineOpacity = .28;
+    this.lineWidth = 1.5;
+    this.lineOpacity = .58;
     this._initGl();
     installSpatialInteraction(this, this.overlay);
     installResize(this);
@@ -736,9 +759,23 @@ export class TrajectoryRenderer extends SpatialBase {
     this.drawGl();
   }
   setLineStyle(width, opacity) {
-    this.lineWidth = Math.max(.5, Math.min(8, Number(width) || 2.2));
-    this.lineOpacity = Math.max(.03, Math.min(1, Number(opacity) || .28));
+    this.lineWidth = Math.max(.5, Math.min(8, Number(width) || 1.5));
+    this.lineOpacity = Math.max(.03, Math.min(1, Number(opacity) || .58));
     this.drawGl();
+  }
+  setObservationWindows(windows) {
+    if (!this.data) return;
+    this.data.windows = (windows || []).map(window => ({...window}));
+    this.drawOverlay();
+  }
+  setSegmentObserver(segmentCodes, showContext = true) {
+    if (!this.data) return;
+    this.ringEntries.fill(-1);
+    for (const code of segmentCodes || []) if (code >= 0 && code < this.ringEntries.length) this.ringEntries[code] = 0;
+    this.ringEnabled = !!segmentCodes?.length;
+    this.ringContext = !!showContext;
+    this.data.ringEnabled = false;
+    this._uploadRingEntries(); this.draw();
   }
   resize() {
     const dpr = setupCanvas(this.canvas, this.width, this.height);
@@ -792,6 +829,7 @@ export class TrajectoryRenderer extends SpatialBase {
       });
       drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
       drawPanelRings(this.ctx, this.width, this.height, this.data, this.view);
+      drawPanelWindows(this.ctx, this.width, this.height, this.data, this.view);
     }
   }
 }

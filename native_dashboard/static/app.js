@@ -3,7 +3,7 @@ import {
 } from "/static/renderers.js";
 import {
   EChartsPolarRenderer, EChartsHeadingRenderer, EChartsMetricsRenderer,
-  EChartsRoiRenderer, EChartsHistogramRenderer,
+  EChartsRoiRenderer, EChartsHistogramRenderer, EChartsTransitionRenderer,
 } from "/static/echarts_renderers.js";
 
 const byId = id => document.getElementById(id);
@@ -63,6 +63,7 @@ let metricsRenderer;
 let roiRenderer;
 let velocityHistogram;
 let displacementHistogram;
+let transitionRenderer;
 
 try {
   trajectoryRenderer = new TrajectoryRenderer(byId("trajectory-plot"), syncView);
@@ -74,6 +75,7 @@ try {
   roiRenderer = new EChartsRoiRenderer(byId("roi-plot"));
   velocityHistogram = new EChartsHistogramRenderer(byId("velocity-hist"), "velocity-distribution");
   displacementHistogram = new EChartsHistogramRenderer(byId("displacement-hist"), "displacement-distribution");
+  transitionRenderer = new EChartsTransitionRenderer(byId("transition-plot"));
 } catch (error) {
   setStatus("error", "Renderer unavailable", error.message);
   throw error;
@@ -95,6 +97,16 @@ trajectoryRenderer.setRingMoveHandler((index, x, z, final, radius = null) => {
   activeRing = index;
   updateRingControlValues();
   scheduleLocalRingObserver(final);
+});
+transitionRenderer.setInspectHandler(item => {
+  if (!workerReady || !worker) return;
+  const requestId = ++latestInspectRequest;
+  worker.postMessage({
+    type: "transition-inspect", requestId,
+    panel: Number(item.panelIndex),
+    ix: Number(item.value?.[0]), iz: Number(item.value?.[1]), x: Number(item.x), z: Number(item.z),
+  });
+  setStatus("working", "Selecting transition paths", "Finding the unique segments that entered the selected spatial cell.");
 });
 
 function parseBinary(buffer) {
@@ -334,6 +346,16 @@ function rangeValue(minId, maxId, fallback) {
   return [lo, hi];
 }
 
+function observationWindows() {
+  return ["a", "b"].map((key, index) => {
+    let xmin = numberValue(`window-${key}-xmin`), xmax = numberValue(`window-${key}-xmax`);
+    let zmin = numberValue(`window-${key}-zmin`), zmax = numberValue(`window-${key}-zmax`);
+    if (xmin > xmax) [xmin, xmax] = [xmax, xmin];
+    if (zmin > zmax) [zmin, zmax] = [zmax, zmin];
+    return {name: `Window ${String.fromCharCode(65 + index)}`, xmin, xmax, zmin, zmax};
+  });
+}
+
 function collectState() {
   const ranges = datasetHeader.ranges;
   return {
@@ -373,6 +395,8 @@ function collectState() {
     headingMode: byId("heading-mode").value,
     headingBin: numberValue("heading-bin", .25),
     headingSectors: numberValue("heading-sectors", 36),
+    windows: observationWindows(),
+    windowsVisible: byId("window-show").checked,
     lens: currentLens,
     view: currentView,
     panelOrders,
@@ -392,6 +416,8 @@ function persistState() {
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
   params.set("pcap", state.playbackPercentile);
   params.set("hmode", state.headingMode); params.set("hbin", state.headingBin); params.set("hsec", state.headingSectors);
+  params.set("windows", JSON.stringify(state.windows));
+  if (state.windowsVisible) params.set("wshow", "1"); else params.delete("wshow");
   params.set("lens", currentLens);
   params.set("view", currentView);
   if (Object.keys(panelOrders).length) params.set("order", JSON.stringify(panelOrders));
@@ -434,11 +460,19 @@ function restoreViewStateFromUrl() {
     "flow-speed": params.get("fspeed"), "flow-variability": params.get("fvar"),
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
+  byId("window-show").checked = params.get("wshow") === "1";
   setDashboardView(params.get("view") || params.get("lens") || "trajectory", false);
   try {
     const restoredOrder = JSON.parse(params.get("order") || "{}");
     panelOrders = restoredOrder && typeof restoredOrder === "object" ? restoredOrder : {};
   } catch (_) { panelOrders = {}; }
+  try {
+    const restoredWindows = JSON.parse(params.get("windows") || "null");
+    if (Array.isArray(restoredWindows)) for (const [index, window] of restoredWindows.slice(0, 2).entries()) {
+      const key = index ? "b" : "a";
+      for (const bound of ["xmin", "xmax", "zmin", "zmax"]) if (window?.[bound] != null) byId(`window-${key}-${bound}`).value = window[bound];
+    }
+  } catch (_) { /* malformed optional observation windows are ignored */ }
   try {
     const filters = JSON.parse(params.get("filters") || "{}");
     for (const [key, selected] of Object.entries(filters)) {
@@ -478,7 +512,9 @@ const scopeProducts = {
   layout: [], trajectory: ["trajectory"], playback: ["heading"], heading: ["heading"],
   polar: ["polar"], spatial: ["heatmap", "direction"],
   color: ["trajectory", "polar", "heading"], sample: ["trajectory", "polar", "heading"],
-  statistics: ["polar", "metrics", "roi"],
+  statistics: ["polar", "metrics", "roi", "statistics"],
+  transition: ["transition"],
+  windows: ["windows"],
   movement: ["trajectory", "direction", "polar", "heading", "roi"],
 };
 
@@ -525,7 +561,7 @@ function flushCompute() {
 function updateColumns() {
   const columns = numberValue("panel-columns");
   for (const value of Object.values(products)) if (value && typeof value === "object" && "columns" in value) value.columns = columns;
-  for (const renderer of [...spatialRenderers, polarRenderer, headingRenderer]) renderer.setColumns?.(columns);
+  for (const renderer of [...spatialRenderers, polarRenderer, headingRenderer, transitionRenderer]) renderer.setColumns?.(columns);
   persistState();
 }
 
@@ -556,6 +592,59 @@ function applyDirectionVisuals() {
     speed: numberValue("flow-speed", 1),
     variability: numberValue("flow-variability", 1),
   });
+}
+
+function applyTransitionVisuals() {
+  if (!transitionRenderer.data) return;
+  transitionRenderer.setVisualOptions({
+    outcome: byId("transition-outcome").value,
+    display: byId("transition-display").value,
+    minimumSupport: numberValue("transition-support", 5),
+  });
+}
+
+function formatP(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  if (number < .001) return "<.001";
+  return number.toFixed(3).replace(/^0/, "");
+}
+
+function renderStatistics(data) {
+  const host = byId("statistics-content");
+  const metricLabels = {
+    distance: "Distance walked", displacement: "Net displacement",
+    speed: "Median velocity", tortuosity: "Local tortuosity",
+  };
+  const metricCards = data.metrics.map(result => {
+    const significant = result.pairwise.filter(test => Number(test.adjustedP) < .05);
+    const rows = significant.length ? significant.map(test => `
+      <tr><td>${escapeHtml(data.panels[test.first])}</td><td>${escapeHtml(data.panels[test.second])}</td>
+      <td><span class="stat-pill significant">${formatP(test.adjustedP)}</span></td></tr>`).join("")
+      : `<tr><td colspan="3">No Holm-adjusted pairwise differences at α = .05.</td></tr>`;
+    return `<article class="statistics-card"><h3>${escapeHtml(metricLabels[result.metric] || result.metric)}</h3>
+      <small>Kruskal–Wallis H(${result.omnibus.df}) = ${formatNumber(result.omnibus.h, 1)} · p ${formatP(result.omnibus.p)} · n ${result.counts.join(" / ")}</small>
+      <table><thead><tr><th>Panel</th><th>Panel</th><th>Holm p</th></tr></thead><tbody>${rows}</tbody></table></article>`;
+  }).join("");
+  const rayleighRows = data.rayleigh.map(result => `<tr><td>${escapeHtml(data.panels[result.panel])}</td><td>${formatNumber(result.n, 0)}</td><td>${formatNumber(result.angle, 1)}°</td><td>${formatNumber(result.r, 1)}</td><td><span class="stat-pill ${result.p < .05 ? "significant" : ""}">${formatP(result.p)}</span></td></tr>`).join("");
+  host.innerHTML = `<div class="statistics-grid">${metricCards}<article class="statistics-card"><h3>Circular direction</h3>
+    <small>Rayleigh test of uniformity on independent-unit resultant angles.</small>
+    <table><thead><tr><th>Panel</th><th>n</th><th>Mean</th><th>R</th><th>p</th></tr></thead><tbody>${rayleighRows}</tbody></table></article>
+    <article class="statistics-card"><h3>Method</h3><small>${escapeHtml(data.method)}</small><p class="control-note">Inferential work is calculated on demand in the browser worker, so trajectory interaction and playback remain responsive.</p></article></div>`;
+}
+
+function renderWindows(data) {
+  const host = byId("windows-content");
+  const cards = data.panels.map((panelName, panel) => {
+    const summaries = data.summaries.filter(item => item.panel === panel);
+    const inference = data.paired.find(item => item.panel === panel);
+    const rows = summaries.map(item => `<tr><td>${escapeHtml(data.windows[item.window].name)}</td><td>${formatCount(item.segments)}</td><td>${formatNumber(item.seconds, 1)}</td><td>${formatNumber(item.distance, 1)}</td><td>${formatNumber(item.angle, 1)}° / ${formatNumber(item.r, 1)}</td></tr>`).join("");
+    return `<article class="statistics-card"><h3>${escapeHtml(panelName)}</h3><small>Totals inside each editable spatial rectangle.</small>
+      <table><thead><tr><th>Window</th><th>Segments</th><th>Seconds</th><th>Path</th><th>Direction / R</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="control-note">Paired residence p <span class="stat-pill ${inference?.residence?.p < .05 ? "significant" : ""}">${formatP(inference?.residence?.p)}</span> · paired path p <span class="stat-pill ${inference?.distance?.p < .05 ? "significant" : ""}">${formatP(inference?.distance?.p)}</span></p></article>`;
+  }).join("");
+  host.innerHTML = `<div class="statistics-grid">${cards}<article class="statistics-card"><h3>Window geometry</h3>
+    <table><thead><tr><th>Window</th><th>X</th><th>Z</th></tr></thead><tbody>${data.windows.map(window => `<tr><td>${escapeHtml(window.name)}</td><td>${formatNumber(window.xmin, 1)} to ${formatNumber(window.xmax, 1)}</td><td>${formatNumber(window.zmin, 1)} to ${formatNumber(window.zmax, 1)}</td></tr>`).join("")}</tbody></table><p class="control-note">${escapeHtml(data.method)}</p></article></div>`;
 }
 
 function populatePlaybackSegments() {
@@ -629,7 +718,8 @@ function renderProducts(incoming, summary) {
   if (incoming.trajectory) {
     incoming.trajectory.columns = numberValue("panel-columns");
     trajectoryRenderer.setData(incoming.trajectory, preserve);
-    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 2.2), numberValue("trajectory-opacity", .28));
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.5), numberValue("trajectory-opacity", .58));
+    trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
     updatePlaybackScope();
     if (!preserve) sharedView = {...trajectoryRenderer.view};
     syncView(sharedView, trajectoryRenderer);
@@ -653,6 +743,13 @@ function renderProducts(incoming, summary) {
   }
   if (incoming.heading) { incoming.heading.columns = numberValue("panel-columns"); headingRenderer.setData(incoming.heading); }
   if (incoming.metrics) metricsRenderer.setData(incoming.metrics);
+  if (incoming.statistics) renderStatistics(incoming.statistics);
+  if (incoming.windows) renderWindows(incoming.windows);
+  if (incoming.transition) {
+    incoming.transition.columns = numberValue("panel-columns");
+    transitionRenderer.setData(incoming.transition);
+    applyTransitionVisuals();
+  }
   if (incoming.roi) {
     roiRenderer.setData(incoming.roi);
     byId("roi-summary").textContent = `${formatCount(incoming.roi.baseSegments)} quality-filtered segments contribute to fraction and residence denominators.`;
@@ -681,8 +778,16 @@ function handleWorkerMessage(event) {
     workerBusy = false;
     if (message.requestId === latestRequest) {
       displayedRequest = message.requestId;
+      if (message.scope === "full") {
+        delete products.statistics; delete products.transition; delete products.windows;
+        byId("statistics-content").innerHTML = '<div class="analysis-empty">Open this view to calculate inferential statistics for the current filters.</div>';
+        byId("windows-content").innerHTML = '<div class="analysis-empty">Open this view to compare the current spatial windows.</div>';
+      }
       renderProducts(message.products, message.summary);
       setStatus("ready", "Ready for exploration", `${formatCount(message.summary.visibleRows)} points · ${formatCount(message.summary.visibleSegments)} segments · worker filter ${message.summary.filterMs.toFixed(0)} ms`);
+      if (message.scope === "full" && currentView === "statistics") scheduleCompute("statistics", 0);
+      if (message.scope === "full" && currentView === "transitions") scheduleCompute("transition", 0);
+      if (message.scope === "full" && currentView === "windows") scheduleCompute("windows", 0);
     }
     flushCompute();
     return;
@@ -692,6 +797,13 @@ function handleWorkerMessage(event) {
     byId("segment-inspector").textContent = match
       ? `${match.sourceFile} · trial ${formatNumber(match.trial, 0)} / step ${formatNumber(match.step, 0)} · ${match.config} · ${match.fly}@${match.vr} · path ${formatNumber(match.distance, 1)}, displacement ${formatNumber(match.displacement, 1)}, peak ${formatNumber(match.peakSpeed, 1)}, median ${formatNumber(match.medianSpeed, 1)}, tortuosity ${formatNumber(match.tortuosity, 1)}`
       : "No retained path was close enough; click nearer a visible line.";
+    return;
+  }
+  if (message.type === "transition-inspect-result") {
+    trajectoryRenderer.setSegmentObserver(message.segments, true);
+    setDashboardView("trajectory");
+    byId("segment-inspector").textContent = `${formatCount(message.segments.length)} unique segments entered the selected transition cell at X ${formatNumber(message.x, 1)}, Z ${formatNumber(message.z, 1)}. Context paths remain faint; open Curtain or update analysis to clear the selection.`;
+    setStatus("ready", "Transition paths selected", `${formatCount(message.segments.length)} unique segments entered the selected cell.`);
     return;
   }
   if (message.type === "error") {
@@ -747,8 +859,9 @@ function compositePlot(hostId) {
 function setDashboardView(view, save = true) {
   const allowed = new Set([
     "trajectory", "occupancy", "direction", "polar", "compare",
-    "roi", "heading", "metrics", "diagnostics",
+    "roi", "windows", "heading", "metrics", "statistics", "transitions", "diagnostics",
   ]);
+  const previousView = currentView;
   currentView = allowed.has(view) ? view : "trajectory";
   const spatial = new Set(["trajectory", "occupancy", "direction", "polar", "compare"]);
   if (spatial.has(currentView)) currentLens = currentView;
@@ -756,10 +869,29 @@ function setDashboardView(view, save = true) {
   for (const button of document.querySelectorAll("[data-view-button]")) {
     button.classList.toggle("active", button.dataset.viewButton === currentView);
   }
+  const activeButton = document.querySelector(`[data-view-button="${currentView}"]`);
+  activeButton?.scrollIntoView({behavior: "smooth", block: "nearest", inline: "center"});
+  const viewMeta = {
+    trajectory: ["Paths", "Spatial trajectories"], occupancy: ["Occupancy", "Spatial density"],
+    direction: ["Flow", "Local direction field"], polar: ["Polar", "Trial resultants"],
+    roi: ["Targets", "ROI outcomes"], heading: ["Heading", "Local trial time"],
+    windows: ["Windows", "Spatial subset comparison"],
+    metrics: ["Metrics", "Exact segment summaries"], statistics: ["Statistics", "Adjusted inference"],
+    transitions: ["Transitions", "Cell-entry outcomes"], diagnostics: ["Diagnostics", "Load-time distributions"],
+    compare: ["Compare 2×2", "Linked spatial views"],
+  }[currentView] || ["Paths", "Spatial trajectories"];
+  byId("view-title").textContent = viewMeta[0]; byId("view-subtitle").textContent = viewMeta[1];
   const activeSection = spatial.has(currentView) ? "explore-section" : `${currentView}-section`;
+  const order = [...document.querySelectorAll("[data-view-button]")].map(button => button.dataset.viewButton);
+  const direction = order.indexOf(currentView) >= order.indexOf(previousView) ? "nav-forward" : "nav-back";
   for (const section of document.querySelectorAll(".plot-section")) {
     section.classList.toggle("active-section", section.id === activeSection);
+    section.classList.remove("nav-forward", "nav-back");
+    if (section.id === activeSection && previousView !== currentView) section.classList.add(direction);
   }
+  if (datasetHeader && currentView === "statistics" && !products.statistics) scheduleCompute("statistics", 0);
+  if (datasetHeader && currentView === "transitions" && !products.transition) scheduleCompute("transition", 0);
+  if (datasetHeader && currentView === "windows" && !products.windows) scheduleCompute("windows", 0);
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const shown = currentView === "compare"
       ? new Set(["trajectory", "occupancy", "direction", "polar"])
@@ -770,6 +902,7 @@ function setDashboardView(view, save = true) {
     if (shown.has("polar")) { polarRenderer.chart.resize({animation: {duration: 0}}); polarRenderer.draw(); }
     if (shown.has("heading")) { headingRenderer.chart.resize({animation: {duration: 0}}); headingRenderer.draw(); }
     if (shown.has("metrics")) { metricsRenderer.chart.resize({animation: {duration: 0}}); metricsRenderer.draw(); }
+    if (shown.has("transitions")) { transitionRenderer.chart.resize({animation: {duration: 0}}); transitionRenderer.draw(); }
     if (shown.has("roi")) { roiRenderer.chart.resize({animation: {duration: 0}}); roiRenderer.draw(); }
     if (shown.has("diagnostics")) {
       velocityHistogram.chart.resize({animation: {duration: 0}}); velocityHistogram.draw();
@@ -788,7 +921,7 @@ function downloadActivePlot() {
     trajectory: "trajectory-plot", occupancy: "heatmap-plot",
     direction: "direction-plot", polar: "polar-plot", roi: "roi-plot",
     heading: "heading-plot", metrics: "metrics-plot",
-    diagnostics: "velocity-hist",
+    transitions: "transition-plot", diagnostics: "velocity-hist",
   }[lens];
   const url = compositePlot(host);
   if (!url) return;
@@ -854,7 +987,7 @@ function applyRecipeControls(recipe) {
     headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
   };
   for (const [key, id] of Object.entries(valueIds)) if (state[key] != null) byId(id).value = state[key];
-  for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context"})) {
+  for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context",windowsVisible:"window-show"})) {
     if (state[key] != null) byId(id).checked = !!state[key];
   }
   if (Array.isArray(state.polarR)) { byId("polar-r-min").value = state.polarR[0]; byId("polar-r-max").value = state.polarR[1]; }
@@ -869,11 +1002,16 @@ function applyRecipeControls(recipe) {
   }
   panelOrders = state.panelOrders && typeof state.panelOrders === "object" ? structuredClone(state.panelOrders) : panelOrders;
   if (Array.isArray(state.rings) && state.rings.length) rings = state.rings.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||.01)}));
+  if (Array.isArray(state.windows)) for (const [index, window] of state.windows.slice(0, 2).entries()) {
+    const key = index ? "b" : "a";
+    for (const bound of ["xmin", "xmax", "zmin", "zmax"]) if (window?.[bound] != null) byId(`window-${key}-${bound}`).value = window[bound];
+  }
   sampleSeed = Number(state.sampleSeed) || 0;
   for (const [id, value] of Object.entries(recipe.visuals || {})) if (byId(id) && value != null) byId(id).value = value;
   setDashboardView(state.view || state.lens || "trajectory", false);
   renderRingControls(); renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
-  trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 2.2), numberValue("trajectory-opacity", .28));
+  trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.5), numberValue("trajectory-opacity", .58));
+  trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
   applyHeatmapVisuals(); applyDirectionVisuals(); updateFraction(); updatePlaybackLimit(); applyLocalRingObserver(false);
 }
 
@@ -915,14 +1053,19 @@ function exportNativeReport() {
     ["Local direction", "direction-plot"], ["Polar direction", "polar-plot"],
     ["ROI outcomes", "roi-plot"], ["Heading over time", "heading-plot"],
     ["Trial metrics", "metrics-plot"], ["Velocity", "velocity-hist"],
-    ["Displacement", "displacement-hist"],
+    ["Displacement", "displacement-hist"], ["Transition probability", "transition-plot"],
   ];
   const figures = sections.map(([title, id]) => [title, compositePlot(id)]).filter(([, image]) => image);
+  const tableSections = [
+    ["Observation windows", products.windows ? byId("windows-content").innerHTML : ""],
+    ["Inferential statistics", products.statistics ? byId("statistics-content").innerHTML : ""],
+  ].filter(([, content]) => content);
   const counts = datasetHeader.counts;
   const html = `<!doctype html><meta charset="utf-8"><title>Daari Deepa native report</title>
-    <style>body{margin:32px auto;max-width:1500px;padding:0 24px;color:#18221f;background:#f4f1ea;font:14px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}section{margin:28px 0;padding:14px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px}img{display:block;width:100%;height:auto}small{color:#66716d}</style>
+    <style>body{margin:32px auto;max-width:1500px;padding:0 24px;color:#18221f;background:#f4f1ea;font:14px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}section{margin:28px 0;padding:14px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px}img{display:block;width:100%;height:auto}small{color:#66716d}.statistics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.statistics-card{padding:12px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse}th,td{padding:5px;border-top:1px solid #eee;text-align:left;font-size:12px}</style>
     <header><h1>Daari Deepa — native analysis report</h1><p>${escapeHtml(sourceInput.value)}</p><small>${formatCount(counts.retainedRows)} retained of ${formatCount(counts.sourceRows)} source rows · ${formatCount(counts.segments)} segments · ${formatCount(counts.animals)} animals</small></header>
     ${figures.map(([title, image]) => `<section><h2>${escapeHtml(title)}</h2><img src="${image}" alt="${escapeHtml(title)}"></section>`).join("")}
+    ${tableSections.map(([title, content]) => `<section><h2>${escapeHtml(title)}</h2>${content}</section>`).join("")}
     <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Figures are a static record of the current native browser state.</small></footer>`;
   const blob = new Blob([html], {type: "text/html"});
   const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
@@ -1068,12 +1211,30 @@ byId("controls-toggle").addEventListener("click", () => {
   byId("controls-toggle").setAttribute("aria-expanded", String(!collapsed));
   setTimeout(() => {
     for (const renderer of spatialRenderers) { renderer.resize(); renderer.draw(); }
-    for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer, velocityHistogram, displacementHistogram]) {
+    for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer, transitionRenderer, velocityHistogram, displacementHistogram]) {
       renderer.chart.resize({animation: {duration: 0}});
       renderer.draw();
     }
   }, 220);
 });
+byId("sidebar-close").addEventListener("click", () => byId("controls-toggle").click());
+
+function setCurtainPalette(open) {
+  const palette = byId("curtain-palette");
+  palette.hidden = !open;
+  byId("curtain-toggle").setAttribute("aria-expanded", String(open));
+  if (open) {
+    byId("source-popover").open = false;
+    for (const details of document.querySelectorAll(".context-settings[open]")) details.open = false;
+    setDashboardView("trajectory");
+    if (!byId("ring-enabled").checked) {
+      byId("ring-enabled").checked = true;
+    }
+    applyLocalRingObserver(true);
+  }
+}
+byId("curtain-toggle").addEventListener("click", () => setCurtainPalette(byId("curtain-palette").hidden));
+byId("curtain-close").addEventListener("click", () => setCurtainPalette(false));
 applyButton.addEventListener("click", () => scheduleCompute("full"));
 resetViewButton.addEventListener("click", () => trajectoryRenderer.resetView(true));
 function setCleanMode(enabled) {
@@ -1103,6 +1264,39 @@ byId("group-by").addEventListener("change", () => {
 for (const button of document.querySelectorAll("[data-view-button]")) {
   button.addEventListener("click", () => setDashboardView(button.dataset.viewButton));
 }
+function stepDashboardView(delta) {
+  const views = [...document.querySelectorAll("[data-view-button]")].map(button => button.dataset.viewButton);
+  const index = Math.max(0, views.indexOf(currentView));
+  setDashboardView(views[(index + delta + views.length) % views.length]);
+}
+byId("view-prev").addEventListener("click", () => stepDashboardView(-1));
+byId("view-next").addEventListener("click", () => stepDashboardView(1));
+let railWheelLocked = false;
+byId("workspace").addEventListener("wheel", event => {
+  const onRail = event.target.closest(".view-rail-track, .rail-context");
+  const safeWorkspace = !event.target.closest(".plot-host, .tool-palette, .context-settings-panel, input, select, textarea, button, details");
+  if ((!onRail && !safeWorkspace) || Math.abs(event.deltaY) + Math.abs(event.deltaX) < 18) return;
+  event.preventDefault();
+  if (railWheelLocked) return;
+  railWheelLocked = true;
+  stepDashboardView((Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY) > 0 ? 1 : -1);
+  setTimeout(() => { railWheelLocked = false; }, 320);
+}, {passive: false});
+document.addEventListener("keydown", event => {
+  if (event.target.closest("input, select, textarea") || event.metaKey || event.ctrlKey) return;
+  if (event.key === "ArrowRight") stepDashboardView(1);
+  else if (event.key === "ArrowLeft") stepDashboardView(-1);
+});
+for (const details of document.querySelectorAll(".context-settings")) details.addEventListener("toggle", () => {
+  if (!details.open) return;
+  setCurtainPalette(false);
+  for (const other of document.querySelectorAll(".context-settings[open]")) if (other !== details) other.open = false;
+});
+byId("source-popover").addEventListener("toggle", () => {
+  if (!byId("source-popover").open) return;
+  setCurtainPalette(false);
+  for (const details of document.querySelectorAll(".context-settings[open]")) details.open = false;
+});
 byId("animals-all").addEventListener("click", () => {
   animalVisibility.fill(true); renderAnimalVisibility(); applyAnimalVisibility();
 });
@@ -1147,10 +1341,17 @@ for (const id of ["flow-metric", "flow-range-mode", "flow-cmin", "flow-cmax",
 }
 for (const id of ["trajectory-width", "trajectory-opacity"]) {
   byId(id).addEventListener("input", () => {
-    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 2.2), numberValue("trajectory-opacity", .28));
+    trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.5), numberValue("trajectory-opacity", .58));
     persistState();
   });
 }
+for (const id of ["transition-outcome", "transition-display", "transition-support"]) {
+  byId(id).addEventListener(id === "transition-support" ? "input" : "change", applyTransitionVisuals);
+}
+byId("window-show").addEventListener("change", () => {
+  trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
+  persistState();
+});
 byId("spatial-grid").addEventListener("change", () => {
   for (const renderer of spatialRenderers) renderer.setGridVisible(byId("spatial-grid").checked);
 });
@@ -1182,6 +1383,10 @@ for (const control of document.querySelectorAll("[data-scope]")) {
   control.addEventListener("change", () => {
     const scope = control.dataset.scope;
     if (scope === "layout") updateColumns();
+    else if (scope === "windows") {
+      trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
+      scheduleCompute("windows", 40);
+    }
     else scheduleCompute(scope, scope === "full" ? 180 : 80);
   });
 }
