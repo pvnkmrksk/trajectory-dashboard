@@ -63,11 +63,13 @@ Plotly.
   first, format as int. (Animal identity — `FlyID@VR` — is a *separate* grouping
   that intentionally merges files.)
 - `TrialIndex` is a derived 1-based per-`SourceFile` ordinal over contiguous
-  `_seg_id` segments after the load-time sort. It is internal/helper metadata;
-  the dashboard's trial-range control, trial colour mode, and
-  `FilterSpec.trial_range` and `FilterSpec.step_range` use the dataset's raw
-  numeric `CurrentTrial`/`CurrentStep` values and keep complete `_seg_id`
-  segments.
+  `_seg_id` segments after the load-time sort. The browser-native dashboard
+  exposes it as **Replicate order** alongside the raw Trial and Step filters,
+  which gives early/late experiment slices one consistent axis whether Trial,
+  Step, or both were advanced by the acquisition sequence. The Dash dashboard's
+  trial-range control, trial colour mode, and `FilterSpec.trial_range` and
+  `FilterSpec.step_range` continue to use the dataset's raw numeric
+  `CurrentTrial`/`CurrentStep` values and keep complete `_seg_id` segments.
 - **Velocity is in raw position-units per second, NOT cm/s.** The trajectory
   colour, native velocity histogram, and per-segment peak/median statistics all
   use the same 10-frame within-segment smoothed series after reset-spikes above

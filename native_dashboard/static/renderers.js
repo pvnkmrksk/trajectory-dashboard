@@ -933,6 +933,57 @@ export class TrajectoryRenderer extends SpatialBase {
       drawPanelWindows(this.ctx, this.width, this.height, this.data, this.view);
     }
   }
+  snapshotDataUrl(exportWidth = 1200, exportHeight = 700) {
+    if (!this.data || !this.instanceCount) return null;
+    const previousWidth = this.width, previousHeight = this.height;
+    const staged = this.width < 64 || this.height < 64;
+    if (staged) {
+      this.width = Math.max(320, exportWidth);
+      this.height = Math.max(240, exportHeight);
+      this.resize();
+    }
+    this.draw();
+    const gl = this.gl;
+    const width = gl.drawingBufferWidth, height = gl.drawingBufferHeight;
+    if (!(width > 0 && height > 0)) {
+      if (staged) {
+        this.width = previousWidth; this.height = previousHeight;
+        this.resize(); this.draw();
+      }
+      return null;
+    }
+    gl.finish();
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    let ink = 0;
+    for (let index = 0; index < pixels.length; index += 64) {
+      if (pixels[index] < 248 || pixels[index + 1] < 248 || pixels[index + 2] < 248) ink += 1;
+    }
+    this.lastSnapshotInk = ink;
+    if (!ink) {
+      if (staged) {
+        this.width = previousWidth; this.height = previousHeight;
+        this.resize(); this.draw();
+      }
+      return null;
+    }
+    const flipped = new Uint8ClampedArray(pixels.length);
+    const stride = width * 4;
+    for (let y = 0; y < height; y += 1) {
+      flipped.set(pixels.subarray((height - y - 1) * stride, (height - y) * stride), y * stride);
+    }
+    const output = document.createElement("canvas");
+    output.width = width; output.height = height;
+    const context = output.getContext("2d");
+    context.putImageData(new ImageData(flipped, width, height), 0, 0);
+    context.drawImage(this.overlay, 0, 0, width, height);
+    const result = output.toDataURL("image/png");
+    if (staged) {
+      this.width = previousWidth; this.height = previousHeight;
+      this.resize(); this.draw();
+    }
+    return result;
+  }
 }
 
 class CanvasSpatialRenderer extends SpatialBase {

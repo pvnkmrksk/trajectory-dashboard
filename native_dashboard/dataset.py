@@ -32,7 +32,7 @@ from trajectory_dashboard.roi import rois_by_config
 
 
 FORMAT_NAME = "trajectory-native-columns"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 _CACHE_MAX = 2
 _CACHE: "OrderedDict[str, NativeDataset]" = OrderedDict()
 _CACHE_LOOKUP: dict[tuple, str] = {}
@@ -176,6 +176,25 @@ def _movement_heading(x: np.ndarray, z: np.ndarray,
     return out
 
 
+def _segment_resultant(angles: np.ndarray, starts: np.ndarray,
+                       ends: np.ndarray) -> np.ndarray:
+    """Return the circular resultant length for every contiguous segment."""
+
+    radians = np.deg2rad(np.asarray(angles, dtype=np.float64))
+    valid = np.isfinite(radians)
+    sine = np.where(valid, np.sin(radians), 0.0)
+    cosine = np.where(valid, np.cos(radians), 0.0)
+    counts = np.add.reduceat(valid.astype(np.int64), starts)
+    sum_sine = np.add.reduceat(sine, starts)
+    sum_cosine = np.add.reduceat(cosine, starts)
+    result = np.zeros(len(starts), dtype=np.float32)
+    present = counts > 0
+    result[present] = (
+        np.hypot(sum_sine[present], sum_cosine[present]) / counts[present]
+    ).astype(np.float32)
+    return result
+
+
 def _stats_by_segment(stats: pd.DataFrame, segment_ids: list[str],
                       column: str, default: float) -> np.ndarray:
     if stats is None or len(stats) == 0 or column not in stats:
@@ -288,7 +307,10 @@ def _display_config(raw: str) -> str:
     )
 
 
-def _histogram_payload(values: np.ndarray, bins: int = 48) -> dict[str, Any]:
+def _histogram_payload(values: np.ndarray, bins: int = 48, *,
+                       display_hi: float | None = None,
+                       exact_range: tuple[float, float] | None = None
+                       ) -> dict[str, Any]:
     """Small bounded histogram for data-guided browser range controls."""
 
     finite = np.asarray(values, dtype=float)
@@ -298,10 +320,15 @@ def _histogram_payload(values: np.ndarray, bins: int = 48) -> dict[str, Any]:
             "edges": [0.0, 1.0], "counts": [0], "range": [0.0, 1.0],
             "displayRange": [0.0, 1.0], "overflow": 0,
         }
-    lo, hi = float(np.min(finite)), float(np.max(finite))
-    display_hi = float(np.percentile(finite, 99.5))
+    lo, hi = (exact_range if exact_range is not None else
+              (float(np.min(finite)), float(np.max(finite))))
+    if display_hi is None:
+        display_hi = float(np.percentile(finite, 99.5))
+    display_hi = float(display_hi)
     if not math.isfinite(display_hi) or display_hi <= lo:
         display_hi = hi if hi > lo else lo + 1.0
+    display_hi = min(max(display_hi, lo + 1e-12),
+                     hi if hi > lo else display_hi)
     counts, edges = np.histogram(
         finite, bins=max(8, int(bins)), range=(lo, display_hi)
     )
@@ -491,6 +518,12 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
     segment_ids = [str(value) for value in segment_labels.tolist()]
     segment_trial = _finite_float(first["CurrentTrial"], fill=0.0)
     segment_step = _finite_float(first["CurrentStep"], fill=0.0)
+    segment_replicate = _finite_float(
+        first.get("TrialIndex", pd.Series(np.arange(1, len(starts) + 1))),
+        fill=1.0,
+    )
+    segment_orientation_r = _segment_resultant(orientation, starts, ends)
+    segment_movement_r = _segment_resultant(movement, starts, ends)
     arrays: dict[str, np.ndarray] = {
         "x": x,
         "z": z,
@@ -503,6 +536,9 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         "segment": segment,
         "segmentTrial": segment_trial,
         "segmentStep": segment_step,
+        "segmentReplicate": segment_replicate,
+        "segmentOrientationR": segment_orientation_r,
+        "segmentMovementR": segment_movement_r,
         "segmentPoints": _stats_by_segment(stats, segment_ids, "n_points", 0).astype(
             np.uint32
         ),
@@ -569,6 +605,8 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
             "rawSpeed": _range(raw_speed, (0.0, 1.0)),
             "trial": _range(segment_trial),
             "step": _range(segment_step),
+            "replicate": _range(segment_replicate, (1.0, 1.0)),
+            "resultant": [0.0, 1.0],
             "peakSpeed": _range(arrays["segmentPeakSpeed"], (0.0, 1.0)),
             "displacement": _range(arrays["segmentDisplacement"], (0.0, 1.0)),
             "distance": _range(arrays["segmentDistance"], (0.0, 1.0)),
@@ -581,6 +619,14 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         "filterHistograms": {
             "trial": _histogram_payload(segment_trial),
             "step": _histogram_payload(segment_step),
+            "replicate": _histogram_payload(segment_replicate),
+            "time": _histogram_payload(
+                local_time, display_hi=duration_quantiles["median"]
+            ),
+            "resultant": _histogram_payload(
+                segment_orientation_r, display_hi=1.0,
+                exact_range=(0.0, 1.0),
+            ),
             "peak": _histogram_payload(arrays["segmentPeakSpeed"]),
             "displacement": _histogram_payload(arrays["segmentDisplacement"]),
             "distance": _histogram_payload(arrays["segmentDistance"]),

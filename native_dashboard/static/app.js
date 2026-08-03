@@ -247,12 +247,13 @@ function drawMiniHistogram(canvas, histogram, selected) {
 function createRangeControl(key, label, idMin, idMax) {
   let histogram = datasetHeader.filterHistograms[key];
   const exact = histogram.range, display = histogram.displayRange;
-  const integer = key === "trial" || key === "step";
+  const integer = key === "trial" || key === "step" || key === "replicate";
   const step = integer ? 1 : Math.max(1e-6, (display[1] - display[0]) / 500);
   const inputStep = integer ? 1 : .1;
+  const initialRange = key === "time" ? display : exact;
   const shownExact = [
-    displayRangeBound(exact[0], integer, false),
-    displayRangeBound(exact[1], integer, true),
+    displayRangeBound(initialRange[0], integer, false),
+    displayRangeBound(initialRange[1], integer, true),
   ];
   const host = document.createElement("section"); host.className = "range-filter";
   host.innerHTML = `
@@ -278,14 +279,14 @@ function createRangeControl(key, label, idMin, idMax) {
     loInput.value = displayRangeBound(low.value, integer, false);
     hiInput.value = displayRangeBound(high.value, integer, true);
     redraw();
-    scheduleCompute("full", 120);
+    scheduleDataUpdate(120);
   };
   low.addEventListener("input", () => fromSlider(low));
   high.addEventListener("input", () => fromSlider(high));
   for (const input of [loInput, hiInput]) input.addEventListener("change", () => {
     low.value = Math.max(Number(low.min), Math.min(Number(low.max), Number(loInput.value)));
     high.value = Math.max(Number(high.min), Math.min(Number(high.max), Number(hiInput.value)));
-    redraw(); scheduleCompute("full", 100);
+    redraw(); scheduleDataUpdate(100);
   });
   new ResizeObserver(redraw).observe(canvas);
   redraw();
@@ -331,7 +332,7 @@ function renderDisplayLabels() {
       } catch (_) { /* local persistence is best-effort */ }
       const option = byId(`filter-${key}`)?.options[index];
       if (option) option.textContent = displayNames[key][index];
-      scheduleCompute("full", 20);
+      scheduleDataUpdate(20);
     });
   });
 }
@@ -352,11 +353,14 @@ function populateControls() {
       option.textContent = displayNames[key]?.[index] || text; select.appendChild(option);
     }
     label.appendChild(select); categories.appendChild(label);
-    select.addEventListener("change", () => scheduleCompute("full", 140));
+    select.addEventListener("change", () => scheduleDataUpdate(140));
   }
   byId("range-filters").replaceChildren(); rangeControls.clear();
   createRangeControl("trial", "Trial number", "trial-min", "trial-max");
   createRangeControl("step", "Step / segment", "step-min", "step-max");
+  createRangeControl("replicate", "Replicate order (trial × step)", "replicate-min", "replicate-max");
+  createRangeControl("time", "Local trial time (seconds)", "time-min", "time-max");
+  createRangeControl("resultant", "Trial resultant R", "resultant-min", "resultant-max");
   createRangeControl("peak", "Peak smoothed velocity", "peak-min", "peak-max");
   createRangeControl("displacement", "Net displacement", "disp-min", "disp-max");
   createRangeControl("distance", "Distance walked", "distance-min", "distance-max");
@@ -407,6 +411,9 @@ function collectState() {
     ranges: {
       trial: rangeValue("trial-min", "trial-max", ranges.trial),
       step: rangeValue("step-min", "step-max", ranges.step),
+      replicate: rangeValue("replicate-min", "replicate-max", ranges.replicate),
+      time: rangeValue("time-min", "time-max", [0, datasetHeader.playbackQuantiles?.median ?? ranges.time[1]]),
+      resultant: rangeValue("resultant-min", "resultant-max", ranges.resultant),
       peak: rangeValue("peak-min", "peak-max", ranges.peakSpeed),
       displacement: rangeValue("disp-min", "disp-max", ranges.displacement),
       distance: rangeValue("distance-min", "distance-max", ranges.distance),
@@ -428,6 +435,7 @@ function collectState() {
     statsUnit: byId("stats-unit").value,
     polarR: [numberValue("polar-r-min", 0), numberValue("polar-r-max", 1)],
     polarValidMin: numberValue("polar-valid-min", 0),
+    polarMode: byId("polar-mode").value,
     roiReach: numberValue("roi-reach", 3),
     roiEntered: byId("roi-entered").checked,
     roiTrim: byId("roi-trim").checked,
@@ -460,6 +468,7 @@ function persistState() {
   if (state.panelColumns) params.set("cols", state.panelColumns); else params.delete("cols");
   if (state.binSize) params.set("bin", state.binSize); else params.delete("bin");
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
+  params.set("pmode", state.polarMode);
   params.set("pcap", state.playbackPercentile);
   params.set("hmode", state.headingMode); params.set("hbin", state.headingBin); params.set("hsec", state.headingSectors);
   params.set("windows", JSON.stringify(state.windows));
@@ -502,6 +511,7 @@ function restoreViewStateFromUrl() {
     "overview-grouping": params.get("overview"),
     "panel-columns": params.get("cols"), "bin-size": params.get("bin"),
     "bound-percent": params.get("bound"), "angle-source": params.get("angle"),
+    "polar-mode": params.get("pmode"),
     "stats-unit": params.get("unit"), "playback-cap": params.get("pcap"),
     "heading-mode": params.get("hmode"), "heading-bin": params.get("hbin"),
     "heading-sectors": params.get("hsec"), "trajectory-width": params.get("tw"),
@@ -540,10 +550,15 @@ function restoreViewStateFromUrl() {
   } catch (_) { /* malformed optional URL state is ignored */ }
   try {
     const ranges = JSON.parse(params.get("ranges") || "{}");
-    const ids = {trial:["trial-min","trial-max"], step:["step-min","step-max"], peak:["peak-min","peak-max"], displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"]};
+    const ids = {
+      trial:["trial-min","trial-max"], step:["step-min","step-max"],
+      replicate:["replicate-min","replicate-max"], time:["time-min","time-max"],
+      resultant:["resultant-min","resultant-max"], peak:["peak-min","peak-max"],
+      displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"],
+    };
     for (const [key, valuesForRange] of Object.entries(ranges)) {
       if (!ids[key] || !Array.isArray(valuesForRange)) continue;
-      const integer = key === "trial" || key === "step";
+      const integer = key === "trial" || key === "step" || key === "replicate";
       byId(ids[key][0]).value = displayRangeBound(valuesForRange[0], integer, false);
       byId(ids[key][1]).value = displayRangeBound(valuesForRange[1], integer, true);
       const control = rangeControls.get(key);
@@ -572,21 +587,13 @@ const scopeProducts = {
   heatmap: ["heatmap"], direction: ["direction"], overview: ["trajectory", "heatmap", "direction", "polar"],
   overviewPreview: ["heatmap", "direction"],
   color: ["trajectory", "polar", "heading"], sample: ["trajectory", "polar", "heading"],
+  metrics: ["metrics"], roi: ["roi"], diagnostics: ["diagnostics"],
+  background: ["polar", "heading", "metrics", "roi", "windows"],
   statistics: ["polar", "metrics", "roi", "statistics"],
   transition: ["transition"],
   windows: ["windows"],
   movement: ["trajectory", "direction", "polar", "heading", "roi"],
 };
-
-function mergeScopes(first, second) {
-  if (!first || first === second) return second || first || null;
-  if (first === "full" || second === "full") return "full";
-  const needed = new Set([...(scopeProducts[first] || []), ...(scopeProducts[second] || [])]);
-  const candidates = Object.entries(scopeProducts)
-    .filter(([, productsForScope]) => [...needed].every(product => productsForScope.includes(product)))
-    .sort((a, b) => a[1].length - b[1].length);
-  return candidates[0]?.[0] || "full";
-}
 
 let computeTimer = null;
 let scheduledScope = null;
@@ -594,8 +601,10 @@ let scheduledExtra = {};
 function scheduleCompute(scope = "full", delay = 0, extra = {}) {
   if (!workerReady || !datasetHeader) return;
   clearTimeout(computeTimer);
-  scheduledScope = mergeScopes(mergeScopes(pendingCompute?.scope, scheduledScope), scope);
-  scheduledExtra = {...scheduledExtra, ...extra};
+  // A newer interaction replaces a pending request. Merging stale scopes made
+  // small filter changes quietly expand back into an all-view rebuild.
+  scheduledScope = scope;
+  scheduledExtra = {...extra};
   computeTimer = setTimeout(() => {
     const chosenScope = scheduledScope || "full";
     const chosenExtra = scheduledExtra;
@@ -604,13 +613,52 @@ function scheduleCompute(scope = "full", delay = 0, extra = {}) {
   }, delay);
 }
 
+let deferredAnalysisTimer = null;
+let deferredStatisticsTimer = null;
+
+function scopeForCurrentView() {
+  return {
+    trajectory: "trajectory", occupancy: "heatmap", direction: "direction",
+    polar: "polar", compare: "overview", transitions: "transition",
+    roi: "roi", windows: "windows", heading: "heading", metrics: "metrics",
+    statistics: "statistics", diagnostics: "diagnostics",
+  }[currentView] || "trajectory";
+}
+
+function invalidateDerivedProducts() {
+  for (const key of ["trajectory", "heatmap", "direction", "polar", "heading",
+    "metrics", "roi", "statistics", "transition", "windows"]) delete products[key];
+  byId("statistics-content").innerHTML = '<div class="analysis-empty">Statistics will refresh after 16 seconds of inactivity, or immediately when this view is opened.</div>';
+  byId("windows-content").innerHTML = '<div class="analysis-empty">Window summaries will refresh in the background, or immediately when this view is opened.</div>';
+}
+
+function armDeferredAnalysis() {
+  clearTimeout(deferredAnalysisTimer); clearTimeout(deferredStatisticsTimer);
+  deferredAnalysisTimer = setTimeout(() => {
+    scheduleCompute("background", 0, {quiet: true});
+  }, 8000);
+  deferredStatisticsTimer = setTimeout(() => {
+    scheduleCompute("statistics", 0, {quiet: true});
+  }, 16000);
+}
+
+function scheduleDataUpdate(delay = 0) {
+  if (!workerReady || !datasetHeader) return;
+  invalidateDerivedProducts();
+  scheduleCompute(scopeForCurrentView(), delay);
+  armDeferredAnalysis();
+}
+
 function queueCompute(scope, extra = {}) {
   const requestId = ++latestRequest;
   pendingCompute = {type: "compute", requestId, state: collectState(), scope, ...extra};
   persistState();
   if (!extra.quiet) setStatus("working", scope === "full" ? "Updating analysis" : "Refreshing view", "The retained table is running in a browser worker; the page remains interactive.");
   flushCompute();
+  return requestId;
 }
+
+let reportRequestId = null;
 
 function flushCompute() {
   if (!workerReady || workerBusy || !pendingCompute) return;
@@ -829,7 +877,10 @@ function renderProducts(incoming, summary, quiet = false) {
   }
   if (incoming.polar) {
     incoming.polar.columns = numberValue("panel-columns"); polarRenderer.setData(incoming.polar);
-    byId("polar-summary").textContent = `${formatCount(incoming.polar.units)} ${byId("stats-unit").value === "animal" ? "animal" : "trial"} resultants retained by the quality gates`;
+    const polarMode = byId("polar-mode").value;
+    byId("polar-summary").textContent = polarMode === "density"
+      ? "Circular density of all retained headings in the selected trial-time window"
+      : `${formatCount(incoming.polar.units)} ${byId("stats-unit").value === "animal" ? "animal" : "replicate"} resultants retained by the quality gates`;
   }
   if (incoming.heading) { incoming.heading.columns = numberValue("panel-columns"); headingRenderer.setData(incoming.heading); }
   if (incoming.metrics) metricsRenderer.setData(incoming.metrics);
@@ -868,25 +919,20 @@ function handleWorkerMessage(event) {
   const message = event.data;
   if (message.type === "ready") {
     workerReady = true;
-    setStatus("working", "Preparing native views", "Filtering, spatial bins, circular summaries, and exact metrics are running off the main thread.");
-    queueCompute("full");
+    setStatus("working", "Preparing visible view", "The current layer is calculated first; other analyses refresh after the interface is idle.");
+    scheduleDataUpdate(0);
     return;
   }
   if (message.type === "result") {
     workerBusy = false;
     if (message.requestId === latestRequest) {
       displayedRequest = message.requestId;
-      if (message.scope === "full") {
-        delete products.statistics; delete products.transition; delete products.windows;
-        byId("statistics-content").innerHTML = '<div class="analysis-empty">Open this view to calculate inferential statistics for the current filters.</div>';
-        byId("windows-content").innerHTML = '<div class="analysis-empty">Open this view to compare the current spatial windows.</div>';
-      }
       renderProducts(message.products, message.summary, message.quiet);
       if (!message.quiet) setStatus("ready", "Ready for exploration", `${formatCount(message.summary.visibleRows)} points · ${formatCount(message.summary.visibleSegments)} segments · worker filter ${message.summary.filterMs.toFixed(0)} ms`);
-      if (message.scope === "full" && ["statistics", "metrics", "polar"].includes(currentView)) scheduleCompute("statistics", 0);
-      if (message.scope === "full" && currentView === "compare") scheduleCompute("overview", 0);
-      if (message.scope === "full" && currentView === "transitions") scheduleCompute("transition", 0);
-      if (message.scope === "full" && currentView === "windows") scheduleCompute("windows", 0);
+      if (message.requestId === reportRequestId) {
+        reportRequestId = null;
+        void captureNativeReport();
+      }
     }
     flushCompute();
     return;
@@ -898,7 +944,7 @@ function handleWorkerMessage(event) {
       return;
     }
     byId("segment-inspector").textContent = match
-      ? `${match.sourceFile} · trial ${formatNumber(match.trial, 0)} / step ${formatNumber(match.step, 0)} · ${match.config} · ${match.fly}@${match.vr} · path ${formatNumber(match.distance, 1)}, displacement ${formatNumber(match.displacement, 1)}, peak ${formatNumber(match.peakSpeed, 1)}, median ${formatNumber(match.medianSpeed, 1)}, tortuosity ${formatNumber(match.tortuosity, 1)}`
+      ? `${match.sourceFile} · replicate ${formatNumber(match.replicate, 0)} · trial ${formatNumber(match.trial, 0)} / step ${formatNumber(match.step, 0)} · ${match.config} · ${match.fly}@${match.vr} · path ${formatNumber(match.distance, 1)}, displacement ${formatNumber(match.displacement, 1)}, peak ${formatNumber(match.peakSpeed, 1)}, median ${formatNumber(match.medianSpeed, 1)}, tortuosity ${formatNumber(match.tortuosity, 1)}`
       : "No retained path was close enough; click nearer a visible line.";
     return;
   }
@@ -1022,11 +1068,14 @@ function setDashboardView(view, save = true) {
     section.classList.remove("nav-forward", "nav-back");
     if (section.id === activeSection && previousView !== currentView) section.classList.add(direction);
   }
-  if (datasetHeader && ["statistics", "metrics", "polar"].includes(currentView) && !products.statistics) scheduleCompute("statistics", 0);
-  if (datasetHeader && currentView === "transitions" && !products.transition) scheduleCompute("transition", 0);
-  if (datasetHeader && currentView === "windows" && !products.windows) scheduleCompute("windows", 0);
-  if (datasetHeader && currentView === "compare") scheduleCompute("overview", 0);
-  else if (datasetHeader && previousView === "compare" && currentView !== "compare") scheduleCompute("full", 0);
+  const productForView = {
+    trajectory: "trajectory", occupancy: "heatmap", direction: "direction",
+    polar: "polar", transitions: "transition", roi: "roi", windows: "windows",
+    heading: "heading", metrics: "metrics", statistics: "statistics",
+    diagnostics: "diagnostics",
+  }[currentView];
+  if (datasetHeader && (currentView === "compare" || previousView === "compare"
+      || !products[productForView])) scheduleCompute(scopeForCurrentView(), 0);
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const shown = currentView === "compare"
       ? new Set(["trajectory", "occupancy", "direction", "polar"])
@@ -1058,7 +1107,7 @@ function downloadActivePlot() {
     heading: "heading-plot", metrics: "metrics-plot",
     transitions: "transition-plot", diagnostics: "velocity-hist",
   }[lens];
-  const url = compositePlot(host);
+  const url = lens === "trajectory" ? trajectoryRenderer.snapshotDataUrl() : compositePlot(host);
   if (!url) return;
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -1071,7 +1120,7 @@ const recipeVisualIds = [
   "heat-range-mode", "heat-cmin", "heat-cmax", "flow-metric",
   "flow-range-mode", "flow-cmin", "flow-cmax", "particle-rate",
   "trail-length", "flow-speed", "flow-variability", "flow-color-mode",
-  "flow-velocity-mode", "transition-split", "trial-fraction",
+  "flow-velocity-mode", "polar-mode", "transition-split", "trial-fraction",
   "transition-outcome", "transition-display", "transition-support",
 ];
 
@@ -1105,10 +1154,15 @@ function applyRecipeControls(recipe) {
     if (Array.isArray(labels)) selected = labels.map(label => datasetHeader.categories[key].indexOf(label)).filter(code => code >= 0);
     for (const option of select.options) option.selected = selected.includes(Number(option.value));
   }
-  const rangeIds = {trial:["trial-min","trial-max"], step:["step-min","step-max"], peak:["peak-min","peak-max"], displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"]};
+  const rangeIds = {
+    trial:["trial-min","trial-max"], step:["step-min","step-max"],
+    replicate:["replicate-min","replicate-max"], time:["time-min","time-max"],
+    resultant:["resultant-min","resultant-max"], peak:["peak-min","peak-max"],
+    displacement:["disp-min","disp-max"], distance:["distance-min","distance-max"],
+  };
   for (const [key, ids] of Object.entries(rangeIds)) {
     const values = state.ranges?.[key]; if (!Array.isArray(values)) continue;
-    const integer = key === "trial" || key === "step";
+    const integer = key === "trial" || key === "step" || key === "replicate";
     byId(ids[0]).value = displayRangeBound(values[0], integer, false);
     byId(ids[1]).value = displayRangeBound(values[1], integer, true);
     const control = rangeControls.get(key);
@@ -1121,6 +1175,7 @@ function applyRecipeControls(recipe) {
     overviewGrouping:"overview-grouping",
     walkThreshold:"walk-threshold", binSize:"bin-size", boundPercent:"bound-percent",
     angleSource:"angle-source", statsUnit:"stats-unit", polarValidMin:"polar-valid-min",
+    polarMode:"polar-mode",
     roiReach:"roi-reach", ringMatch:"ring-match", playbackPercentile:"playback-cap",
     headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
   };
@@ -1175,24 +1230,43 @@ async function copyRecipe() {
 function downloadRecipe() {
   if (!byId("recipe-json").value.trim()) captureRecipe();
   const blob = new Blob([byId("recipe-json").value], {type: "application/json"});
-  const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
-  anchor.href = url; anchor.download = `daari-deepa-view-${new Date().toISOString().slice(0, 10)}.json`;
-  anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  downloadBlob(blob, `daari-deepa-view-${new Date().toISOString().slice(0, 10)}.json`);
 }
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>\"]/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[character]));
 }
 
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url; anchor.download = filename; anchor.hidden = true;
+  document.body.appendChild(anchor);
+  anchor.click(); anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
 async function exportNativeReport() {
-  if (!datasetHeader) return;
+  if (!datasetHeader || reportRequestId != null) return;
   const exportButton = byId("export-button");
   exportButton.disabled = true; exportButton.textContent = "Preparing report…";
   setStatus("working", "Preparing native report", "Capturing the current linked views and analytical tables locally in your browser.");
+  const coreProducts = ["trajectory", "heatmap", "direction", "polar", "roi", "heading", "metrics", "diagnostics"];
+  if (coreProducts.some(product => !products[product])) {
+    reportRequestId = queueCompute("full", {quiet: true});
+    return;
+  }
+  await captureNativeReport();
+}
+
+async function captureNativeReport() {
+  const exportButton = byId("export-button");
   await new Promise(resolve => requestAnimationFrame(() => resolve()));
   try {
+  const trajectoryImage = trajectoryRenderer.snapshotDataUrl();
+  if (!trajectoryImage) throw new Error("The trajectory framebuffer was empty; the report was not downloaded.");
   const sections = [
-    ["Trajectory field", () => compositePlot("trajectory-plot")],
+    ["Trajectory field", () => trajectoryImage],
     ["Occupancy", () => compositePlot("heatmap-plot")],
     ["Local direction", () => compositePlot("direction-plot")],
     ["Polar direction", () => snapshotChart(polarRenderer)],
@@ -1216,10 +1290,8 @@ async function exportNativeReport() {
     ${tableSections.map(([title, content]) => `<section><h2>${escapeHtml(title)}</h2>${content}</section>`).join("")}
     <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Figures are a static record of the current native browser state.</small></footer>`;
   const blob = new Blob([html], {type: "text/html"});
-  const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
-  anchor.href = url; anchor.download = `daari-deepa-native-${new Date().toISOString().slice(0,10)}.html`;
-  anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-  setStatus("ready", "Report exported", "The self-contained HTML report was downloaded from the current local browser state.");
+  downloadBlob(blob, `daari-deepa-native-${new Date().toISOString().slice(0,10)}.html`);
+  setStatus("ready", "Report exported", `${figures.length} figures embedded locally, including ${formatCount(trajectoryRenderer.lastSnapshotInk || 0)} sampled trajectory pixels.`);
   } catch (error) {
     setStatus("error", "Report export failed", error.message || String(error));
   } finally {
@@ -1245,8 +1317,15 @@ function renderRingControls() {
   byId("ring-quick-delete").disabled = !rings.length;
   byId("curtain-state").textContent = byId("ring-enabled").checked && rings.length
     ? `${rings.length} curtain ${rings.length === 1 ? "ring" : "rings"}` : "Curtain off";
-  byId("curtain-toggle").textContent = byId("ring-enabled").checked && rings.length
-    ? `Curtain · ${rings.length}` : "Curtain";
+  updateCurtainLabels();
+}
+
+function updateCurtainLabels() {
+  const enabled = byId("ring-enabled").checked && rings.length;
+  byId("curtain-toggle").innerHTML = `<span class="curtain-icon" aria-hidden="true"></span>Curtain${enabled ? ` · ${rings.length}` : ""}`;
+  const center = byId("curtain-center");
+  center.classList.toggle("active", !!enabled);
+  center.querySelector("b").textContent = enabled ? `${rings.length} ring${rings.length === 1 ? "" : "s"}` : "Curtain";
 }
 
 function updateRingControlValues() {
@@ -1273,7 +1352,7 @@ function renderPanelOrder(codes = lastSummary?.panelKeys || []) {
   const commit = next => {
     panelOrders = {...panelOrders, [key]: next};
     renderPanelOrder(next);
-    scheduleCompute("full", 30);
+    scheduleDataUpdate(30);
   };
   codes.map(Number).forEach((code, index) => {
     const item = document.createElement("div"); item.className = "panel-order-item";
@@ -1321,7 +1400,7 @@ function applyLocalRingObserver(save = false) {
   }
   byId("curtain-state").textContent = enabled
     ? `${rings.length} curtain ${rings.length === 1 ? "ring" : "rings"}` : "Curtain off";
-  byId("curtain-toggle").textContent = enabled ? `Curtain · ${rings.length}` : "Curtain";
+  updateCurtainLabels();
   updateTrajectorySummary(stats);
   if (save) persistState();
   return stats;
@@ -1353,7 +1432,7 @@ function scheduleLocalRingObserver(final = false, source = null) {
     ringFrame = null;
     applyLocalRingObserver(true);
     transitionSelectionActive = false;
-    scheduleCompute("full", 180);
+    scheduleDataUpdate(180);
     return;
   }
   if (ringFrame) return;
@@ -1428,8 +1507,9 @@ function setCurtainPalette(open) {
   }
 }
 byId("curtain-toggle").addEventListener("click", () => setCurtainPalette(byId("curtain-palette").hidden));
+byId("curtain-center").addEventListener("click", () => setCurtainPalette(true));
 byId("curtain-close").addEventListener("click", () => setCurtainPalette(false));
-applyButton.addEventListener("click", () => scheduleCompute("full"));
+applyButton.addEventListener("click", () => scheduleDataUpdate(0));
 resetViewButton.addEventListener("click", () => trajectoryRenderer.resetView(true));
 function setCleanMode(enabled) {
   shell.classList.toggle("clean-mode", enabled);
@@ -1474,8 +1554,7 @@ byId("overview-grouping").addEventListener("change", () => scheduleCompute("over
 let railWheelLocked = false;
 byId("workspace").addEventListener("wheel", event => {
   const onRail = event.target.closest(".view-rail-track, .rail-context");
-  const safeWorkspace = !event.target.closest(".plot-host, .tool-palette, .context-settings-panel, input, select, textarea, button, details");
-  if ((!onRail && !safeWorkspace) || Math.abs(event.deltaY) + Math.abs(event.deltaX) < 18) return;
+  if (!onRail || Math.abs(event.deltaY) + Math.abs(event.deltaX) < 18) return;
   event.preventDefault();
   if (railWheelLocked) return;
   railWheelLocked = true;
@@ -1484,8 +1563,13 @@ byId("workspace").addEventListener("wheel", event => {
 }, {passive: false});
 document.addEventListener("keydown", event => {
   if (event.target.closest("input, select, textarea") || event.metaKey || event.ctrlKey) return;
-  if (event.key === "ArrowRight" || event.key === "ArrowDown") stepDashboardView(1);
-  else if (event.key === "ArrowLeft" || event.key === "ArrowUp") stepDashboardView(-1);
+  const spatialViews = ["trajectory", "occupancy", "direction", "polar", "transitions", "compare"];
+  if ((event.key === "ArrowRight" || event.key === "ArrowLeft") && spatialViews.includes(currentView)) {
+    const delta = event.key === "ArrowRight" ? 1 : -1;
+    const index = spatialViews.indexOf(currentView);
+    setDashboardView(spatialViews[(index + delta + spatialViews.length) % spatialViews.length]);
+  } else if (event.key === "ArrowDown" || (event.key === "ArrowRight" && !spatialViews.includes(currentView))) stepDashboardView(1);
+  else if (event.key === "ArrowUp" || (event.key === "ArrowLeft" && !spatialViews.includes(currentView))) stepDashboardView(-1);
   else if (event.key.toLowerCase() === "c") setCurtainPalette(byId("curtain-palette").hidden);
 });
 for (const details of document.querySelectorAll(".context-settings")) details.addEventListener("toggle", () => {
@@ -1505,7 +1589,12 @@ byId("animals-none").addEventListener("click", () => {
   animalVisibility.fill(false); renderAnimalVisibility(); applyAnimalVisibility();
 });
 byId("trial-fraction").addEventListener("input", updateFraction);
-byId("resample-button").addEventListener("click", () => { sampleSeed += 1; scheduleCompute("sample"); });
+byId("resample-button").addEventListener("click", () => {
+  sampleSeed += 1;
+  delete products.trajectory; delete products.polar; delete products.heading;
+  const scope = scopeForCurrentView();
+  if (["trajectory", "polar", "heading", "overview"].includes(scope)) scheduleCompute(scope);
+});
 byId("roi-show").addEventListener("change", () => {
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
 });
@@ -1591,9 +1680,22 @@ for (const control of document.querySelectorAll("[data-scope]")) {
     if (scope === "layout") updateColumns();
     else if (scope === "windows") {
       trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
-      scheduleCompute("windows", 40);
+      delete products.windows;
+      if (currentView === "windows") scheduleCompute("windows", 40);
+      else armDeferredAnalysis();
     }
-    else scheduleCompute(scope, scope === "full" ? 180 : 80);
+    else if (scope === "full" || scope === "movement") scheduleDataUpdate(scope === "full" ? 180 : 80);
+    else if (scope === "spatial") {
+      delete products.heatmap; delete products.direction; delete products.transition;
+      if (["occupancy", "direction", "transitions", "compare"].includes(currentView)) scheduleCompute(scopeForCurrentView(), 80);
+    } else {
+      const dependencies = new Set(scopeProducts[scope] || []);
+      for (const product of dependencies) delete products[product];
+      const visibleScope = scopeForCurrentView();
+      const visibleProducts = scopeProducts[visibleScope] || [];
+      if (visibleProducts.some(product => dependencies.has(product))) scheduleCompute(visibleScope, 80);
+      else armDeferredAnalysis();
+    }
   });
 }
 

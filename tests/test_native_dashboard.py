@@ -40,6 +40,15 @@ def _header(payload: bytes):
     return header, body_offset
 
 
+def _array(payload: bytes, header: dict, body_offset: int, name: str):
+    descriptor = header["arrays"][name]
+    dtype = np.dtype(descriptor["dtype"])
+    return np.frombuffer(
+        payload, dtype=dtype, count=descriptor["length"],
+        offset=body_offset + descriptor["offset"],
+    )
+
+
 def test_native_binary_is_aligned_and_file_scoped(tmp_path):
     _write_csv(tmp_path / "session_VR1_.csv", 0)
     _write_csv(tmp_path / "restart_VR1_.csv", 4)
@@ -63,11 +72,38 @@ def test_native_binary_is_aligned_and_file_scoped(tmp_path):
     assert "rawColumns" not in header
     assert header["arrays"]["segmentDuration"]["length"] == 2
     assert set(header["filterHistograms"]) == {
-        "trial", "step", "peak", "displacement", "distance",
+        "trial", "step", "replicate", "time", "resultant",
+        "peak", "displacement", "distance",
     }
+    assert header["arrays"]["segmentReplicate"]["length"] == 2
+    assert header["arrays"]["segmentOrientationR"]["length"] == 2
     for descriptor in header["arrays"].values():
         item_size = np.dtype(descriptor["dtype"]).itemsize
         assert (body_offset + descriptor["offset"]) % item_size == 0
+
+
+def test_native_replicate_order_combines_trial_and_step_sequence(tmp_path):
+    rows = []
+    base = pd.Timestamp("2026-01-01T00:00:00")
+    for replicate, (trial, step) in enumerate([(0, 0), (0, 1), (1, 0)], 1):
+        for sample in range(2):
+            rows.append({
+                "Current Time": base + pd.Timedelta(seconds=replicate * 10 + sample),
+                "CurrentTrial": trial, "CurrentStep": step,
+                "GameObjectPosX": sample, "GameObjectPosZ": replicate,
+                "GameObjectRotY": 15 * replicate,
+                "ConfigFile": "Choice_Test.json", "Scene": "Choice",
+                "FlyID": "fly-1",
+            })
+    pd.DataFrame(rows).to_csv(tmp_path / "sequence_VR1_.csv", index=False)
+
+    dataset = load_native_dataset(str(tmp_path))
+    header, body_offset = _header(dataset.binary)
+
+    assert _array(dataset.binary, header, body_offset, "segmentTrial").tolist() == [0, 0, 1]
+    assert _array(dataset.binary, header, body_offset, "segmentStep").tolist() == [0, 1, 0]
+    assert _array(dataset.binary, header, body_offset, "segmentReplicate").tolist() == [1, 2, 3]
+    assert header["ranges"]["replicate"] == [1.0, 3.0]
 
 
 def test_native_loader_normalizes_mixed_timezone_files_without_warnings(tmp_path):
@@ -269,8 +305,13 @@ def test_native_view_recipe_returns_readable_python_groups(tmp_path):
         "filtersByLabel": {"config": ["Choice_Test.json"]},
         "state": {
             "groupBy": "config",
+            "angleSource": "orientation",
             "filters": {},
-            "ranges": {"trial": [0, 0], "step": [0, 0]},
+            "ranges": {
+                "trial": [0, 0], "step": [0, 0],
+                "replicate": [1, 1], "time": [0, 1],
+                "resultant": [0, 1],
+            },
         },
         "visuals": {"trajectory-width": "1.7"},
     }
@@ -278,7 +319,10 @@ def test_native_view_recipe_returns_readable_python_groups(tmp_path):
     view = load_view_recipe(recipe)
 
     assert view.filter_spec.configs == ("Choice_Test.json",)
-    assert len(view.filter_result.filtered) == 6
+    assert view.filter_spec.replicate_range == (1, 1)
+    assert view.filter_spec.local_time_range == (0, 1)
+    assert view.filter_spec.resultant_range == (0, 1)
+    assert len(view.filter_result.filtered) == 4
     assert list(view.groups) == ["Choice_Test.json"]
 
 
@@ -291,3 +335,4 @@ def test_native_url_state_is_parseable_without_starting_the_dashboard():
     assert recipe.source == "data/session"
     assert recipe.state["groupBy"] == "scene"
     assert recipe.state["filters"] == {"config": [0]}
+    assert recipe.state["angleSource"] == "orientation"

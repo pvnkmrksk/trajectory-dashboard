@@ -26,10 +26,11 @@ with three responsibilities:
 
 The payload stores row-varying values only at row granularity: X, Z, local time,
 smoothed/raw speed, body/movement heading, local tortuosity, and segment code.
-Trial, step, source/category codes, and exact summaries are stored once per
-segment. Filter mini-histograms and robust segment-duration quantiles are stored
-once in the compact header. The generic raw-channel explorer is intentionally
-not part of the product.
+Trial, step, chronological replicate order, body/movement resultant R,
+source/category codes, and exact summaries are stored once per segment. Filter
+mini-histograms and robust segment-duration quantiles are stored once in the
+compact header. The generic raw-channel explorer is intentionally not part of
+the product.
 
 ## Browser model
 
@@ -48,13 +49,16 @@ table off the main thread and prepares narrow drawing products:
 - load-time velocity/displacement histograms.
 
 Newer UI requests replace a pending request instead of accumulating a callback
-queue. Results from an obsolete request are ignored. Filtering changes run a
-full worker pass. Panel labels/order remap the cached visible segments without
-rerunning the filter. The worker also caches sparse per-segment occupancy and
-direction-cell contributions, so curtain-only previews add matched segments'
-existing cells instead of rescanning every retained row. Occupancy remains
-cached separately from direction, and colour, movement, heading, polar,
-playback, statistics, and layout changes rebuild only their dependent products.
+queue. Results from an obsolete request are ignored. Filtering changes rebuild
+the visible view first; polar/heading/metrics/ROI/windows refresh after eight
+seconds of inactivity and inference after sixteen seconds, or immediately when
+their workspace is opened. Panel labels/order remap the cached visible segments
+without rerunning the filter. The worker also caches sparse per-segment
+occupancy and direction-cell contributions, so curtain-only previews add
+matched segments' existing cells instead of rescanning every retained row.
+Occupancy remains cached separately from direction, and colour, movement,
+heading, polar, playback, statistics, and layout changes rebuild only their
+dependent products.
 
 The rendering boundary is deliberately hybrid:
 
@@ -75,7 +79,9 @@ The rendering boundary is deliberately hybrid:
   viewport gesture is active;
 - polar, heading time, ROI diagnostics, metrics, and histograms
   use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
-  interactive legends, data zoom, reset, accessibility, and export;
+  interactive legends, data zoom, reset, accessibility, and export. Polar can
+  show trial/animal vectors, a histogram of resultant directions, or a
+  circularly smoothed density of every retained heading sample;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
 - one compact, wheel/keyboard/arrow-snapping view rail moves through the
   spatial workspace, Targets, Windows, Heading, Metrics, Statistics, and
@@ -157,9 +163,16 @@ refreshes the slower analytical products, making the ring a subset shared by
 paths, occupancy, flow, transitions, polar, heading, ROI, metrics, windows, and
 statistics rather than a trajectory-only highlight.
 
+Native report export reads the WebGL framebuffer immediately after a redraw,
+flips it into top-left Canvas coordinates, composites the annotation layer, and
+embeds that raster in the self-contained HTML. It therefore does not depend on
+the browser preserving a presented WebGL canvas between animation frames.
+
 ## Analytical invariants preserved
 
 - `_seg_id` remains file + normalized integer trial + normalized integer step.
+- `TrialIndex` is exposed separately as Replicate order and never replaces
+  `_seg_id`; it is the chronological segment ordinal within each source file.
 - One load-time segment/time order is reused everywhere.
 - Exact per-source-file segment statistics are finalized before retention.
 - Filter ranges and movement metrics use raw position units.
@@ -176,19 +189,19 @@ statistics rather than a trajectory-only highlight.
 |---|---|
 | Bounded parallel CSV/metadata load | Complete |
 | Config/scene/VR/fly/folder grouping and filters | Complete |
-| Trial/step/peak/displacement/distance and quality filters | Complete |
+| Trial/step/replicate/time/resultant-R/peak/displacement/distance and quality filters | Complete |
 | GPU trajectories, colour modes, moving gate, point budget | Complete |
 | Shared pan/zoom, reset, responsive columns, clean layout | Complete |
 | GPU playback (segment-local time; all/single; p95/p99/max caps) and displayed-trial fraction | Complete |
 | Occupancy count/time/percent, crisp cells, linear/log and adjustable colour limits | Complete |
 | Local body/movement flow field with abundance/R uncertainty controls and hue legend | Complete |
-| Trial/animal polar and trial/mean/density heading time | Complete |
+| Trial/animal polar vectors, resultant histogram, all-heading circular density, and trial/mean/density heading time | Complete |
 | Trial/animal movement metrics | Complete |
 | ROI rings, first-reached counts, entered-only, tail trim | Complete |
 | ROI fraction/residence/time/error diagnostics | Complete |
 | Native filter mini-histograms with dual range and compact numeric controls | Complete (histograms refresh to the current AND subset) |
 | Exact nearest-segment inspection | Complete |
-| Static self-contained native HTML report | Complete |
+| Static self-contained native HTML report | Complete (WebGL trajectories captured from the framebuffer) |
 | Shareable principal URL state and readable JSON view recipe | Complete |
 | Python recipe/URL → `FilterSpec`/grouped frames bridge | Complete |
 | Multi-ring curtain observer, Any/All, editable geometry | Complete (direct on every Cartesian spatial layer; center/edge drag, keyboard/UI/drag-to-trash deletion; exact shared analytical subset) |

@@ -25,7 +25,9 @@ CSV files only below that exact folder boundary.
 
 The browser receives one compact typed-column payload, transfers ownership to a
 Web Worker, and then keeps filtering, grouping, binning, playback, displayed-
-trial sampling, and circular summaries off the main thread. Trajectories use
+trial sampling, and circular summaries off the main thread. The visible
+workspace is rebuilt first; off-screen analytical views refresh after idle time
+or immediately when opened. Trajectories use
 one instanced WebGL draw call; occupancy, animated flow, and transition
 probability use linked Canvas renderers; polar, ROI, heading-time, metrics, and diagnostics use vendored
 Apache ECharts for mature hover, zoom, legend, and export interactions. Pan and
@@ -160,6 +162,10 @@ spec = FilterSpec(
     jump_buffer_ms=100,
     trial_range=(0, 40),      # inclusive CurrentTrial window
     step_range=(1, 3),        # inclusive CurrentStep window
+    replicate_range=(1, 12),  # chronological Trial×Step ordinal per source file
+    local_time_range=(0, 15), # seconds since the current segment began
+    resultant_range=(0.3, 1), # circular R for each complete segment
+    resultant_source="orientation",  # or "movement"
     configs=("Choice_Push.json",),
 )
 filtered = filter_frame(df, spec).filtered
@@ -452,6 +458,9 @@ cross-panel comparisons.
 | Min displacement | Removes whole segments whose start-to-end displacement is below this value. Auto uses 5% of median segment displacement. | Drops trials where the animal effectively did not move. |
 | Trial range | Inclusive `CurrentTrial` min/max fields in the Subset section. | Splits early vs late trials without changing segment identity or writing a separate preprocessing script. |
 | Step range | Inclusive `CurrentStep` min/max fields in the Subset section. | Selects repeated scene steps while preserving complete `SourceFile+Trial+Step` segments. |
+| Replicate order | Inclusive chronological `TrialIndex` window within each source file. | Gives early/late slices one axis whether Trial, Step, or both advanced during acquisition. |
+| Local trial time | Inclusive seconds-from-segment-start window; the native default upper bound is the median segment duration. | Compares the same portion of differently sized trials without letting one outlier dictate the range. |
+| Trial resultant R | Inclusive circular-resultant gate from body orientation or movement heading. | Selects strongly or weakly directed trials directly from the distribution. |
 | Trim segment edges (Advanced) | Removes N samples from both ends of every segment after spike filtering. | Blunt instrument for start/end artifacts; normally leave at `0` and prefer the time-based spike buffer. |
 | Histogram range selections | Drag-select peak-velocity, net-displacement, or cumulative-distance-walked ranges. All three have synchronized, unbounded exact min/max boxes. | Separates straight-line progress from actual path length while keeping the sliders robust to outliers and precise beyond their displayed spans. |
 | Retention summary | Reports final retained/discarded points, trials, and animals. The sidebar audit shows each criterion serially, relative to the previous step. | Makes active filters auditable without mixing independent and sequential denominators. |

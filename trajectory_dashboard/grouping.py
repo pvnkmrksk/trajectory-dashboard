@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from .filters import apply_filters, compute_segment_stats, filter_by_stat_range, jump_buffer_seconds
@@ -62,6 +63,10 @@ class FilterSpec:
     folders: tuple[str, ...] | None = None
     trial_range: tuple[float | None, float | None] | None = None
     step_range: tuple[float | None, float | None] | None = None
+    replicate_range: tuple[float | None, float | None] | None = None
+    local_time_range: tuple[float | None, float | None] | None = None
+    resultant_range: tuple[float | None, float | None] | None = None
+    resultant_source: str = "orientation"
     velocity_range: tuple[float, float] | None = None
     displacement_range: tuple[float, float] | None = None
     distance_walked_range: tuple[float, float] | None = None
@@ -101,20 +106,24 @@ def subset_frame(
     folders=None,
     trial_range: tuple[float | None, float | None] | None = None,
     step_range: tuple[float | None, float | None] | None = None,
+    replicate_range: tuple[float | None, float | None] | None = None,
 ) -> pd.DataFrame:
-    """Return rows matching optional metadata, trial, and step subsets.
+    """Return rows matching optional metadata and complete-segment subsets.
 
     `trial_range` is inclusive and uses the dataset's numeric `CurrentTrial`
     column. `step_range` is inclusive and uses numeric `CurrentStep`; because
     step is constant within `_seg_id`, this keeps or drops complete segments.
+    `replicate_range` uses the chronological 1-based `TrialIndex`, which is the
+    combined Trial/Step sequence order within each source file.
     """
 
     if df is None or len(df) == 0:
         return df
     trng = _normalise_range(trial_range)
     srng = _normalise_range(step_range)
+    rrng = _normalise_range(replicate_range)
     if (not any(_has_values(v) for v in (configs, vrs, fly_ids, scenes, folders))
-            and not trng and not srng):
+            and not trng and not srng and not rrng):
         return df
     mask = pd.Series(True, index=df.index)
     if _has_values(configs):
@@ -141,7 +150,75 @@ def subset_frame(
             mask &= step >= float(lo)
         if hi is not None:
             mask &= step <= float(hi)
+    if rrng:
+        lo, hi = rrng
+        replicate = pd.to_numeric(df["TrialIndex"], errors="coerce")
+        if lo is not None:
+            mask &= replicate >= float(lo)
+        if hi is not None:
+            mask &= replicate <= float(hi)
     return df[mask].copy()
+
+
+def _filter_resultant_range(
+    df: pd.DataFrame,
+    value_range: tuple[float | None, float | None] | None,
+    source: str,
+) -> pd.DataFrame:
+    value_range = _normalise_range(value_range)
+    if not value_range or len(df) == 0:
+        return df
+    lo, hi = value_range
+    if (lo is None or float(lo) <= 0) and (hi is None or float(hi) >= 1):
+        return df
+    starts = df["_seg_id"].ne(df["_seg_id"].shift()).to_numpy()
+    if str(source).lower() == "movement":
+        x = pd.to_numeric(df["GameObjectPosX"], errors="coerce").to_numpy(dtype=float)
+        z = pd.to_numeric(df["GameObjectPosZ"], errors="coerce").to_numpy(dtype=float)
+        dx = np.empty(len(df), dtype=float); dz = np.empty(len(df), dtype=float)
+        dx[0] = np.nan; dz[0] = np.nan
+        dx[1:] = np.diff(x); dz[1:] = np.diff(z)
+        dx[starts] = np.nan; dz[starts] = np.nan
+        angles = np.arctan2(dx, dz)
+    else:
+        angles = np.deg2rad(pd.to_numeric(
+            df["GameObjectRotY"], errors="coerce"
+        ).to_numpy(dtype=float))
+    codes = np.cumsum(starts) - 1
+    count = int(codes[-1]) + 1
+    valid = np.isfinite(angles)
+    sine = np.bincount(codes[valid], weights=np.sin(angles[valid]), minlength=count)
+    cosine = np.bincount(codes[valid], weights=np.cos(angles[valid]), minlength=count)
+    samples = np.bincount(codes[valid], minlength=count)
+    resultant = np.zeros(count, dtype=float)
+    present = samples > 0
+    resultant[present] = np.hypot(sine[present], cosine[present]) / samples[present]
+    keep = np.ones(count, dtype=bool)
+    if lo is not None:
+        keep &= resultant >= float(lo)
+    if hi is not None:
+        keep &= resultant <= float(hi)
+    return df[keep[codes]].copy()
+
+
+def _filter_local_time(
+    df: pd.DataFrame,
+    value_range: tuple[float | None, float | None] | None,
+) -> pd.DataFrame:
+    value_range = _normalise_range(value_range)
+    if not value_range or len(df) == 0:
+        return df
+    time_ns = df["Current Time"].astype("int64", copy=False).to_numpy(dtype=np.int64)
+    starts = df["_seg_id"].ne(df["_seg_id"].shift()).to_numpy()
+    start_rows = np.maximum.accumulate(np.where(starts, np.arange(len(df)), 0))
+    elapsed = (time_ns - time_ns[start_rows]) / 1e9
+    lo, hi = value_range
+    keep = np.ones(len(df), dtype=bool)
+    if lo is not None:
+        keep &= elapsed >= float(lo)
+    if hi is not None:
+        keep &= elapsed <= float(hi)
+    return df[keep].copy()
 
 
 def filter_frame(
@@ -164,6 +241,7 @@ def filter_frame(
         folders=spec.folders,
         trial_range=spec.trial_range,
         step_range=spec.step_range,
+        replicate_range=spec.replicate_range,
     )
     if len(subset) == 0:
         return FilterResult(subset, subset, None)
@@ -188,6 +266,11 @@ def filter_frame(
         subset_stats = subset_stats if subset_stats is not None else compute_segment_stats(subset)
         lo, hi = spec.velocity_range
         subset = filter_by_stat_range(subset, subset_stats, "peak_velocity", lo, hi)
+    if spec.resultant_range:
+        subset = _filter_resultant_range(
+            subset, spec.resultant_range, spec.resultant_source
+        )
+        has_range = True
     if has_range:
         if subset_stats is not None and len(subset):
             kept_ids = pd.Index(subset["_seg_id"].astype(str).unique())
@@ -200,6 +283,11 @@ def filter_frame(
         subset_stats = compute_segment_stats(subset)
     elif not compute_stats:
         subset_stats = None
+
+    if spec.local_time_range:
+        subset = _filter_local_time(subset, spec.local_time_range)
+        if compute_stats:
+            subset_stats = compute_segment_stats(subset) if len(subset) else None
 
     if _positive(spec.vel_threshold) or _positive(spec.min_displacement) or _positive(spec.edge_trim_samples):
         filtered = apply_filters(

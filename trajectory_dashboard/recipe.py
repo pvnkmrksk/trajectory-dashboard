@@ -68,6 +68,7 @@ def recipe_from_url(url: str) -> ViewRecipe:
         "panelOrders": _json_param(query, "order", {}),
         "groupBy": query.get("group", ["config"])[0],
         "colorBy": query.get("color", ["categorical"])[0],
+        "angleSource": query.get("angle", ["orientation"])[0],
         **quality,
     }
     return ViewRecipe(
@@ -141,6 +142,10 @@ def filter_spec_from_recipe(
         folders=_selected_labels(recipe, dataset, "folder"),
         trial_range=tuple(ranges["trial"]) if ranges.get("trial") else None,
         step_range=tuple(ranges["step"]) if ranges.get("step") else None,
+        replicate_range=tuple(ranges["replicate"]) if ranges.get("replicate") else None,
+        local_time_range=tuple(ranges["time"]) if ranges.get("time") else None,
+        resultant_range=tuple(ranges["resultant"]) if ranges.get("resultant") else None,
+        resultant_source=state.get("angleSource", "orientation"),
         velocity_range=tuple(peak_range) if peak_range else None,
         displacement_range=tuple(ranges["displacement"]) if ranges.get("displacement") else None,
         distance_walked_range=tuple(ranges["distance"]) if ranges.get("distance") else None,

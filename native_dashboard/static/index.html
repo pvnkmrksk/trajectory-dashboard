@@ -75,6 +75,7 @@
               <option value="folder">Source folder</option>
               <option value="roi">ROI outcome</option>
               <option value="trial">Trial</option>
+              <option value="replicate">Replicate order</option>
               <option value="time">Local time</option>
               <option value="speed">Velocity</option>
               <option value="tortuosity">Tortuosity</option>
@@ -82,6 +83,11 @@
           </label>
           <label>Point budget
             <input id="point-budget" data-scope="trajectory" type="number" min="10000" step="10000" value="150000" title="Maximum rendered line segments; analysis always uses the retained data.">
+          </label>
+          <label>Panel columns
+            <select id="panel-columns" data-scope="layout" aria-label="Panel columns">
+              <option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option>
+            </select>
           </label>
           <label class="check"><input id="moving-only" data-scope="movement" type="checkbox"> Moving samples only</label>
           <label class="check"><input id="spatial-grid" type="checkbox" checked> Spatial grid</label>
@@ -175,8 +181,8 @@
         <button class="icon-button rail-menu" id="controls-toggle" type="button" aria-expanded="false" aria-controls="analysis-sidebar" aria-label="Open analysis controls">☰</button>
         <div class="rail-brand" aria-label="Daari Deepa"><span class="rail-brand-lamp" aria-hidden="true"></span><b>Daari Deepa</b></div>
         <button class="icon-button rail-step" id="view-prev" type="button" aria-label="Previous view">‹</button>
-        <div class="view-rail-track">
-          <button type="button" data-view-button="trajectory" class="active">Spatial</button>
+        <div class="view-rail-track" title="Scroll here or use ↑/↓ to move between workspaces. Within Explore, use ←/→ for Paths, Occupancy, Flow, Polar, Transitions, and Overview.">
+          <button type="button" data-view-button="trajectory" class="active">Explore</button>
           <span class="rail-divider" aria-hidden="true"></span>
           <button type="button" data-view-button="roi">Targets</button>
           <button type="button" data-view-button="windows">Windows</button>
@@ -187,7 +193,7 @@
         </div>
         <button class="icon-button rail-step" id="view-next" type="button" aria-label="Next view">›</button>
         <div class="rail-context" aria-live="polite"><b id="view-title">Paths</b><span id="view-subtitle">Spatial trajectories</span></div>
-        <button class="rail-action curtain-action" id="curtain-toggle" type="button" aria-expanded="false" aria-controls="curtain-palette" aria-keyshortcuts="C" title="Curtain observer (C): add, select, combine, resize, or delete shared spatial rings">Curtain</button>
+        <button class="rail-action curtain-action" id="curtain-toggle" type="button" aria-expanded="false" aria-controls="curtain-palette" aria-keyshortcuts="C" title="Curtain observer (C): add, select, combine, resize, or delete shared spatial rings"><span class="curtain-icon" aria-hidden="true"></span>Curtain</button>
         <details class="source-popover" id="source-popover">
           <summary>Source</summary>
           <form class="source-form" id="source-form">
@@ -230,9 +236,6 @@
             <button type="button" data-layer-button="transitions" role="tab">Transitions</button>
             <button type="button" data-layer-button="compare" role="tab" aria-label="Spatial overview">Overview</button>
           </div>
-          <label class="spatial-columns">Columns<select id="panel-columns" data-scope="layout" aria-label="Panel columns">
-            <option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option>
-          </select></label>
           <label class="overview-mode">Overview<select id="overview-grouping" aria-label="Overview detail">
             <option value="pooled">Pooled · 4 views</option><option value="panels">All panels × 4</option>
           </select></label>
@@ -241,6 +244,7 @@
           <button id="ring-quick-delete" type="button" hidden aria-hidden="true" tabindex="-1">Delete</button>
         </div>
         <div class="explore-grid">
+      <button class="curtain-center" id="curtain-center" type="button" aria-label="Open the shared curtain observer"><span aria-hidden="true"></span><b>Curtain</b></button>
       <article class="lens-panel hero-section" id="trajectory-section" data-view="trajectory">
         <div class="section-heading">
           <div><span class="section-kicker">Spatial paths</span><h2>Trajectory field</h2></div>
@@ -320,7 +324,13 @@
           <div><span class="section-kicker">Trial resultants</span><h2>Polar direction</h2></div>
           <div class="section-summary" id="polar-summary"></div>
         </div>
-        <div class="plot-card"><div class="plot-host" id="polar-plot" aria-label="Polar direction plot"></div></div>
+        <div class="plot-card">
+          <details class="context-settings"><summary>Polar display</summary><div class="context-settings-panel inline-controls">
+            <label>Representation<select id="polar-mode" data-scope="polar"><option value="vectors">Resultant vectors</option><option value="histogram">Resultant histogram</option><option value="density">All-heading density</option></select></label>
+            <small>Vectors summarize each replicate. Histogram counts replicate directions. All-heading density uses every retained heading sample in the selected local-time window.</small>
+          </div></details>
+          <div class="plot-host" id="polar-plot" aria-label="Polar direction plot"></div>
+        </div>
       </article>
 
       <article class="lens-panel" id="transitions-section" data-view="transitions">

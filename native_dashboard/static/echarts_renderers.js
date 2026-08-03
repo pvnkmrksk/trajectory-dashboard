@@ -180,7 +180,7 @@ export class EChartsPolarRenderer extends EChartRenderer {
     super(host);
     this.radialMax = 1;
     host.addEventListener("wheel", event => {
-      if (!this.data) return;
+      if (!this.data || (this.data.mode || "vectors") !== "vectors") return;
       event.preventDefault();
       const factor = event.deltaY < 0 ? .82 : 1 / .82;
       this.radialMax = Math.max(.15, Math.min(1, this.radialMax * factor));
@@ -200,7 +200,7 @@ export class EChartsPolarRenderer extends EChartRenderer {
       const col = panel % cols, row = Math.floor(panel / cols);
       polar.push({
         center: [col * cellW + cellW / 2, top + row * cellH + cellH * .55],
-        radius: Math.max(30, Math.min(cellW, cellH) * .34),
+        radius: Math.max(34, Math.min(cellW, cellH) * .39),
       });
       angleAxis.push({
         polarIndex: panel, type: "value", min: -180, max: 180, interval: 90,
@@ -223,6 +223,76 @@ export class EChartsPolarRenderer extends EChartRenderer {
       });
     }
 
+    const mode = data.mode || "vectors";
+    if (mode !== "vectors") {
+      const bins = mode === "histogram" ? 36 : data.densityBins;
+      const counts = Array.from({length: count}, () => new Float64Array(bins));
+      if (mode === "histogram") {
+        for (let index = 0; index < data.angle.length; index += 1) {
+          if (data.sample[index] > this.fraction || this.animalVisibility?.[data.animal[index]] === false) continue;
+          const bin = Math.max(0, Math.min(bins - 1,
+            Math.floor((((data.angle[index] + 180) % 360 + 360) % 360) / 360 * bins)));
+          counts[data.panel[index]][bin] += 1;
+        }
+      } else {
+        const animalCount = Math.max(1, data.animalNames?.length || 1);
+        for (let panel = 0; panel < count; panel += 1) for (let animal = 0; animal < animalCount; animal += 1) {
+          if (this.animalVisibility?.[animal] === false) continue;
+          const offset = (panel * animalCount + animal) * bins;
+          for (let bin = 0; bin < bins; bin += 1) counts[panel][bin] += data.headingDensity[offset + bin] || 0;
+        }
+      }
+      let maximum = 0;
+      for (let panel = 0; panel < count; panel += 1) {
+        if (mode === "density") {
+          const source = counts[panel], smoothed = new Float64Array(bins);
+          const kernel = [1, 4, 7, 10, 7, 4, 1], kernelTotal = 34;
+          for (let bin = 0; bin < bins; bin += 1) for (let shift = -3; shift <= 3; shift += 1) {
+            smoothed[bin] += source[(bin + shift + bins) % bins] * kernel[shift + 3] / kernelTotal;
+          }
+          counts[panel] = smoothed;
+        }
+        const total = counts[panel].reduce((sum, value) => sum + value, 0);
+        if (total > 0) for (let bin = 0; bin < bins; bin += 1) {
+          counts[panel][bin] = counts[panel][bin] / total * 100;
+          maximum = Math.max(maximum, counts[panel][bin]);
+        }
+      }
+      maximum = Math.max(1, maximum * 1.08);
+      for (const axis of radiusAxis) Object.assign(axis, {
+        min: 0, max: maximum, interval: null,
+        axisLabel: {color: MUTED, fontSize: 9, formatter: value => `${formatNumber(value, 1)}%`},
+      });
+      const series = [];
+      for (let panel = 0; panel < count; panel += 1) {
+        const values = Array.from({length: bins}, (_, bin) => [
+          counts[panel][bin], -180 + (bin + .5) * 360 / bins,
+        ]);
+        series.push({
+          name: data.panelNames?.[panel] || "All data", type: "line",
+          coordinateSystem: "polar", polarIndex: panel,
+          data: [...values, values[0]], encode: {radius: 0, angle: 1},
+          showSymbol: false, smooth: mode === "density" ? .42 : false,
+          step: mode === "histogram" ? "middle" : false,
+          lineStyle: {color: "#0e7c73", width: mode === "histogram" ? 1.4 : 2},
+          areaStyle: {color: mode === "histogram" ? "rgba(14,124,115,.30)" : "rgba(14,124,115,.20)"},
+        });
+      }
+      return {
+        ...this.base(mode === "histogram" ? "polar-resultant-histogram" : "polar-heading-density", false),
+        title: titles, legend: {show: false},
+        tooltip: {trigger: "item", confine: true, formatter: params => {
+          const value = params.data || [];
+          return `<b>${escapeHtml(params.seriesName)}</b><br>${formatNumber(value[1], 1)}° · ${formatNumber(value[0], 1)}%`;
+        }},
+        polar, angleAxis, radiusAxis, series,
+        graphic: [{type: "text", right: 16, top: 17, silent: true, style: {
+          text: mode === "histogram" ? "replicate direction histogram" : "circularly smoothed heading density",
+          fill: MUTED, font: "10px Inter, system-ui",
+        }}],
+      };
+    }
+
     const grouped = new Map();
     for (let i = 0; i < data.angle.length; i += 1) {
       if (data.sample[i] > this.fraction) continue;
@@ -233,7 +303,7 @@ export class EChartsPolarRenderer extends EChartRenderer {
         coords: [[0, data.angle[i]], [data.r[i], data.angle[i]]],
         value: [data.r[i], data.angle[i]], animal,
         panel: data.panelNames?.[data.panel[i]] || "All data",
-        trial: data.trial[i], step: data.step[i],
+        replicate: data.replicate[i], trial: data.trial[i], step: data.step[i],
       });
     }
     const series = [];
@@ -284,7 +354,7 @@ export class EChartsPolarRenderer extends EChartRenderer {
         formatter: params => {
           const item = params.data || {};
           if (item.population) return `<b>${escapeHtml(item.panel)}</b><br>Population mean<br>Angle ${formatNumber(item.value?.[1], 1)}° · R ${formatNumber(item.value?.[0], 1)}`;
-          const trial = Number.isFinite(item.trial) ? `<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}` : "";
+          const trial = Number.isFinite(item.trial) ? `<br>Replicate ${formatNumber(item.replicate, 0)} · trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}` : "";
           return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>Angle ${formatNumber(item.value?.[1], 1)}° · R ${formatNumber(item.value?.[0], 1)}`;
         },
       },
@@ -448,7 +518,7 @@ export class EChartsMetricsRenderer extends EChartRenderer {
       series.push({
         type: "custom", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
         data: profiles.map(profile => [profile.panel, profile.median]),
-        silent: true, z: 1,
+        silent: true, clip: true, z: 1,
         renderItem: (params, api) => {
           const profile = profiles[params.dataIndex];
           if (!profile) return null;
@@ -473,12 +543,12 @@ export class EChartsMetricsRenderer extends EChartRenderer {
           points.push({
             value: [data.panel[i], data[key][i], deterministicJitter(i, data.trial[i], data.step[i], animal)],
             animal: data.animalNames[animal], panel: data.panelNames[data.panel[i]],
-            trial: data.trial[i], step: data.step[i], metric: title,
+            replicate: data.replicate[i], trial: data.trial[i], step: data.step[i], metric: title,
           });
         }
         if (points.length) series.push({
           name: data.animalNames[animal], type: "custom", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
-          data: points, encode: {x: 0, y: 1}, z: 4,
+          data: points, encode: {x: 0, y: 1}, clip: true, z: 4,
           itemStyle: {color: animalColor(animal), opacity: .38},
           renderItem: (_params, api) => {
             const point = api.coord([api.value(0), api.value(1)]);
@@ -497,7 +567,7 @@ export class EChartsMetricsRenderer extends EChartRenderer {
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {};
         if (params.seriesType === "boxplot") return `<b>${escapeHtml(params.name)}</b><br>min ${formatNumber(item[0], 1)} · Q1 ${formatNumber(item[1], 1)}<br>median ${formatNumber(item[2], 1)} · Q3 ${formatNumber(item[3], 1)} · max ${formatNumber(item[4], 1)}`;
-        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${escapeHtml(item.metric)} ${formatNumber(item.value?.[1], 1)}`;
+        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Replicate ${formatNumber(item.replicate, 0)} · trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${escapeHtml(item.metric)} ${formatNumber(item.value?.[1], 1)}`;
       }},
       dataZoom: metrics.map((_, index) => ({
         type: "inside", yAxisIndex: index, filterMode: "none", throttle: 35,

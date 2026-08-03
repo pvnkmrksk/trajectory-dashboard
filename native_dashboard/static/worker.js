@@ -88,9 +88,26 @@ function setOrNull(values) {
   return values && values.length ? new Set(values.map(Number)) : null;
 }
 
+function stablePanelKeys(state, labels, visibleCategories) {
+  const selected = state.filters?.[state.groupBy];
+  const candidates = Array.isArray(selected) && selected.length
+    ? selected.map(Number)
+    : labels.map((_, index) => index);
+  const valid = candidates.filter(category => Number.isInteger(category)
+    && category >= 0 && category < labels.length);
+  const requested = (state.panelOrders?.[state.groupBy] || []).map(Number);
+  const ordered = requested.filter(category => valid.includes(category));
+  for (const category of valid) if (!ordered.includes(category)) ordered.push(category);
+  // Preserve a category that is present in the data even if an older URL or
+  // recipe omitted it from its saved selector state.
+  for (const category of visibleCategories) if (!ordered.includes(category)) ordered.push(category);
+  return ordered;
+}
+
 function analysisKey(state) {
   return JSON.stringify({
     filters: state.filters, ranges: state.ranges,
+    angleSource: state.angleSource,
     jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
     minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
     roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
@@ -126,6 +143,13 @@ function linkHitsRing(x0, z0, x1, z1, ring) {
   return (px - ring.x) ** 2 + (pz - ring.z) ** 2 <= ring.r ** 2;
 }
 
+function retainedTimeMaximum(seg, rowKeep) {
+  for (let row = ends[seg] - 1; row >= starts[seg]; row -= 1) {
+    if (rowKeep[row] && Number.isFinite(data.time[row])) return data.time[row];
+  }
+  return NaN;
+}
+
 function buildAnalysis(state) {
   const started = performance.now();
   const ns = starts.length;
@@ -141,10 +165,14 @@ function buildAnalysis(state) {
     for (let seg = 0; seg < ns; seg += 1) if (!selected.has(field[seg])) segmentKeep[seg] = 0;
   }
   const r = state.ranges || {};
+  const segmentResultant = state.angleSource === "movement"
+    ? data.segmentMovementR : data.segmentOrientationR;
   for (let seg = 0; seg < ns; seg += 1) {
     if (!segmentKeep[seg]) continue;
     if (!inRange(data.segmentTrial[seg], r.trial)
       || !inRange(data.segmentStep[seg], r.step)
+      || !inRange(data.segmentReplicate[seg], r.replicate)
+      || !inRange(segmentResultant[seg], r.resultant)
       || !inRange(data.segmentPeakSpeed[seg], r.peak)
       || !inRange(data.segmentDisplacement[seg], r.displacement)
       || !inRange(data.segmentDistance[seg], r.distance)) segmentKeep[seg] = 0;
@@ -153,6 +181,16 @@ function buildAnalysis(state) {
   const rowKeep = new Uint8Array(data.segment.length);
   for (let seg = 0; seg < ns; seg += 1) {
     if (segmentKeep[seg]) rowKeep.fill(1, starts[seg], ends[seg]);
+  }
+
+  const timeRange = r.time;
+  if (timeRange) {
+    for (let seg = 0; seg < ns; seg += 1) {
+      if (!segmentKeep[seg]) continue;
+      for (let row = starts[seg]; row < ends[seg]; row += 1) {
+        if (!inRange(data.time[row], timeRange)) rowKeep[row] = 0;
+      }
+    }
   }
 
   const jump = Number(state.jumpThreshold) || 0;
@@ -268,9 +306,7 @@ function buildAnalysis(state) {
       const category = field[seg];
       if (!seenCategories.has(category)) { seenCategories.add(category); visibleCategories.push(category); }
     }
-    const requested = (state.panelOrders?.[state.groupBy] || []).map(Number);
-    panelKeys = requested.filter(category => seenCategories.has(category));
-    for (const category of visibleCategories) if (!panelKeys.includes(category)) panelKeys.push(category);
+    panelKeys = stablePanelKeys(state, labels, visibleCategories);
     const panelByCategory = new Map(panelKeys.map((category, index) => [category, index]));
     panelNames = panelKeys.map(category => labels[category] ?? "unknown");
     for (const seg of visibleSegments) {
@@ -283,7 +319,7 @@ function buildAnalysis(state) {
   const animals = new Set();
   for (const seg of visibleSegments) animals.add(`${data.segmentFly[seg]}@${data.segmentVr[seg]}`);
   const durations = visibleSegments
-    .map(seg => data.segmentDuration[seg])
+    .map(seg => retainedTimeMaximum(seg, rowKeep))
     .filter(Number.isFinite)
     .sort((a, b) => a - b);
   const durationSummary = {
@@ -359,7 +395,7 @@ function applyCurtain(state, base) {
   }
   const animals = new Set();
   for (const seg of visibleSegments) animals.add(`${data.segmentFly[seg]}@${data.segmentVr[seg]}`);
-  const durations = visibleSegments.map(seg => data.segmentDuration[seg]).filter(Number.isFinite).sort((a, b) => a - b);
+  const durations = visibleSegments.map(seg => retainedTimeMaximum(seg, rowKeep)).filter(Number.isFinite).sort((a, b) => a - b);
   const left = new Uint32Array(base.panelCount), right = new Uint32Array(base.panelCount);
   for (const seg of visibleSegments) {
     const panel = base.segmentPanel[seg];
@@ -431,9 +467,7 @@ function applyPanelMapping(state, analysis) {
       const category = field[seg];
       if (!seen.has(category)) { seen.add(category); visibleCategories.push(category); }
     }
-    const requested = (state.panelOrders?.[state.groupBy] || []).map(Number);
-    panelKeys = requested.filter(category => seen.has(category));
-    for (const category of visibleCategories) if (!panelKeys.includes(category)) panelKeys.push(category);
+    panelKeys = stablePanelKeys(state, labels, visibleCategories);
     const indices = new Map(panelKeys.map((category, index) => [category, index]));
     panelNames = panelKeys.map(category => labels[category] ?? "unknown");
     for (const seg of analysis.visibleSegments) segmentPanel[seg] = indices.get(field[seg]);
@@ -499,6 +533,7 @@ function rowColor(row, seg, state, analysis) {
     case "folder": return data.segmentFolder[seg] % CATEGORY_COLORS;
     case "roi": return analysis.segmentOutcome[seg] === 1 ? 0 : (analysis.segmentOutcome[seg] === 2 ? 1 : 17);
     case "trial": return sequentialIndex(data.segmentTrial[seg], header.ranges.trial);
+    case "replicate": return sequentialIndex(data.segmentReplicate[seg], header.ranges.replicate);
     case "time": return sequentialIndex(data.time[row], header.ranges.time);
     case "speed": return sequentialIndex(data.speed[row], header.ranges.speed);
     case "tortuosity": return sequentialIndex(data.tortuosity[row], [1, Math.max(2, header.ranges.distance[1])]);
@@ -786,6 +821,9 @@ function unitColor(seg, state, analysis) {
 function buildPolar(state, analysis) {
   const started = performance.now();
   const ns = starts.length, heading = state.angleSource === "movement" ? data.movement : data.orientation;
+  const densityBins = 72;
+  const animalCount = Math.max(1, header.categories.animal.length);
+  const headingDensity = new Uint32Array(analysis.panelCount * animalCount * densityBins);
   const sumSin = new Float64Array(ns), sumCos = new Float64Array(ns), valid = new Uint32Array(ns), available = new Uint32Array(ns);
   for (const seg of analysis.visibleSegments) {
     for (let row = starts[seg]; row < ends[seg]; row += 1) {
@@ -793,6 +831,10 @@ function buildPolar(state, analysis) {
       available[seg] += 1;
       const angle = heading[row];
       if (!Number.isFinite(angle) || (state.movingOnly && data.speed[row] < (Number(state.walkThreshold) || 0))) continue;
+      const densityBin = Math.max(0, Math.min(densityBins - 1,
+        Math.floor((wrapAngle(angle) + 180) / 360 * densityBins)));
+      headingDensity[(analysis.segmentPanel[seg] * animalCount
+        + data.segmentAnimal[seg]) * densityBins + densityBin] += 1;
       const radians = angle * Math.PI / 180;
       sumSin[seg] += Math.sin(radians); sumCos[seg] += Math.cos(radians); valid[seg] += 1;
     }
@@ -809,7 +851,7 @@ function buildPolar(state, analysis) {
       const key = `${analysis.segmentPanel[seg]}|${data.segmentFly[seg]}|${data.segmentVr[seg]}`;
       const unit = map.get(key) || {
         panel: analysis.segmentPanel[seg], animal: data.segmentAnimal[seg],
-        trial: NaN, step: NaN, sin: 0, cos: 0, count: 0,
+        replicate: NaN, trial: NaN, step: NaN, sin: 0, cos: 0, count: 0,
         color: unitColor(seg, state, analysis), seed: seg,
       };
       unit.sin += sumSin[seg]; unit.cos += sumCos[seg]; unit.count += valid[seg]; map.set(key, unit);
@@ -822,6 +864,7 @@ function buildPolar(state, analysis) {
       if (rr < rMin || rr > rMax || valid[seg] / Math.max(1, available[seg]) < validMin) continue;
       units.push({
         panel: analysis.segmentPanel[seg], animal: data.segmentAnimal[seg],
+        replicate: data.segmentReplicate[seg],
         trial: data.segmentTrial[seg], step: data.segmentStep[seg],
         sin: sumSin[seg], cos: sumCos[seg], count: valid[seg],
         color: unitColor(seg, state, analysis), seed: seg,
@@ -829,13 +872,13 @@ function buildPolar(state, analysis) {
     }
   }
   const angle = new Float32Array(units.length), r = new Float32Array(units.length), panel = new Uint16Array(units.length), color = new Uint8Array(units.length), sample = new Float32Array(units.length);
-  const animal = new Uint16Array(units.length), trial = new Float32Array(units.length), step = new Float32Array(units.length);
+  const animal = new Uint16Array(units.length), replicate = new Float32Array(units.length), trial = new Float32Array(units.length), step = new Float32Array(units.length);
   const popSin = new Float64Array(analysis.panelCount), popCos = new Float64Array(analysis.panelCount), popWeight = new Float64Array(analysis.panelCount);
   for (let i = 0; i < units.length; i += 1) {
     const unit = units[i], magnitude = Math.hypot(unit.sin, unit.cos);
     angle[i] = Math.atan2(unit.sin, unit.cos) * 180 / Math.PI; r[i] = magnitude / Math.max(1, unit.count);
     panel[i] = unit.panel; color[i] = unit.color; sample[i] = hashSample(unit.seed, state.sampleSeed || 0);
-    animal[i] = unit.animal; trial[i] = unit.trial; step[i] = unit.step;
+    animal[i] = unit.animal; replicate[i] = unit.replicate; trial[i] = unit.trial; step[i] = unit.step;
     const weight = state.statsUnit === "animal" ? 1 : unit.count;
     popSin[unit.panel] += Math.sin(angle[i] * Math.PI / 180) * weight;
     popCos[unit.panel] += Math.cos(angle[i] * Math.PI / 180) * weight;
@@ -848,7 +891,9 @@ function buildPolar(state, analysis) {
     populationR[p] = Math.hypot(popSin[p], popCos[p]) / popWeight[p];
   }
   return {
-    angle, r, panel, color, sample, animal, trial, step,
+    mode: state.polarMode || "vectors",
+    angle, r, panel, color, sample, animal, replicate, trial, step,
+    headingDensity, densityBins,
     populationAngle, populationR, panelCount: analysis.panelCount,
     panelNames: analysis.panelNames, animalNames: header.categories.animal,
     columns: Number(state.panelColumns) || 0, units: units.length,
@@ -1003,33 +1048,73 @@ function buildHeading(state, analysis) {
 }
 
 function buildMetrics(state, analysis) {
+  const segmentMetric = seg => {
+    let complete = true;
+    for (let row = starts[seg]; row < ends[seg]; row += 1) if (!analysis.rowKeep[row]) { complete = false; break; }
+    if (complete) return {
+      distance: data.segmentDistance[seg], displacement: data.segmentDisplacement[seg],
+      speed: data.segmentMedianSpeed[seg], tortuosity: data.segmentTortuosity[seg],
+    };
+    let first = -1, last = -1, previous = -1, distance = 0;
+    const speeds = [], tortuosities = [];
+    for (let row = starts[seg]; row < ends[seg]; row += 1) {
+      if (!analysis.rowKeep[row]) { previous = -1; continue; }
+      if (first < 0) first = row;
+      last = row;
+      if (previous >= 0) distance += Math.hypot(
+        data.x[row] - data.x[previous], data.z[row] - data.z[previous],
+      );
+      previous = row;
+      if (Number.isFinite(data.speed[row])) speeds.push(data.speed[row]);
+      if (Number.isFinite(data.tortuosity[row])) tortuosities.push(data.tortuosity[row]);
+    }
+    speeds.sort((a, b) => a - b); tortuosities.sort((a, b) => a - b);
+    return {
+      distance,
+      displacement: first >= 0 && last >= 0
+        ? Math.hypot(data.x[last] - data.x[first], data.z[last] - data.z[first]) : NaN,
+      speed: speeds.length ? percentile(speeds, .5) : NaN,
+      tortuosity: tortuosities.length ? percentile(tortuosities, .5) : NaN,
+    };
+  };
+  const segmentValues = new Map();
+  const metricFor = seg => {
+    if (!segmentValues.has(seg)) segmentValues.set(seg, segmentMetric(seg));
+    return segmentValues.get(seg);
+  };
   const units = [];
   if (state.statsUnit === "animal") {
     const map = new Map();
     for (const seg of analysis.visibleSegments) {
+      const metric = metricFor(seg);
       const key = `${analysis.segmentPanel[seg]}|${data.segmentFly[seg]}|${data.segmentVr[seg]}`;
       const unit = map.get(key) || {
         panel: analysis.segmentPanel[seg], animal: data.segmentAnimal[seg],
-        trial: NaN, step: NaN, distance: 0, displacement: 0,
+        replicate: NaN, trial: NaN, step: NaN, distance: 0, displacement: 0,
         speed: 0, tortuosity: 0, n: 0,
       };
-      unit.distance += data.segmentDistance[seg]; unit.displacement += data.segmentDisplacement[seg];
-      unit.speed += data.segmentMedianSpeed[seg]; unit.tortuosity += data.segmentTortuosity[seg]; unit.n += 1; map.set(key, unit);
+      unit.distance += metric.distance; unit.displacement += metric.displacement;
+      unit.speed += metric.speed; unit.tortuosity += metric.tortuosity; unit.n += 1; map.set(key, unit);
     }
     for (const unit of map.values()) {
       unit.distance /= unit.n; unit.displacement /= unit.n; unit.speed /= unit.n; unit.tortuosity /= unit.n; units.push(unit);
     }
   } else {
-    for (const seg of analysis.visibleSegments) units.push({
-      panel: analysis.segmentPanel[seg], animal: data.segmentAnimal[seg],
-      trial: data.segmentTrial[seg], step: data.segmentStep[seg],
-      distance: data.segmentDistance[seg], displacement: data.segmentDisplacement[seg],
-      speed: data.segmentMedianSpeed[seg], tortuosity: data.segmentTortuosity[seg],
-    });
+    for (const seg of analysis.visibleSegments) {
+      const metric = metricFor(seg);
+      units.push({
+        panel: analysis.segmentPanel[seg], animal: data.segmentAnimal[seg],
+        replicate: data.segmentReplicate[seg],
+        trial: data.segmentTrial[seg], step: data.segmentStep[seg],
+        distance: metric.distance, displacement: metric.displacement,
+        speed: metric.speed, tortuosity: metric.tortuosity,
+      });
+    }
   }
   return {
     panel: Uint16Array.from(units.map(u => u.panel)),
     animal: Uint16Array.from(units.map(u => u.animal)),
+    replicate: Float32Array.from(units.map(u => u.replicate)),
     trial: Float32Array.from(units.map(u => u.trial)),
     step: Float32Array.from(units.map(u => u.step)),
     distance: Float32Array.from(units.map(u => u.distance)),
@@ -1375,9 +1460,13 @@ function buildDiagnostics() {
   return {velocity: histogram(data.speed), displacement: histogram(data.segmentDisplacement)};
 }
 
-function buildFilterHistograms(analysis) {
+function buildFilterHistograms(analysis, state) {
+  const segmentResultant = state.angleSource === "movement"
+    ? data.segmentMovementR : data.segmentOrientationR;
   const fields = {
-    trial: data.segmentTrial, step: data.segmentStep, peak: data.segmentPeakSpeed,
+    trial: data.segmentTrial, step: data.segmentStep,
+    replicate: data.segmentReplicate, resultant: segmentResultant,
+    peak: data.segmentPeakSpeed,
     displacement: data.segmentDisplacement, distance: data.segmentDistance,
   };
   const result = {};
@@ -1396,6 +1485,24 @@ function buildFilterHistograms(analysis) {
       counts[index] += 1;
     }
     result[key] = {edges, counts, overflow, visible: analysis.visibleSegments.length};
+  }
+  const timeDescriptor = header.filterHistograms?.time;
+  if (timeDescriptor?.edges?.length) {
+    const edges = timeDescriptor.edges.map(Number), counts = new Uint32Array(edges.length - 1);
+    const lo = edges[0], hi = edges[edges.length - 1], span = Math.max(1e-12, hi - lo);
+    let overflow = 0;
+    for (const segment of analysis.visibleSegments) {
+      for (let row = starts[segment]; row < ends[segment]; row += 1) {
+        if (!analysis.rowKeep[row]) continue;
+        const value = data.time[row];
+        if (!Number.isFinite(value) || value < lo) continue;
+        if (value > hi) { overflow += 1; continue; }
+        const index = Math.max(0, Math.min(counts.length - 1,
+          Math.floor((value - lo) / span * counts.length)));
+        counts[index] += 1;
+      }
+    }
+    result.time = {edges, counts, overflow, visible: analysis.visibleRows};
   }
   return result;
 }
@@ -1426,8 +1533,7 @@ function compute(message) {
     lastCurtainKey = ringKey;
     lastOccupancy = null; lastOccupancyKey = "";
   }
-  let scope = message.scope || "full";
-  if (analysisChanged || panelChanged) scope = "full";
+  const scope = message.scope || "full";
   const productAnalysis = ["overview", "overviewPreview"].includes(scope) && state.overviewGrouping !== "panels"
     ? pooledAnalysis(lastAnalysis) : lastAnalysis;
   const products = {};
@@ -1449,21 +1555,23 @@ function compute(message) {
   } else if (scope === "movement") {
     products.direction = buildDirection(state, productAnalysis);
   }
-  if (["full", "movement", "color", "sample", "statistics", "polar", "overview"].includes(scope)) {
+  if (["full", "movement", "color", "sample", "statistics", "polar", "overview", "background"].includes(scope)) {
     products.polar = buildPolar(state, productAnalysis);
   }
-  if (["full", "movement", "color", "sample", "heading", "playback"].includes(scope)) {
+  if (["full", "movement", "color", "sample", "heading", "playback", "background"].includes(scope)) {
     products.heading = buildHeading(state, productAnalysis);
   }
-  if (["full", "statistics"].includes(scope)) {
+  if (["full", "statistics", "metrics", "background"].includes(scope)) {
     products.metrics = buildMetrics(state, productAnalysis);
   }
-  if (["full", "statistics", "movement"].includes(scope)) {
+  if (["full", "statistics", "movement", "roi", "background"].includes(scope)) {
     products.roi = buildRoi(state, productAnalysis);
   }
-  if (scope === "full") {
+  if (["full", "diagnostics"].includes(scope)) {
     products.diagnostics = buildDiagnostics();
-    products.filterHistograms = buildFilterHistograms(lastAnalysis);
+  }
+  if (analysisChanged || curtainChanged || panelChanged || scope === "full") {
+    products.filterHistograms = buildFilterHistograms(lastAnalysis, state);
   }
   if (scope === "statistics") {
     products.statistics = buildStatistics(products.metrics, products.polar);
@@ -1475,12 +1583,12 @@ function compute(message) {
       x0: products.transition.x0, z0: products.transition.z0, bin: products.transition.bin,
     };
   }
-  if (scope === "windows") products.windows = buildWindows(state, lastAnalysis);
-  const segmentOptions = scope === "full"
+  if (["windows", "background"].includes(scope)) products.windows = buildWindows(state, lastAnalysis);
+  const segmentOptions = analysisChanged || curtainChanged || panelChanged || scope === "full"
     ? lastAnalysis.visibleSegments.map(seg => ({
       code: seg,
-      label: `${header.categories.file[data.segmentFile[seg]]} · trial ${data.segmentTrial[seg]} / step ${data.segmentStep[seg]}`,
-      duration: data.segmentDuration[seg],
+      label: `${header.categories.file[data.segmentFile[seg]]} · replicate ${data.segmentReplicate[seg]} · trial ${data.segmentTrial[seg]} / step ${data.segmentStep[seg]}`,
+      duration: retainedTimeMaximum(seg, lastAnalysis.rowKeep),
       animal: data.segmentAnimal[seg],
     }))
     : null;
@@ -1522,6 +1630,7 @@ function inspectPoint(message) {
     match: {
       segmentId: header.segmentIds[seg],
       sourceFile: header.categories.file[data.segmentFile[seg]],
+      replicate: data.segmentReplicate[seg],
       trial: data.segmentTrial[seg], step: data.segmentStep[seg],
       config: header.categories.config[data.segmentConfig[seg]],
       scene: header.categories.scene[data.segmentScene[seg]],
