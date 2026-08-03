@@ -271,6 +271,8 @@ function drawPanelRings(ctx, width, height, data, view) {
   for (let panel = 0; panel < data.panelCount; panel += 1) {
     const {left, right, top, bottom} = panelPane(layout, panel);
     const shown = equalScaleView(view, panelPane(layout, panel));
+    ctx.save();
+    ctx.beginPath(); ctx.rect(left, top, right - left, bottom - top); ctx.clip();
     for (let index = 0; index < data.rings.length; index += 1) {
       const ring = data.rings[index];
       const x = left + (ring.x - shown.xmin) / (shown.xmax - shown.xmin) * (right - left);
@@ -281,6 +283,7 @@ function drawPanelRings(ctx, width, height, data, view) {
       ctx.fillStyle = "rgba(24,34,31,.82)"; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
       ctx.fillText(String(index + 1), x + 5, y - 12);
     }
+    ctx.restore();
   }
   ctx.restore();
 }
@@ -327,12 +330,26 @@ function installSpatialInteraction(renderer, canvas) {
   tooltip.hidden = true;
   renderer.host.appendChild(tooltip);
   renderer.tooltip = tooltip;
+  canvas.tabIndex = 0;
+  const trash = document.createElement("div");
+  trash.className = "ring-trash-target";
+  trash.setAttribute("aria-hidden", "true");
+  trash.textContent = "Release to delete";
+  renderer.host.appendChild(trash);
+  const overTrash = event => {
+    const rect = trash.getBoundingClientRect();
+    return event.clientX >= rect.left && event.clientX <= rect.right
+      && event.clientY >= rect.top && event.clientY <= rect.bottom;
+  };
 
   canvas.addEventListener("pointerdown", event => {
     if (!renderer.data || !renderer.view) return;
     const rect = canvas.getBoundingClientRect();
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
-    if (!point) return;
+    if (!point) {
+      if (renderer.backgroundHandler) drag = {mode: "background", moved: false, x: event.clientX, y: event.clientY};
+      return;
+    }
     canvas.setPointerCapture(event.pointerId);
     const ringHit = renderer.hitRing?.(point) || null;
     if (ringHit && renderer.ringMoveHandler) {
@@ -342,6 +359,9 @@ function installSpatialInteraction(renderer, canvas) {
         offsetX: point.x - ring.x, offsetZ: point.z - ring.z,
         startRadius: ring.r, moved: false,
       };
+      renderer.activeRing = ringHit.index;
+      renderer.ringSelectHandler?.(ringHit.index);
+      renderer.host.classList.add("ring-dragging");
       canvas.style.cursor = "grabbing";
     } else {
       const layout = panelLayout(renderer.width, renderer.height, renderer.data.panelCount, renderer.data.columns);
@@ -356,8 +376,13 @@ function installSpatialInteraction(renderer, canvas) {
     const finished = drag;
     drag = null;
     canvas.style.cursor = "";
+    renderer.host.classList.remove("ring-dragging", "ring-delete-ready");
     try { canvas.releasePointerCapture(event.pointerId); } catch (_) { /* no-op */ }
     if (finished?.mode === "ring-move" || finished?.mode === "ring-resize") {
+      if (overTrash(event)) {
+        renderer.ringDeleteHandler?.(finished.ringIndex);
+        return;
+      }
       const rect = canvas.getBoundingClientRect();
       const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
       if (point && finished.mode === "ring-resize") renderer.resizeRing(
@@ -369,17 +394,25 @@ function installSpatialInteraction(renderer, canvas) {
       else if (point) renderer.moveRing(finished.ringIndex, point.x - finished.offsetX, point.z - finished.offsetZ, true);
       return;
     }
+    if (finished?.mode === "background" && !finished.moved) {
+      renderer.backgroundHandler?.();
+      return;
+    }
     if (finished && !finished.moved && renderer.inspectHandler) {
       const rect = canvas.getBoundingClientRect();
       const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
       if (point) renderer.inspectHandler(point, renderer.view);
     }
   });
-  canvas.addEventListener("pointercancel", () => { drag = null; canvas.style.cursor = ""; });
+  canvas.addEventListener("pointercancel", () => {
+    drag = null; canvas.style.cursor = "";
+    renderer.host.classList.remove("ring-dragging", "ring-delete-ready");
+  });
   canvas.addEventListener("pointermove", event => {
     const rect = canvas.getBoundingClientRect();
     if (drag) {
       if (drag.mode === "ring-move" || drag.mode === "ring-resize") {
+        renderer.host.classList.toggle("ring-delete-ready", overTrash(event));
         const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
         if (point && drag.mode === "ring-resize") renderer.resizeRing(
           drag.ringIndex,
@@ -390,6 +423,10 @@ function installSpatialInteraction(renderer, canvas) {
         else if (point) renderer.moveRing(drag.ringIndex, point.x - drag.offsetX, point.z - drag.offsetZ, false);
         drag.moved = true;
         tooltip.hidden = true;
+        return;
+      }
+      if (drag.mode === "background") {
+        drag.moved = Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 3;
         return;
       }
       if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 3) drag.moved = true;
@@ -439,6 +476,13 @@ function installSpatialInteraction(renderer, canvas) {
     event.preventDefault();
     renderer.resetView(true);
   });
+  canvas.addEventListener("keydown", event => {
+    if (!renderer.data?.ringEnabled || !renderer.data?.rings?.length) return;
+    if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      renderer.ringDeleteHandler?.(Math.max(0, renderer.activeRing || 0));
+    }
+  });
 }
 
 class SpatialBase {
@@ -462,7 +506,18 @@ class SpatialBase {
     this.draw();
   }
   setInspectHandler(handler) { this.inspectHandler = handler; }
+  setBackgroundHandler(handler) { this.backgroundHandler = handler; }
   setRingMoveHandler(handler) { this.ringMoveHandler = handler; }
+  setRingDeleteHandler(handler) { this.ringDeleteHandler = handler; }
+  setRingSelectHandler(handler) { this.ringSelectHandler = handler; }
+  setRings(rings, enabled = true, match = "any") {
+    if (!this.data) return;
+    this.data.rings = (rings || []).map(ring => ({...ring}));
+    this.data.ringEnabled = !!enabled && this.data.rings.length > 0;
+    this.data.ringMatch = match;
+    this.activeRing = Math.max(0, Math.min(this.data.rings.length - 1, this.activeRing || 0));
+    this.draw();
+  }
   hitRing(point) {
     if (!this.data?.ringEnabled || !this.data?.rings?.length || !this.view) return null;
     const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
@@ -480,14 +535,16 @@ class SpatialBase {
   moveRing(index, x, z, final = false) {
     if (!this.data?.rings?.[index] || !Number.isFinite(x) || !Number.isFinite(z)) return;
     this.data.rings[index] = {...this.data.rings[index], x, z};
-    this.drawOverlay?.();
+    if (typeof this.drawOverlay === "function") this.drawOverlay();
+    else this.draw();
     this.ringMoveHandler?.(index, x, z, final);
   }
   resizeRing(index, radius, final = false) {
     if (!this.data?.rings?.[index] || !Number.isFinite(radius)) return;
     const ring = this.data.rings[index];
     ring.r = Math.max(.01, radius);
-    this.drawOverlay?.();
+    if (typeof this.drawOverlay === "function") this.drawOverlay();
+    else this.draw();
     this.ringMoveHandler?.(index, ring.x, ring.z, final, ring.r);
   }
   setView(view, notify = false) {
@@ -869,6 +926,15 @@ class CanvasSpatialRenderer extends SpatialBase {
       pane.bottom - (z - shown.zmin) / (shown.zmax - shown.zmin) * pane.height,
     ];
   }
+  drawSharedOverlays() {
+    drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view, {
+      hideTicks: this.cleanMode, showGrid: this.gridVisible && !this.cleanMode,
+      scaleBar: true,
+    });
+    drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
+    drawPanelRings(this.ctx, this.width, this.height, this.data, this.view);
+    drawPanelWindows(this.ctx, this.width, this.height, this.data, this.view);
+  }
 }
 
 export class HeatmapRenderer extends CanvasSpatialRenderer {
@@ -1003,11 +1069,80 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
       }
       this.ctx.restore();
     }
-    drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view, {
-      hideTicks: this.cleanMode, showGrid: this.gridVisible && !this.cleanMode,
-      scaleBar: true,
-    });
-    drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
+    this.drawSharedOverlays();
+  }
+}
+
+export class TransitionRenderer extends HeatmapRenderer {
+  constructor(host, onViewChange) {
+    super(host, onViewChange);
+    this.visualOptions = {outcome: "crossed", display: "fraction", minimumSupport: 5};
+  }
+  setVisualOptions(options = {}) {
+    Object.assign(this.visualOptions, options);
+    this.buildTextures();
+    this.draw();
+  }
+  cellAt(point) {
+    if (!this.data) return null;
+    const ix = Math.floor((point.x - this.data.x0) / this.data.bin);
+    const iz = Math.floor((point.z - this.data.z0) / this.data.bin);
+    if (ix < 0 || ix >= this.data.nx || iz < 0 || iz >= this.data.nz) return null;
+    const index = point.panel * this.data.nx * this.data.nz + iz * this.data.nx + ix;
+    const entered = Number(this.data.entered[index]) || 0;
+    const support = Math.max(1, Number(this.visualOptions.minimumSupport) || 1);
+    if (entered < support) return null;
+    const outcome = this.visualOptions.outcome === "ended" ? this.data.ended : this.data.crossed;
+    const numerator = Number(outcome[index]) || 0;
+    return {panel: point.panel, ix, iz, x: point.x, z: point.z, entered, numerator,
+      value: this.visualOptions.display === "count" ? numerator : numerator / entered};
+  }
+  tooltipText(point) {
+    const cell = this.cellAt(point);
+    if (!cell) return `${this.data?.panelNames?.[point.panel] || "All"} · no supported transition cell`;
+    const shown = this.visualOptions.display === "count"
+      ? `${formatNumber(cell.value, 0)} paths`
+      : `${formatNumber(cell.value * 100, 1)}%`;
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${shown} · ${formatNumber(cell.entered, 0)} entered · click for raw paths`;
+  }
+  buildTextures() {
+    this.textures = [];
+    if (!this.data) return;
+    const {nx, nz, panelCount, entered} = this.data;
+    const outcome = this.visualOptions.outcome === "ended" ? this.data.ended : this.data.crossed;
+    const cells = nx * nz, support = Math.max(1, Number(this.visualOptions.minimumSupport) || 1);
+    const panelValues = [], positive = [];
+    for (let panel = 0; panel < panelCount; panel += 1) {
+      const values = new Float32Array(cells);
+      for (let cell = 0; cell < cells; cell += 1) {
+        const index = panel * cells + cell;
+        if (entered[index] < support) continue;
+        const value = this.visualOptions.display === "count"
+          ? outcome[index] : outcome[index] / Math.max(1, entered[index]);
+        values[cell] = value;
+        if (value > 0 && Number.isFinite(value)) positive.push(value);
+      }
+      panelValues.push(values);
+    }
+    positive.sort((a, b) => a - b);
+    const lo = 0, hi = this.visualOptions.display === "fraction" ? 1 : Math.max(1, positive[positive.length - 1] || 1);
+    this.valueRange = {lo, hi};
+    for (let panel = 0; panel < panelCount; panel += 1) {
+      const canvas = document.createElement("canvas");
+      canvas.width = nx; canvas.height = nz;
+      const context = canvas.getContext("2d");
+      const image = context.createImageData(nx, nz);
+      for (let iz = 0; iz < nz; iz += 1) for (let ix = 0; ix < nx; ix += 1) {
+        const value = panelValues[panel][iz * nx + ix];
+        const norm = Math.max(0, Math.min(1, value / Math.max(1e-12, hi)));
+        const rgb = hexRgb(sequentialColor(norm));
+        const target = ((nz - 1 - iz) * nx + ix) * 4;
+        image.data[target] = rgb[0]; image.data[target + 1] = rgb[1]; image.data[target + 2] = rgb[2];
+        image.data[target + 3] = value > 0 ? 255 : 0;
+      }
+      context.putImageData(image, 0, 0);
+      this.textures.push(canvas);
+    }
   }
 }
 
@@ -1282,11 +1417,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       }
       this.ctx.restore();
     }
-    drawPanelChrome(this.ctx, this.width, this.height, this.data, this.view, {
-      hideTicks: this.cleanMode, showGrid: this.gridVisible && !this.cleanMode,
-      scaleBar: true,
-    });
-    drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
+    this.drawSharedOverlays();
   }
   drawParticles(now) {
     if (!this.data || !this.view || !this.particleCtx || !this.particles.length) return;
@@ -1332,6 +1463,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
       particle.x = nx; particle.z = nz; particle.age += 1;
     }
+    drawPanelRings(ctx, this.width, this.height, this.data, this.view);
   }
 }
 

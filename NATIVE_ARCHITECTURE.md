@@ -61,6 +61,9 @@ The rendering boundary is deliberately hybrid:
   selected-segment visibility, and playback time handled by shaders/buffers;
 - occupancy is a crisp nearest-neighbour per-panel raster with a visible colour
   bar and absolute or percentile colour clipping;
+- transition probability is a second native raster layer on the same grid,
+  viewport, and interaction transform as paths/occupancy/flow; supported cells
+  drill into their exact raw segments and blank space clears that observer;
 - the direction field uses a lightweight Canvas particle layer because its
   spatial transform must remain exactly synchronized with trajectory/occupancy;
   abundance drives spawning, R drives mean alignment/angular spread, and the
@@ -69,10 +72,10 @@ The rendering boundary is deliberately hybrid:
   use vendored Apache ECharts 6.1 (Canvas renderer) for maintained hover,
   interactive legends, data zoom, reset, accessibility, and export;
 - pan/zoom uses one shared world rectangle and never enters the worker; and
-- one compact, wheel/keyboard/arrow-snapping view rail moves directly through
-  Paths, Occupancy, Flow, Polar, Targets, Windows, Heading, Metrics, Statistics,
-  Transitions, and Diagnostics; all four spatial views can also
-  appear in a compact 2×2 comparison without changing analysis state; and
+- one compact, wheel/keyboard/arrow-snapping view rail moves through the
+  spatial workspace, Polar, Targets, Windows, Heading, Metrics, Statistics,
+  and Diagnostics. Paths, Occupancy, Flow, and Transitions are layers of that
+  one spatial workspace, with a compact 2×2 overview; and
 - the source picker and complete analysis controls are drawers. They remain
   available without permanently taking plot area, and the controls drawer
   starts collapsed so data is the dominant visual element.
@@ -138,12 +141,13 @@ JavaScript would still need to read and decode roughly 4 GB; a future static
 browser mode is valuable for deployment convenience and privacy, but is not by
 itself a load-time optimization.
 
-Pan/zoom and displayed-trial fraction are renderer-local. Playback advanced a
-GPU time uniform while the application status remained Ready; it created no
-worker request or server request. The curtain observer is also renderer-local:
-it scans only mounted GPU links once per animation frame and uploads a small
-per-segment entry-time texture instead of rescanning retained rows or rebuilding
-the trajectory product.
+Pan/zoom and displayed-trial fraction are renderer-local. Playback advances a
+GPU time uniform while the application status remains Ready; it creates no
+worker request or server request. Curtain geometry is updated locally during a
+drag for immediate feedback. On release, the worker applies an exact retained
+path/circle intersection rule once, making the ring an analytical subset shared
+by paths, occupancy, flow, transitions, polar, heading, ROI, metrics, windows,
+and statistics rather than a trajectory-only highlight.
 
 ## Analytical invariants preserved
 
@@ -179,15 +183,15 @@ the trajectory product.
 | Static self-contained native HTML report | Complete |
 | Shareable principal URL state and readable JSON view recipe | Complete |
 | Python recipe/URL → `FilterSpec`/grouped frames bridge | Complete |
-| Multi-ring curtain observer, Any/All, editable geometry | Complete (renderer-local live update; direct center move and edge resize) |
+| Multi-ring curtain observer, Any/All, editable geometry | Complete (direct on every Cartesian spatial layer; center/edge drag, keyboard/UI/drag-to-trash deletion; exact shared analytical subset) |
 | Whole-window folder drop, exact manifest/path resolution, strict source boundary, automatic load | Complete |
 | Per-animal immediate visibility across trajectory and interactive charts | Complete |
 | ECharts hover/legend/zoom/export for analytical charts | Complete |
 | Device-local human-readable labels for every grouping axis | Complete |
 | Draggable/keyboard panel ordering across linked views | Complete |
-| Focused spatial lens and compact 2×2 comparison workspace | Complete |
+| Shared spatial layers and compact 2×2 overview | Complete (one viewport/subset/curtain across paths, occupancy, flow, and transitions) |
 | Editable observation windows and paired window inference | Complete (shared spatial transform; on-demand worker-side Wilcoxon summaries) |
-| Transition-probability cell observer | Complete (unique segment/cell entry, crossed/ended outcomes, support and fraction/count controls) |
+| Transition-probability cell observer | Complete (native shared-grid layer; unique segment/cell entry, crossed/ended outcomes, support/fraction/count controls, raw-path drill-down and blank reset) |
 | Delayed Holm/Rayleigh annotation layer | Complete (on-demand worker pass; Holm-adjusted metric comparisons and Rayleigh panel summaries) |
 
 The old Dash app stays runnable on this branch as a reference implementation;

@@ -703,3 +703,178 @@ h1 span { font-size: 8px; }
   .playback-settings .context-settings-panel { grid-template-columns: 1fr; }
   .context-settings-panel { grid-template-columns: 1fr; }
 }
+
+/* Shared spatial workspace ------------------------------------------------ */
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", Inter, ui-sans-serif, sans-serif;
+}
+body { letter-spacing: -.006em; }
+button, input, select { letter-spacing: -.004em; }
+.view-rail-track { flex: 0 1 auto; }
+.rail-context { margin-left: auto; }
+.view-rail .rail-action { margin-left: 0; }
+
+.explore-section {
+  position: relative;
+  padding: 4px 6px 6px;
+}
+.explore-section > .spatial-hud {
+  position: absolute;
+  z-index: 30;
+  top: 11px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: calc(100% - 28px);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.layer-switch,
+.spatial-curtain-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  padding: 3px;
+  border: 1px solid rgba(197,211,207,.92);
+  border-radius: 10px;
+  background: rgba(250,252,251,.94);
+  box-shadow: 0 6px 18px rgba(19,43,37,.08);
+  backdrop-filter: blur(12px);
+  pointer-events: auto;
+}
+.layer-switch button {
+  min-height: 26px;
+  padding: 4px 9px;
+  border-color: transparent;
+  border-radius: 7px;
+  color: #65716d;
+  background: transparent;
+  box-shadow: none;
+  font-size: 9px;
+  font-weight: 680;
+}
+.layer-switch button.active {
+  color: #075e55;
+  border-color: #c9dad6;
+  background: white;
+  box-shadow: 0 2px 7px rgba(20,46,40,.07);
+}
+.spatial-curtain-tools { gap: 4px; padding-left: 7px; }
+.spatial-curtain-tools .icon-button { width: 26px; height: 26px; min-height: 26px; padding: 0; font-size: 13px; }
+.curtain-state { max-width: 105px; overflow: hidden; color: #596762; font-size: 8px; font-weight: 690; text-overflow: ellipsis; white-space: nowrap; }
+
+.explore-section .section-heading { display: none; }
+.explore-section .explore-grid { height: 100%; min-height: 0; }
+.explore-section .lens-panel { height: 100%; min-height: 0; }
+.explore-section[data-lens="trajectory"] .lens-panel[data-view="trajectory"],
+.explore-section[data-lens="occupancy"] .lens-panel[data-view="occupancy"],
+.explore-section[data-lens="direction"] .lens-panel[data-view="direction"],
+.explore-section[data-lens="polar"] .lens-panel[data-view="polar"],
+.explore-section[data-lens="transitions"] .lens-panel[data-view="transitions"] { display: flex; }
+.explore-section .plot-card {
+  height: 100%;
+  min-height: 0;
+  padding: 3px;
+  overflow: visible;
+  border-radius: 10px;
+}
+.explore-section .plot-host,
+.explore-section .plot-host.large {
+  height: 100%;
+  min-height: 0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.explore-section .plot-card > .context-settings {
+  position: absolute;
+  z-index: 26;
+  top: 48px;
+  right: 10px;
+}
+.explore-section .context-settings > summary {
+  min-height: 25px;
+  padding: 4px 7px;
+  border-color: rgba(204,216,212,.9);
+  background: rgba(255,255,255,.9);
+  box-shadow: 0 3px 10px rgba(20,43,38,.045);
+  backdrop-filter: blur(8px);
+  font-size: 8px;
+}
+.explore-section .primary-toolbar {
+  position: absolute;
+  z-index: 24;
+  top: 48px;
+  left: 10px;
+  width: auto;
+  max-width: calc(100% - 150px);
+  min-height: 27px;
+  padding: 3px 5px;
+  overflow: visible;
+  border: 1px solid rgba(209,220,217,.82);
+  border-radius: 8px;
+  background: rgba(255,255,255,.88);
+  box-shadow: 0 3px 10px rgba(20,43,38,.04);
+  backdrop-filter: blur(8px);
+}
+.explore-section .primary-toolbar > label:not(.check),
+.explore-section .primary-toolbar > output,
+.explore-section .primary-toolbar > .segment-inspector { display: none; }
+.explore-section .playback-settings { margin-left: 0; }
+.explore-section .segment-inspector {
+  display: block;
+  left: 10px;
+  bottom: 10px;
+  max-width: min(620px, calc(100% - 20px));
+  padding: 4px 7px;
+  border-radius: 7px;
+  font-size: 8px;
+  line-height: 1.25;
+}
+.explore-section .direction-key { top: auto; right: 10px; bottom: 10px; }
+
+.ring-trash-target {
+  position: absolute;
+  z-index: 40;
+  right: 14px;
+  bottom: 14px;
+  display: grid;
+  place-items: center;
+  min-width: 105px;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 1px dashed #bd685a;
+  border-radius: 9px;
+  color: #923e31;
+  background: rgba(255,244,241,.96);
+  box-shadow: 0 8px 20px rgba(94,39,30,.12);
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity .12s ease, transform .12s ease, background .12s ease;
+  pointer-events: none;
+  font-size: 9px;
+  font-weight: 720;
+}
+.ring-dragging .ring-trash-target { opacity: 1; transform: none; }
+.ring-delete-ready .ring-trash-target { color: white; border-style: solid; background: #a64636; }
+.plot-host canvas:focus-visible { outline: 2px solid rgba(8,124,114,.45); outline-offset: -3px; }
+
+.explore-section[data-lens="compare"] .explore-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+.explore-section[data-lens="compare"] .lens-panel { display: flex; min-height: 0; padding: 0; }
+.explore-section[data-lens="compare"] .lens-panel[data-view="polar"] { display: none; }
+.explore-section[data-lens="compare"] .plot-host,
+.explore-section[data-lens="compare"] .plot-host.large { height: 100%; min-height: 0; }
+.explore-section[data-lens="compare"] .context-settings,
+.explore-section[data-lens="compare"] .direction-key,
+.explore-section[data-lens="compare"] .primary-toolbar { display: none; }
+
+@media (max-width: 820px) {
+  .explore-section > .spatial-hud { left: 10px; max-width: calc(100% - 20px); transform: none; }
+  .curtain-state { display: none; }
+  .layer-switch { overflow-x: auto; }
+}

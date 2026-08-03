@@ -75,6 +75,8 @@ function analysisKey(state) {
     jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
     minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
     roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
+    ringEnabled: state.ringEnabled, ringMatch: state.ringMatch,
+    rings: state.rings,
   });
 }
 
@@ -91,6 +93,16 @@ function targetsForSegment(seg) {
 
 function wrapAngle(value) {
   return ((value + 180) % 360 + 360) % 360 - 180;
+}
+
+function linkHitsRing(x0, z0, x1, z1, ring) {
+  const dx = x1 - x0, dz = z1 - z0;
+  const length2 = dx * dx + dz * dz;
+  const fraction = length2 > 0
+    ? Math.max(0, Math.min(1, ((ring.x - x0) * dx + (ring.z - z0) * dz) / length2))
+    : 0;
+  const px = x0 + dx * fraction, pz = z0 + dz * fraction;
+  return (px - ring.x) ** 2 + (pz - ring.z) ** 2 <= ring.r ** 2;
 }
 
 function buildAnalysis(state) {
@@ -160,6 +172,44 @@ function buildAnalysis(state) {
       for (let i = starts[seg]; i < ends[seg] && removed < trim; i += 1) if (rowKeep[i]) { rowKeep[i] = 0; removed += 1; }
       removed = 0;
       for (let i = ends[seg] - 1; i >= starts[seg] && removed < trim; i -= 1) if (rowKeep[i]) { rowKeep[i] = 0; removed += 1; }
+    }
+  }
+
+  // Curtain rings are an analytical subset, not a trajectory-only styling
+  // effect. Apply the same exact path-intersection rule before every derived
+  // view so occupancy, flow, transitions, polar, heading, and statistics all
+  // describe the same retained segments.
+  const activeRings = state.ringEnabled && Array.isArray(state.rings)
+    ? state.rings.map(ring => ({
+      x: Number(ring.x) || 0, z: Number(ring.z) || 0,
+      r: Math.max(.000001, Number(ring.r) || .000001),
+    })) : [];
+  if (activeRings.length) {
+    const requireAll = state.ringMatch === "all";
+    for (let seg = 0; seg < ns; seg += 1) {
+      if (!segmentKeep[seg]) continue;
+      const hits = new Uint8Array(activeRings.length);
+      let hitCount = 0, previous = -1;
+      for (let row = starts[seg]; row < ends[seg]; row += 1) {
+        if (!rowKeep[row]) continue;
+        for (let index = 0; index < activeRings.length; index += 1) {
+          if (hits[index]) continue;
+          const ring = activeRings[index];
+          const inside = (data.x[row] - ring.x) ** 2 + (data.z[row] - ring.z) ** 2 <= ring.r ** 2;
+          if (inside || (previous >= 0 && linkHitsRing(
+            data.x[previous], data.z[previous], data.x[row], data.z[row], ring,
+          ))) {
+            hits[index] = 1; hitCount += 1;
+          }
+        }
+        previous = row;
+        if ((requireAll && hitCount === activeRings.length) || (!requireAll && hitCount > 0)) break;
+      }
+      const qualifies = requireAll ? hitCount === activeRings.length : hitCount > 0;
+      if (!qualifies) {
+        segmentKeep[seg] = 0;
+        rowKeep.fill(0, starts[seg], ends[seg]);
+      }
     }
   }
 
@@ -493,6 +543,8 @@ function spatialCommon(state, analysis, grid) {
     rois: analysis.panelRois,
     roiCounts: {left: Array.from(analysis.roiCounts.left), right: Array.from(analysis.roiCounts.right)},
     reach: analysis.roiReach,
+    rings: state.rings || [], ringEnabled: !!state.ringEnabled,
+    ringMatch: state.ringMatch || "any",
   };
 }
 
@@ -1181,6 +1233,13 @@ function compute(message) {
   if (scope === "full" || scope === "spatial") {
     products.heatmap = buildOccupancy(state, lastAnalysis);
     products.direction = buildDirection(state, lastAnalysis);
+    if (scope === "spatial") {
+      products.transition = buildTransition(state, lastAnalysis);
+      lastTransitionGeometry = {
+        nx: products.transition.nx, nz: products.transition.nz,
+        x0: products.transition.x0, z0: products.transition.z0, bin: products.transition.bin,
+      };
+    }
   } else if (scope === "movement") {
     products.direction = buildDirection(state, lastAnalysis);
   }

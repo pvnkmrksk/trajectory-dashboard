@@ -1,9 +1,10 @@
 import {
-  TrajectoryRenderer, HeatmapRenderer, DirectionRenderer, NATIVE_PALETTE, formatNumber,
+  TrajectoryRenderer, HeatmapRenderer, DirectionRenderer, TransitionRenderer,
+  NATIVE_PALETTE, formatNumber,
 } from "/static/renderers.js";
 import {
   EChartsPolarRenderer, EChartsHeadingRenderer, EChartsMetricsRenderer,
-  EChartsRoiRenderer, EChartsHistogramRenderer, EChartsTransitionRenderer,
+  EChartsRoiRenderer, EChartsHistogramRenderer,
 } from "/static/echarts_renderers.js";
 
 const byId = id => document.getElementById(id);
@@ -39,6 +40,7 @@ let lastSummary = null;
 let ringFrame = null;
 let currentLens = "trajectory";
 let currentView = "trajectory";
+let transitionSelectionActive = false;
 let panelOrders = {};
 const rangeControls = new Map();
 
@@ -75,12 +77,12 @@ try {
   roiRenderer = new EChartsRoiRenderer(byId("roi-plot"));
   velocityHistogram = new EChartsHistogramRenderer(byId("velocity-hist"), "velocity-distribution");
   displacementHistogram = new EChartsHistogramRenderer(byId("displacement-hist"), "displacement-distribution");
-  transitionRenderer = new EChartsTransitionRenderer(byId("transition-plot"));
+  transitionRenderer = new TransitionRenderer(byId("transition-plot"), syncView);
 } catch (error) {
   setStatus("error", "Renderer unavailable", error.message);
   throw error;
 }
-const spatialRenderers = [trajectoryRenderer, heatmapRenderer, directionRenderer];
+const spatialRenderers = [trajectoryRenderer, heatmapRenderer, directionRenderer, transitionRenderer];
 trajectoryRenderer.setInspectHandler((point, view) => {
   if (!workerReady || !worker) return;
   const requestId = ++latestInspectRequest;
@@ -90,24 +92,59 @@ trajectoryRenderer.setInspectHandler((point, view) => {
   });
   byId("segment-inspector").textContent = "Finding the nearest retained segment…";
 });
-trajectoryRenderer.setRingMoveHandler((index, x, z, final, radius = null) => {
+function handleRingMove(source, index, x, z, final, radius = null) {
   if (!rings[index]) return;
   rings[index] = {...rings[index], x, z,
     r: Number.isFinite(radius) ? Math.max(.01, radius) : rings[index].r};
   activeRing = index;
   updateRingControlValues();
+  for (const renderer of spatialRenderers) {
+    if (renderer === source || !renderer.data) continue;
+    renderer.setRings(rings, byId("ring-enabled").checked, byId("ring-match").value);
+  }
   scheduleLocalRingObserver(final);
-});
-transitionRenderer.setInspectHandler(item => {
+}
+
+function selectRing(index) {
+  activeRing = Math.max(0, Math.min(rings.length - 1, Number(index) || 0));
+  renderRingControls();
+}
+
+function deleteRing(index = activeRing) {
+  if (!rings.length) return;
+  rings.splice(Math.max(0, Math.min(rings.length - 1, Number(index) || 0)), 1);
+  activeRing = Math.max(0, Math.min(rings.length - 1, activeRing));
+  if (!rings.length) byId("ring-enabled").checked = false;
+  renderRingControls();
+  scheduleLocalRingObserver(true);
+}
+
+for (const renderer of spatialRenderers) {
+  renderer.setRingMoveHandler((...args) => handleRingMove(renderer, ...args));
+  renderer.setRingSelectHandler(selectRing);
+  renderer.setRingDeleteHandler(deleteRing);
+}
+
+function clearTransitionSelection() {
+  if (!transitionSelectionActive) return;
+  transitionSelectionActive = false;
+  applyLocalRingObserver(false);
+  byId("segment-inspector").textContent = "Transition selection cleared. Click a supported cell to reveal its raw paths.";
+  setStatus("ready", "Transition selection cleared", "The shared curtain and analytical subset remain active.");
+}
+
+transitionRenderer.setInspectHandler(point => {
+  const cell = transitionRenderer.cellAt(point);
+  if (!cell) { clearTransitionSelection(); return; }
   if (!workerReady || !worker) return;
   const requestId = ++latestInspectRequest;
   worker.postMessage({
     type: "transition-inspect", requestId,
-    panel: Number(item.panelIndex),
-    ix: Number(item.value?.[0]), iz: Number(item.value?.[1]), x: Number(item.x), z: Number(item.z),
+    panel: cell.panel, ix: cell.ix, iz: cell.iz, x: cell.x, z: cell.z,
   });
   setStatus("working", "Selecting transition paths", "Finding the unique segments that entered the selected spatial cell.");
 });
+transitionRenderer.setBackgroundHandler(clearTransitionSelection);
 
 function parseBinary(buffer) {
   const view = new DataView(buffer);
@@ -504,13 +541,13 @@ function restoreViewStateFromUrl() {
   byId("ring-match").value = params.get("ringmatch") || "any";
   try {
     const restored = JSON.parse(params.get("rings") || "null");
-    if (Array.isArray(restored) && restored.length) rings = restored.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||3)}));
+    if (Array.isArray(restored)) rings = restored.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||3)}));
   } catch (_) { /* retain safe default */ }
 }
 
 const scopeProducts = {
   layout: [], trajectory: ["trajectory"], playback: ["heading"], heading: ["heading"],
-  polar: ["polar"], spatial: ["heatmap", "direction"],
+  polar: ["polar"], spatial: ["heatmap", "direction", "transition"],
   color: ["trajectory", "polar", "heading"], sample: ["trajectory", "polar", "heading"],
   statistics: ["polar", "metrics", "roi", "statistics"],
   transition: ["transition"],
@@ -561,7 +598,7 @@ function flushCompute() {
 function updateColumns() {
   const columns = numberValue("panel-columns");
   for (const value of Object.values(products)) if (value && typeof value === "object" && "columns" in value) value.columns = columns;
-  for (const renderer of [...spatialRenderers, polarRenderer, headingRenderer, transitionRenderer]) renderer.setColumns?.(columns);
+  for (const renderer of [...spatialRenderers, polarRenderer, headingRenderer]) renderer.setColumns?.(columns);
   persistState();
 }
 
@@ -747,8 +784,9 @@ function renderProducts(incoming, summary) {
   if (incoming.windows) renderWindows(incoming.windows);
   if (incoming.transition) {
     incoming.transition.columns = numberValue("panel-columns");
-    transitionRenderer.setData(incoming.transition);
+    transitionRenderer.setData(incoming.transition, !!sharedView);
     applyTransitionVisuals();
+    if (sharedView) transitionRenderer.setView(sharedView, false);
   }
   if (incoming.roi) {
     roiRenderer.setData(incoming.roi);
@@ -794,15 +832,20 @@ function handleWorkerMessage(event) {
   }
   if (message.type === "inspect-result") {
     const match = message.match;
+    if (!match && transitionSelectionActive) {
+      clearTransitionSelection();
+      return;
+    }
     byId("segment-inspector").textContent = match
       ? `${match.sourceFile} · trial ${formatNumber(match.trial, 0)} / step ${formatNumber(match.step, 0)} · ${match.config} · ${match.fly}@${match.vr} · path ${formatNumber(match.distance, 1)}, displacement ${formatNumber(match.displacement, 1)}, peak ${formatNumber(match.peakSpeed, 1)}, median ${formatNumber(match.medianSpeed, 1)}, tortuosity ${formatNumber(match.tortuosity, 1)}`
       : "No retained path was close enough; click nearer a visible line.";
     return;
   }
   if (message.type === "transition-inspect-result") {
+    transitionSelectionActive = true;
     trajectoryRenderer.setSegmentObserver(message.segments, true);
     setDashboardView("trajectory");
-    byId("segment-inspector").textContent = `${formatCount(message.segments.length)} unique segments entered the selected transition cell at X ${formatNumber(message.x, 1)}, Z ${formatNumber(message.z, 1)}. Context paths remain faint; open Curtain or update analysis to clear the selection.`;
+    byId("segment-inspector").textContent = `${formatCount(message.segments.length)} unique segments entered the selected transition cell at X ${formatNumber(message.x, 1)}, Z ${formatNumber(message.z, 1)}. Context paths remain faint; return to Transitions and click white space to clear.`;
     setStatus("ready", "Transition paths selected", `${formatCount(message.segments.length)} unique segments entered the selected cell.`);
     return;
   }
@@ -863,13 +906,20 @@ function setDashboardView(view, save = true) {
   ]);
   const previousView = currentView;
   currentView = allowed.has(view) ? view : "trajectory";
-  const spatial = new Set(["trajectory", "occupancy", "direction", "polar", "compare"]);
-  if (spatial.has(currentView)) currentLens = currentView;
+  const spatial = new Set(["trajectory", "occupancy", "direction", "transitions", "compare"]);
+  const exploreViews = new Set([...spatial, "polar"]);
+  if (exploreViews.has(currentView)) currentLens = currentView;
   byId("explore-section").dataset.lens = currentLens;
   for (const button of document.querySelectorAll("[data-view-button]")) {
-    button.classList.toggle("active", button.dataset.viewButton === currentView);
+    const selected = spatial.has(currentView) ? "trajectory" : currentView;
+    button.classList.toggle("active", button.dataset.viewButton === selected);
   }
-  const activeButton = document.querySelector(`[data-view-button="${currentView}"]`);
+  for (const button of document.querySelectorAll("[data-layer-button]")) {
+    button.classList.toggle("active", button.dataset.layerButton === currentLens);
+    button.setAttribute("aria-selected", String(button.dataset.layerButton === currentLens));
+  }
+  const railView = spatial.has(currentView) ? "trajectory" : currentView;
+  const activeButton = document.querySelector(`[data-view-button="${railView}"]`);
   activeButton?.scrollIntoView({behavior: "smooth", block: "nearest", inline: "center"});
   const viewMeta = {
     trajectory: ["Paths", "Spatial trajectories"], occupancy: ["Occupancy", "Spatial density"],
@@ -877,13 +927,14 @@ function setDashboardView(view, save = true) {
     roi: ["Targets", "ROI outcomes"], heading: ["Heading", "Local trial time"],
     windows: ["Windows", "Spatial subset comparison"],
     metrics: ["Metrics", "Exact segment summaries"], statistics: ["Statistics", "Adjusted inference"],
-    transitions: ["Transitions", "Cell-entry outcomes"], diagnostics: ["Diagnostics", "Load-time distributions"],
+    transitions: ["Spatial · Transitions", "Cell-entry outcomes"], diagnostics: ["Diagnostics", "Load-time distributions"],
     compare: ["Compare 2×2", "Linked spatial views"],
   }[currentView] || ["Paths", "Spatial trajectories"];
   byId("view-title").textContent = viewMeta[0]; byId("view-subtitle").textContent = viewMeta[1];
-  const activeSection = spatial.has(currentView) ? "explore-section" : `${currentView}-section`;
+  const activeSection = exploreViews.has(currentView) ? "explore-section" : `${currentView}-section`;
   const order = [...document.querySelectorAll("[data-view-button]")].map(button => button.dataset.viewButton);
-  const direction = order.indexOf(currentView) >= order.indexOf(previousView) ? "nav-forward" : "nav-back";
+  const previousRail = spatial.has(previousView) ? "trajectory" : previousView;
+  const direction = order.indexOf(railView) >= order.indexOf(previousRail) ? "nav-forward" : "nav-back";
   for (const section of document.querySelectorAll(".plot-section")) {
     section.classList.toggle("active-section", section.id === activeSection);
     section.classList.remove("nav-forward", "nav-back");
@@ -894,7 +945,7 @@ function setDashboardView(view, save = true) {
   if (datasetHeader && currentView === "windows" && !products.windows) scheduleCompute("windows", 0);
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const shown = currentView === "compare"
-      ? new Set(["trajectory", "occupancy", "direction", "polar"])
+      ? new Set(["trajectory", "occupancy", "direction", "transitions"])
       : new Set([currentView]);
     if (shown.has("trajectory")) { trajectoryRenderer.resize(); trajectoryRenderer.draw(); }
     if (shown.has("occupancy")) { heatmapRenderer.resize(); heatmapRenderer.draw(); }
@@ -902,7 +953,7 @@ function setDashboardView(view, save = true) {
     if (shown.has("polar")) { polarRenderer.chart.resize({animation: {duration: 0}}); polarRenderer.draw(); }
     if (shown.has("heading")) { headingRenderer.chart.resize({animation: {duration: 0}}); headingRenderer.draw(); }
     if (shown.has("metrics")) { metricsRenderer.chart.resize({animation: {duration: 0}}); metricsRenderer.draw(); }
-    if (shown.has("transitions")) { transitionRenderer.chart.resize({animation: {duration: 0}}); transitionRenderer.draw(); }
+    if (shown.has("transitions")) { transitionRenderer.resize(); transitionRenderer.draw(); }
     if (shown.has("roi")) { roiRenderer.chart.resize({animation: {duration: 0}}); roiRenderer.draw(); }
     if (shown.has("diagnostics")) {
       velocityHistogram.chart.resize({animation: {duration: 0}}); velocityHistogram.draw();
@@ -1001,7 +1052,7 @@ function applyRecipeControls(recipe) {
     }
   }
   panelOrders = state.panelOrders && typeof state.panelOrders === "object" ? structuredClone(state.panelOrders) : panelOrders;
-  if (Array.isArray(state.rings) && state.rings.length) rings = state.rings.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||.01)}));
+  if (Array.isArray(state.rings)) rings = state.rings.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||.01)}));
   if (Array.isArray(state.windows)) for (const [index, window] of state.windows.slice(0, 2).entries()) {
     const key = index ? "b" : "a";
     for (const bound of ["xmin", "xmax", "zmin", "zmax"]) if (window?.[bound] != null) byId(`window-${key}-${bound}`).value = window[bound];
@@ -1080,12 +1131,17 @@ function updateFraction() {
 }
 
 function renderRingControls() {
-  activeRing = Math.max(0, Math.min(rings.length - 1, activeRing));
+  activeRing = rings.length ? Math.max(0, Math.min(rings.length - 1, activeRing)) : 0;
+  for (const renderer of spatialRenderers) renderer.activeRing = activeRing;
   const select = byId("ring-active"); select.replaceChildren();
   rings.forEach((_, index) => select.add(new Option(`Ring ${index + 1}`, String(index))));
+  if (!rings.length) select.add(new Option("No rings", ""));
   select.value = String(activeRing);
   updateRingControlValues();
-  byId("ring-delete").disabled = rings.length <= 1;
+  byId("ring-delete").disabled = !rings.length;
+  byId("ring-quick-delete").disabled = !rings.length;
+  byId("curtain-state").textContent = byId("ring-enabled").checked && rings.length
+    ? `${rings.length} curtain ${rings.length === 1 ? "ring" : "rings"}` : "Curtain off";
 }
 
 function updateRingControlValues() {
@@ -1146,10 +1202,16 @@ function updateTrajectorySummary(ringStats = null) {
 }
 
 function applyLocalRingObserver(save = false) {
+  const enabled = byId("ring-enabled").checked && rings.length > 0;
   const stats = trajectoryRenderer.setRingObserver(
-    byId("ring-enabled").checked, rings, byId("ring-match").value,
+    enabled, rings, byId("ring-match").value,
     byId("ring-context").checked,
   );
+  for (const renderer of [heatmapRenderer, directionRenderer, transitionRenderer]) {
+    renderer.setRings(rings, enabled, byId("ring-match").value);
+  }
+  byId("curtain-state").textContent = enabled
+    ? `${rings.length} curtain ${rings.length === 1 ? "ring" : "rings"}` : "Curtain off";
   updateTrajectorySummary(stats);
   if (save) persistState();
   return stats;
@@ -1160,6 +1222,8 @@ function scheduleLocalRingObserver(final = false) {
   if (final) {
     ringFrame = null;
     applyLocalRingObserver(true);
+    transitionSelectionActive = false;
+    scheduleCompute("full", 120);
     return;
   }
   if (ringFrame) return;
@@ -1170,6 +1234,7 @@ function scheduleLocalRingObserver(final = false) {
 }
 
 function updateActiveRing() {
+  if (!rings.length) rings.push({x: 0, z: 0, r: 3});
   rings[activeRing] = {
     x: numberValue("ring-x"), z: numberValue("ring-z"),
     r: Math.max(.01, numberValue("ring-radius", 3)),
@@ -1211,7 +1276,7 @@ byId("controls-toggle").addEventListener("click", () => {
   byId("controls-toggle").setAttribute("aria-expanded", String(!collapsed));
   setTimeout(() => {
     for (const renderer of spatialRenderers) { renderer.resize(); renderer.draw(); }
-    for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer, transitionRenderer, velocityHistogram, displacementHistogram]) {
+    for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer, velocityHistogram, displacementHistogram]) {
       renderer.chart.resize({animation: {duration: 0}});
       renderer.draw();
     }
@@ -1226,11 +1291,7 @@ function setCurtainPalette(open) {
   if (open) {
     byId("source-popover").open = false;
     for (const details of document.querySelectorAll(".context-settings[open]")) details.open = false;
-    setDashboardView("trajectory");
-    if (!byId("ring-enabled").checked) {
-      byId("ring-enabled").checked = true;
-    }
-    applyLocalRingObserver(true);
+    renderRingControls();
   }
 }
 byId("curtain-toggle").addEventListener("click", () => setCurtainPalette(byId("curtain-palette").hidden));
@@ -1264,9 +1325,14 @@ byId("group-by").addEventListener("change", () => {
 for (const button of document.querySelectorAll("[data-view-button]")) {
   button.addEventListener("click", () => setDashboardView(button.dataset.viewButton));
 }
+for (const button of document.querySelectorAll("[data-layer-button]")) {
+  button.addEventListener("click", () => setDashboardView(button.dataset.layerButton));
+}
 function stepDashboardView(delta) {
   const views = [...document.querySelectorAll("[data-view-button]")].map(button => button.dataset.viewButton);
-  const index = Math.max(0, views.indexOf(currentView));
+  const currentRailView = ["trajectory", "occupancy", "direction", "transitions", "compare"].includes(currentView)
+    ? "trajectory" : currentView;
+  const index = Math.max(0, views.indexOf(currentRailView));
   setDashboardView(views[(index + delta + views.length) % views.length]);
 }
 byId("view-prev").addEventListener("click", () => stepDashboardView(-1));
@@ -1308,27 +1374,28 @@ byId("resample-button").addEventListener("click", () => { sampleSeed += 1; sched
 byId("roi-show").addEventListener("change", () => {
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
 });
-byId("ring-enabled").addEventListener("change", () => applyLocalRingObserver(true));
+byId("ring-enabled").addEventListener("change", () => scheduleLocalRingObserver(true));
 byId("ring-context").addEventListener("change", () => applyLocalRingObserver(true));
-byId("ring-match").addEventListener("change", () => applyLocalRingObserver(true));
+byId("ring-match").addEventListener("change", () => scheduleLocalRingObserver(true));
 byId("ring-active").addEventListener("change", () => { activeRing = Number(byId("ring-active").value) || 0; renderRingControls(); });
 for (const id of ["ring-x", "ring-z", "ring-radius"]) {
   byId(id).addEventListener("input", updateActiveRing);
-  byId(id).addEventListener("change", () => applyLocalRingObserver(true));
+  byId(id).addEventListener("change", () => scheduleLocalRingObserver(true));
 }
 byId("ring-radius-slider").addEventListener("input", () => {
   byId("ring-radius").value = byId("ring-radius-slider").value;
   updateActiveRing();
 });
-byId("ring-radius-slider").addEventListener("change", () => applyLocalRingObserver(true));
-byId("ring-add").addEventListener("click", () => {
+byId("ring-radius-slider").addEventListener("change", () => scheduleLocalRingObserver(true));
+function addRing() {
   const current = rings[activeRing] || {x:0,z:0,r:3}; rings.push({...current, x: current.x + current.r * .5}); activeRing = rings.length - 1;
-  renderRingControls(); applyLocalRingObserver(true);
-});
-byId("ring-delete").addEventListener("click", () => {
-  if (rings.length <= 1) return; rings.splice(activeRing, 1); activeRing = Math.max(0, activeRing - 1);
-  renderRingControls(); applyLocalRingObserver(true);
-});
+  byId("ring-enabled").checked = true;
+  renderRingControls(); scheduleLocalRingObserver(true);
+}
+byId("ring-add").addEventListener("click", addRing);
+byId("ring-quick-add").addEventListener("click", addRing);
+byId("ring-delete").addEventListener("click", () => deleteRing(activeRing));
+byId("ring-quick-delete").addEventListener("click", () => deleteRing(activeRing));
 for (const id of ["heat-metric", "heat-scale", "heat-range-mode", "heat-cmin", "heat-cmax"]) {
   byId(id).addEventListener(id.startsWith("heat-c") ? "input" : "change", () => {
     applyHeatmapVisuals(); persistState();

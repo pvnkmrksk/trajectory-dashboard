@@ -26,11 +26,13 @@ CSV files only below that exact folder boundary.
 The browser receives one compact typed-column payload, transfers ownership to a
 Web Worker, and then keeps filtering, grouping, binning, playback, displayed-
 trial sampling, and circular summaries off the main thread. Trajectories use
-one instanced WebGL draw call; occupancy and animated flow use focused Canvas
-renderers; polar, ROI, heading-time, metrics, and diagnostics use vendored
+one instanced WebGL draw call; occupancy, animated flow, and transition
+probability use linked Canvas renderers; polar, ROI, heading-time, metrics, and diagnostics use vendored
 Apache ECharts for mature hover, zoom, legend, and export interactions. Pan and
-zoom are shared locally between all spatial views. The generic raw-channel
-explorer has been removed.
+zoom are shared locally between all Cartesian spatial layers. Curtain rings can
+be moved or resized directly on any of them and become one exact analytical
+subset for every downstream view. The generic raw-channel explorer has been
+removed.
 
 The behavioral contract and the distinction between scientific requirements
 and old framework artifacts are in

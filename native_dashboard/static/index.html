@@ -193,9 +193,7 @@
         <button class="icon-button rail-menu" id="controls-toggle" type="button" aria-expanded="false" aria-controls="analysis-sidebar" aria-label="Open analysis controls">☰</button>
         <button class="icon-button rail-step" id="view-prev" type="button" aria-label="Previous view">‹</button>
         <div class="view-rail-track">
-          <button type="button" data-view-button="trajectory" class="active">Paths</button>
-          <button type="button" data-view-button="occupancy">Occupancy</button>
-          <button type="button" data-view-button="direction">Flow</button>
+          <button type="button" data-view-button="trajectory" class="active">Spatial</button>
           <button type="button" data-view-button="polar">Polar</button>
           <span class="rail-divider" aria-hidden="true"></span>
           <button type="button" data-view-button="roi">Targets</button>
@@ -203,10 +201,7 @@
           <button type="button" data-view-button="heading">Heading</button>
           <button type="button" data-view-button="metrics">Metrics</button>
           <button type="button" data-view-button="statistics">Statistics</button>
-          <button type="button" data-view-button="transitions">Transitions</button>
           <button type="button" data-view-button="diagnostics">Diagnostics</button>
-          <span class="rail-divider" aria-hidden="true"></span>
-          <button type="button" data-view-button="compare">Compare 2×2</button>
         </div>
         <button class="icon-button rail-step" id="view-next" type="button" aria-label="Next view">›</button>
         <div class="rail-context" aria-live="polite"><b id="view-title">Paths</b><span id="view-subtitle">Spatial trajectories</span></div>
@@ -229,7 +224,7 @@
       </nav>
 
       <section class="tool-palette curtain-palette" id="curtain-palette" hidden aria-label="Curtain-ring observer">
-        <header><div><b>Curtain observer</b><small>Drag a centre or edge directly on the path view.</small></div><button class="icon-button" id="curtain-close" type="button" aria-label="Close curtain controls">×</button></header>
+        <header><div><b>Curtain observer</b><small>Drag a centre or edge on Paths, Occupancy, Flow, or Transitions.</small></div><button class="icon-button" id="curtain-close" type="button" aria-label="Close curtain controls">×</button></header>
         <div class="palette-grid">
           <label class="check"><input id="ring-enabled" type="checkbox"> Match paths</label>
           <label class="check"><input id="ring-context" type="checkbox" checked> Faint context</label>
@@ -244,6 +239,20 @@
       </section>
 
       <section class="plot-section explore-section active-section" id="explore-section" data-lens="trajectory">
+        <div class="spatial-hud" aria-label="Spatial layers and curtain tools">
+          <div class="layer-switch" role="tablist" aria-label="Spatial representation">
+            <button type="button" data-layer-button="trajectory" class="active" role="tab">Paths</button>
+            <button type="button" data-layer-button="occupancy" role="tab">Occupancy</button>
+            <button type="button" data-layer-button="direction" role="tab">Flow</button>
+            <button type="button" data-layer-button="transitions" role="tab">Transitions</button>
+            <button type="button" data-layer-button="compare" role="tab" aria-label="Spatial overview">Overview</button>
+          </div>
+          <div class="spatial-curtain-tools">
+            <span class="curtain-state" id="curtain-state">Curtain off</span>
+            <button class="icon-button" id="ring-quick-add" type="button" title="Add a curtain ring" aria-label="Add curtain ring">＋</button>
+            <button class="icon-button" id="ring-quick-delete" type="button" title="Delete the selected curtain ring (Delete)" aria-label="Delete selected curtain ring">⌫</button>
+          </div>
+        </div>
         <div class="explore-grid">
       <article class="lens-panel hero-section" id="trajectory-section" data-view="trajectory">
         <div class="section-heading">
@@ -277,6 +286,8 @@
       <article class="lens-panel" id="occupancy-section" data-view="occupancy">
         <div class="section-heading">
           <div><span class="section-kicker">Spatial density</span><h2>Occupancy</h2></div>
+        </div>
+        <div class="plot-card">
           <details class="context-settings"><summary>Heatmap settings</summary><div class="context-settings-panel inline-controls">
             <label>Metric<select id="heat-metric"><option value="time">Seconds</option><option value="count">Samples</option><option value="percent">Percent</option></select></label>
             <label>Scale<select id="heat-scale"><option value="linear">Linear</option><option value="log">Log</option></select></label>
@@ -286,13 +297,15 @@
             <label>Grid size<input id="bin-size" data-scope="spatial" type="number" min="0" step="0.01" placeholder="Auto"></label>
             <label>Central %<input id="bound-percent" data-scope="spatial" type="number" min="50" max="100" value="98"></label>
           </div></details>
+          <div class="plot-host" id="heatmap-plot" aria-label="Occupancy heatmap"></div>
         </div>
-        <div class="plot-card"><div class="plot-host" id="heatmap-plot" aria-label="Occupancy heatmap"></div></div>
       </article>
 
       <article class="lens-panel" id="direction-section" data-view="direction">
         <div class="section-heading">
           <div><span class="section-kicker">Circular mean by cell</span><h2>Local direction field</h2></div>
+        </div>
+        <div class="plot-card">
           <details class="context-settings"><summary>Flow settings</summary><div class="context-settings-panel inline-controls flow-controls">
             <label>Abundance<select id="flow-metric"><option value="count">Samples</option><option value="time">Seconds</option></select></label>
             <label>Limits<select id="flow-range-mode"><option value="percentile">Percentiles</option><option value="absolute">Values</option></select></label>
@@ -303,8 +316,6 @@
             <label>Flow speed<input id="flow-speed" type="range" min="0.25" max="3" step="0.05" value="1"></label>
             <label>R variability<input id="flow-variability" type="range" min="0" max="2" step="0.05" value="1"></label>
           </div></details>
-        </div>
-        <div class="plot-card">
           <details class="direction-key" aria-label="Direction colour legend">
             <summary>Direction key</summary>
             <div class="direction-key-body">
@@ -322,6 +333,18 @@
           <div class="section-summary" id="polar-summary"></div>
         </div>
         <div class="plot-card"><div class="plot-host" id="polar-plot" aria-label="Polar direction plot"></div></div>
+      </article>
+
+      <article class="lens-panel" id="transitions-section" data-view="transitions">
+        <div class="section-heading"><div><span class="section-kicker">Cell entry outcomes</span><h2>Transition observer</h2></div></div>
+        <div class="plot-card">
+          <details class="context-settings"><summary>Transition settings</summary><div class="context-settings-panel inline-controls transition-controls">
+            <label>Outcome<select id="transition-outcome"><option value="crossed">Crossed opposite half</option><option value="ended">Ended opposite half</option></select></label>
+            <label>Display<select id="transition-display"><option value="fraction">Fraction</option><option value="count">Count</option></select></label>
+            <label>Minimum support<input id="transition-support" type="number" min="1" step="1" value="5"></label>
+          </div></details>
+          <div class="plot-host" id="transition-plot" aria-label="Transition probability observer"></div>
+        </div>
       </article>
         </div>
       </section>
@@ -376,13 +399,6 @@
       <section class="plot-section" id="statistics-section">
         <div class="section-heading"><div><span class="section-kicker">Worker-side inference</span><h2>Statistics</h2></div><div class="legend-note">Kruskal–Wallis · Holm-adjusted pairwise tests · Rayleigh uniformity</div></div>
         <div class="statistics-workspace" id="statistics-content"><div class="analysis-empty">Open this view after loading data to calculate inferential statistics without blocking the plots.</div></div>
-      </section>
-
-      <section class="plot-section" id="transitions-section">
-        <div class="section-heading"><div><span class="section-kicker">Cell entry outcomes</span><h2>Transition observer</h2></div>
-          <div class="inline-controls transition-controls"><label>Outcome<select id="transition-outcome"><option value="crossed">Crossed opposite half</option><option value="ended">Ended opposite half</option></select></label><label>Display<select id="transition-display"><option value="fraction">Fraction</option><option value="count">Count</option></select></label><label>Minimum support<input id="transition-support" type="number" min="1" step="1" value="5"></label></div>
-        </div>
-        <div class="plot-card"><div class="plot-host" id="transition-plot" aria-label="Transition probability observer"></div></div>
       </section>
 
       <section class="plot-section" id="diagnostics-section">
