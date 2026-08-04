@@ -44,6 +44,14 @@ let transitionSelectionActive = false;
 let panelOrders = {};
 const rangeControls = new Map();
 
+function syncAngleSourceControls(value) {
+  const next = value === "movement" ? "movement" : "orientation";
+  for (const id of ["angle-source", "polar-angle-source"]) {
+    const control = byId(id);
+    if (control) control.value = next;
+  }
+}
+
 function setStatus(kind, title, detail) {
   statusDock.className = `status-dock ${kind || ""}`;
   statusDock.title = detail ? `${title} — ${detail}` : title;
@@ -528,6 +536,7 @@ function restoreViewStateFromUrl() {
     "transition-support": params.get("tsupport"),
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
+  syncAngleSourceControls(byId("angle-source").value);
   byId("window-show").checked = params.get("wshow") === "1";
   setDashboardView(params.get("view") || params.get("lens") || "trajectory", false);
   try {
@@ -1180,6 +1189,7 @@ function applyRecipeControls(recipe) {
     headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
   };
   for (const [key, id] of Object.entries(valueIds)) if (state[key] != null) byId(id).value = state[key];
+  syncAngleSourceControls(byId("angle-source").value);
   for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context",windowsVisible:"window-show"})) {
     if (state[key] != null) byId(id).checked = !!state[key];
   }
@@ -1673,6 +1683,11 @@ byId("play-button").addEventListener("click", () => {
   if (playing) stopPlayback();
   else { byId("play-button").textContent = "Pause"; playbackLast = 0; playbackFrame = requestAnimationFrame(playbackTick); }
 });
+
+for (const id of ["angle-source", "polar-angle-source"]) {
+  byId(id).addEventListener("change", event => syncAngleSourceControls(event.target.value));
+}
+syncAngleSourceControls(byId("angle-source").value);
 
 for (const control of document.querySelectorAll("[data-scope]")) {
   control.addEventListener("change", () => {

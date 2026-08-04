@@ -326,8 +326,9 @@
         </div>
         <div class="plot-card">
           <details class="context-settings"><summary>Polar display</summary><div class="context-settings-panel inline-controls">
+            <label>Direction source<select id="polar-angle-source" data-scope="movement" title="Body orientation uses the recorded facing angle; movement heading uses successive X/Z positions."><option value="orientation">Body orientation</option><option value="movement">Movement heading</option></select></label>
             <label>Representation<select id="polar-mode" data-scope="polar"><option value="vectors">Resultant vectors</option><option value="histogram">Resultant histogram</option><option value="density">All-heading density</option></select></label>
-            <small>Vectors summarize each replicate. Histogram counts replicate directions. All-heading density uses every retained heading sample in the selected local-time window.</small>
+            <small class="span-two">The direction source applies to resultants, the R filter, all-heading density, flow, heading plots, and circular statistics. Vectors summarize each replicate.</small>
           </div></details>
           <div class="plot-host" id="polar-plot" aria-label="Polar direction plot"></div>
         </div>

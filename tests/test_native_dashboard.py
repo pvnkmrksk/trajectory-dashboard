@@ -163,6 +163,7 @@ def test_native_server_serves_plotly_free_shell_and_binary(tmp_path):
     assert b"TrajectoryRenderer" not in shell.data
     assert b"plotly.min.js" not in shell.data.lower()
     assert b"vendor/echarts.min.js" in shell.data
+    assert b"polar-angle-source" in shell.data
 
     response = client.post("/api/load", json={"source": str(tmp_path)})
     assert response.status_code == 200
