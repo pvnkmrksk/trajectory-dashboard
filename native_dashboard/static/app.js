@@ -675,10 +675,50 @@ function flushCompute() {
   worker.postMessage(message);
 }
 
+const panelPlotSpecs = [
+  ["trajectory", "trajectory-plot"], ["heatmap", "heatmap-plot"],
+  ["direction", "direction-plot"], ["transition", "transition-plot"],
+  ["polar", "polar-plot"], ["heading", "heading-plot"],
+];
+
+function sizePanelPlot(host, product) {
+  if (!host || !product) return;
+  const panelCount = Math.max(1, Number(product.panelCount) || 1);
+  const requested = Math.max(1, Number(product.columns) || numberValue("panel-columns", 2));
+  const columns = Math.min(panelCount, requested);
+  const rows = Math.max(1, Math.ceil(panelCount / columns));
+  const workspaceWidth = Math.max(360, byId("workspace")?.clientWidth || innerWidth);
+  const plotWidth = Math.max(320,
+    host.clientWidth || host.closest(".lens-panel, .plot-section")?.clientWidth || workspaceWidth);
+
+  // Give every panel the same fraction of the viewport in both dimensions:
+  // two columns are about half-page width by half-page height, four columns
+  // about quarter-page width by quarter-page height. A floor prevents dense
+  // grids from becoming unreadable; extra rows extend the scrollable document.
+  const viewportAspect = Math.max(.35, innerHeight / Math.max(640, innerWidth));
+  const rowHeight = Math.round(Math.max(280,
+    Math.min(Math.max(420, innerHeight - 92), (plotWidth / columns) * viewportAspect)));
+  const gridHeight = rows * rowHeight;
+
+  host.dataset.panelGrid = "true";
+  host.dataset.panelCount = String(panelCount);
+  host.dataset.panelColumns = String(columns);
+  host.dataset.panelRows = String(rows);
+  host.style.setProperty("--panel-grid-height", `${gridHeight}px`);
+}
+
+function updatePanelGridSizing() {
+  for (const [productName, hostId] of panelPlotSpecs) {
+    sizePanelPlot(byId(hostId), products[productName]);
+  }
+}
+
 function updateColumns() {
   const columns = numberValue("panel-columns");
   for (const value of Object.values(products)) if (value && typeof value === "object" && "columns" in value) value.columns = columns;
+  updatePanelGridSizing();
   for (const renderer of [...spatialRenderers, polarRenderer, headingRenderer]) renderer.setColumns?.(columns);
+  requestAnimationFrame(updatePanelGridSizing);
   persistState();
 }
 
@@ -921,6 +961,8 @@ function renderProducts(incoming, summary, quiet = false) {
   applyAnimalVisibility();
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
   for (const renderer of spatialRenderers) renderer.setGridVisible(byId("spatial-grid").checked);
+  updatePanelGridSizing();
+  requestAnimationFrame(() => requestAnimationFrame(updatePanelGridSizing));
   newDataset = false;
 }
 
@@ -1086,6 +1128,7 @@ function setDashboardView(view, save = true) {
   if (datasetHeader && (currentView === "compare" || previousView === "compare"
       || !products[productForView])) scheduleCompute(scopeForCurrentView(), 0);
   requestAnimationFrame(() => requestAnimationFrame(() => {
+    updatePanelGridSizing();
     const shown = currentView === "compare"
       ? new Set(["trajectory", "occupancy", "direction", "polar"])
       : new Set([currentView]);
@@ -1571,6 +1614,11 @@ byId("workspace").addEventListener("wheel", event => {
   stepDashboardView((Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY) > 0 ? 1 : -1);
   setTimeout(() => { railWheelLocked = false; }, 320);
 }, {passive: false});
+let panelResizeFrame = null;
+window.addEventListener("resize", () => {
+  cancelAnimationFrame(panelResizeFrame);
+  panelResizeFrame = requestAnimationFrame(updatePanelGridSizing);
+});
 document.addEventListener("keydown", event => {
   if (event.target.closest("input, select, textarea") || event.metaKey || event.ctrlKey) return;
   const spatialViews = ["trajectory", "occupancy", "direction", "polar", "transitions", "compare"];

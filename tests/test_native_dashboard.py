@@ -165,6 +165,14 @@ def test_native_server_serves_plotly_free_shell_and_binary(tmp_path):
     assert b"vendor/echarts.min.js" in shell.data
     assert b"polar-angle-source" in shell.data
 
+    script = client.get("/static/app.js")
+    styles = client.get("/static/dashboard.css")
+    assert script.status_code == styles.status_code == 200
+    assert b"--panel-grid-height" in script.data
+    assert b'panelGrid = "true"' in script.data
+    assert b'overflow-y: auto' in styles.data
+    assert b'grid-auto-rows: auto' in styles.data
+
     response = client.post("/api/load", json={"source": str(tmp_path)})
     assert response.status_code == 200
     assert response.mimetype == "application/vnd.trajectory-dashboard"

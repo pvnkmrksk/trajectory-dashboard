@@ -1116,3 +1116,65 @@ button, input, select { letter-spacing: -.004em; }
   .curtain-icon { display: block; }
   .view-rail-track { flex-basis: 280px; }
 }
+
+/* Legible treatment grids -------------------------------------------------
+   The renderer owns panel columns; the document owns rows. Never squeeze an
+   arbitrary number of treatments into one viewport-height canvas. */
+.workspace,
+.clean-mode .workspace {
+  height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+.view-rail {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  flex: 0 0 46px;
+}
+.plot-section.active-section {
+  flex: 0 0 auto;
+  min-height: calc(100vh - 46px);
+  overflow: visible;
+}
+.explore-section .explore-grid,
+.explore-section .lens-panel,
+.explore-section .plot-card {
+  height: auto;
+  min-height: 0;
+}
+.explore-section .explore-grid,
+.explore-section .lens-panel,
+.explore-section .plot-card,
+.plot-section.active-section > .plot-card {
+  flex: 0 0 auto;
+}
+.plot-host[data-panel-grid="true"],
+.plot-host.large[data-panel-grid="true"],
+.plot-host.tall[data-panel-grid="true"],
+.plot-host.short[data-panel-grid="true"],
+.explore-section .plot-host[data-panel-grid="true"],
+.explore-section .plot-host.large[data-panel-grid="true"] {
+  height: var(--panel-grid-height);
+  min-height: 280px;
+  flex: 0 0 auto;
+}
+.explore-section[data-lens="compare"] .explore-grid {
+  grid-template-rows: none;
+  grid-auto-rows: auto;
+  align-items: start;
+  height: auto;
+}
+.explore-section[data-lens="compare"] .lens-panel {
+  height: auto;
+  align-self: start;
+}
+.clean-mode .plot-section.active-section { min-height: calc(100vh - 36px); }
+
+@media (max-width: 820px) {
+  .plot-host[data-panel-grid="true"],
+  .explore-section .plot-host[data-panel-grid="true"] { min-height: 300px; }
+  .explore-section[data-lens="compare"] .explore-grid { grid-template-columns: 1fr; }
+}
