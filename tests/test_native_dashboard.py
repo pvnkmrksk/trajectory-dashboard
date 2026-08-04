@@ -324,6 +324,40 @@ def test_config_labels_follow_target_geometry_and_define_mirror_pool():
     assert first["mirrorSign"] == -reflected["mirrorSign"]
 
 
+def test_config_x_separator_discards_protocol_prefix_and_uses_unity_sides():
+    targets = [
+        {
+            "x": 29.6, "z": 0, "r": 29.6,
+            "side": "right", "type": "LocustBand_black",
+        },
+        {
+            "x": -29.6, "z": 0, "r": 29.6,
+            "side": "left", "type": "LocustBand",
+        },
+    ]
+    black_first = _config_presentation(
+        "bilateral_bandH0_constant_distance_black_animated_x_gregarious_animated.json",
+        targets,
+    )
+    gregarious_first = _config_presentation(
+        "bilateral_bandH0_constant_distance_gregarious_animated_x_black_animated.json",
+        [
+            dict(targets[0], type="LocustBand"),
+            dict(targets[1], type="LocustBand_black"),
+        ],
+    )
+
+    assert black_first["label"] == (
+        "Left: gregarious animated · Right: black animated"
+    )
+    assert gregarious_first["label"] == (
+        "Left: black animated · Right: gregarious animated"
+    )
+    assert black_first["mirrorKey"] == gregarious_first["mirrorKey"]
+    assert black_first["mirrorSign"] == -1
+    assert gregarious_first["mirrorSign"] == 1
+
+
 def test_native_dataset_only_pools_geometry_confirmed_mirror_pairs(tmp_path):
     rows = []
     for step, config in enumerate(("Choice_SubFlip_BigFarNoFlip.json", "Choice_BigFarNoFlip_SubFlip.json")):

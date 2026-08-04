@@ -188,7 +188,9 @@ live dashboard layout are restored after capture.
   direction cells, polar, and heading error.
 - Config labels assign filename stimulus tokens to the actual target objects,
   then order them by target X: negative X is Left and positive X is Right in
-  the Unity left-handed frame. Confirmed left/right control pairs can be pooled
+  the Unity left-handed frame. Long protocol filenames using `_x_` treat that
+  marker as the two-stimulus separator and do not mistake the shared protocol
+  prefix for target names. Confirmed left/right control pairs can be pooled
   by reflecting one member (`X -> -X`, `heading -> -heading`); Z and time are
   unchanged. The mapping and transform are preserved in the JSON view recipe.
 - ROI fraction/residence denominators use the quality-filtered pre-ROI segment

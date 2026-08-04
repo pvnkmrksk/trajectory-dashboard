@@ -282,6 +282,48 @@ _CONFIG_LABELS = {
 }
 
 
+_CONFIG_WORD_REPLACEMENTS = {
+    "noflip": "no flip",
+    "subnoflip": "near / no flip",
+    "subflip": "near / flip",
+    "bigfarnoflip": "far / no flip",
+    "bigfarflip": "far / flip",
+    "unibg": "uniform background",
+}
+
+
+def _humanize_config_word(word: str) -> str:
+    return _CONFIG_WORD_REPLACEMENTS.get(
+        word.lower(), word.replace("noflip", "no flip")
+    )
+
+
+def _config_pair_words(raw: str) -> list[str] | None:
+    """Extract the two stimulus names around a filename ``_x_`` marker.
+
+    Experimental filenames often prepend a long shared protocol description,
+    for example ``bilateral_bandH0_constant_distance_``.  The two stimulus
+    descriptions on either side of ``_x_`` use the same number of underscore-
+    separated qualifiers, so the matching suffix before the marker is the
+    first stimulus; everything earlier is protocol metadata, not a target.
+    """
+
+    stem = os.path.splitext(str(raw or ""))[0]
+    marker = stem.lower().rfind("_x_")
+    if marker < 0:
+        return None
+    before, after = stem[:marker], stem[marker + 3:]
+    right_parts = [part for part in after.replace("-", "_").split("_") if part]
+    left_parts = [part for part in before.replace("-", "_").split("_") if part]
+    if not right_parts or len(left_parts) < len(right_parts):
+        return None
+    left_parts = left_parts[-len(right_parts):]
+    return [
+        " ".join(_humanize_config_word(part) for part in left_parts),
+        " ".join(_humanize_config_word(part) for part in right_parts),
+    ]
+
+
 def _config_words(raw: str) -> list[str]:
     text = str(raw or "unknown")
     if text in _CONFIG_LABELS:
@@ -289,18 +331,7 @@ def _config_words(raw: str) -> list[str]:
     stem = os.path.splitext(text)[0]
     stem = stem.removeprefix("Choice_").removeprefix("BinaryChoice_")
     words = [part for part in stem.replace("-", "_").split("_") if part]
-    replacements = {
-        "noflip": "no flip",
-        "subnoflip": "near / no flip",
-        "subflip": "near / flip",
-        "bigfarnoflip": "far / no flip",
-        "bigfarflip": "far / flip",
-        "unibg": "uniform background",
-    }
-    return [
-        replacements.get(word.lower(), word.replace("noflip", "no flip"))
-        for word in words
-    ] or [text]
+    return [_humanize_config_word(word) for word in words] or [text]
 
 
 def _config_presentation(raw: str, targets: list[dict] | None = None) -> dict[str, Any]:
@@ -312,7 +343,7 @@ def _config_presentation(raw: str, targets: list[dict] | None = None) -> dict[st
     order the resulting display label by target X instead.
     """
 
-    words = _config_words(raw)
+    words = _config_pair_words(raw) or _config_words(raw)
     actual = [
         target for target in (targets or [])
         if not target.get("inferred") and target.get("side") in {"left", "right"}
@@ -331,11 +362,16 @@ def _config_presentation(raw: str, targets: list[dict] | None = None) -> dict[st
         }
 
     left, right = side_words["left"], side_words["right"]
+
+    def geometry_value(value: Any) -> float:
+        rounded = round(float(value), 4)
+        return 0.0 if rounded == 0 else rounded
+
     geometry = tuple(sorted(
         (
-            round(abs(float(target.get("x", 0.0))), 4),
-            round(float(target.get("z", 0.0)), 4),
-            round(float(target.get("r", 0.0)), 4),
+            geometry_value(abs(float(target.get("x", 0.0)))),
+            geometry_value(target.get("z", 0.0)),
+            geometry_value(target.get("r", 0.0)),
             str(target.get("type", "object")),
         )
         for target in actual
