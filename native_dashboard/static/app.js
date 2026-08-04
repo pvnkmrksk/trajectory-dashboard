@@ -338,30 +338,57 @@ function renderDisplayLabels() {
         stored[key][name] = displayNames[key][index];
         localStorage.setItem("daari-deepa-labels", JSON.stringify(stored));
       } catch (_) { /* local persistence is best-effort */ }
-      const option = byId(`filter-${key}`)?.options[index];
+      const option = byId(`filter-${key}`)?.querySelector(`span[data-code="${index}"]`);
       if (option) option.textContent = displayNames[key][index];
       scheduleDataUpdate(20);
     });
   });
 }
 
+function filterChoices(key) {
+  return [...(byId(`filter-${key}`)?.querySelectorAll('input[type="checkbox"][data-code]') || [])];
+}
+
+function setFilterSelection(key, selected, defaultAll = true) {
+  const choices = filterChoices(key);
+  const wanted = new Set((selected || []).map(Number));
+  for (const choice of choices) choice.checked = defaultAll && !wanted.size
+    ? true : wanted.has(Number(choice.value));
+}
+
 function populateControls() {
   datasetSummary();
   loadDisplayNames();
+  const mirrorPairs = Object.values(datasetHeader.configPresentation || {})
+    .filter(config => config?.poolable).length / 2;
+  byId("mirror-pool").disabled = mirrorPairs < 1;
+  if (mirrorPairs < 1) byId("mirror-pool").checked = false;
+  byId("mirror-pool").closest("label").title = mirrorPairs >= 1
+    ? `${formatCount(mirrorPairs)} mirrored left/right pair${mirrorPairs === 1 ? "" : "s"} detected. Pool by reflecting X and heading into one canonical frame.`
+    : "No geometry-confirmed left/right-swapped treatment pairs were detected in this source.";
   const categories = byId("category-filters");
   categories.replaceChildren();
   const labels = {config: "Treatments", scene: "Scenes", vr: "VR arenas", fly: "Animals", folder: "Source folders"};
   for (const key of ["config", "scene", "vr", "fly", "folder"]) {
-    const label = document.createElement("label");
-    label.textContent = labels[key];
-    const select = document.createElement("select");
-    select.multiple = true; select.id = `filter-${key}`; select.dataset.scope = "full";
+    const fieldset = document.createElement("fieldset"); fieldset.className = "category-filter";
+    const legend = document.createElement("legend"); legend.textContent = labels[key];
+    const actions = document.createElement("span"); actions.className = "category-filter-actions";
+    const all = document.createElement("button"); all.type = "button"; all.textContent = "All";
+    const none = document.createElement("button"); none.type = "button"; none.textContent = "None";
+    actions.append(all, none); legend.appendChild(actions);
+    const checklist = document.createElement("div"); checklist.id = `filter-${key}`; checklist.className = "category-checklist";
     for (const [index, text] of datasetHeader.categories[key].entries()) {
-      const option = document.createElement("option"); option.value = index;
-      option.textContent = displayNames[key]?.[index] || text; select.appendChild(option);
+      const option = document.createElement("label"); option.className = "category-check";
+      const input = document.createElement("input"); input.type = "checkbox";
+      input.value = index; input.dataset.code = index; input.checked = true; input.dataset.scope = "full";
+      const caption = document.createElement("span"); caption.dataset.code = index;
+      caption.textContent = displayNames[key]?.[index] || text;
+      option.append(input, caption); checklist.appendChild(option);
     }
-    label.appendChild(select); categories.appendChild(label);
-    select.addEventListener("change", () => scheduleDataUpdate(140));
+    fieldset.append(legend, checklist); categories.appendChild(fieldset);
+    checklist.addEventListener("change", () => scheduleDataUpdate(140));
+    all.addEventListener("click", () => { setFilterSelection(key, []); scheduleDataUpdate(80); });
+    none.addEventListener("click", () => { setFilterSelection(key, [], false); scheduleDataUpdate(80); });
   }
   byId("range-filters").replaceChildren(); rangeControls.clear();
   createRangeControl("trial", "Trial number", "trial-min", "trial-max");
@@ -387,8 +414,8 @@ function populateControls() {
 }
 
 function selectedCodes(key) {
-  const element = byId(`filter-${key}`);
-  return element ? [...element.selectedOptions].map(option => Number(option.value)) : [];
+  const selected = filterChoices(key).filter(choice => choice.checked).map(choice => Number(choice.value));
+  return selected.length ? selected : [-1];
 }
 
 function numberValue(id, fallback = 0) {
@@ -436,6 +463,7 @@ function collectState() {
     colorBy: byId("color-by").value,
     pointBudget: numberValue("point-budget", 150000),
     movingOnly: byId("moving-only").checked,
+    mirrorPool: byId("mirror-pool").checked,
     walkThreshold: numberValue("walk-threshold"),
     binSize: numberValue("bin-size", 0),
     boundPercent: numberValue("bound-percent", 98),
@@ -473,6 +501,7 @@ function persistState() {
   const params = url.searchParams;
   params.set("source", sourceInput.value);
   params.set("group", state.groupBy); params.set("color", state.colorBy);
+  if (state.mirrorPool) params.set("mirror", "1"); else params.delete("mirror");
   if (state.panelColumns) params.set("cols", state.panelColumns); else params.delete("cols");
   if (state.binSize) params.set("bin", state.binSize); else params.delete("bin");
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
@@ -537,6 +566,7 @@ function restoreViewStateFromUrl() {
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
   syncAngleSourceControls(byId("angle-source").value);
+  byId("mirror-pool").checked = params.get("mirror") === "1" && !byId("mirror-pool").disabled;
   byId("window-show").checked = params.get("wshow") === "1";
   setDashboardView(params.get("view") || params.get("lens") || "trajectory", false);
   try {
@@ -553,8 +583,8 @@ function restoreViewStateFromUrl() {
   try {
     const filters = JSON.parse(params.get("filters") || "{}");
     for (const [key, selected] of Object.entries(filters)) {
-      const select = byId(`filter-${key}`); if (!select || !Array.isArray(selected)) continue;
-      for (const option of select.options) option.selected = selected.map(Number).includes(Number(option.value));
+      if (!byId(`filter-${key}`) || !Array.isArray(selected)) continue;
+      setFilterSelection(key, selected, false);
     }
   } catch (_) { /* malformed optional URL state is ignored */ }
   try {
@@ -643,12 +673,18 @@ function invalidateDerivedProducts() {
 
 function armDeferredAnalysis() {
   clearTimeout(deferredAnalysisTimer); clearTimeout(deferredStatisticsTimer);
+  const panels = Math.max(1, Number(lastSummary?.panels)
+    || (byId("group-by")?.value === "config" && byId("mirror-pool")?.checked
+      ? datasetHeader?.categories?.mirrorConfig?.length
+      : datasetHeader?.categories?.[byId("group-by")?.value]?.length) || 1);
+  const analysisDelay = panels > 8 ? 35000 : (panels > 4 ? 18000 : 8000);
+  const statisticsDelay = panels > 8 ? 75000 : (panels > 4 ? 36000 : 16000);
   deferredAnalysisTimer = setTimeout(() => {
     scheduleCompute("background", 0, {quiet: true});
-  }, 8000);
+  }, analysisDelay);
   deferredStatisticsTimer = setTimeout(() => {
     scheduleCompute("statistics", 0, {quiet: true});
-  }, 16000);
+  }, statisticsDelay);
 }
 
 function scheduleDataUpdate(delay = 0) {
@@ -925,18 +961,29 @@ function renderProducts(incoming, summary, quiet = false) {
     if (sharedView) directionRenderer.setView(sharedView, false);
   }
   if (incoming.polar) {
-    incoming.polar.columns = numberValue("panel-columns"); polarRenderer.setData(incoming.polar);
+    incoming.polar.columns = numberValue("panel-columns");
+    if (currentView === "polar" || currentView === "compare") polarRenderer.setData(incoming.polar);
+    else polarRenderer.data = incoming.polar;
     const polarMode = byId("polar-mode").value;
     byId("polar-summary").textContent = polarMode === "density"
       ? "Circular density of all retained headings in the selected trial-time window"
       : `${formatCount(incoming.polar.units)} ${byId("stats-unit").value === "animal" ? "animal" : "replicate"} resultants retained by the quality gates`;
   }
-  if (incoming.heading) { incoming.heading.columns = numberValue("panel-columns"); headingRenderer.setData(incoming.heading); }
-  if (incoming.metrics) metricsRenderer.setData(incoming.metrics);
+  if (incoming.heading) {
+    incoming.heading.columns = numberValue("panel-columns");
+    if (currentView === "heading") headingRenderer.setData(incoming.heading);
+    else headingRenderer.data = incoming.heading;
+  }
+  if (incoming.metrics) {
+    if (currentView === "metrics") metricsRenderer.setData(incoming.metrics);
+    else metricsRenderer.data = incoming.metrics;
+  }
   if (incoming.statistics) {
     renderStatistics(incoming.statistics);
-    polarRenderer.setStatistics?.(incoming.statistics);
-    metricsRenderer.setStatistics?.(incoming.statistics);
+    if (currentView === "polar" || currentView === "compare") polarRenderer.setStatistics?.(incoming.statistics);
+    else polarRenderer.statistics = incoming.statistics;
+    if (currentView === "metrics") metricsRenderer.setStatistics?.(incoming.statistics);
+    else metricsRenderer.statistics = incoming.statistics;
   }
   if (incoming.windows) renderWindows(incoming.windows);
   if (incoming.transition) {
@@ -946,7 +993,8 @@ function renderProducts(incoming, summary, quiet = false) {
     if (sharedView) transitionRenderer.setView(sharedView, false);
   }
   if (incoming.roi) {
-    roiRenderer.setData(incoming.roi);
+    if (currentView === "roi") roiRenderer.setData(incoming.roi);
+    else roiRenderer.data = incoming.roi;
     byId("roi-summary").textContent = `${formatCount(incoming.roi.baseSegments)} quality-filtered segments contribute to fraction and residence denominators.`;
   }
   if (incoming.diagnostics) {
@@ -1047,21 +1095,56 @@ async function loadDataset(source) {
   }
 }
 
-function compositePlot(hostId) {
-  const canvases = [...byId(hostId).querySelectorAll("canvas")]
-    .filter(canvas => canvas.width > 0 && canvas.height > 0);
-  if (!canvases.length) return null;
-  const output = document.createElement("canvas");
-  output.width = canvases[0].width; output.height = canvases[0].height;
-  const context = output.getContext("2d");
-  for (const canvas of canvases) context.drawImage(canvas, 0, 0, output.width, output.height);
-  return output.toDataURL("image/png");
+function talkGrid(product, spatialCanvas = false) {
+  const panelCount = Math.max(1, Number(product?.panelCount) || 1);
+  const columns = Math.min(2, panelCount);
+  const rows = Math.max(1, Math.ceil(panelCount / columns));
+  const scale = spatialCanvas ? 2 / Math.min(devicePixelRatio || 1, 2) : 1;
+  return {panelCount, columns, rows, width: columns * 800 * scale, height: rows * 450 * scale};
 }
 
-function snapshotChart(renderer, height = 700) {
+function snapshotSpatialRenderer(renderer, product) {
+  if (!renderer?.data || !product) return null;
+  const layout = talkGrid(product, true);
+  const previousColumns = renderer.data.columns;
+  const previousWidth = renderer.width, previousHeight = renderer.height;
+  renderer.data.columns = layout.columns;
+  try {
+    if (typeof renderer.snapshotDataUrl === "function") {
+      return renderer.snapshotDataUrl(layout.width, layout.height);
+    }
+    renderer.width = layout.width; renderer.height = layout.height;
+    renderer.resize(); renderer.draw();
+    const canvases = [...renderer.host.querySelectorAll("canvas")]
+      .filter(canvas => canvas.width > 0 && canvas.height > 0);
+    if (!canvases.length) return null;
+    const output = document.createElement("canvas");
+    output.width = canvases[0].width; output.height = canvases[0].height;
+    const context = output.getContext("2d");
+    context.imageSmoothingEnabled = false;
+    for (const canvas of canvases) context.drawImage(canvas, 0, 0, output.width, output.height);
+    return output.toDataURL("image/png");
+  } finally {
+    renderer.data.columns = previousColumns;
+    if (typeof renderer.snapshotDataUrl === "function") renderer.draw();
+    else {
+      renderer.width = previousWidth; renderer.height = previousHeight;
+      renderer.resize(); renderer.draw();
+    }
+  }
+}
+
+function snapshotChart(renderer, height = 700, product = null, visualCells = null) {
   if (!renderer?.data || !globalThis.echarts) return null;
+  const layout = visualCells
+    ? talkGrid({panelCount: visualCells})
+    : (product ? talkGrid(product) : {width: 1200, height});
+  const previousColumns = renderer.data.columns;
+  const previousExportMode = renderer.exportMode;
+  if (product) renderer.data.columns = layout.columns;
+  renderer.exportMode = true;
   const staging = document.createElement("div");
-  staging.style.cssText = `position:fixed;left:-20000px;top:0;width:1200px;height:${height}px;background:white`;
+  staging.style.cssText = `position:fixed;left:-20000px;top:0;width:${layout.width}px;height:${layout.height}px;background:white`;
   document.body.appendChild(staging);
   const originalHost = renderer.host;
   let chart = null;
@@ -1074,6 +1157,8 @@ function snapshotChart(renderer, height = 700) {
     return chart.getDataURL({type: "png", pixelRatio: 2, backgroundColor: "#ffffff"});
   } finally {
     renderer.host = originalHost;
+    renderer.data.columns = previousColumns;
+    renderer.exportMode = previousExportMode;
     chart?.dispose(); staging.remove();
   }
 }
@@ -1085,6 +1170,7 @@ function setDashboardView(view, save = true) {
   ]);
   const previousView = currentView;
   currentView = allowed.has(view) ? view : "trajectory";
+  polarRenderer.setRadialZoomEnabled?.(currentView === "polar");
   const spatial = new Set(["trajectory", "occupancy", "direction", "polar", "transitions", "compare"]);
   const exploreViews = new Set(spatial);
   if (exploreViews.has(currentView)) currentLens = currentView;
@@ -1153,18 +1239,31 @@ function setSpatialLens(lens, save = true) { setDashboardView(lens, save); }
 
 function downloadActivePlot() {
   const lens = currentView === "compare" ? "trajectory" : currentView;
-  const host = {
-    trajectory: "trajectory-plot", occupancy: "heatmap-plot",
-    direction: "direction-plot", polar: "polar-plot", roi: "roi-plot",
-    heading: "heading-plot", metrics: "metrics-plot",
-    transitions: "transition-plot", diagnostics: "velocity-hist",
-  }[lens];
-  const url = lens === "trajectory" ? trajectoryRenderer.snapshotDataUrl() : compositePlot(host);
-  if (!url) return;
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `daari-deepa-${lens}-${new Date().toISOString().slice(0, 10)}.png`;
-  anchor.click();
+  const exports = {
+    trajectory: {product: products.trajectory, capture: () => snapshotSpatialRenderer(trajectoryRenderer, products.trajectory)},
+    occupancy: {product: products.heatmap, capture: () => snapshotSpatialRenderer(heatmapRenderer, products.heatmap)},
+    direction: {product: products.direction, capture: () => snapshotSpatialRenderer(directionRenderer, products.direction)},
+    transitions: {product: products.transition, capture: () => snapshotSpatialRenderer(transitionRenderer, products.transition)},
+    polar: {product: products.polar, capture: () => snapshotChart(polarRenderer, 700, products.polar)},
+    heading: {product: products.heading, capture: () => snapshotChart(headingRenderer, 700, products.heading)},
+    roi: {product: {panelCount: 4}, capture: () => snapshotChart(roiRenderer, 700, null, 4)},
+    metrics: {product: {panelCount: 4}, capture: () => snapshotChart(metricsRenderer, 700, null, 4)},
+    diagnostics: {product: {panelCount: 1}, capture: () => snapshotChart(velocityHistogram, 430, null, 1)},
+  };
+  setStatus("working", "Rendering talk-ready PNG", "Using a fixed two-column grid with 1600 × 900 output pixels per panel.");
+  try {
+    const spec = exports[lens];
+    const url = spec?.capture();
+    if (!url) throw new Error("Open a rendered plot before exporting it.");
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `daari-deepa-${lens}-${new Date().toISOString().slice(0, 10)}.png`;
+    anchor.click();
+    const layout = talkGrid(spec.product || {panelCount: 1});
+    setStatus("ready", "Talk-ready PNG exported", `${layout.panelCount} panel${layout.panelCount === 1 ? "" : "s"} · fixed 2-column sheet · 1600 × 900 pixels per panel.`);
+  } catch (error) {
+    setStatus("error", "PNG export failed", error.message || String(error));
+  }
 }
 
 const recipeVisualIds = [
@@ -1185,6 +1284,11 @@ function currentRecipe() {
       key, codes.map(code => datasetHeader?.categories?.[key]?.[code]).filter(Boolean),
     ])),
     state,
+    targetFrame: {
+      convention: "Unity left-handed X/Z; negative X is left, positive X is right",
+      mirroredPoolTransform: "X → -X; orientation and movement heading → -angle; Z and time unchanged",
+      configs: datasetHeader?.configPresentation || {},
+    },
     visuals: Object.fromEntries(recipeVisualIds.map(id => [id, byId(id).value])),
   };
 }
@@ -1200,11 +1304,11 @@ function applyRecipeControls(recipe) {
   const state = recipe?.state || {};
   const filterCodes = state.filters || {};
   for (const key of ["config", "scene", "vr", "fly", "folder"]) {
-    const select = byId(`filter-${key}`); if (!select) continue;
+    if (!byId(`filter-${key}`)) continue;
     let selected = Array.isArray(filterCodes[key]) ? filterCodes[key].map(Number) : [];
     const labels = recipe.filtersByLabel?.[key];
     if (Array.isArray(labels)) selected = labels.map(label => datasetHeader.categories[key].indexOf(label)).filter(code => code >= 0);
-    for (const option of select.options) option.selected = selected.includes(Number(option.value));
+    setFilterSelection(key, selected);
   }
   const rangeIds = {
     trial:["trial-min","trial-max"], step:["step-min","step-max"],
@@ -1233,16 +1337,17 @@ function applyRecipeControls(recipe) {
   };
   for (const [key, id] of Object.entries(valueIds)) if (state[key] != null) byId(id).value = state[key];
   syncAngleSourceControls(byId("angle-source").value);
-  for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context",windowsVisible:"window-show"})) {
-    if (state[key] != null) byId(id).checked = !!state[key];
+  for (const [key, id] of Object.entries({movingOnly:"moving-only",mirrorPool:"mirror-pool",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context",windowsVisible:"window-show"})) {
+    if (state[key] != null && !(id === "mirror-pool" && byId(id).disabled)) byId(id).checked = !!state[key];
   }
   if (Array.isArray(state.polarR)) { byId("polar-r-min").value = state.polarR[0]; byId("polar-r-max").value = state.polarR[1]; }
   if (state.labels && typeof state.labels === "object") {
     displayNames = structuredClone(state.labels);
     for (const key of ["config", "scene", "vr", "fly", "folder"]) {
-      const select = byId(`filter-${key}`);
-      if (select) for (let index = 0; index < select.options.length; index += 1) {
-        select.options[index].textContent = displayNames[key]?.[index] || datasetHeader.categories[key][index];
+      const choices = filterChoices(key);
+      for (let index = 0; index < choices.length; index += 1) {
+        const caption = choices[index].closest("label")?.querySelector("span[data-code]");
+        if (caption) caption.textContent = displayNames[key]?.[index] || datasetHeader.categories[key][index];
       }
     }
   }
@@ -1316,19 +1421,19 @@ async function captureNativeReport() {
   const exportButton = byId("export-button");
   await new Promise(resolve => requestAnimationFrame(() => resolve()));
   try {
-  const trajectoryImage = trajectoryRenderer.snapshotDataUrl();
+  const trajectoryImage = snapshotSpatialRenderer(trajectoryRenderer, products.trajectory);
   if (!trajectoryImage) throw new Error("The trajectory framebuffer was empty; the report was not downloaded.");
   const sections = [
     ["Trajectory field", () => trajectoryImage],
-    ["Occupancy", () => compositePlot("heatmap-plot")],
-    ["Local direction", () => compositePlot("direction-plot")],
-    ["Polar direction", () => snapshotChart(polarRenderer)],
-    ["ROI outcomes", () => snapshotChart(roiRenderer)],
-    ["Heading over time", () => snapshotChart(headingRenderer)],
-    ["Trial metrics", () => snapshotChart(metricsRenderer)],
-    ["Velocity", () => snapshotChart(velocityHistogram, 430)],
-    ["Displacement", () => snapshotChart(displacementHistogram, 430)],
-    ["Transition probability", () => products.transition ? compositePlot("transition-plot") : null],
+    ["Occupancy", () => snapshotSpatialRenderer(heatmapRenderer, products.heatmap)],
+    ["Local direction", () => snapshotSpatialRenderer(directionRenderer, products.direction)],
+    ["Polar direction", () => snapshotChart(polarRenderer, 700, products.polar)],
+    ["ROI outcomes", () => snapshotChart(roiRenderer, 700, null, 4)],
+    ["Heading over time", () => snapshotChart(headingRenderer, 700, products.heading)],
+    ["Trial metrics", () => snapshotChart(metricsRenderer, 700, null, 4)],
+    ["Velocity", () => snapshotChart(velocityHistogram, 430, null, 1)],
+    ["Displacement", () => snapshotChart(displacementHistogram, 430, null, 1)],
+    ["Transition probability", () => products.transition ? snapshotSpatialRenderer(transitionRenderer, products.transition) : null],
   ];
   const figures = sections.map(([title, capture]) => [title, capture()]).filter(([, image]) => image);
   const tableSections = [
@@ -1336,11 +1441,11 @@ async function captureNativeReport() {
     ["Inferential statistics", products.statistics ? byId("statistics-content").innerHTML : ""],
   ].filter(([, content]) => content);
   const counts = datasetHeader.counts;
-  const html = `<!doctype html><meta charset="utf-8"><title>Daari Deepa native report</title>
-    <style>body{margin:32px auto;max-width:1500px;padding:0 24px;color:#18221f;background:#f4f1ea;font:14px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}section{margin:28px 0;padding:14px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px}img{display:block;width:100%;height:auto}small{color:#66716d}.statistics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.statistics-card{padding:12px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse}th,td{padding:5px;border-top:1px solid #eee;text-align:left;font-size:12px}</style>
+  const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Daari Deepa native report</title>
+    <style>body{margin:24px auto;max-width:1840px;padding:0 24px;color:#18221f;background:#f4f1ea;font:15px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}.figure{margin:24px 0;padding:16px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px;overflow:auto}.figure h2{margin:0 0 12px}.figure img{display:block;width:100%;height:auto;image-rendering:auto}small{color:#66716d}.statistics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.statistics-card{padding:12px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse}th,td{padding:5px;border-top:1px solid #eee;text-align:left;font-size:12px}@media print{body{max-width:none;margin:0;padding:0;background:#fff}.figure{break-before:page;border:0;border-radius:0;margin:0;padding:12mm;overflow:visible}.figure img{max-width:100%;page-break-inside:avoid}}</style>
     <header><h1>Daari Deepa — native analysis report</h1><p>${escapeHtml(sourceInput.value)}</p><small>${formatCount(counts.retainedRows)} retained of ${formatCount(counts.sourceRows)} source rows · ${formatCount(counts.segments)} segments · ${formatCount(counts.animals)} animals</small></header>
-    ${figures.map(([title, image]) => `<section><h2>${escapeHtml(title)}</h2><img src="${image}" alt="${escapeHtml(title)}"></section>`).join("")}
-    ${tableSections.map(([title, content]) => `<section><h2>${escapeHtml(title)}</h2>${content}</section>`).join("")}
+    ${figures.map(([title, image]) => `<section class="figure"><h2>${escapeHtml(title)}</h2><img src="${image}" alt="${escapeHtml(title)}"></section>`).join("")}
+    ${tableSections.map(([title, content]) => `<section class="figure"><h2>${escapeHtml(title)}</h2>${content}</section>`).join("")}
     <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Figures are a static record of the current native browser state.</small></footer>`;
   const blob = new Blob([html], {type: "text/html"});
   downloadBlob(blob, `daari-deepa-native-${new Date().toISOString().slice(0,10)}.html`);
@@ -1401,9 +1506,12 @@ function renderPanelOrder(codes = lastSummary?.panelKeys || []) {
     empty.textContent = key === "all" ? "All data is pooled into one panel." : "No visible panels.";
     host.appendChild(empty); return;
   }
-  const names = displayNames[key] || datasetHeader?.categories?.[key] || [];
+  const orderKey = key === "config" && byId("mirror-pool").checked ? "mirrorConfig" : key;
+  const names = orderKey === "mirrorConfig"
+    ? (datasetHeader?.displayCategories?.mirrorConfig || datasetHeader?.categories?.mirrorConfig || [])
+    : (displayNames[key] || datasetHeader?.categories?.[key] || []);
   const commit = next => {
-    panelOrders = {...panelOrders, [key]: next};
+    panelOrders = {...panelOrders, [orderKey]: next};
     renderPanelOrder(next);
     scheduleDataUpdate(30);
   };
@@ -1470,7 +1578,9 @@ function curtainPreviewScope() {
 function scheduleCurtainPreview() {
   const scope = curtainPreviewScope();
   if (!scope || curtainPreviewTimer) return;
-  const wait = Math.max(0, 125 - (performance.now() - curtainPreviewAt));
+  const panels = Math.max(1, Number(lastSummary?.panels) || 1);
+  const cadence = panels > 8 ? 450 : (panels > 4 ? 250 : 125);
+  const wait = Math.max(0, cadence - (performance.now() - curtainPreviewAt));
   curtainPreviewTimer = setTimeout(() => {
     curtainPreviewTimer = null; curtainPreviewAt = performance.now();
     scheduleCompute(scope, 0, {quiet: true});

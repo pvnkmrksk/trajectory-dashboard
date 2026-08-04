@@ -936,10 +936,12 @@ export class TrajectoryRenderer extends SpatialBase {
   snapshotDataUrl(exportWidth = 1200, exportHeight = 700) {
     if (!this.data || !this.instanceCount) return null;
     const previousWidth = this.width, previousHeight = this.height;
-    const staged = this.width < 64 || this.height < 64;
+    exportWidth = Math.max(320, Math.round(exportWidth));
+    exportHeight = Math.max(240, Math.round(exportHeight));
+    const staged = this.width !== exportWidth || this.height !== exportHeight;
     if (staged) {
-      this.width = Math.max(320, exportWidth);
-      this.height = Math.max(240, exportHeight);
+      this.width = exportWidth;
+      this.height = exportHeight;
       this.resize();
     }
     this.draw();

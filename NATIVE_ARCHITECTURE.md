@@ -50,10 +50,12 @@ table off the main thread and prepares narrow drawing products:
 
 Newer UI requests replace a pending request instead of accumulating a callback
 queue. Results from an obsolete request are ignored. Filtering changes rebuild
-the visible view first; polar/heading/metrics/ROI/windows refresh after eight
-seconds of inactivity and inference after sixteen seconds, or immediately when
-their workspace is opened. Panel labels/order remap the cached visible segments
-without rerunning the filter. The worker also caches sparse per-segment
+the visible view first; polar/heading/metrics/ROI/windows and inference refresh
+after adaptive idle delays, or immediately when their workspace is opened.
+The delays grow for five-to-eight and more-than-eight visible panels so a large
+treatment comparison does not compete with the active spatial view. Panel
+labels/order remap the cached visible segments without rerunning the filter.
+The worker also caches sparse per-segment
 occupancy and direction-cell contributions, so curtain-only previews add
 matched segments' existing cells instead of rescanning every retained row.
 Occupancy remains cached separately from direction, and colour, movement,
@@ -90,7 +92,9 @@ The rendering boundary is deliberately hybrid:
   representations, with an explicit all-panels comparison when needed; and
 - the source picker and complete analysis controls are drawers. They remain
   available without permanently taking plot area, and the controls drawer
-  starts collapsed so data is the dominant visual element.
+  starts collapsed so data is the dominant visual element. Category filters
+  are explicit checklists with All/None actions rather than modifier-key
+  multi-select boxes.
 
 Spatial panes use the available rectangular card area. Their world ranges are
 expanded to the pane's pixel aspect, so the WebGL shader and both Canvas
@@ -167,6 +171,10 @@ Native report export reads the WebGL framebuffer immediately after a redraw,
 flips it into top-left Canvas coordinates, composites the annotation layer, and
 embeds that raster in the self-contained HTML. It therefore does not depend on
 the browser preserving a presented WebGL canvas between animation frames.
+PNG and report captures are staged independently of the current viewport in a
+fixed two-column grid. Each treatment cell is rendered at a 16:9 logical size
+and at least 1600 x 900 output pixels; renderer dimensions, columns, and the
+live dashboard layout are restored after capture.
 
 ## Analytical invariants preserved
 
@@ -178,6 +186,11 @@ the browser preserving a presented WebGL canvas between animation frames.
 - Filter ranges and movement metrics use raw position units.
 - Unity X/Z and heading conventions are shared by target overlays, reach tests,
   direction cells, polar, and heading error.
+- Config labels assign filename stimulus tokens to the actual target objects,
+  then order them by target X: negative X is Left and positive X is Right in
+  the Unity left-handed frame. Confirmed left/right control pairs can be pooled
+  by reflecting one member (`X -> -X`, `heading -> -heading`); Z and time are
+  unchanged. The mapping and transform are preserved in the JSON view recipe.
 - ROI fraction/residence denominators use the quality-filtered pre-ROI segment
   table; time-to-target and heading-error use the visible ROI-filtered table.
 - Displayed-trial fraction affects mounted path/polar/heading drawings but not
@@ -189,6 +202,7 @@ the browser preserving a presented WebGL canvas between animation frames.
 |---|---|
 | Bounded parallel CSV/metadata load | Complete |
 | Config/scene/VR/fly/folder grouping and filters | Complete |
+| Geometry-aware Left/Right config labels and mirrored-control pooling | Complete (automatic only for confirmed target-reflection pairs; mapping is recipe-persisted) |
 | Trial/step/replicate/time/resultant-R/peak/displacement/distance and quality filters | Complete |
 | GPU trajectories, colour modes, moving gate, point budget | Complete |
 | Shared pan/zoom, reset, responsive columns, clean layout | Complete |
@@ -201,7 +215,7 @@ the browser preserving a presented WebGL canvas between animation frames.
 | ROI fraction/residence/time/error diagnostics | Complete |
 | Native filter mini-histograms with dual range and compact numeric controls | Complete (histograms refresh to the current AND subset) |
 | Exact nearest-segment inspection | Complete |
-| Static self-contained native HTML report | Complete (WebGL trajectories captured from the framebuffer) |
+| Talk-ready PNG and static self-contained native HTML report | Complete (fixed two-column 16:9 capture; at least 1600 x 900 pixels per treatment panel; live layout restored) |
 | Shareable principal URL state and readable JSON view recipe | Complete |
 | Python recipe/URL → `FilterSpec`/grouped frames bridge | Complete |
 | Multi-ring curtain observer, Any/All, editable geometry | Complete (direct on every Cartesian spatial layer; center/edge drag, keyboard/UI/drag-to-trash deletion; exact shared analytical subset) |

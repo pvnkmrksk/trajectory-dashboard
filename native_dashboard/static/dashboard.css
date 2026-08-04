@@ -109,6 +109,27 @@ button.wide { width: 100%; }
 .check input { width: auto !important; min-height: 0; margin: 0 !important; accent-color: var(--teal); }
 .category-filters label { margin-top: 9px; }
 .category-filters select { min-height: 72px; }
+.category-filter { min-width: 0; margin: 9px 0 0; padding: 0; border: 0; }
+.category-filter legend {
+  display: flex; width: 100%; align-items: center; justify-content: space-between;
+  padding: 0; color: var(--muted); font-size: 10px; font-weight: 700;
+}
+.category-filter-actions { display: flex; gap: 3px; }
+.category-filter-actions button {
+  min-height: 20px; padding: 1px 5px; border-color: transparent;
+  color: #697570; background: transparent; font-size: 8px;
+}
+.category-checklist {
+  display: grid; gap: 2px; max-height: 142px; margin-top: 4px; padding: 4px;
+  overflow-y: auto; border: 1px solid #dce5e2; border-radius: 8px; background: #fbfcfc;
+}
+.category-checklist .category-check {
+  display: flex; align-items: start; gap: 6px; margin: 0; padding: 4px 5px;
+  border-radius: 5px; color: #35443f; font-size: 9px; font-weight: 560; line-height: 1.25;
+}
+.category-checklist .category-check:hover { background: #edf5f3; }
+.category-checklist input { flex: 0 0 auto; width: auto; min-height: 0; margin: 1px 0 0; accent-color: var(--teal); }
+.category-checklist span { overflow-wrap: anywhere; }
 .range-filters { display: grid; gap: 10px; margin-top: 12px; }
 .range-filter { padding: 8px; border: 1px solid #e0e8e6; border-radius: 9px; background: rgba(248,251,250,.86); }
 .range-filter-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }

@@ -163,7 +163,7 @@ class EChartRenderer {
       textStyle: {fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif", color: INK},
       color: NATIVE_PALETTE,
       aria: {enabled: true},
-      toolbox: toolbox(name, zoom),
+      toolbox: this.exportMode ? {show: false} : toolbox(name, zoom),
     };
   }
   draw() {
@@ -179,15 +179,34 @@ export class EChartsPolarRenderer extends EChartRenderer {
   constructor(host) {
     super(host);
     this.radialMax = 1;
+    this.radialZoomEnabled = false;
     host.addEventListener("wheel", event => {
-      if (!this.data || (this.data.mode || "vectors") !== "vectors") return;
+      if (!this.radialZoomEnabled || !this.data || (this.data.mode || "vectors") !== "vectors") return;
+      const count = Math.max(1, this.data.panelCount);
+      const cols = autoColumns(count, this.data.columns), rows = Math.ceil(count / cols);
+      const rect = host.getBoundingClientRect();
+      const x = event.clientX - rect.left, y = event.clientY - rect.top;
+      const top = 54, cellW = Math.max(320, host.clientWidth) / cols;
+      const cellH = (Math.max(320, host.clientHeight) - top) / rows;
+      let inside = false;
+      for (let panel = 0; panel < count; panel += 1) {
+        const col = panel % cols, row = Math.floor(panel / cols);
+        const cx = col * cellW + cellW / 2, cy = top + row * cellH + cellH * .55;
+        const radius = Math.max(34, Math.min(cellW, cellH) * .39) + 8;
+        if (Math.hypot(x - cx, y - cy) <= radius) { inside = true; break; }
+      }
+      if (!inside) return;
       event.preventDefault();
       const factor = event.deltaY < 0 ? .82 : 1 / .82;
       this.radialMax = Math.max(.15, Math.min(1, this.radialMax * factor));
       this.draw();
     }, {passive: false});
-    host.addEventListener("dblclick", () => { this.radialMax = 1; this.draw(); });
+    host.addEventListener("dblclick", () => {
+      if (!this.radialZoomEnabled) return;
+      this.radialMax = 1; this.draw();
+    });
   }
+  setRadialZoomEnabled(value) { this.radialZoomEnabled = !!value; }
   option() {
     const data = this.data;
     const count = Math.max(1, data.panelCount);

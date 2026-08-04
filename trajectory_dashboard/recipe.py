@@ -69,6 +69,7 @@ def recipe_from_url(url: str) -> ViewRecipe:
         "groupBy": query.get("group", ["config"])[0],
         "colorBy": query.get("color", ["categorical"])[0],
         "angleSource": query.get("angle", ["orientation"])[0],
+        "mirrorPool": query.get("mirror", ["0"])[0] == "1",
         **quality,
     }
     return ViewRecipe(

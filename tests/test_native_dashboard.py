@@ -8,7 +8,9 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from native_dashboard.dataset import FORMAT_NAME, load_native_dataset
+from native_dashboard.dataset import (
+    FORMAT_NAME, _config_presentation, load_native_dataset,
+)
 from native_dashboard.server import create_native_app
 from trajectory_dashboard.recipe import load_view_recipe, recipe_from_url
 from trajectory_dashboard.roi import roi_xz, rois_by_config, rois_from_config
@@ -304,6 +306,52 @@ def test_roi_geometry_keeps_unity_xz_convention():
     mapped = rois_by_config(metadata)
     assert mapped["Choice_Targets.json"]
     assert mapped["Choice_None.json"][0]["inferred"] is True
+
+
+def test_config_labels_follow_target_geometry_and_define_mirror_pool():
+    first = _config_presentation("Choice_SubFlip_BigFarNoFlip.json", [
+        {"x": 4, "z": 8, "r": 9, "side": "right", "type": "tree"},
+        {"x": -4, "z": 8, "r": 9, "side": "left", "type": "tree"},
+    ])
+    reflected = _config_presentation("Choice_BigFarNoFlip_SubFlip.json", [
+        {"x": 4, "z": 8, "r": 9, "side": "right", "type": "tree"},
+        {"x": -4, "z": 8, "r": 9, "side": "left", "type": "tree"},
+    ])
+
+    assert first["label"] == "Left: far / no flip · Right: near / flip"
+    assert reflected["label"] == "Left: near / flip · Right: far / no flip"
+    assert first["mirrorKey"] == reflected["mirrorKey"]
+    assert first["mirrorSign"] == -reflected["mirrorSign"]
+
+
+def test_native_dataset_only_pools_geometry_confirmed_mirror_pairs(tmp_path):
+    rows = []
+    for step, config in enumerate(("Choice_SubFlip_BigFarNoFlip.json", "Choice_BigFarNoFlip_SubFlip.json")):
+        for sample in range(3):
+            rows.append({
+                "Current Time": f"2026-01-01T00:00:0{sample}",
+                "CurrentTrial": 0, "CurrentStep": step,
+                "GameObjectPosX": sample, "GameObjectPosZ": sample * .5,
+                "GameObjectRotY": sample * 10, "ConfigFile": config,
+                "Scene": "Choice", "FlyID": "fly-1",
+            })
+    pd.DataFrame(rows).to_csv(tmp_path / "session_VR1_.csv", index=False)
+    left_right = {"objects": [
+        {"type": "tree", "position": {"x": -4, "z": 8}},
+        {"type": "tree", "position": {"x": 4, "z": 8}},
+    ]}
+    for name in ("Choice_SubFlip_BigFarNoFlip.json", "Choice_BigFarNoFlip_SubFlip.json"):
+        (tmp_path / f"test_ControlScene_{name}").write_text(json.dumps(left_right))
+
+    dataset = load_native_dataset(str(tmp_path))
+    header, body_offset = _header(dataset.binary)
+    signs = _array(dataset.binary, header, body_offset, "segmentMirrorSign")
+    pooled = _array(dataset.binary, header, body_offset, "segmentMirrorConfig")
+
+    assert len(header["categories"]["mirrorConfig"]) == 1
+    assert set(signs.tolist()) == {-1, 1}
+    assert set(pooled.tolist()) == {0}
+    assert all(item["poolable"] for item in header["configPresentation"].values())
 
 
 def test_native_view_recipe_returns_readable_python_groups(tmp_path):

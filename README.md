@@ -26,8 +26,9 @@ CSV files only below that exact folder boundary.
 The browser receives one compact typed-column payload, transfers ownership to a
 Web Worker, and then keeps filtering, grouping, binning, playback, displayed-
 trial sampling, and circular summaries off the main thread. The visible
-workspace is rebuilt first; off-screen analytical views refresh after idle time
-or immediately when opened. Trajectories use
+workspace is rebuilt first; off-screen analytical views refresh after an
+adaptive idle delay—or immediately when opened—so large treatment sets do not
+make the visible plot wait. Trajectories use
 one instanced WebGL draw call; occupancy, animated flow, and transition
 probability use linked Canvas renderers; polar, ROI, heading-time, metrics, and diagnostics use vendored
 Apache ECharts for mature hover, zoom, legend, and export interactions. Pan and
@@ -37,6 +38,16 @@ subset for every downstream view. Sparse per-segment occupancy/direction
 contributions keep live curtain previews incremental; the compact overview can
 show four pooled representations or every treatment panel. The generic
 raw-channel explorer has been removed.
+
+Config labels use the target geometry rather than trusting filename order:
+negative Unity X is shown as Left and positive X as Right. When the metadata
+confirms a reflected left/right control pair, **Pool mirrored L/R controls**
+puts both into one reference frame by reflecting X and heading (Z and time are
+unchanged). This mapping is included in captured view-recipe JSON. Category
+subsets use checklists with All/None controls. PNG and offline-report figures
+are captured in a fixed two-column, 16:9 presentation grid at a minimum of
+1600 x 900 pixels per treatment panel, independent of the current browser
+viewport.
 
 The behavioral contract and the distinction between scientific requirements
 and old framework artifacts are in

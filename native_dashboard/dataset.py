@@ -282,29 +282,79 @@ _CONFIG_LABELS = {
 }
 
 
-def _display_config(raw: str) -> str:
-    """Return a useful default label; the browser can still edit it live."""
-
+def _config_words(raw: str) -> list[str]:
     text = str(raw or "unknown")
     if text in _CONFIG_LABELS:
-        return _CONFIG_LABELS[text]
+        return [_CONFIG_LABELS[text]]
     stem = os.path.splitext(text)[0]
     stem = stem.removeprefix("Choice_").removeprefix("BinaryChoice_")
     words = [part for part in stem.replace("-", "_").split("_") if part]
-    if not words:
-        return text
     replacements = {
         "noflip": "no flip",
         "subnoflip": "near / no flip",
         "subflip": "near / flip",
         "bigfarnoflip": "far / no flip",
         "bigfarflip": "far / flip",
-        "uniBG": "uniform background",
+        "unibg": "uniform background",
     }
-    return " · ".join(
-        replacements.get(word, word.replace("noflip", "no flip"))
+    return [
+        replacements.get(word.lower(), word.replace("noflip", "no flip"))
         for word in words
-    )
+    ] or [text]
+
+
+def _config_presentation(raw: str, targets: list[dict] | None = None) -> dict[str, Any]:
+    """Describe a config in Unity left/right space and its mirror pool.
+
+    Filename tokens identify the two stimulus variants, but their order is not
+    a trustworthy left/right convention.  When the scene contains one actual
+    left and one actual right target, pair tokens with the object order and
+    order the resulting display label by target X instead.
+    """
+
+    words = _config_words(raw)
+    actual = [
+        target for target in (targets or [])
+        if not target.get("inferred") and target.get("side") in {"left", "right"}
+    ]
+    side_words: dict[str, str] = {}
+    if len(words) == len(actual):
+        for word, target in zip(words, actual):
+            side_words.setdefault(str(target["side"]), word)
+    paired = set(side_words) == {"left", "right"}
+    if not paired:
+        label = " · ".join(words)
+        return {
+            "label": label, "mirrorKey": f"unpaired:{raw}",
+            "mirrorLabel": label, "mirrorSign": 1,
+            "left": None, "right": None,
+        }
+
+    left, right = side_words["left"], side_words["right"]
+    geometry = tuple(sorted(
+        (
+            round(abs(float(target.get("x", 0.0))), 4),
+            round(float(target.get("z", 0.0)), 4),
+            round(float(target.get("r", 0.0)), 4),
+            str(target.get("type", "object")),
+        )
+        for target in actual
+    ))
+    canonical = tuple(sorted((left, right), key=str.casefold))
+    mirror_key = json.dumps([canonical, geometry], separators=(",", ":"))
+    return {
+        "label": f"Left: {left} · Right: {right}",
+        "mirrorKey": mirror_key,
+        "mirrorLabel": f"Left: {canonical[0]} · Right: {canonical[1]} · mirrored pool",
+        "mirrorSign": 1 if left == canonical[0] else -1,
+        "left": left, "right": right,
+    }
+
+
+def _display_config(raw: str, targets: list[dict] | None = None) -> str:
+    """Return a geometry-aware default label; the browser can edit it live."""
+
+    return str(_config_presentation(raw, targets)["label"])
 
 
 def _histogram_payload(values: np.ndarray, bins: int = 48, *,
@@ -503,6 +553,48 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         category_codes[key] = codes
         category_labels[key] = labels
 
+    rois = rois_by_config(metadata)
+    config_presentations = {
+        raw: _config_presentation(raw, rois.get(raw, []))
+        for raw in category_labels.get("config", [])
+    }
+    mirror_members: dict[str, list[dict[str, Any]]] = {}
+    for presentation in config_presentations.values():
+        mirror_members.setdefault(str(presentation["mirrorKey"]), []).append(
+            presentation
+        )
+    poolable_keys = {
+        key for key, members in mirror_members.items()
+        if len(members) > 1
+        and {int(member["mirrorSign"]) for member in members} == {-1, 1}
+    }
+    mirror_indices: dict[str, int] = {}
+    mirror_labels: list[str] = []
+    raw_to_mirror: list[int] = []
+    raw_mirror_sign: list[int] = []
+    for raw in category_labels.get("config", []):
+        presentation = config_presentations[raw]
+        poolable = str(presentation["mirrorKey"]) in poolable_keys
+        presentation["poolable"] = poolable
+        key = str(presentation["mirrorKey"]) if poolable else f"unpaired:{raw}"
+        mirror_label = presentation["mirrorLabel"] if poolable else presentation["label"]
+        mirror_sign = int(presentation["mirrorSign"]) if poolable else 1
+        if key not in mirror_indices:
+            mirror_indices[key] = len(mirror_labels)
+            mirror_labels.append(str(mirror_label))
+        raw_to_mirror.append(mirror_indices[key])
+        raw_mirror_sign.append(mirror_sign)
+    config_codes = category_codes.get(
+        "config", np.zeros(len(starts), dtype=np.uint16)
+    ).astype(np.int64, copy=False)
+    category_codes["mirrorConfig"] = np.asarray(raw_to_mirror, dtype=np.uint16)[
+        config_codes
+    ] if raw_to_mirror else np.zeros(len(starts), dtype=np.uint16)
+    category_labels["mirrorConfig"] = mirror_labels or ["All data"]
+    segment_mirror_sign = np.asarray(raw_mirror_sign, dtype=np.int8)[
+        config_codes
+    ] if raw_mirror_sign else np.ones(len(starts), dtype=np.int8)
+
     # Fly IDs can repeat across VR arenas.  The UI's per-animal visibility
     # control therefore uses the same FlyID@VR identity as the dataset summary,
     # while the existing FlyID filter remains available for parity.
@@ -562,13 +654,13 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         ),
     }
     for key, codes in category_codes.items():
-        arrays[f"segment{key.title()}"] = codes
+        arrays[f"segment{key[:1].upper()}{key[1:]}"] = codes
+    arrays["segmentMirrorSign"] = segment_mirror_sign
 
     token = repr(frame.attrs.get("_frame_token", (pattern, len(frame))))
     dataset_id = hashlib.sha1(
         f"{pattern}|{token}|{len(frame)}|{len(starts)}".encode("utf-8")
     ).hexdigest()[:16]
-    rois = rois_by_config(metadata)
     segment_durations = arrays["segmentDuration"]
     finite_durations = segment_durations[np.isfinite(segment_durations)]
     duration_quantiles = {
@@ -579,7 +671,7 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
     }
     playback_max = duration_quantiles["p95"]
     display_categories = {
-        key: ([_display_config(value) for value in labels]
+        key: ([_display_config(value, rois.get(value, [])) for value in labels]
               if key == "config" else list(labels))
         for key, labels in category_labels.items()
     }
@@ -615,6 +707,7 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         "playbackQuantiles": duration_quantiles,
         "categories": category_labels,
         "displayCategories": display_categories,
+        "configPresentation": _json_safe(config_presentations),
         "segmentIds": segment_ids,
         "filterHistograms": {
             "trial": _histogram_payload(segment_trial),
