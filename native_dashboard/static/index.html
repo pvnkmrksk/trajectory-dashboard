@@ -36,6 +36,7 @@
           <div><b>—</b><span>animals</span></div>
           <div><b>—</b><span>files</span></div>
         </div>
+        <div class="filter-audit" id="filter-audit" aria-label="Filter retention audit"></div>
       </section>
 
       <details class="control-card animal-card" open>
@@ -44,6 +45,7 @@
           <div class="visibility-actions">
             <button class="compact" id="animals-all" type="button" disabled>Show all</button>
             <button class="compact" id="animals-none" type="button" disabled>Hide all</button>
+            <button class="compact" id="animals-invert" type="button" disabled>Invert</button>
           </div>
           <div class="animal-visibility" id="animal-visibility">
             <span class="empty-control">Load data to choose animals.</span>
@@ -92,9 +94,22 @@
           <label class="check"><input id="moving-only" data-scope="movement" type="checkbox"> Moving samples only</label>
           <label class="check" title="Pool left/right-swapped controls in one canonical frame using X → −X and heading → −heading for the reflected member."><input id="mirror-pool" data-scope="full" type="checkbox"> Pool mirrored L/R controls</label>
           <label class="check"><input id="spatial-grid" type="checkbox" checked> Spatial grid</label>
+          <label class="check"><input id="show-marginals" type="checkbox"> Marginal distributions</label>
           <label>Walk threshold
             <input id="walk-threshold" data-scope="movement" type="number" min="0" step="0.01" value="0">
           </label>
+        </div>
+      </details>
+
+      <details class="control-card mirror-card">
+        <summary>Mirror pairing</summary>
+        <div class="control-body">
+          <p class="control-note">Match a reference treatment with the treatment to reflect. The Unity ground plane is X/Z: X mirrors left/right; Z mirrors forward/back.</p>
+          <div class="mirror-pair-list" id="mirror-pair-list"><span class="empty-control">Load data to match treatments.</span></div>
+          <div class="recipe-actions">
+            <button class="compact" id="mirror-pair-add" type="button" disabled>Add pair</button>
+            <button class="compact" id="mirror-pair-clear" type="button" disabled>Clear pairs</button>
+          </div>
         </div>
       </details>
 
@@ -208,6 +223,7 @@
         <div class="status-dock" id="status-dock" aria-live="polite" title="Waiting for data">
           <span class="status-light"></span><b id="status-title">Waiting for data</b>
           <small id="status-detail">Drop a folder anywhere or choose a source.</small>
+          <progress id="load-progress" max="100" value="0" hidden aria-label="Dataset loading progress"></progress>
         </div>
         <button class="rail-action" id="download-plot-button" type="button">PNG</button>
       </nav>
@@ -238,7 +254,7 @@
             <button type="button" data-layer-button="compare" role="tab" aria-label="Spatial overview">Overview</button>
           </div>
           <label class="overview-mode">Overview<select id="overview-grouping" aria-label="Overview detail">
-            <option value="pooled">Pooled · 4 views</option><option value="panels">All panels × 4</option>
+            <option value="pooled">Pooled · 4 views</option><option value="panels" selected>All panels × 4</option>
           </select></label>
           <span class="curtain-state" id="curtain-state" hidden>Curtain off</span>
           <button id="ring-quick-add" type="button" hidden aria-hidden="true" tabindex="-1">Add</button>
@@ -253,7 +269,7 @@
         </div>
         <div class="plot-card spatial-card">
           <div class="plot-toolbar primary-toolbar">
-            <label class="check"><input id="playback-enabled" type="checkbox"> Playback</label>
+            <button class="compact playback-toggle" id="play-button" type="button" disabled aria-pressed="false">▶ Play</button>
             <label>Displayed trials <input id="trial-fraction" type="range" min="1" max="100" value="100"></label>
             <output id="fraction-output">100%</output>
             <button class="compact" id="resample-button" type="button" disabled>New sample</button>
@@ -263,7 +279,6 @@
               <small class="span-two">The point budget controls decimation only; filters and statistics still use every retained sample.</small>
             </div></details>
             <details class="context-settings playback-settings"><summary>Playback settings</summary><div class="context-settings-panel">
-              <button class="compact" id="play-button" type="button" disabled>Play</button>
               <label>Mode<select id="playback-scope"><option value="all">All segments together</option><option value="single">One segment</option></select></label>
               <button class="compact trial-stepper" id="trial-prev" type="button" disabled aria-label="Previous segment">←</button>
               <label class="trial-picker">Segment<select id="playback-trial" disabled><option value="">Choose a segment</option></select></label>
@@ -276,7 +291,7 @@
             <span class="segment-inspector" id="segment-inspector">Click near a path to inspect its exact segment.</span>
           </div>
           <div class="plot-host large" id="trajectory-plot" aria-label="Trajectory plot"></div>
-          <div class="plot-hint">Drag to pan · wheel to zoom · double-click to reset · drag a ring centre to move or its edge to resize · spatial panels preserve one X unit = one Z unit</div>
+          <div class="plot-hint">Drag to pan · pinch or Alt/⌘ + wheel to zoom · ordinary wheel scrolls the page · double-click resets · drag a ring centre or edge · one X unit = one Z unit</div>
         </div>
       </article>
 
@@ -342,7 +357,8 @@
             <label>Outcome<select id="transition-outcome"><option value="crossed">Crossed opposite half</option><option value="ended">Ended opposite half</option></select></label>
             <label>Display<select id="transition-display"><option value="fraction">Fraction</option><option value="count">Count</option></select></label>
             <label>Minimum support<input id="transition-support" type="number" min="1" step="1" value="5"></label>
-            <label>Split Z<input id="transition-split" type="number" step="0.1" placeholder="Auto" title="Z coordinate dividing the two spatial halves; Auto estimates it from trial starts."></label>
+            <label>Split axis<select id="transition-axis"><option value="z">Z · forward/back</option><option value="x">X · left/right</option></select></label>
+            <label><span id="transition-split-label">Split Z</span><input id="transition-split" type="number" step="0.1" placeholder="Auto" title="Coordinate dividing the two spatial halves; Auto estimates it from trial starts."></label>
           </div></details>
           <div class="plot-host" id="transition-plot" aria-label="Transition probability observer"></div>
         </div>

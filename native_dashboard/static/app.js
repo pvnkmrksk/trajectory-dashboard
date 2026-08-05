@@ -42,6 +42,10 @@ let currentLens = "trajectory";
 let currentView = "trajectory";
 let transitionSelectionActive = false;
 let panelOrders = {};
+let mirrorRules = [];
+let initialUrlStateAvailable = true;
+let playbackPlaying = false;
+let playbackActive = false;
 const rangeControls = new Map();
 
 function syncAngleSourceControls(value) {
@@ -57,6 +61,13 @@ function setStatus(kind, title, detail) {
   statusDock.title = detail ? `${title} — ${detail}` : title;
   statusTitle.textContent = title;
   statusDetail.textContent = detail || "";
+}
+
+function setLoadProgress(value = null) {
+  const progress = byId("load-progress");
+  if (!progress) return;
+  progress.hidden = value == null;
+  if (value != null) progress.value = Math.max(0, Math.min(100, Number(value) || 0));
 }
 
 function syncView(view, source) {
@@ -136,7 +147,7 @@ for (const renderer of spatialRenderers) {
 function clearTransitionSelection() {
   if (!transitionSelectionActive) return;
   transitionSelectionActive = false;
-  applyLocalRingObserver(false);
+  transitionRenderer.clearTrajectoryOverlay();
   byId("segment-inspector").textContent = "Transition selection cleared. Click a supported cell to reveal its raw paths.";
   setStatus("ready", "Transition selection cleared", "The shared curtain and analytical subset remain active.");
 }
@@ -186,6 +197,21 @@ function datasetSummary(visible = null) {
     <div><b>${formatCount(counts.files)}</b><span>files${counts.duplicateFilesSkipped ? ` · ${formatCount(counts.duplicateFilesSkipped)} duplicate copies skipped` : ""}</span></div>`;
 }
 
+function renderFilterAudit(audit = []) {
+  const host = byId("filter-audit");
+  if (!host) return;
+  const source = audit[0] || {segments: 0, rows: 0};
+  const base = Math.max(1, Number(source.rows) || 1);
+  host.innerHTML = audit.map((stage, index) => {
+    const previous = audit[Math.max(0, index - 1)] || source;
+    const kept = Math.max(0, Math.min(100, Number(stage.rows) / base * 100));
+    const lostRows = Math.max(0, (Number(previous.rows) || 0) - (Number(stage.rows) || 0));
+    const lostSegments = Math.max(0, (Number(previous.segments) || 0) - (Number(stage.segments) || 0));
+    const title = `${stage.label}: ${formatCount(stage.rows)} rows and ${formatCount(stage.segments)} segments retained (${formatNumber(kept, 1)}%).${index ? ` This step removed ${formatCount(lostRows)} rows and ${formatCount(lostSegments)} segments.` : ""}`;
+    return `<div class="filter-audit-row" title="${escapeHtml(title)}"><span>${escapeHtml(stage.label)}</span><i style="--kept:${kept.toFixed(1)}%"></i><small>${formatCount(stage.rows)}${index ? ` · −${formatCount(lostRows)}` : ""}</small></div>`;
+  }).join("");
+}
+
 function applyAnimalVisibility() {
   trajectoryRenderer.setAnimalVisibility(animalVisibility);
   const charts = [polarRenderer, headingRenderer, metricsRenderer, roiRenderer];
@@ -226,6 +252,7 @@ function renderAnimalVisibility() {
   });
   byId("animals-all").disabled = !names.length;
   byId("animals-none").disabled = !names.length;
+  byId("animals-invert").disabled = !names.length;
 }
 
 function drawMiniHistogram(canvas, histogram, selected) {
@@ -258,7 +285,9 @@ function createRangeControl(key, label, idMin, idMax) {
   const integer = key === "trial" || key === "step" || key === "replicate";
   const step = integer ? 1 : Math.max(1e-6, (display[1] - display[0]) / 500);
   const inputStep = integer ? 1 : .1;
-  const initialRange = key === "time" ? display : exact;
+  // The mini-chart may clip extreme outliers, but an untouched control always
+  // means the exact full dataset range. Playback has its own p95/p99 cap.
+  const initialRange = exact;
   const shownExact = [
     displayRangeBound(initialRange[0], integer, false),
     displayRangeBound(initialRange[1], integer, true),
@@ -356,16 +385,84 @@ function setFilterSelection(key, selected, defaultAll = true) {
     ? true : wanted.has(Number(choice.value));
 }
 
-function populateControls() {
+function inferredMirrorRules() {
+  const configs = datasetHeader?.categories?.config || [];
+  const groups = new Map();
+  configs.forEach((name, code) => {
+    const presentation = datasetHeader?.configPresentation?.[name];
+    if (!presentation?.poolable || !presentation.mirrorKey) return;
+    const group = groups.get(presentation.mirrorKey) || [];
+    group.push({code, sign: Number(presentation.mirrorSign) || 1, label: presentation.mirrorLabel});
+    groups.set(presentation.mirrorKey, group);
+  });
+  return [...groups.values()].filter(group => group.length >= 2).map(group => {
+    const reference = group.find(item => item.sign >= 0) || group[0];
+    const reflected = group.find(item => item !== reference && item.sign < 0) || group.find(item => item !== reference);
+    return {reference: reference.code, reflected: reflected.code, axis: "x", coordinate: 0,
+      label: reference.label || "Mirrored pair", automatic: true};
+  });
+}
+
+function setMirrorGuide(rule = null) {
+  for (const renderer of spatialRenderers) renderer.setMirrorGuide(rule);
+}
+
+function renderMirrorPairs() {
+  const host = byId("mirror-pair-list");
+  host.replaceChildren();
+  const configs = datasetHeader?.categories?.config || [];
+  const optionHtml = configs.map((name, code) => `<option value="${code}">${escapeHtml(name)}</option>`).join("");
+  if (!mirrorRules.length) {
+    const empty = document.createElement("span"); empty.className = "empty-control";
+    empty.textContent = configs.length > 1 ? "No pairs yet. Add one to define a common frame." : "At least two treatments are required.";
+    host.appendChild(empty);
+  }
+  mirrorRules.forEach((rule, index) => {
+    const row = document.createElement("div"); row.className = "mirror-pair";
+    row.innerHTML = `
+      <label>Keep as reference<select class="mirror-reference">${optionHtml}</select></label>
+      <span class="mirror-arrow" title="Reflect the second treatment into the first treatment's frame">↑ reflect into reference frame</span>
+      <label>Reflect this treatment<select class="mirror-reflected">${optionHtml}</select></label>
+      <label class="mirror-axis">Axis<select><option value="x">X</option><option value="z">Z</option></select></label>
+      <label class="mirror-coordinate">Line<input type="number" step="0.1" value="${Number(rule.coordinate) || 0}"></label>
+      <button class="quiet mirror-remove" type="button" aria-label="Delete pair">×</button>`;
+    const reference = row.querySelector(".mirror-reference"), reflected = row.querySelector(".mirror-reflected");
+    const axis = row.querySelector(".mirror-axis select"), coordinate = row.querySelector(".mirror-coordinate input");
+    reference.value = rule.reference; reflected.value = rule.reflected; axis.value = rule.axis === "z" ? "z" : "x";
+    const update = () => {
+      rule.reference = Number(reference.value); rule.reflected = Number(reflected.value);
+      rule.axis = axis.value === "z" ? "z" : "x"; rule.coordinate = Number(coordinate.value) || 0;
+      rule.automatic = false;
+      setMirrorGuide(rule); byId("mirror-pool").disabled = false;
+      scheduleDataUpdate(120);
+    };
+    for (const control of [reference, reflected, axis, coordinate]) {
+      control.addEventListener("focus", () => setMirrorGuide(rule));
+      control.addEventListener("change", update);
+    }
+    row.querySelector(".mirror-remove").addEventListener("click", () => {
+      mirrorRules.splice(index, 1); renderMirrorPairs(); setMirrorGuide(null);
+      byId("mirror-pool").disabled = (datasetHeader?.categories?.config?.length || 0) < 2;
+      scheduleDataUpdate(80);
+    });
+    host.appendChild(row);
+  });
+  byId("mirror-pair-add").disabled = configs.length < 2;
+  byId("mirror-pair-clear").disabled = !mirrorRules.length;
+}
+
+function populateControls(restoreUrl = false) {
   datasetSummary();
   loadDisplayNames();
   const mirrorPairs = Object.values(datasetHeader.configPresentation || {})
     .filter(config => config?.poolable).length / 2;
-  byId("mirror-pool").disabled = mirrorPairs < 1;
-  if (mirrorPairs < 1) byId("mirror-pool").checked = false;
+  const canPairManually = (datasetHeader.categories.config || []).length >= 2;
+  if (!restoreUrl || !mirrorRules.length) mirrorRules = inferredMirrorRules();
+  byId("mirror-pool").disabled = !canPairManually;
+  if (byId("mirror-pool").disabled) byId("mirror-pool").checked = false;
   byId("mirror-pool").closest("label").title = mirrorPairs >= 1
     ? `${formatCount(mirrorPairs)} mirrored left/right pair${mirrorPairs === 1 ? "" : "s"} detected. Pool by reflecting X and heading into one canonical frame.`
-    : "No geometry-confirmed left/right-swapped treatment pairs were detected in this source.";
+    : (canPairManually ? "No automatic pair was detected. Open Mirror pairing to match treatments explicitly." : "At least two treatments are required for mirrored pooling.");
   const categories = byId("category-filters");
   categories.replaceChildren();
   const labels = {config: "Treatments", scene: "Scenes", vr: "VR arenas", fly: "Animals", folder: "Source folders"};
@@ -375,7 +472,8 @@ function populateControls() {
     const actions = document.createElement("span"); actions.className = "category-filter-actions";
     const all = document.createElement("button"); all.type = "button"; all.textContent = "All";
     const none = document.createElement("button"); none.type = "button"; none.textContent = "None";
-    actions.append(all, none); legend.appendChild(actions);
+    const invert = document.createElement("button"); invert.type = "button"; invert.textContent = "Invert";
+    actions.append(all, none, invert); legend.appendChild(actions);
     const checklist = document.createElement("div"); checklist.id = `filter-${key}`; checklist.className = "category-checklist";
     for (const [index, text] of datasetHeader.categories[key].entries()) {
       const option = document.createElement("label"); option.className = "category-check";
@@ -389,6 +487,10 @@ function populateControls() {
     checklist.addEventListener("change", () => scheduleDataUpdate(140));
     all.addEventListener("click", () => { setFilterSelection(key, []); scheduleDataUpdate(80); });
     none.addEventListener("click", () => { setFilterSelection(key, [], false); scheduleDataUpdate(80); });
+    invert.addEventListener("click", () => {
+      for (const choice of filterChoices(key)) choice.checked = !choice.checked;
+      scheduleDataUpdate(80);
+    });
   }
   byId("range-filters").replaceChildren(); rangeControls.clear();
   createRangeControl("trial", "Trial number", "trial-min", "trial-max");
@@ -406,8 +508,20 @@ function populateControls() {
   byId("export-button").disabled = false;
   const maxTime = Math.max(0, datasetHeader.playbackQuantiles?.p95 ?? datasetHeader.playbackMax ?? 0);
   byId("time-scrubber").max = maxTime; byId("time-scrubber").value = maxTime;
+  byId("time-scrubber").disabled = false; byId("play-button").disabled = false;
   byId("time-output").textContent = "all time";
-  restoreViewStateFromUrl();
+  if (restoreUrl) restoreViewStateFromUrl();
+  else {
+    byId("overview-grouping").value = "panels";
+    byId("mirror-pool").checked = false;
+    byId("moving-only").checked = false;
+    byId("roi-entered").checked = false;
+    byId("roi-trim").checked = false;
+    byId("ring-enabled").checked = false;
+  }
+  byId("mirror-pool").disabled = !canPairManually;
+  renderMirrorPairs();
+  byId("transition-split-label").textContent = `Split ${byId("transition-axis").value.toUpperCase()}`;
   renderRingControls();
   animalVisibility = (datasetHeader.categories.animal || []).map(() => true);
   renderAnimalVisibility();
@@ -464,6 +578,8 @@ function collectState() {
     pointBudget: numberValue("point-budget", 150000),
     movingOnly: byId("moving-only").checked,
     mirrorPool: byId("mirror-pool").checked,
+    mirrorRules: mirrorRules.map(rule => ({reference:Number(rule.reference), reflected:Number(rule.reflected),
+      axis: rule.axis === "z" ? "z" : "x", coordinate:Number(rule.coordinate) || 0, label: rule.label || ""})),
     walkThreshold: numberValue("walk-threshold"),
     binSize: numberValue("bin-size", 0),
     boundPercent: numberValue("bound-percent", 98),
@@ -484,6 +600,8 @@ function collectState() {
     headingMode: byId("heading-mode").value,
     headingBin: numberValue("heading-bin", 2),
     transitionSplit: optionalNumber("transition-split"),
+    transitionAxis: byId("transition-axis").value,
+    showMarginals: byId("show-marginals").checked,
     headingSectors: numberValue("heading-sectors", 36),
     windows: observationWindows(),
     windowsVisible: byId("window-show").checked,
@@ -502,6 +620,7 @@ function persistState() {
   params.set("source", sourceInput.value);
   params.set("group", state.groupBy); params.set("color", state.colorBy);
   if (state.mirrorPool) params.set("mirror", "1"); else params.delete("mirror");
+  if (state.mirrorRules.length) params.set("mirrorRules", JSON.stringify(state.mirrorRules)); else params.delete("mirrorRules");
   if (state.panelColumns) params.set("cols", state.panelColumns); else params.delete("cols");
   if (state.binSize) params.set("bin", state.binSize); else params.delete("bin");
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
@@ -533,6 +652,8 @@ function persistState() {
   params.set("fspeed", byId("flow-speed").value); params.set("fvar", byId("flow-variability").value);
   params.set("fcolor", byId("flow-color-mode").value); params.set("fvelocity", byId("flow-velocity-mode").value);
   if (state.transitionSplit == null) params.delete("tsplit"); else params.set("tsplit", state.transitionSplit);
+  params.set("taxis", state.transitionAxis);
+  if (state.showMarginals) params.set("marginals", "1"); else params.delete("marginals");
   params.set("toutcome", byId("transition-outcome").value); params.set("tdisplay", byId("transition-display").value);
   params.set("tsupport", byId("transition-support").value);
   if (state.ringEnabled) params.set("ring", "1"); else params.delete("ring");
@@ -561,12 +682,22 @@ function restoreViewStateFromUrl() {
     "flow-speed": params.get("fspeed"), "flow-variability": params.get("fvar"),
     "flow-color-mode": params.get("fcolor"), "flow-velocity-mode": params.get("fvelocity"),
     "transition-split": params.get("tsplit"),
+    "transition-axis": params.get("taxis"),
     "transition-outcome": params.get("toutcome"), "transition-display": params.get("tdisplay"),
     "transition-support": params.get("tsupport"),
   };
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
   syncAngleSourceControls(byId("angle-source").value);
   byId("mirror-pool").checked = params.get("mirror") === "1" && !byId("mirror-pool").disabled;
+  byId("show-marginals").checked = params.get("marginals") === "1";
+  try {
+    const restoredRules = JSON.parse(params.get("mirrorRules") || "null");
+    if (Array.isArray(restoredRules)) {
+      mirrorRules = restoredRules;
+      if (mirrorRules.length) byId("mirror-pool").disabled = false;
+      if (params.get("mirror") === "1") byId("mirror-pool").checked = true;
+    }
+  } catch (_) { /* malformed mirror rules are ignored */ }
   byId("window-show").checked = params.get("wshow") === "1";
   setDashboardView(params.get("view") || params.get("lens") || "trajectory", false);
   try {
@@ -930,6 +1061,7 @@ function renderProducts(incoming, summary, quiet = false) {
   Object.assign(products, incoming);
   if (!quiet) {
     datasetSummary(summary);
+    renderFilterAudit(summary.filterAudit || []);
     if (summary.segmentOptions) {
       visibleSegmentOptions = summary.segmentOptions;
       populatePlaybackSegments();
@@ -989,6 +1121,7 @@ function renderProducts(incoming, summary, quiet = false) {
   if (incoming.transition) {
     incoming.transition.columns = numberValue("panel-columns");
     transitionRenderer.setData(incoming.transition, !!sharedView);
+    transitionRenderer.clearTrajectoryOverlay(); transitionSelectionActive = false;
     applyTransitionVisuals();
     if (sharedView) transitionRenderer.setView(sharedView, false);
   }
@@ -1009,6 +1142,7 @@ function renderProducts(incoming, summary, quiet = false) {
   applyAnimalVisibility();
   for (const renderer of spatialRenderers) renderer.setRoisVisible(byId("roi-show").checked);
   for (const renderer of spatialRenderers) renderer.setGridVisible(byId("spatial-grid").checked);
+  for (const renderer of spatialRenderers) renderer.setMarginalsVisible(byId("show-marginals").checked);
   updatePanelGridSizing();
   requestAnimationFrame(() => requestAnimationFrame(updatePanelGridSizing));
   newDataset = false;
@@ -1049,9 +1183,8 @@ function handleWorkerMessage(event) {
   }
   if (message.type === "transition-inspect-result") {
     transitionSelectionActive = true;
-    trajectoryRenderer.setSegmentObserver(message.segments, true);
-    setDashboardView("trajectory");
-    byId("segment-inspector").textContent = `${formatCount(message.segments.length)} unique segments entered the selected transition cell at X ${formatNumber(message.x, 1)}, Z ${formatNumber(message.z, 1)}. Context paths remain faint; return to Transitions and click white space to clear.`;
+    transitionRenderer.setTrajectoryOverlay(products.trajectory, message.segments);
+    byId("segment-inspector").textContent = `${formatCount(message.segments.length)} unique segments entered the selected transition cell at X ${formatNumber(message.x, 1)}, Z ${formatNumber(message.z, 1)}. Their decimated raw paths are overlaid here; click unsupported white space to clear.`;
     setStatus("ready", "Transition paths selected", `${formatCount(message.segments.length)} unique segments entered the selected cell.`);
     return;
   }
@@ -1066,8 +1199,17 @@ function handleWorkerMessage(event) {
 async function loadDataset(source) {
   source = String(source || "").trim();
   if (!source) { setStatus("error", "A data source is required", "Enter a CSV, folder, or recursive glob."); return; }
-  stopPlayback();
+  stopPlayback(true);
+  const urlSource = new URLSearchParams(location.search).get("source") || "";
+  const restoreUrl = initialUrlStateAvailable && urlSource === source;
+  initialUrlStateAvailable = false;
   setStatus("working", "Loading and preprocessing", "Python is applying the trusted loader once, then packaging typed browser columns.");
+  setLoadProgress(4);
+  const progressTimer = setInterval(() => {
+    const progress = byId("load-progress");
+    if (!progress || progress.hidden) return;
+    progress.value = Math.min(72, progress.value + Math.max(.2, (76 - progress.value) * .018));
+  }, 180);
   byId("load-button").disabled = true; applyButton.disabled = true;
   try {
     const response = await fetch("/api/load", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({source})});
@@ -1075,21 +1217,26 @@ async function loadDataset(source) {
       const error = await response.json().catch(() => ({error: `HTTP ${response.status}`}));
       throw new Error(error.error || `Load failed with HTTP ${response.status}`);
     }
+    setLoadProgress(78);
     const buffer = await response.arrayBuffer();
+    setLoadProgress(92);
     const parsed = parseBinary(buffer);
     datasetHeader = parsed.header; sourceInput.value = source;
     byId("source-popover").open = false;
     visibleSegmentOptions = []; currentDurationSummary = datasetHeader.playbackQuantiles || null;
-    populateControls(); products = {}; sharedView = null; newDataset = true; sampleSeed = 0;
+    populateControls(restoreUrl); products = {}; sharedView = null; newDataset = true; sampleSeed = 0;
     if (worker) worker.terminate();
     workerReady = false; workerBusy = false; pendingCompute = null;
     worker = new Worker("/static/worker.js"); worker.onmessage = handleWorkerMessage;
     worker.onerror = event => setStatus("error", "Worker crashed", event.message);
     worker.postMessage({type: "init", header: datasetHeader, buffer, bodyOffset: parsed.bodyOffset}, [buffer]);
+    setLoadProgress(100);
     setStatus("working", "Data loaded", `${formatCount(datasetHeader.counts.retainedRows)} retained rows from ${formatCount(datasetHeader.counts.files)} files transferred once${datasetHeader.counts.duplicateFilesSkipped ? `; ${formatCount(datasetHeader.counts.duplicateFilesSkipped)} duplicate copies skipped` : ""}. Building local views.`);
   } catch (error) {
     setStatus("error", "Could not load data", error.message);
   } finally {
+    clearInterval(progressTimer);
+    setTimeout(() => setLoadProgress(null), 450);
     byId("load-button").disabled = false;
     applyButton.disabled = !datasetHeader;
   }
@@ -1334,10 +1481,11 @@ function applyRecipeControls(recipe) {
     polarMode:"polar-mode",
     roiReach:"roi-reach", ringMatch:"ring-match", playbackPercentile:"playback-cap",
     headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
+    transitionAxis:"transition-axis",
   };
   for (const [key, id] of Object.entries(valueIds)) if (state[key] != null) byId(id).value = state[key];
   syncAngleSourceControls(byId("angle-source").value);
-  for (const [key, id] of Object.entries({movingOnly:"moving-only",mirrorPool:"mirror-pool",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context",windowsVisible:"window-show"})) {
+  for (const [key, id] of Object.entries({movingOnly:"moving-only",mirrorPool:"mirror-pool",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context",windowsVisible:"window-show",showMarginals:"show-marginals"})) {
     if (state[key] != null && !(id === "mirror-pool" && byId(id).disabled)) byId(id).checked = !!state[key];
   }
   if (Array.isArray(state.polarR)) { byId("polar-r-min").value = state.polarR[0]; byId("polar-r-max").value = state.polarR[1]; }
@@ -1352,6 +1500,7 @@ function applyRecipeControls(recipe) {
     }
   }
   panelOrders = state.panelOrders && typeof state.panelOrders === "object" ? structuredClone(state.panelOrders) : panelOrders;
+  if (Array.isArray(state.mirrorRules)) mirrorRules = structuredClone(state.mirrorRules);
   if (Array.isArray(state.rings)) rings = state.rings.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||.01)}));
   if (Array.isArray(state.windows)) for (const [index, window] of state.windows.slice(0, 2).entries()) {
     const key = index ? "b" : "a";
@@ -1360,9 +1509,10 @@ function applyRecipeControls(recipe) {
   sampleSeed = Number(state.sampleSeed) || 0;
   for (const [id, value] of Object.entries(recipe.visuals || {})) if (byId(id) && value != null) byId(id).value = value;
   setDashboardView(state.view || state.lens || "trajectory", false);
-  renderRingControls(); renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
+  renderRingControls(); renderMirrorPairs(); renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
   trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.1), numberValue("trajectory-opacity", .5));
   trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
+  for (const renderer of spatialRenderers) renderer.setMarginalsVisible(byId("show-marginals").checked);
   applyHeatmapVisuals(); applyDirectionVisuals(); updateFraction(); updatePlaybackLimit(); applyLocalRingObserver(false);
 }
 
@@ -1406,6 +1556,7 @@ function downloadBlob(blob, filename) {
 
 async function exportNativeReport() {
   if (!datasetHeader || reportRequestId != null) return;
+  setMirrorGuide(null);
   const exportButton = byId("export-button");
   exportButton.disabled = true; exportButton.textContent = "Preparing report…";
   setStatus("working", "Preparing native report", "Capturing the current linked views and analytical tables locally in your browser.");
@@ -1436,17 +1587,27 @@ async function captureNativeReport() {
     ["Transition probability", () => products.transition ? snapshotSpatialRenderer(transitionRenderer, products.transition) : null],
   ];
   const figures = sections.map(([title, capture]) => [title, capture()]).filter(([, image]) => image);
+  const flowSnapshot = products.direction ? {
+    nx: products.direction.nx, nz: products.direction.nz, x0: products.direction.x0,
+    z0: products.direction.z0, bin: products.direction.bin,
+    panelCount: products.direction.panelCount, panelNames: products.direction.panelNames,
+    bounds: products.direction.bounds,
+    angle: Array.from(products.direction.angle), strength: Array.from(products.direction.strength),
+    abundance: Array.from(products.direction.abundance),
+  } : null;
+  const embeddedFlow = JSON.stringify(flowSnapshot).replaceAll("<", "\\u003c");
   const tableSections = [
     ["Observation windows", products.windows ? byId("windows-content").innerHTML : ""],
     ["Inferential statistics", products.statistics ? byId("statistics-content").innerHTML : ""],
   ].filter(([, content]) => content);
   const counts = datasetHeader.counts;
   const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Daari Deepa native report</title>
-    <style>body{margin:24px auto;max-width:1840px;padding:0 24px;color:#18221f;background:#f4f1ea;font:15px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}.figure{margin:24px 0;padding:16px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px;overflow:auto}.figure h2{margin:0 0 12px}.figure img{display:block;width:100%;height:auto;image-rendering:auto}small{color:#66716d}.statistics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.statistics-card{padding:12px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse}th,td{padding:5px;border-top:1px solid #eee;text-align:left;font-size:12px}@media print{body{max-width:none;margin:0;padding:0;background:#fff}.figure{break-before:page;border:0;border-radius:0;margin:0;padding:12mm;overflow:visible}.figure img{max-width:100%;page-break-inside:avoid}}</style>
+    <style>body{margin:24px auto;max-width:1840px;padding:0 24px;color:#18221f;background:#f4f1ea;font:15px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}.figure{margin:24px 0;padding:16px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px;overflow:hidden}.figure h2{margin:0 0 6px}.figure-stage{position:relative;overflow:hidden;min-height:280px;border:1px solid #e5e1d8;background:#fff;cursor:grab;touch-action:none}.figure-stage:active{cursor:grabbing}.figure img{display:block;width:100%;height:auto;image-rendering:auto;transform-origin:0 0;will-change:transform;user-select:none}.figure-hint{display:block;margin:0 0 9px;color:#6b7672}#flow-live{display:block;width:100%;height:auto;background:#fff;border:1px solid #e5e1d8}small{color:#66716d}.statistics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.statistics-card{padding:12px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse}th,td{padding:5px;border-top:1px solid #eee;text-align:left;font-size:12px}@media print{body{max-width:none;margin:0;padding:0;background:#fff}.figure{break-before:page;border:0;border-radius:0;margin:0;padding:12mm;overflow:visible}.figure-stage{min-height:0;overflow:visible;border:0}.figure img{max-width:100%;transform:none!important;page-break-inside:avoid}#flow-live{display:none}}</style>
     <header><h1>Daari Deepa — native analysis report</h1><p>${escapeHtml(sourceInput.value)}</p><small>${formatCount(counts.retainedRows)} retained of ${formatCount(counts.sourceRows)} source rows · ${formatCount(counts.segments)} segments · ${formatCount(counts.animals)} animals</small></header>
-    ${figures.map(([title, image]) => `<section class="figure"><h2>${escapeHtml(title)}</h2><img src="${image}" alt="${escapeHtml(title)}"></section>`).join("")}
+    ${figures.map(([title, image]) => `<section class="figure"><h2>${escapeHtml(title)}</h2><small class="figure-hint">Drag to pan · wheel to zoom · double-click to reset</small><div class="figure-stage"><img draggable="false" src="${image}" alt="${escapeHtml(title)}"></div>${title === "Local direction" && flowSnapshot ? '<canvas id="flow-live" aria-label="Animated local direction field"></canvas>' : ""}</section>`).join("")}
     ${tableSections.map(([title, content]) => `<section class="figure"><h2>${escapeHtml(title)}</h2>${content}</section>`).join("")}
-    <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Figures are a static record of the current native browser state.</small></footer>`;
+    <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Images retain local pan and zoom; the flow field is animated from the exported binned vectors. No data leaves this file.</small></footer>
+    <script>const FLOW=${embeddedFlow};document.querySelectorAll('.figure-stage').forEach(stage=>{const image=stage.querySelector('img');let scale=1,x=0,y=0,drag=null;const draw=()=>image.style.transform='translate('+x+'px,'+y+'px) scale('+scale+')';stage.addEventListener('wheel',event=>{event.preventDefault();const rect=stage.getBoundingClientRect(),next=Math.max(1,Math.min(8,scale*Math.exp(-event.deltaY*.001)));x=event.clientX-rect.left-(event.clientX-rect.left-x)*next/scale;y=event.clientY-rect.top-(event.clientY-rect.top-y)*next/scale;scale=next;draw()},{passive:false});stage.addEventListener('pointerdown',event=>{drag={x:event.clientX,y:event.clientY,ox:x,oy:y};stage.setPointerCapture(event.pointerId)});stage.addEventListener('pointermove',event=>{if(!drag)return;x=drag.ox+event.clientX-drag.x;y=drag.oy+event.clientY-drag.y;draw()});stage.addEventListener('pointerup',()=>drag=null);stage.addEventListener('dblclick',()=>{scale=1;x=0;y=0;draw()})});if(FLOW){const canvas=document.getElementById('flow-live'),cols=Math.min(2,FLOW.panelCount),rows=Math.ceil(FLOW.panelCount/cols),cellW=800,cellH=450;canvas.width=cols*cellW;canvas.height=rows*cellH;const ctx=canvas.getContext('2d'),cells=FLOW.nx*FLOW.nz,active=[];let max=1;for(const value of FLOW.abundance)max=Math.max(max,value||0);for(let i=0;i<FLOW.angle.length;i++){if(FLOW.angle[i]==null||!(FLOW.abundance[i]>0))continue;const copies=1+Math.floor(3*Math.sqrt(FLOW.abundance[i]/max));for(let n=0;n<copies;n++)active.push(i)}const particles=Array.from({length:Math.min(3500,active.length*2)},(_,i)=>({cell:active[i%active.length],phase:(i*.61803398875)%1,jitter:((i*16807)%997)/997-.5}));const bounds=FLOW.bounds,span=Math.max(bounds.xmax-bounds.xmin,bounds.zmax-bounds.zmin)||1,pad=34,plotW=cellW-pad*2,plotH=cellH-pad*2;function frame(time){ctx.fillStyle='rgba(255,255,255,.18)';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.lineCap='round';for(let panel=0;panel<FLOW.panelCount;panel++){const left=(panel%cols)*cellW+pad,top=Math.floor(panel/cols)*cellH+pad;ctx.fillStyle='#26332f';ctx.font='700 15px system-ui';ctx.fillText(FLOW.panelNames[panel]||'All data',left,top-10);ctx.strokeStyle='rgba(60,80,74,.12)';ctx.strokeRect(left,top,plotW,plotH)}for(const p of particles){const panel=Math.floor(p.cell/cells),local=p.cell%cells,ix=local%FLOW.nx,iz=Math.floor(local/FLOW.nx),angle=FLOW.angle[p.cell]*Math.PI/180,strength=FLOW.strength[p.cell]||0,age=(time*.00024+p.phase)%1,cx=FLOW.x0+(ix+.5)*FLOW.bin,cz=FLOW.z0+(iz+.5)*FLOW.bin,length=FLOW.bin*(.3+1.4*strength),dx=Math.sin(angle)*length,dz=Math.cos(angle)*length,left=(panel%cols)*cellW+pad,top=Math.floor(panel/cols)*cellH+pad,px=value=>left+(value-bounds.xmin)/span*plotW,py=value=>top+plotH-(value-bounds.zmin)/span*plotH,x0=px(cx+dx*(age-.18)+p.jitter*FLOW.bin*.35),y0=py(cz+dz*(age-.18)+p.jitter*FLOW.bin*.35),x1=px(cx+dx*age+p.jitter*FLOW.bin*.35),y1=py(cz+dz*age+p.jitter*FLOW.bin*.35);ctx.strokeStyle='oklch(66% .135 '+(((FLOW.angle[p.cell]%360)+360)%360)+')';ctx.globalAlpha=.18+.55*strength;ctx.lineWidth=.7+1.2*Math.sqrt(FLOW.abundance[p.cell]/max);ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke()}ctx.globalAlpha=1;requestAnimationFrame(frame)}if(active.length)requestAnimationFrame(frame)}</script>`;
   const blob = new Blob([html], {type: "text/html"});
   downloadBlob(blob, `daari-deepa-native-${new Date().toISOString().slice(0,10)}.html`);
   setStatus("ready", "Report exported", `${figures.length} figures embedded locally, including ${formatCount(trajectoryRenderer.lastSnapshotInk || 0)} sampled trajectory pixels.`);
@@ -1577,9 +1738,9 @@ function curtainPreviewScope() {
 }
 function scheduleCurtainPreview() {
   const scope = curtainPreviewScope();
-  if (!scope || curtainPreviewTimer) return;
+  if (!scope || currentView === "trajectory" || curtainPreviewTimer || workerBusy) return;
   const panels = Math.max(1, Number(lastSummary?.panels) || 1);
-  const cadence = panels > 8 ? 450 : (panels > 4 ? 250 : 125);
+  const cadence = panels > 8 ? 1200 : (panels > 4 ? 750 : 420);
   const wait = Math.max(0, cadence - (performance.now() - curtainPreviewAt));
   curtainPreviewTimer = setTimeout(() => {
     curtainPreviewTimer = null; curtainPreviewAt = performance.now();
@@ -1595,7 +1756,13 @@ function scheduleLocalRingObserver(final = false, source = null) {
     ringFrame = null;
     applyLocalRingObserver(true);
     transitionSelectionActive = false;
-    scheduleDataUpdate(180);
+    transitionRenderer.clearTrajectoryOverlay();
+    // Paths are a local WebGL observer: do not enqueue analytical work on
+    // release. Other layers settle once after the drag, while background
+    // products remain deferred until idle or opened.
+    const scope = curtainPreviewScope();
+    if (scope) scheduleCompute(scope, currentView === "compare" ? 220 : 120);
+    else armDeferredAnalysis();
     return;
   }
   if (ringFrame) return;
@@ -1611,7 +1778,7 @@ function scheduleLocalRingObserver(final = false, source = null) {
     for (const renderer of [heatmapRenderer, directionRenderer, transitionRenderer]) {
       if (renderer !== source) renderer.setRings(rings, enabled, byId("ring-match").value, false);
     }
-    scheduleCurtainPreview();
+    if (currentView !== "trajectory") scheduleCurtainPreview();
   });
 }
 
@@ -1626,18 +1793,17 @@ function updateActiveRing() {
 }
 
 function updatePlaybackTime() {
-  const enabled = byId("playback-enabled").checked;
   const value = numberValue("time-scrubber", 0);
   const single = byId("playback-scope").value === "single";
   trajectoryRenderer.setPlaybackSegment(single ? Number(byId("playback-trial").value) : -1);
-  trajectoryRenderer.setTime(enabled ? value : Number.POSITIVE_INFINITY);
-  byId("time-output").textContent = enabled
+  trajectoryRenderer.setTime(playbackActive ? value : Number.POSITIVE_INFINITY);
+  byId("time-output").textContent = playbackActive
     ? `${formatNumber(value, 1)} / ${formatNumber(Number(byId("time-scrubber").max), 1)} s`
     : (single ? "full segment" : "all time");
 }
 
 function playbackTick(now) {
-  if (!byId("playback-enabled").checked || byId("play-button").textContent !== "Pause") { playbackFrame = null; return; }
+  if (!playbackPlaying) { playbackFrame = null; return; }
   const maxTime = Number(byId("time-scrubber").max) || 1;
   const elapsed = playbackLast ? (now - playbackLast) / 1000 : 0; playbackLast = now;
   let value = numberValue("time-scrubber") + elapsed * numberValue("playback-speed", 1);
@@ -1646,18 +1812,28 @@ function playbackTick(now) {
   playbackFrame = requestAnimationFrame(playbackTick);
 }
 
-function stopPlayback() {
+function stopPlayback(reset = false) {
   if (playbackFrame) cancelAnimationFrame(playbackFrame);
   playbackFrame = null; playbackLast = 0;
-  if (byId("play-button")) byId("play-button").textContent = "Play";
+  playbackPlaying = false;
+  if (reset) playbackActive = false;
+  if (byId("play-button")) {
+    byId("play-button").textContent = "▶ Play";
+    byId("play-button").setAttribute("aria-pressed", "false");
+  }
+  updatePlaybackTime();
 }
 
 byId("source-form").addEventListener("submit", event => { event.preventDefault(); loadDataset(sourceInput.value); });
 byId("controls-toggle").addEventListener("click", () => {
   const collapsed = shell.classList.toggle("controls-collapsed");
+  if (collapsed) setMirrorGuide(null);
   byId("controls-toggle").setAttribute("aria-expanded", String(!collapsed));
 });
-byId("sidebar-close").addEventListener("click", () => byId("controls-toggle").click());
+byId("sidebar-close").addEventListener("click", () => { setMirrorGuide(null); byId("controls-toggle").click(); });
+byId("mirror-pair-list").addEventListener("focusout", () => setTimeout(() => {
+  if (!byId("mirror-pair-list").contains(document.activeElement)) setMirrorGuide(null);
+}, 0));
 
 function setCurtainPalette(open) {
   const palette = byId("curtain-palette");
@@ -1756,6 +1932,10 @@ byId("animals-all").addEventListener("click", () => {
 byId("animals-none").addEventListener("click", () => {
   animalVisibility.fill(false); renderAnimalVisibility(); applyAnimalVisibility();
 });
+byId("animals-invert").addEventListener("click", () => {
+  animalVisibility = animalVisibility.map(value => value === false);
+  renderAnimalVisibility(); applyAnimalVisibility();
+});
 byId("trial-fraction").addEventListener("input", updateFraction);
 byId("resample-button").addEventListener("click", () => {
   sampleSeed += 1;
@@ -1811,6 +1991,10 @@ for (const id of ["transition-outcome", "transition-display", "transition-suppor
   byId(id).addEventListener(id === "transition-support" ? "input" : "change", applyTransitionVisuals);
 }
 byId("transition-split").addEventListener("change", () => scheduleCompute("transition", 20));
+byId("transition-axis").addEventListener("change", () => {
+  byId("transition-split-label").textContent = `Split ${byId("transition-axis").value.toUpperCase()}`;
+  scheduleCompute("transition", 20);
+});
 byId("window-show").addEventListener("change", () => {
   trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
   persistState();
@@ -1818,13 +2002,28 @@ byId("window-show").addEventListener("change", () => {
 byId("spatial-grid").addEventListener("change", () => {
   for (const renderer of spatialRenderers) renderer.setGridVisible(byId("spatial-grid").checked);
 });
-byId("playback-enabled").addEventListener("change", () => {
-  const enabled = byId("playback-enabled").checked;
-  byId("play-button").disabled = !enabled; byId("time-scrubber").disabled = !enabled;
-  if (enabled) byId("time-scrubber").value = 0; else stopPlayback();
-  updatePlaybackTime();
+byId("show-marginals").addEventListener("change", () => {
+  for (const renderer of spatialRenderers) renderer.setMarginalsVisible(byId("show-marginals").checked);
+  persistState();
 });
-byId("time-scrubber").addEventListener("input", updatePlaybackTime);
+byId("mirror-pair-add").addEventListener("click", () => {
+  const count = datasetHeader?.categories?.config?.length || 0;
+  if (count < 2) return;
+  const used = new Set(mirrorRules.flatMap(rule => [Number(rule.reference), Number(rule.reflected)]));
+  const available = Array.from({length: count}, (_, code) => code).filter(code => !used.has(code));
+  mirrorRules.push({reference: available[0] ?? 0, reflected: available[1] ?? (available[0] === 0 ? 1 : 0), axis: "x", coordinate: 0});
+  renderMirrorPairs(); setMirrorGuide(mirrorRules[mirrorRules.length - 1]);
+  byId("mirror-pool").disabled = false;
+  persistState();
+});
+byId("mirror-pair-clear").addEventListener("click", () => {
+  mirrorRules = []; renderMirrorPairs(); setMirrorGuide(null);
+  byId("mirror-pool").disabled = (datasetHeader?.categories?.config?.length || 0) < 2;
+  scheduleDataUpdate(80);
+});
+byId("time-scrubber").addEventListener("input", () => {
+  playbackActive = true; updatePlaybackTime();
+});
 byId("playback-scope").addEventListener("change", () => {
   byId("time-scrubber").value = 0; updatePlaybackScope();
 });
@@ -1837,9 +2036,13 @@ byId("playback-cap").addEventListener("change", () => {
   updatePlaybackLimit(); scheduleCompute("playback", 20);
 });
 byId("play-button").addEventListener("click", () => {
-  const playing = byId("play-button").textContent === "Pause";
-  if (playing) stopPlayback();
-  else { byId("play-button").textContent = "Pause"; playbackLast = 0; playbackFrame = requestAnimationFrame(playbackTick); }
+  if (playbackPlaying) { stopPlayback(); return; }
+  const maximum = Number(byId("time-scrubber").max) || 1;
+  if (!playbackActive || numberValue("time-scrubber") >= maximum) byId("time-scrubber").value = 0;
+  playbackActive = true; playbackPlaying = true;
+  byId("play-button").textContent = "❚❚ Pause";
+  byId("play-button").setAttribute("aria-pressed", "true");
+  playbackLast = 0; updatePlaybackTime(); playbackFrame = requestAnimationFrame(playbackTick);
 });
 
 for (const id of ["angle-source", "polar-angle-source"]) {
@@ -1874,7 +2077,7 @@ for (const control of document.querySelectorAll("[data-scope]")) {
 
 async function readDroppedEntry(entry, prefix, paths) {
   if (entry.isFile) {
-    if (entry.name.toLowerCase().endsWith(".csv")) {
+    if (/\.csv(?:\.gz)?$/i.test(entry.name)) {
       const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
       paths.push({path: `${prefix}${entry.name}`, size: file.size});
     }
@@ -1897,7 +2100,7 @@ async function droppedPaths(transfer) {
   } else {
     for (const file of transfer.files || []) {
       const path = file.webkitRelativePath || file.name;
-      if (path.toLowerCase().endsWith(".csv")) paths.push({path, size: file.size});
+      if (/\.csv(?:\.gz)?$/i.test(path)) paths.push({path, size: file.size});
     }
   }
   return paths;

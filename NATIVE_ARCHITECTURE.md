@@ -55,9 +55,10 @@ after adaptive idle delays, or immediately when their workspace is opened.
 The delays grow for five-to-eight and more-than-eight visible panels so a large
 treatment comparison does not compete with the active spatial view. Panel
 labels/order remap the cached visible segments without rerunning the filter.
-The worker also caches sparse per-segment
-occupancy and direction-cell contributions, so curtain-only previews add
-matched segments' existing cells instead of rescanning every retained row.
+The worker also caches sparse per-segment occupancy and direction-cell
+contributions. The exact curtain intersection pass identifies matching
+segments; occupancy and direction then add those segments' existing sparse
+cells instead of rebinnig their retained rows.
 Occupancy remains cached separately from direction, and colour, movement,
 heading, polar, playback, statistics, and layout changes rebuild only their
 dependent products.
@@ -160,10 +161,11 @@ itself a load-time optimization.
 Pan/zoom and displayed-trial fraction are renderer-local. Playback advances a
 GPU time uniform while the application status remains Ready; it creates no
 worker request or server request. Curtain geometry and the raw WebGL mask are
-updated locally during a drag. At a bounded cadence, the worker applies the
-exact retained path/circle intersection but rebuilds only the visible occupancy
-or direction product from cached segment contributions. A settled change then
-refreshes the slower analytical products, making the ring a subset shared by
+updated locally during a drag. Paths never enqueue analytical work during that
+gesture. Aggregate layers use a slower bounded preview cadence and a settled
+update; the worker applies the exact retained path/circle intersection but
+rebuilds occupancy or direction from cached segment contributions. Slower
+analytical products remain idle-deferred, making the ring a subset shared by
 paths, occupancy, flow, transitions, polar, heading, ROI, metrics, windows, and
 statistics rather than a trajectory-only highlight.
 
@@ -174,7 +176,9 @@ the browser preserving a presented WebGL canvas between animation frames.
 PNG and report captures are staged independently of the current viewport in a
 fixed two-column grid. Each treatment cell is rendered at a 16:9 logical size
 and at least 1600 x 900 output pixels; renderer dimensions, columns, and the
-live dashboard layout are restored after capture.
+live dashboard layout are restored after capture. The self-contained report
+adds local pan/zoom to every captured figure and reconstructs an animated flow
+canvas from the exported binned direction vectors.
 
 ## Analytical invariants preserved
 
@@ -204,7 +208,7 @@ live dashboard layout are restored after capture.
 |---|---|
 | Bounded parallel CSV/metadata load | Complete |
 | Config/scene/VR/fly/folder grouping and filters | Complete |
-| Geometry-aware Left/Right config labels and mirrored-control pooling | Complete (automatic only for confirmed target-reflection pairs; mapping is recipe-persisted) |
+| Geometry-aware Left/Right config labels and mirrored-control pooling | Complete (automatic target-reflection pairs plus an explicit reference/reflected pairing editor with X or Z mirror line; mapping is URL/recipe-persisted) |
 | Trial/step/replicate/time/resultant-R/peak/displacement/distance and quality filters | Complete |
 | GPU trajectories, colour modes, moving gate, point budget | Complete |
 | Shared pan/zoom, reset, responsive columns, clean layout | Complete |
@@ -217,7 +221,7 @@ live dashboard layout are restored after capture.
 | ROI fraction/residence/time/error diagnostics | Complete |
 | Native filter mini-histograms with dual range and compact numeric controls | Complete (histograms refresh to the current AND subset) |
 | Exact nearest-segment inspection | Complete |
-| Talk-ready PNG and static self-contained native HTML report | Complete (fixed two-column 16:9 capture; at least 1600 x 900 pixels per treatment panel; live layout restored) |
+| Talk-ready PNG and self-contained native HTML report | Complete (fixed two-column 16:9 capture; at least 1600 x 900 pixels per treatment panel; local pan/zoom and animated exported flow; live layout restored) |
 | Shareable principal URL state and readable JSON view recipe | Complete |
 | Python recipe/URL → `FilterSpec`/grouped frames bridge | Complete |
 | Multi-ring curtain observer, Any/All, editable geometry | Complete (direct on every Cartesian spatial layer; center/edge drag, keyboard/UI/drag-to-trash deletion; exact shared analytical subset) |
@@ -228,7 +232,7 @@ live dashboard layout are restored after capture.
 | Draggable/keyboard panel ordering across linked views | Complete |
 | Shared spatial layers and compact 2×2 overview | Complete (one viewport/subset/curtain across paths, occupancy, flow, polar, and transitions; pooled or all-panel overview) |
 | Editable observation windows and paired window inference | Complete (shared spatial transform; on-demand worker-side Wilcoxon summaries) |
-| Transition-probability cell observer | Complete (native shared-grid layer; unique segment/cell entry, crossed/ended outcomes, support/fraction/count controls, raw-path drill-down and blank reset) |
+| Transition-probability cell observer | Complete (native shared-grid layer; X/Z split coordinate; unique segment/cell entry, crossed/ended outcomes, support/fraction/count controls, in-place raw-path overlay and blank reset) |
 | Delayed Holm/Rayleigh annotation layer | Complete (on-demand worker pass; compact-letter metric comparisons, Rayleigh stars, and Holm-adjusted directional mean permutation tests) |
 
 The old Dash app stays runnable on this branch as a reference implementation;

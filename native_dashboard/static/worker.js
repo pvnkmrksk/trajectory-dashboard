@@ -23,6 +23,16 @@ let activeOrientation = null;
 let activeMovement = null;
 let mirrorFrameEnabled = false;
 let mirroredRois = null;
+let activeSegmentMinX = null;
+let activeSegmentMaxX = null;
+let activeSegmentMinZ = null;
+let activeSegmentMaxZ = null;
+let customMirrorKey = "";
+let customMirrorGroup = null;
+let customMirrorLabels = null;
+let customSegmentReflected = null;
+let customSegmentAxis = null;
+let customSegmentCoordinate = null;
 let lastBaseAnalysis = null;
 let lastAnalysis = null;
 let lastAnalysisKey = "";
@@ -86,6 +96,8 @@ function initDataset(message) {
   }
   activeX = data.x; activeZ = data.z;
   activeOrientation = data.orientation; activeMovement = data.movement;
+  activeSegmentMinX = segmentMinX; activeSegmentMaxX = segmentMaxX;
+  activeSegmentMinZ = segmentMinZ; activeSegmentMaxZ = segmentMaxZ;
   mirroredRois = Object.fromEntries(Object.entries(header.rois || {}).map(([config, targets]) => [
     config, (targets || []).map(target => ({
       ...target, x: -Number(target.x), angle: -Number(target.angle || 0),
@@ -138,6 +150,7 @@ function analysisKey(state) {
     filters: state.filters, ranges: state.ranges,
     angleSource: state.angleSource,
     mirrorPool: !!state.mirrorPool,
+    mirrorRules: state.mirrorRules,
     jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
     minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
     roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
@@ -150,13 +163,25 @@ function curtainKey(state) {
 
 function panelKey(state) {
   return JSON.stringify({
-    groupBy: state.groupBy, mirrorPool: !!state.mirrorPool,
+    groupBy: state.groupBy, mirrorPool: !!state.mirrorPool, mirrorRules: state.mirrorRules,
     labels: state.labels, panelOrders: state.panelOrders,
   });
 }
 
 function targetsForSegment(seg) {
   const config = header.categories.config[data.segmentConfig[seg]];
+  if (mirrorFrameEnabled && customSegmentReflected?.[seg]) {
+    const axis = customSegmentAxis[seg] === 1 ? "z" : "x";
+    const coordinate = customSegmentCoordinate[seg];
+    return (header.rois?.[config] || []).map(target => axis === "z" ? {
+      ...target, z: 2 * coordinate - Number(target.z),
+      angle: wrapAngle(180 - Number(target.angle || 0)),
+    } : {
+      ...target, x: 2 * coordinate - Number(target.x),
+      angle: wrapAngle(-Number(target.angle || 0)),
+      side: target.side === "left" ? "right" : (target.side === "right" ? "left" : target.side),
+    });
+  }
   return mirrorFrameEnabled && data.segmentMirrorSign?.[seg] < 0
     ? (mirroredRois?.[config] || []) : (header.rois?.[config] || []);
 }
@@ -167,13 +192,82 @@ function wrapAngle(value) {
 
 function selectCoordinateFrame(state) {
   mirrorFrameEnabled = !!state.mirrorPool;
+  const rules = mirrorFrameEnabled && Array.isArray(state.mirrorRules)
+    ? state.mirrorRules.filter(rule => Number.isInteger(Number(rule.reference))
+      && Number.isInteger(Number(rule.reflected)) && Number(rule.reference) !== Number(rule.reflected)) : [];
+  if (rules.length) {
+    const key = JSON.stringify({rules, labels: state.labels?.config});
+    if (key !== customMirrorKey || !customMirrorGroup) {
+      const ns = starts.length, n = data.x.length;
+      customMirrorGroup = new Int32Array(ns); customMirrorGroup.fill(-1);
+      customSegmentReflected = new Uint8Array(ns);
+      customSegmentAxis = new Uint8Array(ns);
+      customSegmentCoordinate = new Float32Array(ns);
+      const configGroup = new Map(), reflectedByConfig = new Map();
+      customMirrorLabels = [];
+      const names = state.labels?.config || header.displayCategories?.config || header.categories.config;
+      rules.forEach((rule, group) => {
+        const reference = Number(rule.reference), reflected = Number(rule.reflected);
+        configGroup.set(reference, group); configGroup.set(reflected, group);
+        reflectedByConfig.set(reflected, {axis: rule.axis === "z" ? "z" : "x", coordinate: Number(rule.coordinate) || 0});
+        customMirrorLabels[group] = rule.label || `${names[reference] ?? header.categories.config[reference]} ↔ ${names[reflected] ?? header.categories.config[reflected]}`;
+      });
+      let nextGroup = rules.length;
+      for (let config = 0; config < header.categories.config.length; config += 1) {
+        if (!configGroup.has(config)) {
+          configGroup.set(config, nextGroup++); customMirrorLabels.push(names[config] ?? header.categories.config[config]);
+        }
+      }
+      for (let seg = 0; seg < ns; seg += 1) {
+        const config = data.segmentConfig[seg], transform = reflectedByConfig.get(config);
+        customMirrorGroup[seg] = configGroup.get(config);
+        if (transform) {
+          customSegmentReflected[seg] = 1;
+          customSegmentAxis[seg] = transform.axis === "z" ? 1 : 0;
+          customSegmentCoordinate[seg] = transform.coordinate;
+        }
+      }
+      const x = new Float32Array(n), z = new Float32Array(n);
+      const orientation = new Float32Array(n), movement = new Float32Array(n);
+      const minX = new Float32Array(ns), maxX = new Float32Array(ns), minZ = new Float32Array(ns), maxZ = new Float32Array(ns);
+      minX.fill(Infinity); maxX.fill(-Infinity); minZ.fill(Infinity); maxZ.fill(-Infinity);
+      for (let row = 0; row < n; row += 1) {
+        const seg = data.segment[row], reflected = customSegmentReflected[seg] === 1;
+        const axis = customSegmentAxis[seg], coordinate = customSegmentCoordinate[seg];
+        x[row] = reflected && axis === 0 ? 2 * coordinate - data.x[row] : data.x[row];
+        z[row] = reflected && axis === 1 ? 2 * coordinate - data.z[row] : data.z[row];
+        orientation[row] = reflected ? wrapAngle(axis === 1 ? 180 - data.orientation[row] : -data.orientation[row]) : data.orientation[row];
+        movement[row] = reflected ? wrapAngle(axis === 1 ? 180 - data.movement[row] : -data.movement[row]) : data.movement[row];
+        if (Number.isFinite(x[row])) { minX[seg] = Math.min(minX[seg], x[row]); maxX[seg] = Math.max(maxX[seg], x[row]); }
+        if (Number.isFinite(z[row])) { minZ[seg] = Math.min(minZ[seg], z[row]); maxZ[seg] = Math.max(maxZ[seg], z[row]); }
+      }
+      selectCoordinateFrame.custom = {x, z, orientation, movement, minX, maxX, minZ, maxZ};
+      customMirrorKey = key;
+    }
+    const custom = selectCoordinateFrame.custom;
+    activeX = custom.x; activeZ = custom.z; activeOrientation = custom.orientation; activeMovement = custom.movement;
+    activeSegmentMinX = custom.minX; activeSegmentMaxX = custom.maxX;
+    activeSegmentMinZ = custom.minZ; activeSegmentMaxZ = custom.maxZ;
+    return;
+  }
+  customMirrorGroup = null; customMirrorLabels = null; customSegmentReflected = null;
   activeX = mirrorFrameEnabled ? mirroredX : data.x;
   activeZ = data.z;
   activeOrientation = mirrorFrameEnabled ? mirroredOrientation : data.orientation;
   activeMovement = mirrorFrameEnabled ? mirroredMovement : data.movement;
+  if (mirrorFrameEnabled) {
+    activeSegmentMinX = new Float32Array(starts.length); activeSegmentMaxX = new Float32Array(starts.length);
+    for (let seg = 0; seg < starts.length; seg += 1) {
+      const reflected = data.segmentMirrorSign?.[seg] < 0;
+      activeSegmentMinX[seg] = reflected ? -segmentMaxX[seg] : segmentMinX[seg];
+      activeSegmentMaxX[seg] = reflected ? -segmentMinX[seg] : segmentMaxX[seg];
+    }
+  } else { activeSegmentMinX = segmentMinX; activeSegmentMaxX = segmentMaxX; }
+  activeSegmentMinZ = segmentMinZ; activeSegmentMaxZ = segmentMaxZ;
 }
 
 function groupField(state, fields) {
+  if (state.groupBy === "config" && state.mirrorPool && customMirrorGroup) return customMirrorGroup;
   if (state.groupBy === "config" && state.mirrorPool && data.segmentMirrorConfig) {
     return data.segmentMirrorConfig;
   }
@@ -181,6 +275,7 @@ function groupField(state, fields) {
 }
 
 function groupLabels(state) {
+  if (state.groupBy === "config" && state.mirrorPool && customMirrorLabels) return customMirrorLabels;
   if (state.groupBy === "config" && state.mirrorPool) {
     return header.displayCategories?.mirrorConfig || header.categories.mirrorConfig;
   }
@@ -210,6 +305,17 @@ function retainedTimeMaximum(seg, rowKeep) {
 function buildAnalysis(state) {
   const started = performance.now();
   const ns = starts.length;
+  const filterAudit = [{label: "Loaded source", segments: ns, rows: data.segment.length}];
+  const audit = (label, segmentKeep, rowKeep = null) => {
+    let segments = 0, rows = 0;
+    for (let seg = 0; seg < ns; seg += 1) {
+      if (!segmentKeep[seg]) continue;
+      segments += 1;
+      if (!rowKeep) rows += ends[seg] - starts[seg];
+      else for (let row = starts[seg]; row < ends[seg]; row += 1) rows += rowKeep[row];
+    }
+    filterAudit.push({label, segments, rows});
+  };
   const segmentKeep = new Uint8Array(ns);
   segmentKeep.fill(1);
   const categoryFields = {
@@ -221,6 +327,7 @@ function buildAnalysis(state) {
     if (!selected) continue;
     for (let seg = 0; seg < ns; seg += 1) if (!selected.has(field[seg])) segmentKeep[seg] = 0;
   }
+  audit("Category selection", segmentKeep);
   const r = state.ranges || {};
   const segmentResultant = state.angleSource === "movement"
     ? data.segmentMovementR : data.segmentOrientationR;
@@ -234,6 +341,7 @@ function buildAnalysis(state) {
       || !inRange(data.segmentDisplacement[seg], r.displacement)
       || !inRange(data.segmentDistance[seg], r.distance)) segmentKeep[seg] = 0;
   }
+  audit("Segment ranges", segmentKeep);
 
   const rowKeep = new Uint8Array(data.segment.length);
   for (let seg = 0; seg < ns; seg += 1) {
@@ -249,6 +357,7 @@ function buildAnalysis(state) {
       }
     }
   }
+  if (timeRange) audit("Local-time range", segmentKeep, rowKeep);
 
   const jump = Number(state.jumpThreshold) || 0;
   const buffer = Math.max(0, Number(state.jumpBufferMs) || 0) / 1000;
@@ -267,6 +376,7 @@ function buildAnalysis(state) {
       }
     }
   }
+  if (jump > 0) audit("Jump rejection", segmentKeep, rowKeep);
 
   const minDisplacement = Math.max(0, Number(state.minDisplacement) || 0);
   if (minDisplacement > 0) {
@@ -279,6 +389,7 @@ function buildAnalysis(state) {
       }
     }
   }
+  if (minDisplacement > 0) audit("Minimum displacement", segmentKeep, rowKeep);
 
   const trim = Math.max(0, Math.floor(Number(state.edgeTrim) || 0));
   if (trim > 0) {
@@ -290,6 +401,7 @@ function buildAnalysis(state) {
       for (let i = ends[seg] - 1; i >= starts[seg] && removed < trim; i -= 1) if (rowKeep[i]) { rowKeep[i] = 0; removed += 1; }
     }
   }
+  if (trim > 0) audit("Edge trim", segmentKeep, rowKeep);
 
   // ROI reach is calculated from the quality-filtered table before the
   // entered-only/after-exit mask. This preserves the established denominator
@@ -336,6 +448,7 @@ function buildAnalysis(state) {
       rowKeep.fill(0, exitAt, ends[seg]);
     }
   }
+  if (state.roiEntered || state.roiTrim) audit("ROI mask", segmentKeep, rowKeep);
 
   const visibleSegments = [];
   let visibleRows = 0;
@@ -401,6 +514,7 @@ function buildAnalysis(state) {
     roiStats, roiBaseSegments, segmentOutcome, panelRois,
     roiCounts: {left: roiLeft, right: roiRight}, roiReach,
     durationSummary,
+    filterAudit,
     filterMs: performance.now() - started,
   };
   result.boundsSource = result;
@@ -421,13 +535,12 @@ function applyCurtain(state, base) {
   for (const seg of base.visibleSegments) {
     const hits = new Uint8Array(activeRings.length);
     let hitCount = 0, previous = -1;
-    const reflected = mirrorFrameEnabled && data.segmentMirrorSign?.[seg] < 0;
-    const minX = reflected ? -segmentMaxX[seg] : segmentMinX[seg];
-    const maxX = reflected ? -segmentMinX[seg] : segmentMaxX[seg];
+    const minX = activeSegmentMinX[seg];
+    const maxX = activeSegmentMaxX[seg];
     for (let index = 0; index < activeRings.length; index += 1) {
       const ring = activeRings[index];
       if (maxX < ring.x - ring.r || minX > ring.x + ring.r
-          || segmentMaxZ[seg] < ring.z - ring.r || segmentMinZ[seg] > ring.z + ring.r) hits[index] = 2;
+          || activeSegmentMaxZ[seg] < ring.z - ring.r || activeSegmentMinZ[seg] > ring.z + ring.r) hits[index] = 2;
     }
     for (let row = starts[seg]; row < ends[seg]; row += 1) {
       if (!rowKeep[row]) continue;
@@ -467,6 +580,7 @@ function applyCurtain(state, base) {
       p99: percentile(durations, .99), max: durations.length ? durations[durations.length - 1] : 0,
     },
     boundsSource: base,
+    filterAudit: [...(base.filterAudit || []), {label: "Curtain observer", segments: visibleSegments.length, rows: visibleRows}],
     filterMs: base.filterMs + performance.now() - started,
   };
 }
@@ -581,8 +695,9 @@ function rowColor(row, seg, state, analysis) {
   switch (state.colorBy) {
     case "none": return NEUTRAL_INDEX;
     case "fly": return data.segmentFly[seg] % CATEGORY_COLORS;
-    case "config": return (state.mirrorPool && data.segmentMirrorConfig
-      ? data.segmentMirrorConfig[seg] : data.segmentConfig[seg]) % CATEGORY_COLORS;
+    case "config": return (state.mirrorPool && customMirrorGroup
+      ? customMirrorGroup[seg] : (state.mirrorPool && data.segmentMirrorConfig
+        ? data.segmentMirrorConfig[seg] : data.segmentConfig[seg])) % CATEGORY_COLORS;
     case "scene": return data.segmentScene[seg] % CATEGORY_COLORS;
     case "vr": return data.segmentVr[seg] % CATEGORY_COLORS;
     case "folder": return data.segmentFolder[seg] % CATEGORY_COLORS;
@@ -636,7 +751,9 @@ function buildTrajectory(state, analysis) {
   const times = new Float32Array(selectedLinks * 2);
   const samples = new Float32Array(selectedLinks * 2);
   let link = 0;
+  const segmentLabels = new Array(starts.length);
   for (const seg of trajectorySegments) {
+    segmentLabels[seg] = `${header.categories.file[data.segmentFile[seg]]} · replicate ${data.segmentReplicate[seg]} · trial ${data.segmentTrial[seg]} / step ${data.segmentStep[seg]}`;
     const count = eligibleCount[seg];
     if (count <= 1) continue;
     let position = 0, previous = -1;
@@ -682,6 +799,7 @@ function buildTrajectory(state, analysis) {
     ringMatches: analysis.visibleSegments.length,
     visibleSegments: analysis.visibleSegments.length,
     segmentCount: starts.length,
+    segmentLabels,
     buildMs: performance.now() - started,
   };
 }
@@ -820,6 +938,8 @@ function buildDirection(state, analysis) {
 function buildTransition(state, analysis) {
   const started = performance.now();
   const grid = gridGeometry(state, analysis), cells = grid.nx * grid.nz;
+  const axis = state.transitionAxis === "x" ? "x" : "z";
+  const coordinate = axis === "x" ? activeX : activeZ;
   const entered = new Uint32Array(analysis.panelCount * cells);
   const crossed = new Uint32Array(entered.length), ended = new Uint32Array(entered.length);
   const startsByBin = new Map();
@@ -827,7 +947,7 @@ function buildTransition(state, analysis) {
     let first = -1;
     for (let row = starts[seg]; row < ends[seg]; row += 1) if (analysis.rowKeep[row]) { first = row; break; }
     if (first < 0) continue;
-    const bin = Math.round(activeZ[first] / Math.max(grid.bin, 1e-9));
+    const bin = Math.round(coordinate[first] / Math.max(grid.bin, 1e-9));
     startsByBin.set(bin, (startsByBin.get(bin) || 0) + 1);
   }
   let modalBin = 0, modalCount = -1;
@@ -840,12 +960,12 @@ function buildTransition(state, analysis) {
     const start = starts[seg], end = ends[seg], length = end - start;
     const suffixMin = new Float32Array(length + 1), suffixMax = new Float32Array(length + 1);
     suffixMin[length] = Infinity; suffixMax[length] = -Infinity;
-    let minimum = Infinity, maximum = -Infinity, finalZ = NaN;
+    let minimum = Infinity, maximum = -Infinity, finalCoordinate = NaN;
     for (let offset = length - 1; offset >= 0; offset -= 1) {
       const row = start + offset;
-      if (analysis.rowKeep[row] && Number.isFinite(activeZ[row])) {
-        minimum = Math.min(minimum, activeZ[row]); maximum = Math.max(maximum, activeZ[row]);
-        if (!Number.isFinite(finalZ)) finalZ = activeZ[row];
+      if (analysis.rowKeep[row] && Number.isFinite(coordinate[row])) {
+        minimum = Math.min(minimum, coordinate[row]); maximum = Math.max(maximum, coordinate[row]);
+        if (!Number.isFinite(finalCoordinate)) finalCoordinate = coordinate[row];
       }
       suffixMin[offset] = minimum; suffixMax[offset] = maximum;
     }
@@ -859,13 +979,13 @@ function buildTransition(state, analysis) {
       const local = iz * grid.nx + ix;
       if (seen.has(local)) continue;
       seen.add(local);
-      const index = panel * cells + local, upper = activeZ[row] >= split;
+      const index = panel * cells + local, upper = coordinate[row] >= split;
       entered[index] += 1;
       if (upper ? suffixMin[Math.min(length, offset + 1)] < split : suffixMax[Math.min(length, offset + 1)] > split) crossed[index] += 1;
-      if (Number.isFinite(finalZ) && (upper ? finalZ < split : finalZ > split)) ended[index] += 1;
+      if (Number.isFinite(finalCoordinate) && (upper ? finalCoordinate < split : finalCoordinate > split)) ended[index] += 1;
     }
   }
-  return {...spatialCommon(state, analysis, grid), entered, crossed, ended, split,
+  return {...spatialCommon(state, analysis, grid), entered, crossed, ended, split, axis,
     buildMs: performance.now() - started};
 }
 
@@ -1594,7 +1714,7 @@ function compute(message) {
   const productAnalysis = ["overview", "overviewPreview"].includes(scope) && state.overviewGrouping !== "panels"
     ? pooledAnalysis(lastAnalysis) : lastAnalysis;
   const products = {};
-  if (["full", "trajectory", "movement", "color", "sample", "overview"].includes(scope)) {
+  if (["full", "trajectory", "movement", "color", "sample", "overview", "transition"].includes(scope)) {
     products.trajectory = buildTrajectory(state, productAnalysis);
   }
   if (["full", "spatial", "heatmap", "overview", "overviewPreview"].includes(scope)) {
@@ -1660,6 +1780,7 @@ function compute(message) {
       durationSummary: lastAnalysis.durationSummary,
       panelKeys: lastAnalysis.panelKeys,
       segmentOptions,
+      filterAudit: lastAnalysis.filterAudit,
     },
   };
   postMessage(result, [...new Set(buffers(products))]);

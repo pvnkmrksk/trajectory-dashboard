@@ -12,6 +12,7 @@ from native_dashboard.dataset import (
     FORMAT_NAME, _config_presentation, load_native_dataset,
 )
 from native_dashboard.server import create_native_app
+from trajectory_dashboard.io import find_csv_files
 from trajectory_dashboard.recipe import load_view_recipe, recipe_from_url
 from trajectory_dashboard.roi import roi_xz, rois_by_config, rois_from_config
 
@@ -197,6 +198,30 @@ def test_native_server_resolves_a_dropped_folder(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert response.json["source"].endswith("Dropped Session")
+
+
+def test_directory_and_drop_manifest_include_gzipped_csv(monkeypatch, tmp_path):
+    folder = tmp_path / "Compressed Session"
+    folder.mkdir()
+    plain = folder / "plain_VR1_.csv"
+    compressed = folder / "compressed_VR1_.csv.gz"
+    _write_csv(plain, 0)
+    frame = pd.read_csv(plain)
+    frame.to_csv(compressed, index=False, compression="gzip")
+
+    assert {path.rsplit("/", 1)[-1] for path in find_csv_files(str(folder))} == {
+        plain.name, compressed.name,
+    }
+    monkeypatch.setenv("TRAJ_DATA_ROOT", str(tmp_path))
+    response = create_native_app().test_client().post("/api/resolve-drop", json={
+        "folder": folder.name,
+        "files": [
+            {"path": f"{folder.name}/{plain.name}", "size": plain.stat().st_size},
+            {"path": f"{folder.name}/{compressed.name}", "size": compressed.stat().st_size},
+        ],
+    })
+    assert response.status_code == 200
+    assert response.json["source"].endswith("Compressed Session")
 
 
 def test_playback_uses_duration_p95_instead_of_the_longest_outlier(tmp_path):

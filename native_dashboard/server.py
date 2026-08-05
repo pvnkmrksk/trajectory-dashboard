@@ -41,7 +41,7 @@ def _normalise_drop_manifest(folder: str, files: list[Any]) -> dict[str, int | N
         raw_path = item.get("path") if isinstance(item, dict) else item
         raw_size = item.get("size") if isinstance(item, dict) else None
         path = str(raw_path or "").replace("\\", "/").lstrip("/")
-        if not path.lower().endswith(".csv"):
+        if not path.lower().endswith((".csv", ".csv.gz")):
             continue
         parts = [part for part in path.split("/") if part not in ("", ".")]
         if parts and parts[0] == folder:
@@ -54,10 +54,10 @@ def _normalise_drop_manifest(folder: str, files: list[Any]) -> dict[str, int | N
 
 def _candidate_manifest(folder: str) -> dict[str, int]:
     root = Path(folder)
+    paths = [*root.rglob("*.csv"), *root.rglob("*.csv.gz")]
     return {
         path.relative_to(root).as_posix(): path.stat().st_size
-        for path in sorted(root.rglob("*.csv"))
-        if path.is_file()
+        for path in sorted(set(paths)) if path.is_file()
     }
 
 

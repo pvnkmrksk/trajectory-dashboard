@@ -86,12 +86,18 @@ def find_csv_files(pattern: str) -> list[str]:
             except (OSError, ValueError):
                 return False
 
-        found = sorted(path for path in root.rglob("*.csv") if inside(path))
+        found = sorted({
+            path for suffix in ("*.csv", "*.csv.gz")
+            for path in root.rglob(suffix) if inside(path)
+        })
         return [str(path) for path in found if path.is_file()]
     found = sorted(glob.glob(pattern, recursive=True))
-    if not found and not pattern.endswith(".csv"):
-        found = sorted(glob.glob(pattern + ".csv", recursive=True))
-    return [path for path in found if path.endswith(".csv") and os.path.isfile(path)]
+    if not found and not pattern.endswith((".csv", ".csv.gz")):
+        found = sorted({
+            *glob.glob(pattern + ".csv", recursive=True),
+            *glob.glob(pattern + ".csv.gz", recursive=True),
+        })
+    return [path for path in found if path.endswith((".csv", ".csv.gz")) and os.path.isfile(path)]
 
 
 def loads_tolerant(text: str):

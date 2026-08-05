@@ -213,7 +213,7 @@ button.wide { width: 100%; }
 .plot-toolbar .scrubber { flex: 1 1 220px; }
 .plot-toolbar output { min-width: 48px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .segment-inspector { flex: 1 1 100%; min-height: 24px; padding: 6px 9px; border-radius: 7px; color: var(--muted); background: #f3f6f5; border: 1px solid #e6ecea; font-size: 9px; line-height: 1.35; }
-.plot-host { position: relative; width: 100%; height: clamp(470px, calc(100vh - 265px), 760px); min-height: 430px; background: #fff; border-radius: 9px; overflow: hidden; touch-action: none; }
+.plot-host { position: relative; width: 100%; height: clamp(470px, calc(100vh - 265px), 760px); min-height: 430px; background: #fff; border-radius: 9px; overflow: hidden; touch-action: pan-y pinch-zoom; }
 .plot-host.large { height: clamp(490px, calc(100vh - 285px), 780px); }
 .plot-host.tall { height: 620px; }
 .plot-host.short { height: 260px; min-height: 220px; }
@@ -459,6 +459,39 @@ h1 span { font-size: 8px; }
   .inline-controls { max-width: 66%; }
 }
 
+/* Explicit mirrored-pair editor and compact load feedback. */
+.status-dock progress {
+  width: 72px;
+  height: 3px;
+  border: 0;
+  border-radius: 999px;
+  accent-color: var(--teal);
+}
+.mirror-pair-list { display: grid; gap: 7px; }
+.mirror-pair {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: end;
+  gap: 5px;
+  padding: 7px 34px 7px 7px;
+  border: 1px solid #dbe4e1;
+  border-radius: 8px;
+  background: #fbfcfc;
+}
+.mirror-pair label { min-width: 0; font-size: 7px; color: #6e7c78; }
+.mirror-pair select, .mirror-pair input { min-width: 0; width: 100%; min-height: 25px; padding: 3px 5px; font-size: 8px; }
+.mirror-pair > label:nth-child(1), .mirror-pair > label:nth-child(3),
+.mirror-pair .mirror-arrow { grid-column: 1 / -1; }
+.mirror-pair .mirror-arrow { color: #75827e; font-size: 7px; text-align: center; }
+.mirror-pair .mirror-remove { min-height: 25px; padding: 0; }
+.mirror-pair .mirror-remove { position: absolute; top: 7px; right: 6px; width: 24px; }
+.filter-audit { display: grid; gap: 4px; margin-top: 7px; }
+.filter-audit-row { display: grid; grid-template-columns: minmax(80px, 1fr) 1fr auto; align-items: center; gap: 6px; font-size: 8px; }
+.filter-audit-row i { height: 4px; overflow: hidden; border-radius: 99px; background: #e4ebe9; }
+.filter-audit-row i::after { content: ""; display: block; width: var(--kept); height: 100%; background: var(--teal); }
+.filter-audit-row small { color: #687772; font-variant-numeric: tabular-nums; }
+
 @media (max-width: 560px) {
   .eyebrow, h1 span, .status-dock div { display: none; }
   .topbar { padding-inline: 8px; }
@@ -659,6 +692,23 @@ h1 span { font-size: 8px; }
   background: rgba(255,255,255,.98);
   box-shadow: 0 18px 42px rgba(20,43,38,.14);
 }
+.plot-card > .context-settings { margin: 2px 2px 5px auto; }
+.plot-card > .context-settings[open] { width: calc(100% - 4px); }
+.plot-card > .context-settings > .context-settings-panel {
+  position: static;
+  width: 100%;
+  margin-top: 5px;
+  box-shadow: none;
+  border-color: #dde5e3;
+  background: #f8faf9;
+}
+.primary-toolbar > .context-settings[open] { flex: 1 0 100%; order: 10; margin-left: 0; }
+.primary-toolbar > .context-settings[open] > .context-settings-panel {
+  position: static;
+  width: 100%;
+  margin-top: 5px;
+  box-shadow: none;
+}
 .context-settings-panel label,
 .context-settings-panel.inline-controls label,
 .context-settings-panel.inline-controls.flow-controls label {
@@ -671,7 +721,7 @@ h1 span { font-size: 8px; }
 .window-controls { width: min(410px, calc(100vw - 40px)); }
 .playback-settings .context-settings-panel { grid-template-columns: auto minmax(180px, 1fr) auto minmax(190px, 1fr) auto; width: min(760px, calc(100vw - 40px)); }
 .playback-settings .trial-picker { min-width: 0; }
-.spatial-card .plot-toolbar:has(#playback-enabled:not(:checked)) .playback-settings { display: block; }
+.playback-toggle[aria-pressed="true"] { color: #075e55; border-color: #9dc8c0; background: #e8f5f2; }
 .segment-inspector { max-width: min(520px, calc(100% - 24px)); font-size: 8px; }
 
 .statistics-workspace {
@@ -795,6 +845,8 @@ button, input, select { letter-spacing: -.004em; }
 .explore-section[data-lens="polar"] .lens-panel[data-view="polar"],
 .explore-section[data-lens="transitions"] .lens-panel[data-view="transitions"] { display: flex; }
 .explore-section .plot-card {
+  display: flex;
+  flex-direction: column;
   height: 100%;
   min-height: 0;
   padding: 3px;
@@ -809,10 +861,12 @@ button, input, select { letter-spacing: -.004em; }
   overflow: hidden;
 }
 .explore-section .plot-card > .context-settings {
-  position: absolute;
+  position: relative;
   z-index: 26;
-  top: 48px;
-  right: 10px;
+  top: auto;
+  right: auto;
+  align-self: flex-end;
+  margin: 4px;
 }
 .explore-section .context-settings > summary {
   min-height: 25px;
@@ -824,12 +878,13 @@ button, input, select { letter-spacing: -.004em; }
   font-size: 8px;
 }
 .explore-section .primary-toolbar {
-  position: absolute;
+  position: relative;
   z-index: 24;
-  top: 48px;
-  left: 10px;
-  width: auto;
-  max-width: calc(100% - 150px);
+  top: auto;
+  left: auto;
+  width: calc(100% - 8px);
+  max-width: none;
+  margin: 4px;
   min-height: 27px;
   padding: 3px 5px;
   overflow: visible;
@@ -837,7 +892,7 @@ button, input, select { letter-spacing: -.004em; }
   border-radius: 8px;
   background: rgba(255,255,255,.88);
   box-shadow: 0 3px 10px rgba(20,43,38,.04);
-  backdrop-filter: blur(8px);
+  backdrop-filter: none;
 }
 .explore-section .primary-toolbar > label:not(.check),
 .explore-section .primary-toolbar > output,

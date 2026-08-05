@@ -311,6 +311,69 @@ function drawPanelWindows(ctx, width, height, data, view) {
   ctx.restore();
 }
 
+function drawMirrorGuide(ctx, width, height, data, view, guide) {
+  if (!guide || !Number.isFinite(Number(guide.coordinate))) return;
+  const layout = panelLayout(width, height, data?.panelCount || 1, data?.columns || 0);
+  ctx.save();
+  ctx.strokeStyle = "rgba(191,91,60,.68)";
+  ctx.fillStyle = "rgba(153,67,43,.82)";
+  ctx.lineWidth = 1.25;
+  ctx.setLineDash([7, 5]);
+  ctx.font = "700 8px Inter, system-ui";
+  for (let panel = 0; panel < (data?.panelCount || 1); panel += 1) {
+    const pane = panelPane(layout, panel);
+    const shown = equalScaleView(view, pane);
+    if (guide.axis === "z") {
+      const y = pane.bottom - (guide.coordinate - shown.zmin) / (shown.zmax - shown.zmin) * pane.height;
+      if (y < pane.top || y > pane.bottom) continue;
+      ctx.beginPath(); ctx.moveTo(pane.left, y); ctx.lineTo(pane.right, y); ctx.stroke();
+      ctx.fillText(`mirror Z ${formatNumber(guide.coordinate, 1)}`, pane.left + 5, y - 12);
+    } else {
+      const x = pane.left + (guide.coordinate - shown.xmin) / (shown.xmax - shown.xmin) * pane.width;
+      if (x < pane.left || x > pane.right) continue;
+      ctx.beginPath(); ctx.moveTo(x, pane.top); ctx.lineTo(x, pane.bottom); ctx.stroke();
+      ctx.save(); ctx.translate(x + 10, pane.top + 5); ctx.rotate(Math.PI / 2);
+      ctx.fillText(`mirror X ${formatNumber(guide.coordinate, 1)}`, 0, 0); ctx.restore();
+    }
+  }
+  ctx.restore();
+}
+
+function drawGridMarginals(ctx, width, height, data, view, visible) {
+  if (!visible || !data?.nx || !data?.nz) return;
+  const values = data.count || data.abundance || data.entered;
+  if (!values) return;
+  const layout = panelLayout(width, height, data.panelCount, data.columns);
+  const cells = data.nx * data.nz;
+  ctx.save();
+  ctx.fillStyle = "rgba(12,112,102,.18)";
+  ctx.strokeStyle = "rgba(12,112,102,.42)";
+  ctx.lineWidth = .75;
+  for (let panel = 0; panel < data.panelCount; panel += 1) {
+    const pane = panelPane(layout, panel);
+    const xSums = new Float64Array(data.nx), zSums = new Float64Array(data.nz);
+    for (let iz = 0; iz < data.nz; iz += 1) for (let ix = 0; ix < data.nx; ix += 1) {
+      const value = Number(values[panel * cells + iz * data.nx + ix]) || 0;
+      xSums[ix] += value; zSums[iz] += value;
+    }
+    const xMax = Math.max(1, ...xSums), zMax = Math.max(1, ...zSums);
+    const topH = Math.min(26, pane.height * .09), rightW = Math.min(26, pane.width * .06);
+    ctx.beginPath(); ctx.moveTo(pane.left, pane.top);
+    for (let ix = 0; ix < data.nx; ix += 1) {
+      const x = pane.left + (ix + .5) / data.nx * pane.width;
+      ctx.lineTo(x, pane.top + topH * (1 - xSums[ix] / xMax));
+    }
+    ctx.lineTo(pane.right, pane.top); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pane.right, pane.bottom);
+    for (let iz = 0; iz < data.nz; iz += 1) {
+      const y = pane.bottom - (iz + .5) / data.nz * pane.height;
+      ctx.lineTo(pane.right - rightW * zSums[iz] / zMax, y);
+    }
+    ctx.lineTo(pane.right, pane.top); ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+
 function installResize(renderer) {
   renderer._resizeObserver = new ResizeObserver(entries => {
     const rect = entries[0]?.contentRect;
@@ -462,6 +525,9 @@ function installSpatialInteraction(renderer, canvas) {
   canvas.addEventListener("pointerleave", () => { if (!drag) tooltip.hidden = true; });
   canvas.addEventListener("wheel", event => {
     if (!renderer.data || !renderer.view) return;
+    // Ordinary wheel/trackpad movement belongs to the document. Spatial zoom
+    // is deliberate: pinch (reported as ctrlKey) or Alt/Meta + wheel.
+    if (!event.ctrlKey && !event.metaKey && !event.altKey) return;
     event.preventDefault();
     const rect = canvas.getBoundingClientRect();
     if (renderer.isControlOverlay?.(event.clientX - rect.left, event.clientY - rect.top)) return;
@@ -501,6 +567,8 @@ class SpatialBase {
     this.roisVisible = true;
     this.gridVisible = true;
     this.cleanMode = false;
+    this.marginalsVisible = false;
+    this.mirrorGuide = null;
   }
   setRoisVisible(value) {
     const next = !!value;
@@ -519,6 +587,17 @@ class SpatialBase {
     if (next === this.cleanMode) return;
     this.cleanMode = next;
     this.draw();
+  }
+  setMarginalsVisible(value) {
+    const next = !!value;
+    if (next === this.marginalsVisible) return;
+    this.marginalsVisible = next;
+    this.draw();
+  }
+  setMirrorGuide(guide) {
+    this.mirrorGuide = guide && Number.isFinite(Number(guide.coordinate))
+      ? {axis: guide.axis === "z" ? "z" : "x", coordinate: Number(guide.coordinate)} : null;
+    if (typeof this.drawOverlay === "function") this.drawOverlay(); else this.draw();
   }
   setColumns(columns) {
     if (!this.data) return;
@@ -772,10 +851,45 @@ export class TrajectoryRenderer extends SpatialBase {
       this.segmentMinZ[segment] = Math.min(this.segmentMinZ[segment], z0, z1);
       this.segmentMaxZ[segment] = Math.max(this.segmentMaxZ[segment], z0, z1);
     }
+    this.hoverBins = 64; this.hoverBuckets = new Map(); this.hoverBounds = squareBounds(data.bounds);
+    const xSpan = Math.max(1e-9, this.hoverBounds.xmax - this.hoverBounds.xmin);
+    const zSpan = Math.max(1e-9, this.hoverBounds.zmax - this.hoverBounds.zmin);
+    for (let link = 0; link < data.links; link += 1) {
+      const vertex = link * 4, panel = data.panels[link * 2];
+      const x = (data.vertices[vertex] + data.vertices[vertex + 2]) / 2;
+      const z = (data.vertices[vertex + 1] + data.vertices[vertex + 3]) / 2;
+      const ix = Math.max(0, Math.min(this.hoverBins - 1, Math.floor((x - this.hoverBounds.xmin) / xSpan * this.hoverBins)));
+      const iz = Math.max(0, Math.min(this.hoverBins - 1, Math.floor((z - this.hoverBounds.zmin) / zSpan * this.hoverBins)));
+      const key = `${panel}|${ix}|${iz}`, bucket = this.hoverBuckets.get(key) || [];
+      if (bucket.length < 180) bucket.push(link);
+      this.hoverBuckets.set(key, bucket);
+    }
     this.ringEnabled = false;
     this._uploadRingEntries();
     if (!preserveView || !this.view) this.view = squareBounds(data.bounds);
     this.draw();
+  }
+  tooltipText(point) {
+    if (!this.data?.segmentLabels || !this.hoverBuckets || !this.view) return null;
+    const xSpan = Math.max(1e-9, this.hoverBounds.xmax - this.hoverBounds.xmin);
+    const zSpan = Math.max(1e-9, this.hoverBounds.zmax - this.hoverBounds.zmin);
+    const ix = Math.floor((point.x - this.hoverBounds.xmin) / xSpan * this.hoverBins);
+    const iz = Math.floor((point.z - this.hoverBounds.zmin) / zSpan * this.hoverBins);
+    let best = -1, bestDistance = ((this.view.xmax - this.view.xmin) * .014) ** 2;
+    for (let dz = -1; dz <= 1; dz += 1) for (let dx = -1; dx <= 1; dx += 1) {
+      for (const link of this.hoverBuckets.get(`${point.panel}|${ix + dx}|${iz + dz}`) || []) {
+        const vertex = link * 4;
+        const x0 = this.data.vertices[vertex], z0 = this.data.vertices[vertex + 1];
+        const x1 = this.data.vertices[vertex + 2], z1 = this.data.vertices[vertex + 3];
+        const vx = x1 - x0, vz = z1 - z0, length2 = vx * vx + vz * vz;
+        const t = length2 > 0 ? Math.max(0, Math.min(1, ((point.x - x0) * vx + (point.z - z0) * vz) / length2)) : 0;
+        const distance = (point.x - x0 - vx * t) ** 2 + (point.z - z0 - vz * t) ** 2;
+        if (distance < bestDistance) { bestDistance = distance; best = link; }
+      }
+    }
+    if (best < 0) return `${this.data.panelNames?.[point.panel] || "All"} · X ${formatNumber(point.x, 1)} · Z ${formatNumber(point.z, 1)}`;
+    const segment = this.data.segments[best * 2];
+    return `${this.data.segmentLabels[segment]} · X ${formatNumber(point.x, 1)} · Z ${formatNumber(point.z, 1)}`;
   }
   _uploadRingEntries() {
     const gl = this.gl;
@@ -804,16 +918,15 @@ export class TrajectoryRenderer extends SpatialBase {
     this.ringEntries.fill(-1);
     let matches = this.ringEnabled ? 0 : (this.data.visibleSegments || 0);
     if (this.ringEnabled) {
-      const hitTimes = active.map(() => {
-        const values = new Float32Array(this.ringEntries.length); values.fill(-1); return values;
-      });
       for (let segment = 0; segment < this.ringEntries.length; segment += 1) {
         const first = this.segmentLinkStart[segment], end = this.segmentLinkEnd[segment];
         if (first < 0 || end <= first) continue;
+        let entry = match === "all" ? -Infinity : Infinity, reached = 0;
         for (let index = 0; index < active.length; index += 1) {
           const ring = active[index];
           if (this.segmentMaxX[segment] < ring.x - ring.r || this.segmentMinX[segment] > ring.x + ring.r
               || this.segmentMaxZ[segment] < ring.z - ring.r || this.segmentMinZ[segment] > ring.z + ring.r) continue;
+          let ringEntry = -1;
           for (let link = first; link < end; link += 1) {
             const vertex = link * 4, time = link * 2;
             const fraction = circleEntryFraction(
@@ -821,17 +934,15 @@ export class TrajectoryRenderer extends SpatialBase {
               this.data.vertices[vertex + 2], this.data.vertices[vertex + 3], ring,
             );
             if (fraction == null) continue;
-            hitTimes[index][segment] = this.data.times[time]
+            ringEntry = this.data.times[time]
               + fraction * (this.data.times[time + 1] - this.data.times[time]);
             break;
           }
-        }
-      }
-      for (let segment = 0; segment < this.ringEntries.length; segment += 1) {
-        let entry = match === "all" ? -Infinity : Infinity, reached = 0;
-        for (const values of hitTimes) if (values[segment] >= 0) {
-          reached += 1;
-          entry = match === "all" ? Math.max(entry, values[segment]) : Math.min(entry, values[segment]);
+          if (ringEntry >= 0) {
+            reached += 1;
+            entry = match === "all" ? Math.max(entry, ringEntry) : Math.min(entry, ringEntry);
+          }
+          if (match !== "all" && reached) break;
         }
         const qualifies = match === "all" ? reached === active.length : reached > 0;
         if (qualifies) { this.ringEntries[segment] = entry; matches += 1; }
@@ -931,6 +1042,35 @@ export class TrajectoryRenderer extends SpatialBase {
       drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
       drawPanelRings(this.ctx, this.width, this.height, this.data, this.view);
       drawPanelWindows(this.ctx, this.width, this.height, this.data, this.view);
+      if (this.marginalsVisible && this.data.vertices?.length) {
+        const bins = 42;
+        const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+        const xCounts = Array.from({length: this.data.panelCount}, () => new Uint32Array(bins));
+        const zCounts = Array.from({length: this.data.panelCount}, () => new Uint32Array(bins));
+        const stride = Math.max(1, Math.ceil(this.data.links / 60000));
+        for (let link = 0; link < this.data.links; link += stride) {
+          const panel = this.data.panels[link * 2], vertex = link * 4;
+          const pane = panelPane(layout, panel), shown = equalScaleView(this.view, pane);
+          const x = this.data.vertices[vertex + 2], z = this.data.vertices[vertex + 3];
+          const ix = Math.floor((x - shown.xmin) / (shown.xmax - shown.xmin) * bins);
+          const iz = Math.floor((z - shown.zmin) / (shown.zmax - shown.zmin) * bins);
+          if (ix >= 0 && ix < bins) xCounts[panel][ix] += 1;
+          if (iz >= 0 && iz < bins) zCounts[panel][iz] += 1;
+        }
+        this.ctx.save(); this.ctx.fillStyle = "rgba(12,112,102,.16)"; this.ctx.strokeStyle = "rgba(12,112,102,.4)";
+        for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+          const pane = panelPane(layout, panel), xMax = Math.max(1, ...xCounts[panel]), zMax = Math.max(1, ...zCounts[panel]);
+          const h = Math.min(26, pane.height * .09), w = Math.min(26, pane.width * .06);
+          this.ctx.beginPath(); this.ctx.moveTo(pane.left, pane.top);
+          for (let i = 0; i < bins; i += 1) this.ctx.lineTo(pane.left + (i + .5) / bins * pane.width, pane.top + h * (1 - xCounts[panel][i] / xMax));
+          this.ctx.lineTo(pane.right, pane.top); this.ctx.closePath(); this.ctx.fill(); this.ctx.stroke();
+          this.ctx.beginPath(); this.ctx.moveTo(pane.right, pane.bottom);
+          for (let i = 0; i < bins; i += 1) this.ctx.lineTo(pane.right - w * zCounts[panel][i] / zMax, pane.bottom - (i + .5) / bins * pane.height);
+          this.ctx.lineTo(pane.right, pane.top); this.ctx.closePath(); this.ctx.fill(); this.ctx.stroke();
+        }
+        this.ctx.restore();
+      }
+      drawMirrorGuide(this.ctx, this.width, this.height, this.data, this.view, this.mirrorGuide);
     }
   }
   snapshotDataUrl(exportWidth = 1200, exportHeight = 700) {
@@ -1031,6 +1171,8 @@ class CanvasSpatialRenderer extends SpatialBase {
     drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
     drawPanelRings(this.ctx, this.width, this.height, this.data, this.view);
     drawPanelWindows(this.ctx, this.width, this.height, this.data, this.view);
+    drawGridMarginals(this.ctx, this.width, this.height, this.data, this.view, this.marginalsVisible);
+    drawMirrorGuide(this.ctx, this.width, this.height, this.data, this.view, this.mirrorGuide);
   }
 }
 
@@ -1211,11 +1353,22 @@ export class TransitionRenderer extends HeatmapRenderer {
   constructor(host, onViewChange) {
     super(host, onViewChange);
     this.visualOptions = {outcome: "crossed", display: "fraction", minimumSupport: 5};
+    this.trajectoryOverlay = null;
+    this.overlaySegments = new Set();
   }
   setVisualOptions(options = {}) {
     Object.assign(this.visualOptions, options);
     this.buildTextures();
     this.draw();
+  }
+  setTrajectoryOverlay(trajectory, segmentCodes = []) {
+    this.trajectoryOverlay = trajectory || null;
+    this.overlaySegments = new Set((segmentCodes || []).map(Number));
+    this.draw();
+  }
+  clearTrajectoryOverlay() {
+    if (!this.overlaySegments.size) return;
+    this.overlaySegments.clear(); this.draw();
   }
   cellAt(point) {
     if (!this.data) return null;
@@ -1241,17 +1394,42 @@ export class TransitionRenderer extends HeatmapRenderer {
   }
   draw() {
     super.draw();
-    if (!this.data || !this.view || !Number.isFinite(this.data.split)) return;
+    if (!this.data || !this.view) return;
     const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+    if (this.overlaySegments.size && this.trajectoryOverlay?.vertices) {
+      const trajectory = this.trajectoryOverlay;
+      this.ctx.save(); this.ctx.lineWidth = 1.7; this.ctx.lineCap = "round";
+      this.ctx.strokeStyle = "rgba(20,42,37,.78)";
+      for (let link = 0; link < trajectory.links; link += 1) {
+        const segment = trajectory.segments[link * 2];
+        if (!this.overlaySegments.has(segment)) continue;
+        const panel = trajectory.panels[link * 2];
+        if (panel >= this.data.panelCount) continue;
+        const pane = this.pane(panel, layout), vertex = link * 4;
+        const [x0, y0] = this.worldToPixel(trajectory.vertices[vertex], trajectory.vertices[vertex + 1], pane);
+        const [x1, y1] = this.worldToPixel(trajectory.vertices[vertex + 2], trajectory.vertices[vertex + 3], pane);
+        this.ctx.beginPath(); this.ctx.moveTo(x0, y0); this.ctx.lineTo(x1, y1); this.ctx.stroke();
+      }
+      this.ctx.restore();
+    }
+    if (!Number.isFinite(this.data.split)) return;
     this.ctx.save(); this.ctx.strokeStyle = "rgba(31,49,44,.72)";
     this.ctx.lineWidth = 1.25; this.ctx.setLineDash([5, 4]);
     this.ctx.font = "700 8px Inter, system-ui"; this.ctx.fillStyle = "rgba(31,49,44,.76)";
     for (let panel = 0; panel < this.data.panelCount; panel += 1) {
       const pane = this.pane(panel, layout);
-      const [, y] = this.worldToPixel((this.view.xmin + this.view.xmax) / 2, this.data.split, pane);
-      if (y < pane.top || y > pane.bottom) continue;
-      this.ctx.beginPath(); this.ctx.moveTo(pane.left, y); this.ctx.lineTo(pane.right, y); this.ctx.stroke();
-      this.ctx.fillText(`split Z ${formatNumber(this.data.split, 1)}`, pane.left + 5, y - 5);
+      if (this.data.axis === "x") {
+        const [x] = this.worldToPixel(this.data.split, (this.view.zmin + this.view.zmax) / 2, pane);
+        if (x < pane.left || x > pane.right) continue;
+        this.ctx.beginPath(); this.ctx.moveTo(x, pane.top); this.ctx.lineTo(x, pane.bottom); this.ctx.stroke();
+        this.ctx.save(); this.ctx.translate(x + 9, pane.top + 5); this.ctx.rotate(Math.PI / 2);
+        this.ctx.fillText(`split X ${formatNumber(this.data.split, 1)}`, 0, 0); this.ctx.restore();
+      } else {
+        const [, y] = this.worldToPixel((this.view.xmin + this.view.xmax) / 2, this.data.split, pane);
+        if (y < pane.top || y > pane.bottom) continue;
+        this.ctx.beginPath(); this.ctx.moveTo(pane.left, y); this.ctx.lineTo(pane.right, y); this.ctx.stroke();
+        this.ctx.fillText(`split Z ${formatNumber(this.data.split, 1)}`, pane.left + 5, y - 5);
+      }
     }
     this.ctx.restore();
   }

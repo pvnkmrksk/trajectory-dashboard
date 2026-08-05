@@ -35,19 +35,22 @@ Apache ECharts for mature hover, zoom, legend, and export interactions. Pan and
 zoom are shared locally between all Cartesian spatial layers. Curtain rings can
 be moved or resized directly on any of them and become one exact analytical
 subset for every downstream view. Sparse per-segment occupancy/direction
-contributions keep live curtain previews incremental; the compact overview can
-show four pooled representations or every treatment panel. The generic
+contributions keep settled aggregate curtain updates incremental, while Paths
+stays entirely local during a drag; the compact overview can show four pooled
+representations or every treatment panel. The generic
 raw-channel explorer has been removed.
 
 Config labels use the target geometry rather than trusting filename order:
 negative Unity X is shown as Left and positive X as Right. When the metadata
 confirms a reflected left/right control pair, **Pool mirrored L/R controls**
 puts both into one reference frame by reflecting X and heading (Z and time are
-unchanged). This mapping is included in captured view-recipe JSON. Category
-subsets use checklists with All/None controls. PNG and offline-report figures
+unchanged). A manual match editor can pair treatments explicitly, choose an X
+or Z reflection line, and preview that line on every spatial layer. This
+mapping is included in the URL and captured view-recipe JSON. Category
+subsets use checklists with All/None/Invert controls. PNG and offline-report figures
 are captured in a fixed two-column, 16:9 presentation grid at a minimum of
 1600 x 900 pixels per treatment panel, independent of the current browser
-viewport.
+viewport; the HTML report retains local pan/zoom and an animated flow field.
 
 The behavioral contract and the distinction between scientific requirements
 and old framework artifacts are in
