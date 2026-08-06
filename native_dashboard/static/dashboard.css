@@ -718,6 +718,12 @@ h1 span { font-size: 8px; }
 }
 .context-settings-panel .scrubber { grid-column: 1 / -1; width: 100%; }
 .context-settings-panel .span-two { grid-column: 1 / -1; color: #263530; font-size: 9px; }
+.context-settings-panel.flow-controls,
+.context-settings-panel.transition-controls {
+  grid-template-columns: repeat(auto-fit, minmax(106px, 1fr));
+  align-items: end;
+}
+.context-settings-panel.flow-controls { max-height: min(240px, calc(100vh - 150px)); overflow-y: auto; }
 .window-controls { width: min(410px, calc(100vw - 40px)); }
 .playback-settings .context-settings-panel { grid-template-columns: auto minmax(180px, 1fr) auto minmax(190px, 1fr) auto; width: min(760px, calc(100vw - 40px)); }
 .playback-settings .trial-picker { min-width: 0; }
@@ -738,12 +744,18 @@ h1 span { font-size: 8px; }
 .statistics-card table { width: 100%; margin-top: 8px; border-collapse: collapse; font-size: 9px; }
 .statistics-card th, .statistics-card td { padding: 5px 6px; border-top: 1px solid #edf1f0; text-align: left; }
 .statistics-card th { color: var(--muted); font-size: 8px; font-weight: 700; }
+.filter-statistics-card { grid-column: 1 / -1; }
+.filter-statistics-card table { table-layout: fixed; }
+.filter-statistics-card th:first-child,
+.filter-statistics-card td:first-child { width: 32%; }
 .stat-pill { display: inline-flex; min-width: 42px; justify-content: center; padding: 2px 5px; border-radius: 999px; color: #56635f; background: #eef2f1; font-variant-numeric: tabular-nums; }
 .stat-pill.significant { color: #086056; background: #e3f3ef; }
 
 .section-heading .transition-controls { display: flex; margin-left: auto; }
 .transition-controls label { width: 130px; }
 .transition-controls input, .transition-controls select { min-height: 24px; }
+#heading-section .section-heading { justify-content: flex-end; }
+#heading-section .section-heading .context-settings { margin-left: auto; }
 
 .plot-section.nav-forward.active-section { animation: rail-forward .2s cubic-bezier(.2,.7,.2,1); }
 .plot-section.nav-back.active-section { animation: rail-back .2s cubic-bezier(.2,.7,.2,1); }

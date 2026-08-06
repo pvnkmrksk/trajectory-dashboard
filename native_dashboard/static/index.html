@@ -291,7 +291,7 @@
             <span class="segment-inspector" id="segment-inspector">Click near a path to inspect its exact segment.</span>
           </div>
           <div class="plot-host large" id="trajectory-plot" aria-label="Trajectory plot"></div>
-          <div class="plot-hint">Drag to pan · pinch or Alt/⌘ + wheel to zoom · ordinary wheel scrolls the page · double-click resets · drag a ring centre or edge · one X unit = one Z unit</div>
+          <div class="plot-hint">Drag to pan · wheel or pinch to zoom · Shift + wheel scrolls the page · double-click resets · drag a ring centre or edge · one X unit = one Z unit</div>
         </div>
       </article>
 
@@ -322,7 +322,7 @@
             <label>Direction source<select id="angle-source" data-scope="movement" title="Body orientation uses the recorded facing angle; movement heading uses successive X/Z positions."><option value="orientation">Body orientation</option><option value="movement">Movement heading</option></select></label>
             <label>Abundance<select id="flow-metric"><option value="count">Samples</option><option value="time">Seconds</option></select></label>
             <label>Colour encoding<select id="flow-color-mode" title="Direction uses a perceptually balanced cyclic hue; neutral removes hue as an encoding."><option value="direction">Direction hue</option><option value="neutral">Neutral</option></select></label>
-            <label>Particle motion<select id="flow-velocity-mode" title="Measured velocity uses the mean recorded velocity per cell; illustrative normalises motion for legibility."><option value="measured">Measured velocity</option><option value="illustrative">Illustrative</option></select></label>
+            <label>Particle motion<select id="flow-velocity-mode" title="Illustrative motion emphasizes abundance and directedness; measured velocity uses the recorded mean velocity per cell."><option value="illustrative" selected>Illustrative</option><option value="measured">Measured velocity</option></select></label>
             <label>Limits<select id="flow-range-mode"><option value="percentile">Percentiles</option><option value="absolute">Values</option></select></label>
             <label>Minimum<input id="flow-cmin" type="number" step="0.1" value="0"></label>
             <label>Maximum<input id="flow-cmax" type="number" step="0.1" value="99"></label>
@@ -359,6 +359,8 @@
             <label>Minimum support<input id="transition-support" type="number" min="1" step="1" value="5"></label>
             <label>Split axis<select id="transition-axis"><option value="z">Z · forward/back</option><option value="x">X · left/right</option></select></label>
             <label><span id="transition-split-label">Split Z</span><input id="transition-split" type="number" step="0.1" placeholder="Auto" title="Coordinate dividing the two spatial halves; Auto estimates it from trial starts."></label>
+            <label>Selected path width<input id="transition-path-width" type="range" min="0.4" max="4" step="0.1" value="1.4"></label>
+            <label>Selected path opacity<input id="transition-path-opacity" type="range" min="0.05" max="1" step="0.05" value="0.42"></label>
           </div></details>
           <div class="plot-host" id="transition-plot" aria-label="Transition probability observer"></div>
         </div>

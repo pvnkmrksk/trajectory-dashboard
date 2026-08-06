@@ -339,39 +339,71 @@ function drawMirrorGuide(ctx, width, height, data, view, guide) {
   ctx.restore();
 }
 
+function drawMarginalProfiles(ctx, pane, xValues, zValues) {
+  const xMax = Math.max(1, ...xValues), zMax = Math.max(1, ...zValues);
+  const topH = Math.min(34, Math.max(22, pane.height * .105));
+  const rightW = Math.min(34, Math.max(22, pane.width * .07));
+  ctx.save();
+  ctx.fillStyle = "rgba(252,253,253,.92)";
+  ctx.fillRect(pane.left, pane.top, pane.width, topH);
+  ctx.fillRect(pane.right - rightW, pane.top, rightW, pane.height);
+  ctx.strokeStyle = "rgba(35,67,60,.18)";
+  ctx.lineWidth = .75;
+  ctx.beginPath(); ctx.moveTo(pane.left, pane.top + topH); ctx.lineTo(pane.right, pane.top + topH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(pane.right - rightW, pane.top); ctx.lineTo(pane.right - rightW, pane.bottom); ctx.stroke();
+  const xStep = pane.width / Math.max(1, xValues.length);
+  ctx.fillStyle = "rgba(13,116,106,.30)";
+  for (let index = 0; index < xValues.length; index += 1) {
+    const height = (topH - 4) * xValues[index] / xMax;
+    if (height > 0) ctx.fillRect(pane.left + index * xStep + .25, pane.top + topH - height,
+      Math.max(.5, xStep - .5), height);
+  }
+  const zStep = pane.height / Math.max(1, zValues.length);
+  for (let index = 0; index < zValues.length; index += 1) {
+    const barWidth = (rightW - 4) * zValues[index] / zMax;
+    if (barWidth > 0) ctx.fillRect(pane.right - barWidth, pane.bottom - (index + 1) * zStep + .25,
+      barWidth, Math.max(.5, zStep - .5));
+  }
+  ctx.fillStyle = "rgba(38,61,55,.62)";
+  ctx.font = "700 7px Inter, system-ui";
+  ctx.textBaseline = "top";
+  ctx.fillText("X marginal", pane.left + 4, pane.top + 3);
+  ctx.save(); ctx.translate(pane.right - 3, pane.bottom - 4); ctx.rotate(-Math.PI / 2);
+  ctx.fillText("Z marginal", 0, 0); ctx.restore();
+  ctx.restore();
+}
+
 function drawGridMarginals(ctx, width, height, data, view, visible) {
   if (!visible || !data?.nx || !data?.nz) return;
   const values = data.count || data.abundance || data.entered;
   if (!values) return;
   const layout = panelLayout(width, height, data.panelCount, data.columns);
   const cells = data.nx * data.nz;
-  ctx.save();
-  ctx.fillStyle = "rgba(12,112,102,.18)";
-  ctx.strokeStyle = "rgba(12,112,102,.42)";
-  ctx.lineWidth = .75;
   for (let panel = 0; panel < data.panelCount; panel += 1) {
     const pane = panelPane(layout, panel);
+    const shown = equalScaleView(view, pane);
     const xSums = new Float64Array(data.nx), zSums = new Float64Array(data.nz);
-    for (let iz = 0; iz < data.nz; iz += 1) for (let ix = 0; ix < data.nx; ix += 1) {
+    for (let iz = 0; iz < data.nz; iz += 1) {
+      const z = data.z0 + (iz + .5) * data.bin;
+      if (z < shown.zmin || z > shown.zmax) continue;
+      for (let ix = 0; ix < data.nx; ix += 1) {
+      const x = data.x0 + (ix + .5) * data.bin;
+      if (x < shown.xmin || x > shown.xmax) continue;
       const value = Number(values[panel * cells + iz * data.nx + ix]) || 0;
       xSums[ix] += value; zSums[iz] += value;
+      }
     }
-    const xMax = Math.max(1, ...xSums), zMax = Math.max(1, ...zSums);
-    const topH = Math.min(26, pane.height * .09), rightW = Math.min(26, pane.width * .06);
-    ctx.beginPath(); ctx.moveTo(pane.left, pane.top);
+    const xVisible = [], zVisible = [];
     for (let ix = 0; ix < data.nx; ix += 1) {
-      const x = pane.left + (ix + .5) / data.nx * pane.width;
-      ctx.lineTo(x, pane.top + topH * (1 - xSums[ix] / xMax));
+      const x = data.x0 + (ix + .5) * data.bin;
+      if (x >= shown.xmin && x <= shown.xmax) xVisible.push(xSums[ix]);
     }
-    ctx.lineTo(pane.right, pane.top); ctx.closePath(); ctx.fill(); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(pane.right, pane.bottom);
     for (let iz = 0; iz < data.nz; iz += 1) {
-      const y = pane.bottom - (iz + .5) / data.nz * pane.height;
-      ctx.lineTo(pane.right - rightW * zSums[iz] / zMax, y);
+      const z = data.z0 + (iz + .5) * data.bin;
+      if (z >= shown.zmin && z <= shown.zmax) zVisible.push(zSums[iz]);
     }
-    ctx.lineTo(pane.right, pane.top); ctx.closePath(); ctx.fill(); ctx.stroke();
+    drawMarginalProfiles(ctx, pane, xVisible, zVisible);
   }
-  ctx.restore();
 }
 
 function installResize(renderer) {
@@ -525,14 +557,14 @@ function installSpatialInteraction(renderer, canvas) {
   canvas.addEventListener("pointerleave", () => { if (!drag) tooltip.hidden = true; });
   canvas.addEventListener("wheel", event => {
     if (!renderer.data || !renderer.view) return;
-    // Ordinary wheel/trackpad movement belongs to the document. Spatial zoom
-    // is deliberate: pinch (reported as ctrlKey) or Alt/Meta + wheel.
-    if (!event.ctrlKey && !event.metaKey && !event.altKey) return;
-    event.preventDefault();
+    // The plotting surface owns the wheel for direct zoom. Shift+wheel is the
+    // explicit page-scroll escape for tall panel grids.
+    if (event.shiftKey) return;
     const rect = canvas.getBoundingClientRect();
     if (renderer.isControlOverlay?.(event.clientX - rect.left, event.clientY - rect.top)) return;
     const point = renderer.pixelToWorld(event.clientX - rect.left, event.clientY - rect.top);
     if (!point) return;
+    event.preventDefault();
     const factor = Math.exp(Math.max(-700, Math.min(700, event.deltaY)) * .0011);
     const view = renderer.view;
     renderer.setView({
@@ -1052,23 +1084,19 @@ export class TrajectoryRenderer extends SpatialBase {
           const panel = this.data.panels[link * 2], vertex = link * 4;
           const pane = panelPane(layout, panel), shown = equalScaleView(this.view, pane);
           const x = this.data.vertices[vertex + 2], z = this.data.vertices[vertex + 3];
+          const segment = this.data.segments?.[link * 2];
+          if (x < shown.xmin || x > shown.xmax || z < shown.zmin || z > shown.zmax) continue;
+          if (this.ringEnabled && Number.isFinite(segment) && this.ringEntries[segment] < 0) continue;
+          if (this.data.samples?.[link * 2] > this.fraction || this.data.times?.[link * 2] > this.timeLimit) continue;
+          if (this.visibility?.[link] === 0) continue;
           const ix = Math.floor((x - shown.xmin) / (shown.xmax - shown.xmin) * bins);
           const iz = Math.floor((z - shown.zmin) / (shown.zmax - shown.zmin) * bins);
           if (ix >= 0 && ix < bins) xCounts[panel][ix] += 1;
           if (iz >= 0 && iz < bins) zCounts[panel][iz] += 1;
         }
-        this.ctx.save(); this.ctx.fillStyle = "rgba(12,112,102,.16)"; this.ctx.strokeStyle = "rgba(12,112,102,.4)";
         for (let panel = 0; panel < this.data.panelCount; panel += 1) {
-          const pane = panelPane(layout, panel), xMax = Math.max(1, ...xCounts[panel]), zMax = Math.max(1, ...zCounts[panel]);
-          const h = Math.min(26, pane.height * .09), w = Math.min(26, pane.width * .06);
-          this.ctx.beginPath(); this.ctx.moveTo(pane.left, pane.top);
-          for (let i = 0; i < bins; i += 1) this.ctx.lineTo(pane.left + (i + .5) / bins * pane.width, pane.top + h * (1 - xCounts[panel][i] / xMax));
-          this.ctx.lineTo(pane.right, pane.top); this.ctx.closePath(); this.ctx.fill(); this.ctx.stroke();
-          this.ctx.beginPath(); this.ctx.moveTo(pane.right, pane.bottom);
-          for (let i = 0; i < bins; i += 1) this.ctx.lineTo(pane.right - w * zCounts[panel][i] / zMax, pane.bottom - (i + .5) / bins * pane.height);
-          this.ctx.lineTo(pane.right, pane.top); this.ctx.closePath(); this.ctx.fill(); this.ctx.stroke();
+          drawMarginalProfiles(this.ctx, panelPane(layout, panel), xCounts[panel], zCounts[panel]);
         }
-        this.ctx.restore();
       }
       drawMirrorGuide(this.ctx, this.width, this.height, this.data, this.view, this.mirrorGuide);
     }
@@ -1352,7 +1380,10 @@ export class HeatmapRenderer extends CanvasSpatialRenderer {
 export class TransitionRenderer extends HeatmapRenderer {
   constructor(host, onViewChange) {
     super(host, onViewChange);
-    this.visualOptions = {outcome: "crossed", display: "fraction", minimumSupport: 5};
+    this.visualOptions = {
+      outcome: "crossed", display: "fraction", minimumSupport: 5,
+      pathWidth: 1.4, pathOpacity: .42,
+    };
     this.trajectoryOverlay = null;
     this.overlaySegments = new Set();
   }
@@ -1365,6 +1396,11 @@ export class TransitionRenderer extends HeatmapRenderer {
     this.trajectoryOverlay = trajectory || null;
     this.overlaySegments = new Set((segmentCodes || []).map(Number));
     this.draw();
+  }
+  setOverlayStyle(width, opacity) {
+    this.visualOptions.pathWidth = Math.max(.4, Math.min(4, Number(width) || 1.4));
+    this.visualOptions.pathOpacity = Math.max(.05, Math.min(1, Number(opacity) || .42));
+    if (this.overlaySegments.size) this.draw();
   }
   clearTrajectoryOverlay() {
     if (!this.overlaySegments.size) return;
@@ -1396,10 +1432,21 @@ export class TransitionRenderer extends HeatmapRenderer {
     super.draw();
     if (!this.data || !this.view) return;
     const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
-    if (this.overlaySegments.size && this.trajectoryOverlay?.vertices) {
+    const overlayActive = this.overlaySegments.size && this.trajectoryOverlay?.vertices;
+    if (overlayActive) {
+      // A selected cell becomes a raw-path inspection canvas. Suppressing the
+      // probability raster prevents dense cells from competing with the paths.
+      this.ctx.save(); this.ctx.fillStyle = "rgba(255,255,255,.98)";
+      for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+        const pane = this.pane(panel, layout);
+        this.ctx.fillRect(pane.left, pane.top, pane.width, pane.height);
+      }
+      this.ctx.restore();
       const trajectory = this.trajectoryOverlay;
-      this.ctx.save(); this.ctx.lineWidth = 1.7; this.ctx.lineCap = "round";
-      this.ctx.strokeStyle = "rgba(20,42,37,.78)";
+      this.ctx.save();
+      this.ctx.lineWidth = this.visualOptions.pathWidth;
+      this.ctx.lineCap = "round";
+      this.ctx.strokeStyle = `rgba(20,42,37,${this.visualOptions.pathOpacity})`;
       for (let link = 0; link < trajectory.links; link += 1) {
         const segment = trajectory.segments[link * 2];
         if (!this.overlaySegments.has(segment)) continue;
@@ -1412,26 +1459,33 @@ export class TransitionRenderer extends HeatmapRenderer {
       }
       this.ctx.restore();
     }
-    if (!Number.isFinite(this.data.split)) return;
-    this.ctx.save(); this.ctx.strokeStyle = "rgba(31,49,44,.72)";
-    this.ctx.lineWidth = 1.25; this.ctx.setLineDash([5, 4]);
-    this.ctx.font = "700 8px Inter, system-ui"; this.ctx.fillStyle = "rgba(31,49,44,.76)";
-    for (let panel = 0; panel < this.data.panelCount; panel += 1) {
-      const pane = this.pane(panel, layout);
-      if (this.data.axis === "x") {
-        const [x] = this.worldToPixel(this.data.split, (this.view.zmin + this.view.zmax) / 2, pane);
-        if (x < pane.left || x > pane.right) continue;
-        this.ctx.beginPath(); this.ctx.moveTo(x, pane.top); this.ctx.lineTo(x, pane.bottom); this.ctx.stroke();
-        this.ctx.save(); this.ctx.translate(x + 9, pane.top + 5); this.ctx.rotate(Math.PI / 2);
-        this.ctx.fillText(`split X ${formatNumber(this.data.split, 1)}`, 0, 0); this.ctx.restore();
-      } else {
-        const [, y] = this.worldToPixel((this.view.xmin + this.view.xmax) / 2, this.data.split, pane);
-        if (y < pane.top || y > pane.bottom) continue;
-        this.ctx.beginPath(); this.ctx.moveTo(pane.left, y); this.ctx.lineTo(pane.right, y); this.ctx.stroke();
-        this.ctx.fillText(`split Z ${formatNumber(this.data.split, 1)}`, pane.left + 5, y - 5);
+    if (Number.isFinite(this.data.split)) {
+      this.ctx.save(); this.ctx.strokeStyle = "rgba(31,49,44,.72)";
+      this.ctx.lineWidth = 1.25; this.ctx.setLineDash([5, 4]);
+      this.ctx.font = "700 8px Inter, system-ui"; this.ctx.fillStyle = "rgba(31,49,44,.76)";
+      for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+        const pane = this.pane(panel, layout);
+        if (this.data.axis === "x") {
+          const [x] = this.worldToPixel(this.data.split, (this.view.zmin + this.view.zmax) / 2, pane);
+          if (x < pane.left || x > pane.right) continue;
+          this.ctx.beginPath(); this.ctx.moveTo(x, pane.top); this.ctx.lineTo(x, pane.bottom); this.ctx.stroke();
+          this.ctx.save(); this.ctx.translate(x + 9, pane.top + 5); this.ctx.rotate(Math.PI / 2);
+          this.ctx.fillText(`split X ${formatNumber(this.data.split, 1)}`, 0, 0); this.ctx.restore();
+        } else {
+          const [, y] = this.worldToPixel((this.view.xmin + this.view.xmax) / 2, this.data.split, pane);
+          if (y < pane.top || y > pane.bottom) continue;
+          this.ctx.beginPath(); this.ctx.moveTo(pane.left, y); this.ctx.lineTo(pane.right, y); this.ctx.stroke();
+          this.ctx.fillText(`split Z ${formatNumber(this.data.split, 1)}`, pane.left + 5, y - 5);
+        }
       }
+      this.ctx.restore();
     }
-    this.ctx.restore();
+    if (overlayActive) {
+      const marginalsVisible = this.marginalsVisible;
+      this.marginalsVisible = false;
+      this.drawSharedOverlays();
+      this.marginalsVisible = marginalsVisible;
+    }
   }
   buildTextures() {
     this.textures = [];
@@ -1476,7 +1530,7 @@ export class TransitionRenderer extends HeatmapRenderer {
 
 function oklchRgb(angle) {
   const hue = (((angle % 360) + 360) % 360) * Math.PI / 180;
-  const lightness = .66, chroma = .135;
+  const lightness = .59, chroma = .145;
   const a = chroma * Math.cos(hue), b = chroma * Math.sin(hue);
   const l0 = lightness + .3963377774 * a + .2158037573 * b;
   const m0 = lightness - .1055613458 * a - .0638541728 * b;
@@ -1542,7 +1596,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     this.visualOptions = {
       particleRate: 1, trailLength: 1, speed: 1, variability: 1,
       metric: "time", clipMode: "percentile", clipMin: 0, clipMax: 99,
-      colorMode: "direction", velocityMode: "measured",
+      colorMode: "direction", velocityMode: "illustrative",
     };
     this._rng = 0x6d2b79f5;
     this._pausedUntil = 0;
@@ -1551,7 +1605,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     this._lastFrame = 0;
     this._animate = now => {
       if (this.data && this._visible && document.visibilityState === "visible"
-          && now >= this._pausedUntil && now - this._lastFrame > 35) {
+          && now >= this._pausedUntil && now - this._lastFrame > 25) {
         this.drawParticles(now);
         this._lastFrame = now;
       }
@@ -1683,13 +1737,19 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     particle.x = this.data.x0 + (ix + .08 + this._random() * .84) * this.data.bin;
     particle.z = this.data.z0 + (iz + .08 + this._random() * .84) * this.data.bin;
     particle.originX = particle.x; particle.originZ = particle.z; particle.travel = 0;
-    particle.maxTravel = this.data.bin * Math.min(1.8,
-      .55 + .48 * Math.max(.25, this.visualOptions.trailLength));
+    particle.maxTravel = this.data.bin * Math.min(4.2,
+      .9 + 1.15 * Math.max(.25, this.visualOptions.trailLength));
     particle.age = 0;
     particle.bias = this._normalRandom() * circularSigma * this.visualOptions.variability;
+    particle.emptySteps = 0;
+    particle.lastVector = {
+      angle: this.data.angle[index], strength,
+      abundance: this.abundanceValues[index] || 0,
+      meanSpeed: this.data.meanSpeed?.[index] || 0,
+    };
     const directedMass = abundanceScale * strength;
     particle.maxAge = Math.max(8, Math.round(
-      (16 + 76 * directedMass) * this.visualOptions.trailLength
+      (22 + 96 * directedMass) * this.visualOptions.trailLength
       * (.82 + this._random() * .36)
     ));
   }
@@ -1703,7 +1763,11 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
         900 / this.data.panelCount * this.visualOptions.particleRate * (.35 + .65 * relativeMass)
       )));
       for (let i = 0; i < perPanel; i += 1) {
-        const particle = {panel, x: 0, z: 0, originX: 0, originZ: 0, travel: 0, maxTravel: 1, age: -1, maxAge: 1, bias: 0};
+        const particle = {
+          panel, x: 0, z: 0, originX: 0, originZ: 0, travel: 0,
+          maxTravel: 1, age: -1, maxAge: 1, bias: 0,
+          emptySteps: 0, lastVector: null,
+        };
         this._respawn(particle, panel);
         particle.age = Math.floor(this._random() * particle.maxAge);
         this.particles.push(particle);
@@ -1773,6 +1837,8 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       const shown = equalScaleView(this.view, pane);
       this.ctx.save();
       this.ctx.beginPath(); this.ctx.rect(pane.left, pane.top, pane.right - pane.left, pane.bottom - pane.top); this.ctx.clip();
+      this.ctx.fillStyle = "#f7faf9";
+      this.ctx.fillRect(pane.left, pane.top, pane.width, pane.height);
       for (let iz = 0; iz < nz; iz += 1) {
         const z = this.data.z0 + (iz + .5) * this.data.bin;
         if (z < shown.zmin - this.data.bin || z > shown.zmax + this.data.bin) continue;
@@ -1782,23 +1848,30 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
           const index = panel * cells + iz * nx + ix;
           const count = abundance[index];
           if (!(count > 0) || !Number.isFinite(angle[index])) continue;
-          if ((ix + iz) % 2) continue;
           const [cx, cy] = this.worldToPixel(x, z, pane);
           const [x0] = this.worldToPixel(x - this.data.bin / 2, z, pane);
           const [x1] = this.worldToPixel(x + this.data.bin / 2, z, pane);
           const cellPx = Math.abs(x1 - x0);
           const abundanceScale = Math.sqrt(this._abundanceScale(count));
-          const len = cellPx * .72 * strength[index];
-          const radians = angle[index] * Math.PI / 180;
-          const dx = Math.sin(radians) * len * .5;
-          const dy = -Math.cos(radians) * len * .5;
+          const len = cellPx * (.72 + .44 * abundanceScale) * (.35 + .65 * strength[index]);
+          const sigma = Math.sqrt(Math.max(0, -2 * Math.log(Math.max(.001, Math.min(.999999, strength[index])))));
+          const strands = 1 + Math.floor(abundanceScale * 2.1);
           this.ctx.lineCap = "round";
-          this.ctx.strokeStyle = angleColor(angle[index], .035 + .11 * abundanceScale, this.visualOptions.colorMode);
-          this.ctx.lineWidth = .35 + .5 * abundanceScale;
-          this.ctx.beginPath();
-          this.ctx.moveTo(cx - dx, cy - dy);
-          this.ctx.lineTo(cx + dx, cy + dy);
-          this.ctx.stroke();
+          for (let strand = 0; strand < strands; strand += 1) {
+            const seed = Math.sin((index + 1) * 12.9898 + (strand + 1) * 78.233);
+            const localAngle = angle[index] + seed * sigma * 18 * this.visualOptions.variability;
+            const radians = localAngle * Math.PI / 180;
+            const offset = (strand - (strands - 1) / 2) * Math.min(2.4, cellPx * .13);
+            const dx = Math.sin(radians) * len * .5;
+            const dy = -Math.cos(radians) * len * .5;
+            const ox = Math.cos(radians) * offset, oy = Math.sin(radians) * offset;
+            this.ctx.strokeStyle = angleColor(localAngle, .09 + .24 * abundanceScale, this.visualOptions.colorMode);
+            this.ctx.lineWidth = .5 + .95 * abundanceScale;
+            this.ctx.beginPath();
+            this.ctx.moveTo(cx - dx + ox, cy - dy + oy);
+            this.ctx.quadraticCurveTo(cx + ox, cy + oy, cx + dx + ox, cy + dy + oy);
+            this.ctx.stroke();
+          }
         }
       }
       this.ctx.restore();
@@ -1814,7 +1887,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     this._particleTime = now;
     ctx.setTransform(this.particleDpr || 1, 0, 0, this.particleDpr || 1, 0, 0);
     ctx.globalCompositeOperation = "destination-out";
-    const fade = Math.max(.025, Math.min(.24, .11 / Math.max(.25, this.visualOptions.trailLength)));
+    const fade = Math.max(.018, Math.min(.16, .065 / Math.max(.25, this.visualOptions.trailLength)));
     ctx.fillStyle = `rgba(0,0,0,${fade})`;
     ctx.fillRect(0, 0, this.width, this.height);
     ctx.globalCompositeOperation = "source-over";
@@ -1824,8 +1897,16 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
         this._respawn(particle);
         continue;
       }
-      const vector = this._sampleVector(particle.panel, particle.x, particle.z);
-      if (!vector) { this._respawn(particle); continue; }
+      let vector = this._sampleVector(particle.panel, particle.x, particle.z);
+      if (vector) {
+        particle.lastVector = vector;
+        particle.emptySteps = 0;
+      } else if (particle.lastVector && particle.emptySteps < Math.max(3, Math.round(8 * this.visualOptions.trailLength))) {
+        particle.emptySteps += 1;
+        vector = {...particle.lastVector, abundance: particle.lastVector.abundance * .92 ** particle.emptySteps};
+      } else {
+        this._respawn(particle); continue;
+      }
       const abundanceScale = Math.sqrt(this._abundanceScale(vector.abundance));
       const sigma = Math.sqrt(Math.max(0, -2 * Math.log(Math.max(.001, Math.min(.999999, vector.strength)))))
         * this.visualOptions.variability;
@@ -1849,12 +1930,11 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
       const [x0, y0] = this.worldToPixel(particle.x, particle.z, pane);
       const [x1, y1] = this.worldToPixel(nx, nz, pane);
       const life = Math.sin(Math.PI * particle.age / Math.max(1, particle.maxAge));
-      ctx.strokeStyle = angleColor(vector.angle, (.12 + .58 * abundanceScale) * (.3 + .7 * life), this.visualOptions.colorMode);
-      ctx.lineWidth = .5 + 1.55 * abundanceScale;
+      ctx.strokeStyle = angleColor(vector.angle, (.24 + .68 * abundanceScale) * (.28 + .72 * life), this.visualOptions.colorMode);
+      ctx.lineWidth = .65 + 1.8 * abundanceScale;
       ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
       particle.x = nx; particle.z = nz; particle.travel = travel; particle.age += 1;
     }
-    drawPanelRings(ctx, this.width, this.height, this.data, this.view);
   }
 }
 

@@ -802,6 +802,18 @@ function invalidateDerivedProducts() {
   byId("windows-content").innerHTML = '<div class="analysis-empty">Window summaries will refresh in the background, or immediately when this view is opened.</div>';
 }
 
+function invalidateCurtainProducts() {
+  clearTimeout(computeTimer);
+  scheduledScope = null; scheduledExtra = {};
+  pendingCompute = null;
+  latestRequest += 1;
+  clearTimeout(deferredAnalysisTimer); clearTimeout(deferredStatisticsTimer);
+  for (const key of ["heatmap", "direction", "polar", "heading", "metrics",
+    "roi", "statistics", "transition", "windows"]) delete products[key];
+  byId("statistics-content").innerHTML = '<div class="analysis-empty">Open Statistics to calculate inference for the current curtain and filter intersection.</div>';
+  byId("windows-content").innerHTML = '<div class="analysis-empty">Open Windows to calculate summaries for the current curtain and filter intersection.</div>';
+}
+
 function armDeferredAnalysis() {
   clearTimeout(deferredAnalysisTimer); clearTimeout(deferredStatisticsTimer);
   const panels = Math.max(1, Number(lastSummary?.panels)
@@ -927,6 +939,8 @@ function applyTransitionVisuals() {
     display: byId("transition-display").value,
     minimumSupport: numberValue("transition-support", 5),
     split: optionalNumber("transition-split"),
+    pathWidth: numberValue("transition-path-width", 1.4),
+    pathOpacity: numberValue("transition-path-opacity", .42),
   });
 }
 
@@ -978,7 +992,20 @@ function renderStatistics(data) {
   const circularLetters = compactLetters(data.panels.length, data.circularPairwise);
   const rayleighRows = data.rayleigh.map(result => `<tr><td>${escapeHtml(data.panels[result.panel])}</td><td>${result.p < .05 ? escapeHtml(circularLetters[result.panel]) : "—"}</td><td>${formatNumber(result.n, 0)}</td><td>${formatNumber(result.angle, 1)}°</td><td>${formatNumber(result.r, 1)}</td><td><span class="stat-pill ${result.p < .05 ? "significant" : ""}">${formatP(result.p)}${result.p < .001 ? " ***" : result.p < .01 ? " **" : result.p < .05 ? " *" : ""}</span></td></tr>`).join("");
   const circularRows = (data.circularPairwise || []).map(test => `<tr><td>${escapeHtml(data.panels[test.first])}</td><td>${escapeHtml(data.panels[test.second])}</td><td>${formatNumber(test.difference, 1)}°</td><td><span class="stat-pill ${test.adjustedP < .05 ? "significant" : ""}">${test.comparable === false ? "not directional" : formatP(test.adjustedP)}</span></td></tr>`).join("");
-  host.innerHTML = `<div class="statistics-grid">${metricCards}<article class="statistics-card"><h3>Circular direction</h3>
+  const audit = lastSummary?.filterAudit || [];
+  const sourceRows = Math.max(1, Number(audit[0]?.rows) || 1);
+  const auditRows = audit.map((stage, index) => {
+    const previous = audit[Math.max(0, index - 1)] || stage;
+    const rows = Number(stage.rows) || 0, segments = Number(stage.segments) || 0;
+    const removed = index ? Math.max(0, (Number(previous.rows) || 0) - rows) : 0;
+    const retained = Math.max(0, Math.min(100, rows / sourceRows * 100));
+    return `<tr><td>${escapeHtml(stage.label)}</td><td>${formatCount(rows)}</td><td>${formatCount(segments)}</td>
+      <td>${index ? `−${formatCount(removed)}` : "—"}</td><td>${formatNumber(retained, 1)}%</td></tr>`;
+  }).join("");
+  const auditCard = `<article class="statistics-card filter-statistics-card"><h3>Included-data audit</h3>
+    <small>Every result below uses the final intersection of category, range, quality, ROI, local-time, and curtain filters.</small>
+    <table><thead><tr><th>Stage</th><th>Rows kept</th><th>Segments</th><th>Removed here</th><th>Source retained</th></tr></thead><tbody>${auditRows}</tbody></table></article>`;
+  host.innerHTML = `<div class="statistics-grid">${auditCard}${metricCards}<article class="statistics-card"><h3>Circular direction</h3>
     <small>Rayleigh stars show non-uniformity; letters summarize Holm-adjusted mean-angle comparisons among directional groups.</small>
     <table><thead><tr><th>Panel</th><th>Group</th><th>n</th><th>Mean</th><th>R</th><th>Rayleigh p</th></tr></thead><tbody>${rayleighRows}</tbody></table>
     <table><thead><tr><th>Panel</th><th>Panel</th><th>Δ mean</th><th>Holm p</th></tr></thead><tbody>${circularRows || '<tr><td colspan="4">At least two directional panels are needed.</td></tr>'}</tbody></table></article>
@@ -1420,6 +1447,7 @@ const recipeVisualIds = [
   "trail-length", "flow-speed", "flow-variability", "flow-color-mode",
   "flow-velocity-mode", "polar-mode", "transition-split", "trial-fraction",
   "transition-outcome", "transition-display", "transition-support",
+  "transition-path-width", "transition-path-opacity",
 ];
 
 function currentRecipe() {
@@ -1757,12 +1785,12 @@ function scheduleLocalRingObserver(final = false, source = null) {
     applyLocalRingObserver(true);
     transitionSelectionActive = false;
     transitionRenderer.clearTrajectoryOverlay();
-    // Paths are a local WebGL observer: do not enqueue analytical work on
-    // release. Other layers settle once after the drag, while background
-    // products remain deferred until idle or opened.
+    // Paths remain a local WebGL observer. Every analytical product is marked
+    // stale so polar, heading, metrics and inference cannot silently show the
+    // pre-curtain population; only the currently open view is rebuilt.
+    invalidateCurtainProducts();
     const scope = curtainPreviewScope();
     if (scope) scheduleCompute(scope, currentView === "compare" ? 220 : 120);
-    else armDeferredAnalysis();
     return;
   }
   if (ringFrame) return;
@@ -1989,6 +2017,15 @@ for (const id of ["trajectory-width", "trajectory-opacity"]) {
 }
 for (const id of ["transition-outcome", "transition-display", "transition-support"]) {
   byId(id).addEventListener(id === "transition-support" ? "input" : "change", applyTransitionVisuals);
+}
+for (const id of ["transition-path-width", "transition-path-opacity"]) {
+  byId(id).addEventListener("input", () => {
+    transitionRenderer.setOverlayStyle(
+      numberValue("transition-path-width", 1.4),
+      numberValue("transition-path-opacity", .42),
+    );
+    persistState();
+  });
 }
 byId("transition-split").addEventListener("change", () => scheduleCompute("transition", 20));
 byId("transition-axis").addEventListener("change", () => {

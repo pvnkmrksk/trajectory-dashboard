@@ -403,7 +403,8 @@ export class EChartsHeadingRenderer extends EChartRenderer {
     }
     const axisIndices = Array.from({length: count}, (_, i) => i);
     const dataZoom = [
-      {type: "inside", xAxisIndex: axisIndices, filterMode: "none", throttle: 40},
+      {type: "inside", xAxisIndex: axisIndices, filterMode: "none", throttle: 40,
+        zoomOnMouseWheel: true, moveOnMouseWheel: false, moveOnMouseMove: true},
       {type: "slider", xAxisIndex: axisIndices, filterMode: "none", left: 56, right: 24, bottom: 8, height: 16, borderColor: "transparent", fillerColor: "rgba(14,124,115,.14)", handleStyle: {color: "#0e7c73"}},
     ];
     if (data.mode === "density") {
@@ -458,7 +459,7 @@ export class EChartsHeadingRenderer extends EChartRenderer {
         }},
         visualMap: {
           min: 0, max: Math.max(1, maximum), calculable: true,
-          orient: "horizontal", left: "center", top: 8, itemWidth: 12, itemHeight: 120,
+          orient: "horizontal", right: 92, top: 8, itemWidth: 12, itemHeight: 120,
           textStyle: {color: MUTED, fontSize: 9},
           inRange: {color: ["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"]},
         },
@@ -491,7 +492,7 @@ export class EChartsHeadingRenderer extends EChartRenderer {
     }
     return {
       ...this.base("heading-local-time"), title: titles,
-      legend: {type: "scroll", left: 12, right: 100, top: 8, selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 16, itemHeight: 7},
+      legend: {type: "scroll", right: 92, top: 8, width: "48%", selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 16, itemHeight: 7},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {}, end = item.coords?.[1] || [];
         if (data.mode === "mean") return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>${formatNumber(end[0], 1)} s · circular mean ${formatNumber(end[1], 1)}°<br>Across-trial R ${formatNumber(item.r, 1)}`;
@@ -644,6 +645,10 @@ export class EChartsRoiRenderer extends EChartRenderer {
         const item = params.data || {}, trial = Number.isFinite(item.trial) ? `<br>Trial ${formatNumber(item.trial, 0)}` : "";
         return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>${escapeHtml(item.metric)} · ${escapeHtml(item.value?.[0])}: ${formatNumber(item.value?.[1], 1)}`;
       }},
+      dataZoom: Array.from({length: 4}, (_, index) => ({
+        type: "inside", yAxisIndex: index, filterMode: "none", throttle: 35,
+        zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false,
+      })),
       grid, xAxis, yAxis, series,
     };
   }
