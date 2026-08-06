@@ -127,15 +127,16 @@ function setOrNull(values) {
 }
 
 function stablePanelKeys(state, labels, visibleCategories) {
-  const selected = state.groupBy === "config" && state.mirrorPool
+  const selected = state.mirrorPool
     ? null : state.filters?.[state.groupBy];
   const candidates = Array.isArray(selected) && selected.length
     ? selected.map(Number)
     : labels.map((_, index) => index);
   const valid = candidates.filter(category => Number.isInteger(category)
     && category >= 0 && category < labels.length);
-  const orderKey = state.groupBy === "config" && state.mirrorPool
-    ? "mirrorConfig" : state.groupBy;
+  const orderKey = state.mirrorPool
+    ? (state.groupBy === "config" ? "mirrorConfig" : `mirror:${state.groupBy}`)
+    : state.groupBy;
   const requested = (state.panelOrders?.[orderKey] || []).map(Number);
   const ordered = requested.filter(category => valid.includes(category));
   for (const category of valid) if (!ordered.includes(category)) ordered.push(category);
@@ -191,36 +192,45 @@ function wrapAngle(value) {
 }
 
 function selectCoordinateFrame(state) {
-  mirrorFrameEnabled = !!state.mirrorPool;
-  const rules = mirrorFrameEnabled && Array.isArray(state.mirrorRules)
+  const rules = state.mirrorPool && Array.isArray(state.mirrorRules)
     ? state.mirrorRules.filter(rule => Number.isInteger(Number(rule.reference))
-      && Number.isInteger(Number(rule.reflected)) && Number(rule.reference) !== Number(rule.reflected)) : [];
+      && Number.isInteger(Number(rule.reflected)) && Number(rule.reference) !== Number(rule.reflected)
+      && (rule.groupBy || "config") === state.groupBy) : [];
+  const automaticConfigFrame = state.groupBy === "config" && !!data.segmentMirrorConfig;
+  mirrorFrameEnabled = !!state.mirrorPool && (rules.length > 0 || automaticConfigFrame);
   if (rules.length) {
-    const key = JSON.stringify({rules, labels: state.labels?.config});
+    const categoryFields = {
+      config: data.segmentConfig, scene: data.segmentScene, vr: data.segmentVr,
+      fly: data.segmentFly, folder: data.segmentFolder,
+    };
+    const categoryField = categoryFields[state.groupBy] || data.segmentConfig;
+    const rawNames = header.categories[state.groupBy] || header.categories.config;
+    const names = state.labels?.[state.groupBy]
+      || header.displayCategories?.[state.groupBy] || rawNames;
+    const key = JSON.stringify({groupBy: state.groupBy, rules, labels: names});
     if (key !== customMirrorKey || !customMirrorGroup) {
       const ns = starts.length, n = data.x.length;
       customMirrorGroup = new Int32Array(ns); customMirrorGroup.fill(-1);
       customSegmentReflected = new Uint8Array(ns);
       customSegmentAxis = new Uint8Array(ns);
       customSegmentCoordinate = new Float32Array(ns);
-      const configGroup = new Map(), reflectedByConfig = new Map();
+      const categoryGroup = new Map(), reflectedByCategory = new Map();
       customMirrorLabels = [];
-      const names = state.labels?.config || header.displayCategories?.config || header.categories.config;
       rules.forEach((rule, group) => {
         const reference = Number(rule.reference), reflected = Number(rule.reflected);
-        configGroup.set(reference, group); configGroup.set(reflected, group);
-        reflectedByConfig.set(reflected, {axis: rule.axis === "z" ? "z" : "x", coordinate: Number(rule.coordinate) || 0});
-        customMirrorLabels[group] = rule.label || `${names[reference] ?? header.categories.config[reference]} ↔ ${names[reflected] ?? header.categories.config[reflected]}`;
+        categoryGroup.set(reference, group); categoryGroup.set(reflected, group);
+        reflectedByCategory.set(reflected, {axis: rule.axis === "z" ? "z" : "x", coordinate: Number(rule.coordinate) || 0});
+        customMirrorLabels[group] = rule.label || `${names[reference] ?? rawNames[reference]} ↔ ${names[reflected] ?? rawNames[reflected]}`;
       });
       let nextGroup = rules.length;
-      for (let config = 0; config < header.categories.config.length; config += 1) {
-        if (!configGroup.has(config)) {
-          configGroup.set(config, nextGroup++); customMirrorLabels.push(names[config] ?? header.categories.config[config]);
+      for (let category = 0; category < rawNames.length; category += 1) {
+        if (!categoryGroup.has(category)) {
+          categoryGroup.set(category, nextGroup++); customMirrorLabels.push(names[category] ?? rawNames[category]);
         }
       }
       for (let seg = 0; seg < ns; seg += 1) {
-        const config = data.segmentConfig[seg], transform = reflectedByConfig.get(config);
-        customMirrorGroup[seg] = configGroup.get(config);
+        const category = categoryField[seg], transform = reflectedByCategory.get(category);
+        customMirrorGroup[seg] = categoryGroup.get(category);
         if (transform) {
           customSegmentReflected[seg] = 1;
           customSegmentAxis[seg] = transform.axis === "z" ? 1 : 0;
@@ -267,7 +277,7 @@ function selectCoordinateFrame(state) {
 }
 
 function groupField(state, fields) {
-  if (state.groupBy === "config" && state.mirrorPool && customMirrorGroup) return customMirrorGroup;
+  if (state.mirrorPool && customMirrorGroup) return customMirrorGroup;
   if (state.groupBy === "config" && state.mirrorPool && data.segmentMirrorConfig) {
     return data.segmentMirrorConfig;
   }
@@ -275,7 +285,7 @@ function groupField(state, fields) {
 }
 
 function groupLabels(state) {
-  if (state.groupBy === "config" && state.mirrorPool && customMirrorLabels) return customMirrorLabels;
+  if (state.mirrorPool && customMirrorLabels) return customMirrorLabels;
   if (state.groupBy === "config" && state.mirrorPool) {
     return header.displayCategories?.mirrorConfig || header.categories.mirrorConfig;
   }
@@ -305,8 +315,8 @@ function retainedTimeMaximum(seg, rowKeep) {
 function buildAnalysis(state) {
   const started = performance.now();
   const ns = starts.length;
-  const filterAudit = [{label: "Loaded source", segments: ns, rows: data.segment.length}];
-  const audit = (label, segmentKeep, rowKeep = null) => {
+  const filterAudit = [{label: "Loaded source", detail: "Unfiltered retained table", segments: ns, rows: data.segment.length}];
+  const audit = (label, detail, segmentKeep, rowKeep = null) => {
     let segments = 0, rows = 0;
     for (let seg = 0; seg < ns; seg += 1) {
       if (!segmentKeep[seg]) continue;
@@ -314,34 +324,49 @@ function buildAnalysis(state) {
       if (!rowKeep) rows += ends[seg] - starts[seg];
       else for (let row = starts[seg]; row < ends[seg]; row += 1) rows += rowKeep[row];
     }
-    filterAudit.push({label, segments, rows});
+    filterAudit.push({label, detail, segments, rows});
   };
+  const unchangedAudit = (label, detail) => {
+    const previous = filterAudit[filterAudit.length - 1];
+    filterAudit.push({label, detail, segments: previous.segments, rows: previous.rows});
+  };
+  const rangeText = range => Array.isArray(range) && range.length >= 2
+    ? `${Number(range[0]).toLocaleString()} to ${Number(range[1]).toLocaleString()}` : "Full range";
   const segmentKeep = new Uint8Array(ns);
   segmentKeep.fill(1);
   const categoryFields = {
     config: data.segmentConfig, scene: data.segmentScene, vr: data.segmentVr,
     fly: data.segmentFly, folder: data.segmentFolder,
   };
+  const categoryLabels = {
+    config: "Treatments", scene: "Scenes", vr: "VR arenas",
+    fly: "Animals", folder: "Source folders",
+  };
   for (const [key, field] of Object.entries(categoryFields)) {
     const selected = setOrNull(state.filters?.[key]);
-    if (!selected) continue;
-    for (let seg = 0; seg < ns; seg += 1) if (!selected.has(field[seg])) segmentKeep[seg] = 0;
+    const total = header.categories[key]?.length || 0;
+    const selectedValues = selected ? [...selected].filter(value => value >= 0 && value < total) : [];
+    if (selected) for (let seg = 0; seg < ns; seg += 1) if (!selected.has(field[seg])) segmentKeep[seg] = 0;
+    audit(categoryLabels[key], `${selectedValues.length} of ${total} values selected`, segmentKeep);
   }
-  audit("Category selection", segmentKeep);
   const r = state.ranges || {};
   const segmentResultant = state.angleSource === "movement"
     ? data.segmentMovementR : data.segmentOrientationR;
-  for (let seg = 0; seg < ns; seg += 1) {
-    if (!segmentKeep[seg]) continue;
-    if (!inRange(data.segmentTrial[seg], r.trial)
-      || !inRange(data.segmentStep[seg], r.step)
-      || !inRange(data.segmentReplicate[seg], r.replicate)
-      || !inRange(segmentResultant[seg], r.resultant)
-      || !inRange(data.segmentPeakSpeed[seg], r.peak)
-      || !inRange(data.segmentDisplacement[seg], r.displacement)
-      || !inRange(data.segmentDistance[seg], r.distance)) segmentKeep[seg] = 0;
+  const segmentRanges = [
+    ["Trial number", r.trial, data.segmentTrial],
+    ["Step / segment", r.step, data.segmentStep],
+    ["Replicate order", r.replicate, data.segmentReplicate],
+    [`${state.angleSource === "movement" ? "Movement" : "Body"} resultant R`, r.resultant, segmentResultant],
+    ["Peak smoothed velocity", r.peak, data.segmentPeakSpeed],
+    ["Net displacement", r.displacement, data.segmentDisplacement],
+    ["Distance walked", r.distance, data.segmentDistance],
+  ];
+  for (const [label, range, field] of segmentRanges) {
+    if (range) for (let seg = 0; seg < ns; seg += 1) {
+      if (segmentKeep[seg] && !inRange(field[seg], range)) segmentKeep[seg] = 0;
+    }
+    audit(label, rangeText(range), segmentKeep);
   }
-  audit("Segment ranges", segmentKeep);
 
   const rowKeep = new Uint8Array(data.segment.length);
   for (let seg = 0; seg < ns; seg += 1) {
@@ -357,7 +382,8 @@ function buildAnalysis(state) {
       }
     }
   }
-  if (timeRange) audit("Local-time range", segmentKeep, rowKeep);
+  if (timeRange) audit("Local trial time", `${rangeText(timeRange)} seconds`, segmentKeep, rowKeep);
+  else unchangedAudit("Local trial time", "Full duration");
 
   const jump = Number(state.jumpThreshold) || 0;
   const buffer = Math.max(0, Number(state.jumpBufferMs) || 0) / 1000;
@@ -376,7 +402,8 @@ function buildAnalysis(state) {
       }
     }
   }
-  if (jump > 0) audit("Jump rejection", segmentKeep, rowKeep);
+  if (jump > 0) audit("Jump rejection", `Raw velocity > ${jump.toLocaleString()} · ±${(buffer * 1000).toLocaleString()} ms`, segmentKeep, rowKeep);
+  else unchangedAudit("Jump rejection", "Off");
 
   const minDisplacement = Math.max(0, Number(state.minDisplacement) || 0);
   if (minDisplacement > 0) {
@@ -389,7 +416,8 @@ function buildAnalysis(state) {
       }
     }
   }
-  if (minDisplacement > 0) audit("Minimum displacement", segmentKeep, rowKeep);
+  if (minDisplacement > 0) audit("Minimum displacement", `At least ${minDisplacement.toLocaleString()}`, segmentKeep, rowKeep);
+  else unchangedAudit("Minimum displacement", "Off");
 
   const trim = Math.max(0, Math.floor(Number(state.edgeTrim) || 0));
   if (trim > 0) {
@@ -401,7 +429,8 @@ function buildAnalysis(state) {
       for (let i = ends[seg] - 1; i >= starts[seg] && removed < trim; i -= 1) if (rowKeep[i]) { rowKeep[i] = 0; removed += 1; }
     }
   }
-  if (trim > 0) audit("Edge trim", segmentKeep, rowKeep);
+  if (trim > 0) audit("Edge trim", `${trim.toLocaleString()} retained samples from each end`, segmentKeep, rowKeep);
+  else unchangedAudit("Edge trim", "Off");
 
   // ROI reach is calculated from the quality-filtered table before the
   // entered-only/after-exit mask. This preserves the established denominator
@@ -448,7 +477,10 @@ function buildAnalysis(state) {
       rowKeep.fill(0, exitAt, ends[seg]);
     }
   }
-  if (state.roiEntered || state.roiTrim) audit("ROI mask", segmentKeep, rowKeep);
+  if (state.roiEntered || state.roiTrim) audit("ROI mask",
+    `${state.roiEntered ? "Reached trials only" : "All trials"}${state.roiTrim ? " · trim after exit" : ""} · radius ${roiReach.toLocaleString()}`,
+    segmentKeep, rowKeep);
+  else unchangedAudit("ROI mask", `Off · reach radius ${roiReach.toLocaleString()}`);
 
   const visibleSegments = [];
   let visibleRows = 0;
@@ -580,7 +612,11 @@ function applyCurtain(state, base) {
       p99: percentile(durations, .99), max: durations.length ? durations[durations.length - 1] : 0,
     },
     boundsSource: base,
-    filterAudit: [...(base.filterAudit || []), {label: "Curtain observer", segments: visibleSegments.length, rows: visibleRows}],
+    filterAudit: [...(base.filterAudit || []), {
+      label: "Curtain observer",
+      detail: `${activeRings.length} ring${activeRings.length === 1 ? "" : "s"} · ${requireAll ? "all rings" : "any ring"}`,
+      segments: visibleSegments.length, rows: visibleRows,
+    }],
     filterMs: base.filterMs + performance.now() - started,
   };
 }
@@ -811,9 +847,15 @@ function gridGeometry(state, analysis) {
   if (!(bin > 0)) bin = extent * 2 / 41;
   let half = Math.max(1, Math.ceil(extent / bin));
   const maxAxis = Math.max(11, Math.floor(Math.sqrt(250000 / Math.max(1, analysis.panelCount))));
-  if (half * 2 + 1 > maxAxis) { half = Math.max(5, Math.floor((maxAxis - 1) / 2)); bin = extent / half; }
-  const nx = half * 2 + 1, nz = nx;
-  return {bin, nx, nz, x0: -(half + .5) * bin, z0: -(half + .5) * bin, bounds};
+  const centreOrigin = state.gridOrigin !== "edge";
+  const axisCells = () => centreOrigin ? half * 2 + 1 : half * 2;
+  if (axisCells() > maxAxis) {
+    half = Math.max(5, Math.floor((maxAxis - (centreOrigin ? 1 : 0)) / 2));
+    bin = extent / half;
+  }
+  const nx = axisCells(), nz = nx;
+  const x0 = centreOrigin ? -(half + .5) * bin : -half * bin;
+  return {bin, nx, nz, x0, z0: x0, gridOrigin: centreOrigin ? "center" : "edge", bounds};
 }
 
 function spatialCommon(state, analysis, grid) {
@@ -830,7 +872,7 @@ function spatialCommon(state, analysis, grid) {
 
 function occupancyPlanFor(state, analysis) {
   const base = analysis.boundsSource || analysis;
-  const key = `${lastAnalysisKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${base.overviewPooled ? "pooled" : "panels"}`;
+  const key = `${lastAnalysisKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${state.gridOrigin}|${base.overviewPooled ? "pooled" : "panels"}`;
   if (lastOccupancyPlan && lastOccupancyPlanKey === key) return lastOccupancyPlan;
   const grid = gridGeometry(state, base), cells = grid.nx * grid.nz;
   const contributions = new Array(starts.length);
@@ -869,12 +911,12 @@ function buildOccupancy(state, analysis) {
   for (let i = 0; i < count.length; i += 1) time[i] = count[i] * medianDt;
   const common = spatialCommon(state, analysis, grid);
   lastOccupancy = {common, count, time};
-  lastOccupancyKey = `${lastAnalysisKey}|${lastCurtainKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${analysis.overviewPooled ? "pooled" : "panels"}`;
+  lastOccupancyKey = `${lastAnalysisKey}|${lastCurtainKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${state.gridOrigin}|${analysis.overviewPooled ? "pooled" : "panels"}`;
   return {...common, count: count.slice(), time: time.slice(), buildMs: performance.now() - started};
 }
 
 function occupancyFor(state, analysis) {
-  const key = `${lastAnalysisKey}|${lastCurtainKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${analysis.overviewPooled ? "pooled" : "panels"}`;
+  const key = `${lastAnalysisKey}|${lastCurtainKey}|${lastPanelKey}|${state.binSize}|${state.boundPercent}|${state.gridOrigin}|${analysis.overviewPooled ? "pooled" : "panels"}`;
   if (lastOccupancy && lastOccupancyKey === key) return lastOccupancy;
   buildOccupancy(state, analysis);
   return lastOccupancy;
@@ -1779,6 +1821,7 @@ function compute(message) {
       filterMs: lastAnalysis.filterMs,
       durationSummary: lastAnalysis.durationSummary,
       panelKeys: lastAnalysis.panelKeys,
+      panelNames: lastAnalysis.panelNames,
       segmentOptions,
       filterAudit: lastAnalysis.filterAudit,
     },
@@ -1837,7 +1880,7 @@ function inspectTransition(message) {
     if (matched) matches.push(seg);
   }
   postMessage({type: "transition-inspect-result", requestId: message.requestId, segments: matches,
-    panel, x: message.x, z: message.z});
+    panel, ix: wantedX, iz: wantedZ, x: message.x, z: message.z});
 }
 
 self.onmessage = event => {

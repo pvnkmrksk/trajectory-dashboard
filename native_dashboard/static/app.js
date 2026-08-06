@@ -43,6 +43,8 @@ let currentView = "trajectory";
 let transitionSelectionActive = false;
 let panelOrders = {};
 let mirrorRules = [];
+let mirrorAxis = "x";
+let mirrorCoordinate = 0;
 let initialUrlStateAvailable = true;
 let playbackPlaying = false;
 let playbackActive = false;
@@ -201,14 +203,21 @@ function renderFilterAudit(audit = []) {
   const host = byId("filter-audit");
   if (!host) return;
   const source = audit[0] || {segments: 0, rows: 0};
-  const base = Math.max(1, Number(source.rows) || 1);
+  const baseRows = Math.max(1, Number(source.rows) || 1);
+  const baseSegments = Math.max(1, Number(source.segments) || 1);
   host.innerHTML = audit.map((stage, index) => {
     const previous = audit[Math.max(0, index - 1)] || source;
-    const kept = Math.max(0, Math.min(100, Number(stage.rows) / base * 100));
+    const kept = Math.max(0, Math.min(100, Number(stage.segments) / baseSegments * 100));
+    const rowKept = Math.max(0, Math.min(100, Number(stage.rows) / baseRows * 100));
     const lostRows = Math.max(0, (Number(previous.rows) || 0) - (Number(stage.rows) || 0));
     const lostSegments = Math.max(0, (Number(previous.segments) || 0) - (Number(stage.segments) || 0));
-    const title = `${stage.label}: ${formatCount(stage.rows)} rows and ${formatCount(stage.segments)} segments retained (${formatNumber(kept, 1)}%).${index ? ` This step removed ${formatCount(lostRows)} rows and ${formatCount(lostSegments)} segments.` : ""}`;
-    return `<div class="filter-audit-row" title="${escapeHtml(title)}"><span>${escapeHtml(stage.label)}</span><i style="--kept:${kept.toFixed(1)}%"></i><small>${formatCount(stage.rows)}${index ? ` · −${formatCount(lostRows)}` : ""}</small></div>`;
+    const detail = stage.detail || "Applied to the retained source";
+    const title = `${stage.label} · ${detail}: ${formatCount(stage.segments)} of ${formatCount(source.segments)} replicate segments and ${formatCount(stage.rows)} of ${formatCount(source.rows)} rows retained.${index ? ` This step removed ${formatCount(lostSegments)} segments and ${formatCount(lostRows)} rows.` : ""}`;
+    return `<div class="filter-audit-row" title="${escapeHtml(title)}">
+      <div class="audit-copy"><b>${escapeHtml(stage.label)}</b><span>${escapeHtml(detail)}</span></div>
+      <i aria-hidden="true"><span style="width:${kept.toFixed(1)}%"></span></i>
+      <small><b>${formatCount(stage.segments)} / ${formatCount(source.segments)}</b><span>${formatNumber(kept, 1)}% replicates · ${formatNumber(rowKept, 1)}% rows</span></small>
+    </div>`;
   }).join("");
 }
 
@@ -242,7 +251,7 @@ function renderAnimalVisibility() {
     checkbox.type = "checkbox"; checkbox.checked = animalVisibility[index] !== false;
     checkbox.setAttribute("aria-label", `Show ${name}`);
     const dot = document.createElement("span"); dot.className = "animal-dot";
-    const text = document.createElement("span"); text.textContent = name;
+    const text = document.createElement("span"); text.textContent = name; text.title = name;
     label.append(checkbox, dot, text); host.appendChild(label);
     checkbox.addEventListener("change", () => {
       animalVisibility[index] = checkbox.checked;
@@ -356,11 +365,12 @@ function renderDisplayLabels() {
   const raw = datasetHeader.categories[key] || [];
   raw.forEach((name, index) => {
     const label = document.createElement("label");
-    const source = document.createElement("span"); source.textContent = name;
-    const input = document.createElement("input"); input.value = displayNames[key]?.[index] || name;
+    const source = document.createElement("span"); source.textContent = name; source.title = name;
+    const input = document.createElement("input"); input.value = displayNames[key]?.[index] || name; input.title = input.value;
     label.append(source, input); host.appendChild(label);
     input.addEventListener("change", () => {
       displayNames[key][index] = input.value.trim() || name;
+      input.title = displayNames[key][index];
       try {
         const stored = JSON.parse(localStorage.getItem("daari-deepa-labels") || "{}");
         stored[key] = stored[key] && typeof stored[key] === "object" ? stored[key] : {};
@@ -398,57 +408,121 @@ function inferredMirrorRules() {
   return [...groups.values()].filter(group => group.length >= 2).map(group => {
     const reference = group.find(item => item.sign >= 0) || group[0];
     const reflected = group.find(item => item !== reference && item.sign < 0) || group.find(item => item !== reference);
-    return {reference: reference.code, reflected: reflected.code, axis: "x", coordinate: 0,
+    return {reference: reference.code, reflected: reflected.code, groupBy: "config",
       label: reference.label || "Mirrored pair", automatic: true};
   });
 }
 
+function mirrorGroupKey() {
+  const key = byId("group-by")?.value || "config";
+  return ["config", "scene", "vr", "fly", "folder"].includes(key) ? key : null;
+}
+
+function activeMirrorRules() {
+  const key = mirrorGroupKey();
+  return key ? mirrorRules.filter(rule => (rule.groupBy || "config") === key) : [];
+}
+
+function mirrorOrderKey(key = mirrorGroupKey()) {
+  if (!key) return "all";
+  return key === "config" ? "mirrorConfig" : `mirror:${key}`;
+}
+
+function mirrorGroupLabel(key = mirrorGroupKey()) {
+  return ({config: "Treatment", scene: "Scene", vr: "VR arena", fly: "Animal", folder: "Source folder"})[key] || "Pooled";
+}
+
+function mirrorPreferencesKey() { return "daari-deepa-mirror-configs/v2"; }
+
+function saveMirrorPreferences() {
+  if (!datasetHeader || !sourceInput.value) return;
+  try {
+    const stored = JSON.parse(localStorage.getItem(mirrorPreferencesKey()) || "{}");
+    stored[sourceInput.value] = {
+      rules: mirrorRules.map(rule => ({
+        reference: Number(rule.reference), reflected: Number(rule.reflected),
+        groupBy: rule.groupBy || "config", label: rule.label || "",
+      })),
+      axis: mirrorAxis, coordinate: mirrorCoordinate,
+    };
+    localStorage.setItem(mirrorPreferencesKey(), JSON.stringify(stored));
+  } catch (_) { /* device-local persistence is best-effort */ }
+}
+
+function loadMirrorPreferences() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(mirrorPreferencesKey()) || "{}")?.[sourceInput.value];
+    if (!stored || !Array.isArray(stored.rules)) return false;
+    mirrorRules = stored.rules.map(rule => ({...rule, groupBy: rule.groupBy || "config"}));
+    mirrorAxis = stored.axis === "z" ? "z" : "x";
+    mirrorCoordinate = Number(stored.coordinate) || 0;
+    return true;
+  } catch (_) { return false; }
+}
+
 function setMirrorGuide(rule = null) {
-  for (const renderer of spatialRenderers) renderer.setMirrorGuide(rule);
+  const guide = rule ? {axis: mirrorAxis, coordinate: mirrorCoordinate} : null;
+  for (const renderer of spatialRenderers) renderer.setMirrorGuide(guide);
+}
+
+function syncMirrorAvailability() {
+  const key = mirrorGroupKey();
+  const labels = key ? (datasetHeader?.categories?.[key] || []) : [];
+  const rules = activeMirrorRules();
+  const available = labels.length >= 2 && rules.length > 0;
+  byId("mirror-pool").disabled = !available;
+  if (!available) byId("mirror-pool").checked = false;
+  byId("mirror-pool-label").textContent = key
+    ? `Pool matched ${mirrorGroupLabel(key).toLowerCase()} pairs`
+    : "Choose a categorical panel split to pool pairs";
 }
 
 function renderMirrorPairs() {
   const host = byId("mirror-pair-list");
   host.replaceChildren();
-  const configs = datasetHeader?.categories?.config || [];
-  const optionHtml = configs.map((name, code) => `<option value="${code}">${escapeHtml(name)}</option>`).join("");
-  if (!mirrorRules.length) {
+  const key = mirrorGroupKey();
+  const categories = key ? (datasetHeader?.categories?.[key] || []) : [];
+  const names = key ? (displayNames[key] || categories) : [];
+  const rules = activeMirrorRules();
+  const optionHtml = categories.map((name, code) => `<option value="${code}" title="${escapeHtml(name)}">${escapeHtml(names[code] || name)}</option>`).join("");
+  byId("mirror-group-label").textContent = key ? `${mirrorGroupLabel(key)} panels` : "Choose a panel split";
+  byId("mirror-axis").value = mirrorAxis;
+  byId("mirror-coordinate").value = mirrorCoordinate;
+  if (!rules.length) {
     const empty = document.createElement("span"); empty.className = "empty-control";
-    empty.textContent = configs.length > 1 ? "No pairs yet. Add one to define a common frame." : "At least two treatments are required.";
+    empty.textContent = !key ? "Select a categorical panel split first."
+      : (categories.length > 1 ? `No ${mirrorGroupLabel(key).toLowerCase()} pairs yet. Add one to define a common frame.` : `At least two ${mirrorGroupLabel(key).toLowerCase()} values are required.`);
     host.appendChild(empty);
   }
-  mirrorRules.forEach((rule, index) => {
+  rules.forEach(rule => {
     const row = document.createElement("div"); row.className = "mirror-pair";
     row.innerHTML = `
       <label>Keep as reference<select class="mirror-reference">${optionHtml}</select></label>
       <span class="mirror-arrow" title="Reflect the second treatment into the first treatment's frame">↑ reflect into reference frame</span>
       <label>Reflect this treatment<select class="mirror-reflected">${optionHtml}</select></label>
-      <label class="mirror-axis">Axis<select><option value="x">X</option><option value="z">Z</option></select></label>
-      <label class="mirror-coordinate">Line<input type="number" step="0.1" value="${Number(rule.coordinate) || 0}"></label>
       <button class="quiet mirror-remove" type="button" aria-label="Delete pair">×</button>`;
     const reference = row.querySelector(".mirror-reference"), reflected = row.querySelector(".mirror-reflected");
-    const axis = row.querySelector(".mirror-axis select"), coordinate = row.querySelector(".mirror-coordinate input");
-    reference.value = rule.reference; reflected.value = rule.reflected; axis.value = rule.axis === "z" ? "z" : "x";
+    reference.value = rule.reference; reflected.value = rule.reflected;
     const update = () => {
       rule.reference = Number(reference.value); rule.reflected = Number(reflected.value);
-      rule.axis = axis.value === "z" ? "z" : "x"; rule.coordinate = Number(coordinate.value) || 0;
-      rule.automatic = false;
-      setMirrorGuide(rule); byId("mirror-pool").disabled = false;
+      rule.groupBy = key; rule.automatic = false;
+      setMirrorGuide(rule); syncMirrorAvailability(); saveMirrorPreferences();
       scheduleDataUpdate(120);
     };
-    for (const control of [reference, reflected, axis, coordinate]) {
+    for (const control of [reference, reflected]) {
       control.addEventListener("focus", () => setMirrorGuide(rule));
       control.addEventListener("change", update);
     }
     row.querySelector(".mirror-remove").addEventListener("click", () => {
-      mirrorRules.splice(index, 1); renderMirrorPairs(); setMirrorGuide(null);
-      byId("mirror-pool").disabled = (datasetHeader?.categories?.config?.length || 0) < 2;
+      mirrorRules.splice(mirrorRules.indexOf(rule), 1); renderMirrorPairs(); setMirrorGuide(null);
+      syncMirrorAvailability(); saveMirrorPreferences();
       scheduleDataUpdate(80);
     });
     host.appendChild(row);
   });
-  byId("mirror-pair-add").disabled = configs.length < 2;
-  byId("mirror-pair-clear").disabled = !mirrorRules.length;
+  byId("mirror-pair-add").disabled = categories.length < 2;
+  byId("mirror-pair-clear").disabled = !rules.length;
+  syncMirrorAvailability();
 }
 
 function populateControls(restoreUrl = false) {
@@ -456,13 +530,14 @@ function populateControls(restoreUrl = false) {
   loadDisplayNames();
   const mirrorPairs = Object.values(datasetHeader.configPresentation || {})
     .filter(config => config?.poolable).length / 2;
-  const canPairManually = (datasetHeader.categories.config || []).length >= 2;
-  if (!restoreUrl || !mirrorRules.length) mirrorRules = inferredMirrorRules();
-  byId("mirror-pool").disabled = !canPairManually;
-  if (byId("mirror-pool").disabled) byId("mirror-pool").checked = false;
+  if (!restoreUrl) {
+    mirrorRules = [];
+    mirrorAxis = "x"; mirrorCoordinate = 0;
+    if (!loadMirrorPreferences()) mirrorRules = inferredMirrorRules();
+  } else if (!mirrorRules.length) mirrorRules = inferredMirrorRules();
   byId("mirror-pool").closest("label").title = mirrorPairs >= 1
-    ? `${formatCount(mirrorPairs)} mirrored left/right pair${mirrorPairs === 1 ? "" : "s"} detected. Pool by reflecting X and heading into one canonical frame.`
-    : (canPairManually ? "No automatic pair was detected. Open Mirror pairing to match treatments explicitly." : "At least two treatments are required for mirrored pooling.");
+    ? `${formatCount(mirrorPairs)} mirrored left/right treatment pair${mirrorPairs === 1 ? "" : "s"} detected. The pairing editor also works with Scene, VR arena, Animal, or Source folder panels.`
+    : "Open Mirror pairing to match values from the current categorical panel split.";
   const categories = byId("category-filters");
   categories.replaceChildren();
   const labels = {config: "Treatments", scene: "Scenes", vr: "VR arenas", fly: "Animals", folder: "Source folders"};
@@ -481,6 +556,7 @@ function populateControls(restoreUrl = false) {
       input.value = index; input.dataset.code = index; input.checked = true; input.dataset.scope = "full";
       const caption = document.createElement("span"); caption.dataset.code = index;
       caption.textContent = displayNames[key]?.[index] || text;
+      caption.title = text;
       option.append(input, caption); checklist.appendChild(option);
     }
     fieldset.append(legend, checklist); categories.appendChild(fieldset);
@@ -519,7 +595,6 @@ function populateControls(restoreUrl = false) {
     byId("roi-trim").checked = false;
     byId("ring-enabled").checked = false;
   }
-  byId("mirror-pool").disabled = !canPairManually;
   renderMirrorPairs();
   byId("transition-split-label").textContent = `Split ${byId("transition-axis").value.toUpperCase()}`;
   renderRingControls();
@@ -579,9 +654,13 @@ function collectState() {
     movingOnly: byId("moving-only").checked,
     mirrorPool: byId("mirror-pool").checked,
     mirrorRules: mirrorRules.map(rule => ({reference:Number(rule.reference), reflected:Number(rule.reflected),
-      axis: rule.axis === "z" ? "z" : "x", coordinate:Number(rule.coordinate) || 0, label: rule.label || ""})),
+      groupBy: rule.groupBy || "config", axis: mirrorAxis, coordinate: mirrorCoordinate,
+      label: rule.label || ""})),
+    mirrorAxis,
+    mirrorCoordinate,
     walkThreshold: numberValue("walk-threshold"),
     binSize: numberValue("bin-size", 0),
+    gridOrigin: byId("grid-center-origin").checked ? "center" : "edge",
     boundPercent: numberValue("bound-percent", 98),
     angleSource: byId("angle-source").value,
     statsUnit: byId("stats-unit").value,
@@ -621,8 +700,10 @@ function persistState() {
   params.set("group", state.groupBy); params.set("color", state.colorBy);
   if (state.mirrorPool) params.set("mirror", "1"); else params.delete("mirror");
   if (state.mirrorRules.length) params.set("mirrorRules", JSON.stringify(state.mirrorRules)); else params.delete("mirrorRules");
+  params.set("maxis", state.mirrorAxis); params.set("mline", state.mirrorCoordinate);
   if (state.panelColumns) params.set("cols", state.panelColumns); else params.delete("cols");
   if (state.binSize) params.set("bin", state.binSize); else params.delete("bin");
+  params.set("gcenter", state.gridOrigin === "edge" ? "0" : "1");
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
   params.set("pmode", state.polarMode);
   params.set("pcap", state.playbackPercentile);
@@ -660,6 +741,7 @@ function persistState() {
   if (state.ringContext) params.set("ringcontext", "1"); else params.set("ringcontext", "0");
   params.set("rings", JSON.stringify(rings)); params.set("ringmatch", state.ringMatch);
   history.replaceState(null, "", url);
+  saveMirrorPreferences();
 }
 
 function restoreViewStateFromUrl() {
@@ -668,6 +750,7 @@ function restoreViewStateFromUrl() {
     "group-by": params.get("group"), "color-by": params.get("color"),
     "overview-grouping": params.get("overview"),
     "panel-columns": params.get("cols"), "bin-size": params.get("bin"),
+    "mirror-axis": params.get("maxis"), "mirror-coordinate": params.get("mline"),
     "bound-percent": params.get("bound"), "angle-source": params.get("angle"),
     "polar-mode": params.get("pmode"),
     "stats-unit": params.get("unit"), "playback-cap": params.get("pcap"),
@@ -689,11 +772,14 @@ function restoreViewStateFromUrl() {
   for (const [id, value] of Object.entries(values)) if (value !== null && byId(id)) byId(id).value = value;
   syncAngleSourceControls(byId("angle-source").value);
   byId("mirror-pool").checked = params.get("mirror") === "1" && !byId("mirror-pool").disabled;
+  byId("grid-center-origin").checked = params.get("gcenter") !== "0";
+  mirrorAxis = byId("mirror-axis").value === "z" ? "z" : "x";
+  mirrorCoordinate = numberValue("mirror-coordinate", 0);
   byId("show-marginals").checked = params.get("marginals") === "1";
   try {
     const restoredRules = JSON.parse(params.get("mirrorRules") || "null");
     if (Array.isArray(restoredRules)) {
-      mirrorRules = restoredRules;
+      mirrorRules = restoredRules.map(rule => ({...rule, groupBy: rule.groupBy || "config"}));
       if (mirrorRules.length) byId("mirror-pool").disabled = false;
       if (params.get("mirror") === "1") byId("mirror-pool").checked = true;
     }
@@ -994,17 +1080,21 @@ function renderStatistics(data) {
   const circularRows = (data.circularPairwise || []).map(test => `<tr><td>${escapeHtml(data.panels[test.first])}</td><td>${escapeHtml(data.panels[test.second])}</td><td>${formatNumber(test.difference, 1)}°</td><td><span class="stat-pill ${test.adjustedP < .05 ? "significant" : ""}">${test.comparable === false ? "not directional" : formatP(test.adjustedP)}</span></td></tr>`).join("");
   const audit = lastSummary?.filterAudit || [];
   const sourceRows = Math.max(1, Number(audit[0]?.rows) || 1);
+  const sourceSegments = Math.max(1, Number(audit[0]?.segments) || 1);
   const auditRows = audit.map((stage, index) => {
     const previous = audit[Math.max(0, index - 1)] || stage;
     const rows = Number(stage.rows) || 0, segments = Number(stage.segments) || 0;
     const removed = index ? Math.max(0, (Number(previous.rows) || 0) - rows) : 0;
     const retained = Math.max(0, Math.min(100, rows / sourceRows * 100));
-    return `<tr><td>${escapeHtml(stage.label)}</td><td>${formatCount(rows)}</td><td>${formatCount(segments)}</td>
-      <td>${index ? `−${formatCount(removed)}` : "—"}</td><td>${formatNumber(retained, 1)}%</td></tr>`;
+    const replicateRetained = Math.max(0, Math.min(100, segments / sourceSegments * 100));
+    return `<tr title="${escapeHtml(`${stage.label}: ${stage.detail || "Applied"}`)}"><td><b>${escapeHtml(stage.label)}</b><small>${escapeHtml(stage.detail || "Applied")}</small></td>
+      <td>${formatCount(segments)} / ${formatCount(sourceSegments)}<small>${formatNumber(replicateRetained, 1)}%</small></td>
+      <td>${formatCount(rows)} / ${formatCount(sourceRows)}<small>${formatNumber(retained, 1)}%</small></td>
+      <td>${index ? `−${formatCount(removed)}` : "—"}</td></tr>`;
   }).join("");
   const auditCard = `<article class="statistics-card filter-statistics-card"><h3>Included-data audit</h3>
-    <small>Every result below uses the final intersection of category, range, quality, ROI, local-time, and curtain filters.</small>
-    <table><thead><tr><th>Stage</th><th>Rows kept</th><th>Segments</th><th>Removed here</th><th>Source retained</th></tr></thead><tbody>${auditRows}</tbody></table></article>`;
+    <small>Every result below uses the final intersection shown here. Replicates are the dashboard's exact Source file × Trial × Step segments.</small>
+    <table><thead><tr><th>Filter and setting</th><th>Replicates retained</th><th>Rows retained</th><th>Rows removed here</th></tr></thead><tbody>${auditRows}</tbody></table></article>`;
   host.innerHTML = `<div class="statistics-grid">${auditCard}${metricCards}<article class="statistics-card"><h3>Circular direction</h3>
     <small>Rayleigh stars show non-uniformity; letters summarize Holm-adjusted mean-angle comparisons among directional groups.</small>
     <table><thead><tr><th>Panel</th><th>Group</th><th>n</th><th>Mean</th><th>R</th><th>Rayleigh p</th></tr></thead><tbody>${rayleighRows}</tbody></table>
@@ -1210,7 +1300,9 @@ function handleWorkerMessage(event) {
   }
   if (message.type === "transition-inspect-result") {
     transitionSelectionActive = true;
-    transitionRenderer.setTrajectoryOverlay(products.trajectory, message.segments);
+    transitionRenderer.setTrajectoryOverlay(products.trajectory, message.segments, {
+      panel: message.panel, ix: message.ix, iz: message.iz,
+    });
     byId("segment-inspector").textContent = `${formatCount(message.segments.length)} unique segments entered the selected transition cell at X ${formatNumber(message.x, 1)}, Z ${formatNumber(message.z, 1)}. Their decimated raw paths are overlaid here; click unsupported white space to clear.`;
     setStatus("ready", "Transition paths selected", `${formatCount(message.segments.length)} unique segments entered the selected cell.`);
     return;
@@ -1461,7 +1553,10 @@ function currentRecipe() {
     state,
     targetFrame: {
       convention: "Unity left-handed X/Z; negative X is left, positive X is right",
-      mirroredPoolTransform: "X → -X; orientation and movement heading → -angle; Z and time unchanged",
+      mirroredPoolTransform: mirrorAxis === "x"
+        ? `X → ${formatNumber(2 * mirrorCoordinate, 1)} − X; orientation and movement heading → −angle; Z and time unchanged`
+        : `Z → ${formatNumber(2 * mirrorCoordinate, 1)} − Z; orientation and movement heading → 180° − angle; X and time unchanged`,
+      pairingAxis: mirrorGroupKey(),
       configs: datasetHeader?.configPresentation || {},
     },
     visuals: Object.fromEntries(recipeVisualIds.map(id => [id, byId(id).value])),
@@ -1509,13 +1604,14 @@ function applyRecipeControls(recipe) {
     polarMode:"polar-mode",
     roiReach:"roi-reach", ringMatch:"ring-match", playbackPercentile:"playback-cap",
     headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
-    transitionAxis:"transition-axis",
+    transitionAxis:"transition-axis", mirrorAxis:"mirror-axis", mirrorCoordinate:"mirror-coordinate",
   };
   for (const [key, id] of Object.entries(valueIds)) if (state[key] != null) byId(id).value = state[key];
   syncAngleSourceControls(byId("angle-source").value);
   for (const [key, id] of Object.entries({movingOnly:"moving-only",mirrorPool:"mirror-pool",roiEntered:"roi-entered",roiTrim:"roi-trim",ringEnabled:"ring-enabled",ringContext:"ring-context",windowsVisible:"window-show",showMarginals:"show-marginals"})) {
     if (state[key] != null && !(id === "mirror-pool" && byId(id).disabled)) byId(id).checked = !!state[key];
   }
+  if (state.gridOrigin != null) byId("grid-center-origin").checked = state.gridOrigin !== "edge";
   if (Array.isArray(state.polarR)) { byId("polar-r-min").value = state.polarR[0]; byId("polar-r-max").value = state.polarR[1]; }
   if (state.labels && typeof state.labels === "object") {
     displayNames = structuredClone(state.labels);
@@ -1528,7 +1624,10 @@ function applyRecipeControls(recipe) {
     }
   }
   panelOrders = state.panelOrders && typeof state.panelOrders === "object" ? structuredClone(state.panelOrders) : panelOrders;
-  if (Array.isArray(state.mirrorRules)) mirrorRules = structuredClone(state.mirrorRules);
+  if (Array.isArray(state.mirrorRules)) mirrorRules = structuredClone(state.mirrorRules)
+    .map(rule => ({...rule, groupBy: rule.groupBy || "config"}));
+  mirrorAxis = state.mirrorAxis === "z" ? "z" : (byId("mirror-axis").value === "z" ? "z" : "x");
+  mirrorCoordinate = Number(state.mirrorCoordinate ?? byId("mirror-coordinate").value) || 0;
   if (Array.isArray(state.rings)) rings = state.rings.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||.01)}));
   if (Array.isArray(state.windows)) for (const [index, window] of state.windows.slice(0, 2).entries()) {
     const key = index ? "b" : "a";
@@ -1537,7 +1636,10 @@ function applyRecipeControls(recipe) {
   sampleSeed = Number(state.sampleSeed) || 0;
   for (const [id, value] of Object.entries(recipe.visuals || {})) if (byId(id) && value != null) byId(id).value = value;
   setDashboardView(state.view || state.lens || "trajectory", false);
-  renderRingControls(); renderMirrorPairs(); renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
+  renderRingControls(); renderMirrorPairs();
+  if (state.mirrorPool && !byId("mirror-pool").disabled) byId("mirror-pool").checked = true;
+  renderDisplayLabels(); renderPanelOrder(panelOrders[byId("group-by").value] || []);
+  saveMirrorPreferences();
   trajectoryRenderer.setLineStyle(numberValue("trajectory-width", 1.1), numberValue("trajectory-opacity", .5));
   trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
   for (const renderer of spatialRenderers) renderer.setMarginalsVisible(byId("show-marginals").checked);
@@ -1695,7 +1797,10 @@ function renderPanelOrder(codes = lastSummary?.panelKeys || []) {
     empty.textContent = key === "all" ? "All data is pooled into one panel." : "No visible panels.";
     host.appendChild(empty); return;
   }
-  const orderKey = key === "config" && byId("mirror-pool").checked ? "mirrorConfig" : key;
+  const orderKey = byId("mirror-pool").checked ? mirrorOrderKey(key) : key;
+  const summaryNames = new Map((lastSummary?.panelKeys || []).map((panelKey, index) => [
+    Number(panelKey), lastSummary?.panelNames?.[index],
+  ]));
   const names = orderKey === "mirrorConfig"
     ? (datasetHeader?.displayCategories?.mirrorConfig || datasetHeader?.categories?.mirrorConfig || [])
     : (displayNames[key] || datasetHeader?.categories?.[key] || []);
@@ -1708,7 +1813,9 @@ function renderPanelOrder(codes = lastSummary?.panelKeys || []) {
     const item = document.createElement("div"); item.className = "panel-order-item";
     item.draggable = true; item.dataset.code = code;
     const grip = document.createElement("span"); grip.className = "grip"; grip.textContent = "⋮⋮";
-    const text = document.createElement("span"); text.textContent = names[code] || `Panel ${code + 1}`;
+    const text = document.createElement("span");
+    text.textContent = summaryNames.get(code) || names[code] || `Panel ${code + 1}`;
+    text.title = text.textContent;
     const up = document.createElement("button"); up.type = "button"; up.textContent = "↑"; up.disabled = index === 0;
     const down = document.createElement("button"); down.type = "button"; down.textContent = "↓"; down.disabled = index === codes.length - 1;
     up.addEventListener("click", () => { const next = codes.map(Number); [next[index - 1], next[index]] = [next[index], next[index - 1]]; commit(next); });
@@ -1859,8 +1966,8 @@ byId("controls-toggle").addEventListener("click", () => {
   byId("controls-toggle").setAttribute("aria-expanded", String(!collapsed));
 });
 byId("sidebar-close").addEventListener("click", () => { setMirrorGuide(null); byId("controls-toggle").click(); });
-byId("mirror-pair-list").addEventListener("focusout", () => setTimeout(() => {
-  if (!byId("mirror-pair-list").contains(document.activeElement)) setMirrorGuide(null);
+document.querySelector(".mirror-card").addEventListener("focusout", () => setTimeout(() => {
+  if (!document.querySelector(".mirror-card").contains(document.activeElement)) setMirrorGuide(null);
 }, 0));
 
 function setCurtainPalette(open) {
@@ -1900,6 +2007,7 @@ byId("group-by").addEventListener("change", () => {
     byId("label-axis").value = grouped;
     renderDisplayLabels();
   }
+  renderMirrorPairs(); setMirrorGuide(null);
   renderPanelOrder([]);
 });
 for (const button of document.querySelectorAll("[data-view-button]")) {
@@ -2043,19 +2151,36 @@ byId("show-marginals").addEventListener("change", () => {
   for (const renderer of spatialRenderers) renderer.setMarginalsVisible(byId("show-marginals").checked);
   persistState();
 });
+for (const id of ["mirror-axis", "mirror-coordinate"]) {
+  byId(id).addEventListener("focus", () => setMirrorGuide({}));
+  byId(id).addEventListener("input", () => {
+    mirrorAxis = byId("mirror-axis").value === "z" ? "z" : "x";
+    mirrorCoordinate = numberValue("mirror-coordinate", 0);
+    setMirrorGuide({});
+  });
+  byId(id).addEventListener("change", () => {
+    mirrorAxis = byId("mirror-axis").value === "z" ? "z" : "x";
+    mirrorCoordinate = numberValue("mirror-coordinate", 0);
+    saveMirrorPreferences();
+    if (byId("mirror-pool").checked) scheduleDataUpdate(80); else persistState();
+  });
+}
 byId("mirror-pair-add").addEventListener("click", () => {
-  const count = datasetHeader?.categories?.config?.length || 0;
+  const key = mirrorGroupKey();
+  const count = key ? (datasetHeader?.categories?.[key]?.length || 0) : 0;
   if (count < 2) return;
-  const used = new Set(mirrorRules.flatMap(rule => [Number(rule.reference), Number(rule.reflected)]));
+  const used = new Set(activeMirrorRules().flatMap(rule => [Number(rule.reference), Number(rule.reflected)]));
   const available = Array.from({length: count}, (_, code) => code).filter(code => !used.has(code));
-  mirrorRules.push({reference: available[0] ?? 0, reflected: available[1] ?? (available[0] === 0 ? 1 : 0), axis: "x", coordinate: 0});
-  renderMirrorPairs(); setMirrorGuide(mirrorRules[mirrorRules.length - 1]);
-  byId("mirror-pool").disabled = false;
+  mirrorRules.push({reference: available[0] ?? 0,
+    reflected: available[1] ?? (available[0] === 0 ? 1 : 0), groupBy: key});
+  renderMirrorPairs(); setMirrorGuide(activeMirrorRules().at(-1));
+  saveMirrorPreferences();
   persistState();
 });
 byId("mirror-pair-clear").addEventListener("click", () => {
-  mirrorRules = []; renderMirrorPairs(); setMirrorGuide(null);
-  byId("mirror-pool").disabled = (datasetHeader?.categories?.config?.length || 0) < 2;
+  const key = mirrorGroupKey();
+  mirrorRules = mirrorRules.filter(rule => (rule.groupBy || "config") !== key);
+  renderMirrorPairs(); setMirrorGuide(null); saveMirrorPreferences();
   scheduleDataUpdate(80);
 });
 byId("time-scrubber").addEventListener("input", () => {

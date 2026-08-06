@@ -92,7 +92,7 @@
             </select>
           </label>
           <label class="check"><input id="moving-only" data-scope="movement" type="checkbox"> Moving samples only</label>
-          <label class="check" title="Pool left/right-swapped controls in one canonical frame using X → −X and heading → −heading for the reflected member."><input id="mirror-pool" data-scope="full" type="checkbox"> Pool mirrored L/R controls</label>
+          <label class="check" title="Pool explicitly matched panel categories in one reflected coordinate frame."><input id="mirror-pool" data-scope="full" type="checkbox"> <span id="mirror-pool-label">Pool matched panel pairs</span></label>
           <label class="check"><input id="spatial-grid" type="checkbox" checked> Spatial grid</label>
           <label class="check"><input id="show-marginals" type="checkbox"> Marginal distributions</label>
           <label>Walk threshold
@@ -104,7 +104,12 @@
       <details class="control-card mirror-card">
         <summary>Mirror pairing</summary>
         <div class="control-body">
-          <p class="control-note">Match a reference treatment with the treatment to reflect. The Unity ground plane is X/Z: X mirrors left/right; Z mirrors forward/back.</p>
+          <p class="control-note">Match values from the current panel split. Every pair uses the same mirror line, so the pooled frame remains scientifically interpretable.</p>
+          <div class="mirror-global-controls">
+            <label>Pair within<output id="mirror-group-label">Treatment panels</output></label>
+            <label>Mirror axis<select id="mirror-axis"><option value="x">X · left/right</option><option value="z">Z · forward/back</option></select></label>
+            <label>Mirror line<input id="mirror-coordinate" type="number" step="0.1" value="0"></label>
+          </div>
           <div class="mirror-pair-list" id="mirror-pair-list"><span class="empty-control">Load data to match treatments.</span></div>
           <div class="recipe-actions">
             <button class="compact" id="mirror-pair-add" type="button" disabled>Add pair</button>
@@ -308,6 +313,7 @@
             <label>Colour max<input id="heat-cmax" type="number" step="0.1" value="99"></label>
             <label>Grid size<input id="bin-size" data-scope="spatial" type="number" min="0" step="0.01" placeholder="Auto"></label>
             <label>Central %<input id="bound-percent" data-scope="spatial" type="number" min="50" max="100" value="98"></label>
+            <label class="check" title="On: the origin is the centre of one cell. Off: the origin is the shared corner of four cells."><input id="grid-center-origin" data-scope="spatial" type="checkbox" checked> Centre a cell on origin</label>
           </div></details>
           <div class="plot-host" id="heatmap-plot" aria-label="Occupancy heatmap"></div>
         </div>

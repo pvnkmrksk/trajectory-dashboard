@@ -40,7 +40,7 @@ table off the main thread and prepares narrow drawing products:
 - complete-segment metadata/statistic filters plus row-level jump/trim gates;
 - active-panel codes and labels;
 - a bounded line-pair buffer for one WebGL trajectory draw call;
-- zero-centred occupancy grids and circular direction accumulators;
+- origin-centred or origin-edged occupancy grids and circular direction accumulators;
 - trial/animal polar resultants and signed heading-time pairs;
 - exact per-segment or per-animal movement metrics;
 - target reach, residence, time-to-target, and heading-error products; and
@@ -69,10 +69,13 @@ The rendering boundary is deliberately hybrid:
   pixel width/opacity, colour, displayed-trial fraction, animal visibility,
   selected-segment visibility, and playback time handled by shaders/buffers;
 - occupancy is a crisp nearest-neighbour per-panel raster with a visible colour
-  bar, compact value-density profile, and absolute or percentile colour clipping;
+  bar, compact value-density profile, absolute or percentile colour clipping,
+  and an explicit choice between a bin centred on the origin and four bins
+  meeting at the origin;
 - transition probability is a second native raster layer on the same grid,
   viewport, and interaction transform as paths/occupancy/flow; supported cells
-  drill into their exact raw segments and blank space clears that observer;
+  drill into their exact raw segments, clip those paths to their source pane,
+  and mark the same world cell in every panel; blank space clears that observer;
 - the direction field uses a lightweight Canvas particle layer because its
   spatial transform must remain exactly synchronized with trajectory/occupancy;
   abundance drives spawning, R drives mean alignment/angular spread, measured
@@ -91,9 +94,10 @@ The rendering boundary is deliberately hybrid:
   Diagnostics. Paths, Occupancy, Flow, Polar, and Transitions are layers of
   that workspace. Its compact 2×2 overview defaults to four pooled
   representations, with an explicit all-panels comparison when needed; and
-- the source picker and complete analysis controls are drawers. They remain
-  available without permanently taking plot area, and the controls drawer
-  starts collapsed so data is the dominant visual element. Category filters
+- the source picker and complete analysis controls are drawers. On desktop the
+  controls column pushes, rather than covers, the workspace; on small screens
+  it remains a temporary overlay. The drawer starts collapsed so data is the
+  dominant visual element. Category filters
   are explicit checklists with All/None actions rather than modifier-key
   multi-select boxes.
 
@@ -104,7 +108,10 @@ Grid ticks are generated in world coordinates at stable nice-number intervals,
 including a stronger zero line, so they pan and zoom with the data rather than
 relabelling fixed pixel subdivisions. A physical-unit scale bar provides an
 additional reference. Occupancy uses the standard Viridis palette and nearest-
-neighbour cells. Metric distributions combine density violins, box summaries,
+neighbour cells. Optional top/right spatial marginals are fixed-axis Gaussian
+KDE profiles cached from the active subset: pan/zoom only reprojects them with
+the shared world transform and never recomputes their density. Metric
+distributions combine density violins, box summaries,
 deterministically jittered observations, hover, and inside/box zoom.
 
 At the Python boundary, every timestamp is parsed once as UTC and stored as
@@ -196,7 +203,10 @@ canvas from the exported binned direction vectors.
   marker as the two-stimulus separator and do not mistake the shared protocol
   prefix for target names. Confirmed left/right control pairs can be pooled
   by reflecting one member (`X -> -X`, `heading -> -heading`); Z and time are
-  unchanged. The mapping and transform are preserved in the JSON view recipe.
+  unchanged. Explicit mirroring can instead pair values of whichever category
+  currently splits the panels (config, scene, VR, animal, or folder). Every pair
+  uses one shared X/Z mirror line, and the mapping/transform are preserved in the
+  URL and JSON view recipe plus a source-keyed device-local preference.
 - ROI fraction/residence denominators use the quality-filtered pre-ROI segment
   table; time-to-target and heading-error use the visible ROI-filtered table.
 - Displayed-trial fraction affects mounted path/polar/heading drawings but not
@@ -208,18 +218,18 @@ canvas from the exported binned direction vectors.
 |---|---|
 | Bounded parallel CSV/metadata load | Complete |
 | Config/scene/VR/fly/folder grouping and filters | Complete |
-| Geometry-aware Left/Right config labels and mirrored-control pooling | Complete (automatic target-reflection pairs plus an explicit reference/reflected pairing editor with X or Z mirror line; mapping is URL/recipe-persisted) |
+| Geometry-aware Left/Right labels and mirrored-control pooling | Complete (automatic config target-reflection pairs plus an explicit reference/reflected editor for the current panel grouping; one global X/Z mirror line; source-local, URL, and recipe persistence) |
 | Trial/step/replicate/time/resultant-R/peak/displacement/distance and quality filters | Complete |
 | GPU trajectories, colour modes, moving gate, point budget | Complete |
 | Shared pan/zoom, reset, responsive columns, clean layout | Complete |
 | GPU playback (segment-local time; all/single; p95/p99/max caps) and displayed-trial fraction | Complete |
-| Occupancy count/time/percent, crisp cells, linear/log and adjustable colour limits | Complete |
+| Occupancy count/time/percent, crisp cells, centre/edge origin grid, linear/log and adjustable colour limits | Complete |
 | Local body/movement flow field with abundance/R uncertainty controls and hue legend | Complete |
 | Trial/animal polar vectors, resultant histogram, all-heading circular density, and trial/mean/density heading time | Complete |
 | Trial/animal movement metrics | Complete |
 | ROI rings, first-reached counts, entered-only, tail trim | Complete |
 | ROI fraction/residence/time/error diagnostics | Complete |
-| Native filter mini-histograms with dual range and compact numeric controls | Complete (histograms refresh to the current AND subset) |
+| Native filter mini-histograms with dual range and compact numeric controls | Complete (histograms refresh to the current AND subset; the audit reports each setting and retained replicate/row counts and percentages) |
 | Exact nearest-segment inspection | Complete |
 | Talk-ready PNG and self-contained native HTML report | Complete (fixed two-column 16:9 capture; at least 1600 x 900 pixels per treatment panel; local pan/zoom and animated exported flow; live layout restored) |
 | Shareable principal URL state and readable JSON view recipe | Complete |
@@ -232,7 +242,7 @@ canvas from the exported binned direction vectors.
 | Draggable/keyboard panel ordering across linked views | Complete |
 | Shared spatial layers and compact 2×2 overview | Complete (one viewport/subset/curtain across paths, occupancy, flow, polar, and transitions; pooled or all-panel overview) |
 | Editable observation windows and paired window inference | Complete (shared spatial transform; on-demand worker-side Wilcoxon summaries) |
-| Transition-probability cell observer | Complete (native shared-grid layer; X/Z split coordinate; unique segment/cell entry, crossed/ended outcomes, support/fraction/count controls, in-place raw-path overlay and blank reset) |
+| Transition-probability cell observer | Complete (native shared-grid layer; X/Z split coordinate; unique segment/cell entry, crossed/ended outcomes, support/fraction/count controls, pane-clipped in-place raw paths, cross-panel cell highlight, and blank reset) |
 | Delayed Holm/Rayleigh annotation layer | Complete (on-demand worker pass; compact-letter metric comparisons, Rayleigh stars, and Holm-adjusted directional mean permutation tests) |
 
 The old Dash app stays runnable on this branch as a reference implementation;

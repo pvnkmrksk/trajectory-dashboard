@@ -339,38 +339,86 @@ function drawMirrorGuide(ctx, width, height, data, view, guide) {
   ctx.restore();
 }
 
-function drawMarginalProfiles(ctx, pane, xValues, zValues) {
+function smoothDensity(values) {
+  const radius = 4, sigma = 1.45;
+  const weights = Array.from({length: radius * 2 + 1}, (_, index) =>
+    Math.exp(-.5 * ((index - radius) / sigma) ** 2));
+  const result = new Float64Array(values.length);
+  for (let index = 0; index < values.length; index += 1) {
+    let total = 0, weight = 0;
+    for (let offset = -radius; offset <= radius; offset += 1) {
+      const source = index + offset;
+      if (source < 0 || source >= values.length) continue;
+      const localWeight = weights[offset + radius];
+      total += Number(values[source] || 0) * localWeight; weight += localWeight;
+    }
+    result[index] = weight ? total / weight : 0;
+  }
+  return result;
+}
+
+function drawMarginalProfiles(ctx, pane, profile, shown) {
+  const {xValues, zValues, x0, z0, xStep, zStep} = profile || {};
+  if (!xValues?.length || !zValues?.length || !shown) return;
   const xMax = Math.max(1, ...xValues), zMax = Math.max(1, ...zValues);
-  const topH = Math.min(34, Math.max(22, pane.height * .105));
-  const rightW = Math.min(34, Math.max(22, pane.width * .07));
+  const topH = Math.min(38, Math.max(24, pane.height * .11));
+  const rightW = Math.min(38, Math.max(24, pane.width * .075));
+  const xPixel = index => pane.left + (x0 + index * xStep - shown.xmin)
+    / (shown.xmax - shown.xmin) * pane.width;
+  const zPixel = index => pane.bottom - (z0 + index * zStep - shown.zmin)
+    / (shown.zmax - shown.zmin) * pane.height;
   ctx.save();
-  ctx.fillStyle = "rgba(252,253,253,.92)";
+  ctx.beginPath(); ctx.rect(pane.left, pane.top, pane.width, pane.height); ctx.clip();
+  ctx.fillStyle = "rgba(251,253,252,.90)";
   ctx.fillRect(pane.left, pane.top, pane.width, topH);
   ctx.fillRect(pane.right - rightW, pane.top, rightW, pane.height);
-  ctx.strokeStyle = "rgba(35,67,60,.18)";
-  ctx.lineWidth = .75;
+  ctx.strokeStyle = "rgba(26,91,80,.17)"; ctx.lineWidth = .75;
   ctx.beginPath(); ctx.moveTo(pane.left, pane.top + topH); ctx.lineTo(pane.right, pane.top + topH); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(pane.right - rightW, pane.top); ctx.lineTo(pane.right - rightW, pane.bottom); ctx.stroke();
-  const xStep = pane.width / Math.max(1, xValues.length);
-  ctx.fillStyle = "rgba(13,116,106,.30)";
+
+  const topBase = pane.top + topH;
+  ctx.beginPath(); ctx.moveTo(xPixel(0), topBase);
   for (let index = 0; index < xValues.length; index += 1) {
-    const height = (topH - 4) * xValues[index] / xMax;
-    if (height > 0) ctx.fillRect(pane.left + index * xStep + .25, pane.top + topH - height,
-      Math.max(.5, xStep - .5), height);
+    ctx.lineTo(xPixel(index), topBase - (topH - 5) * xValues[index] / xMax);
   }
-  const zStep = pane.height / Math.max(1, zValues.length);
+  ctx.lineTo(xPixel(xValues.length - 1), topBase); ctx.closePath();
+  ctx.fillStyle = "rgba(8,124,114,.20)"; ctx.fill();
+  ctx.strokeStyle = "rgba(8,105,96,.70)"; ctx.lineWidth = 1.1; ctx.stroke();
+
+  const rightBase = pane.right - rightW;
+  ctx.beginPath(); ctx.moveTo(rightBase, zPixel(0));
   for (let index = 0; index < zValues.length; index += 1) {
-    const barWidth = (rightW - 4) * zValues[index] / zMax;
-    if (barWidth > 0) ctx.fillRect(pane.right - barWidth, pane.bottom - (index + 1) * zStep + .25,
-      barWidth, Math.max(.5, zStep - .5));
+    ctx.lineTo(rightBase + (rightW - 5) * zValues[index] / zMax, zPixel(index));
   }
-  ctx.fillStyle = "rgba(38,61,55,.62)";
-  ctx.font = "700 7px Inter, system-ui";
-  ctx.textBaseline = "top";
-  ctx.fillText("X marginal", pane.left + 4, pane.top + 3);
+  ctx.lineTo(rightBase, zPixel(zValues.length - 1)); ctx.closePath();
+  ctx.fillStyle = "rgba(8,124,114,.20)"; ctx.fill();
+  ctx.strokeStyle = "rgba(8,105,96,.70)"; ctx.stroke();
+  ctx.fillStyle = "rgba(38,61,55,.66)"; ctx.font = "700 7px Inter, system-ui";
+  ctx.textBaseline = "top"; ctx.fillText("X density", pane.left + 4, pane.top + 3);
   ctx.save(); ctx.translate(pane.right - 3, pane.bottom - 4); ctx.rotate(-Math.PI / 2);
-  ctx.fillText("Z marginal", 0, 0); ctx.restore();
+  ctx.fillText("Z density", 0, 0); ctx.restore();
   ctx.restore();
+}
+
+const GRID_MARGINAL_CACHE = new WeakMap();
+function gridMarginalProfiles(data, values) {
+  const cached = GRID_MARGINAL_CACHE.get(data);
+  if (cached?.values === values) return cached.profiles;
+  const cells = data.nx * data.nz;
+  const profiles = Array.from({length: data.panelCount}, (_, panel) => {
+    const xSums = new Float64Array(data.nx), zSums = new Float64Array(data.nz);
+    for (let iz = 0; iz < data.nz; iz += 1) for (let ix = 0; ix < data.nx; ix += 1) {
+      const value = Number(values[panel * cells + iz * data.nx + ix]) || 0;
+      xSums[ix] += value; zSums[iz] += value;
+    }
+    return {
+      xValues: smoothDensity(xSums), zValues: smoothDensity(zSums),
+      x0: data.x0 + data.bin * .5, z0: data.z0 + data.bin * .5,
+      xStep: data.bin, zStep: data.bin,
+    };
+  });
+  GRID_MARGINAL_CACHE.set(data, {values, profiles});
+  return profiles;
 }
 
 function drawGridMarginals(ctx, width, height, data, view, visible) {
@@ -378,31 +426,11 @@ function drawGridMarginals(ctx, width, height, data, view, visible) {
   const values = data.count || data.abundance || data.entered;
   if (!values) return;
   const layout = panelLayout(width, height, data.panelCount, data.columns);
-  const cells = data.nx * data.nz;
+  const profiles = gridMarginalProfiles(data, values);
   for (let panel = 0; panel < data.panelCount; panel += 1) {
     const pane = panelPane(layout, panel);
     const shown = equalScaleView(view, pane);
-    const xSums = new Float64Array(data.nx), zSums = new Float64Array(data.nz);
-    for (let iz = 0; iz < data.nz; iz += 1) {
-      const z = data.z0 + (iz + .5) * data.bin;
-      if (z < shown.zmin || z > shown.zmax) continue;
-      for (let ix = 0; ix < data.nx; ix += 1) {
-      const x = data.x0 + (ix + .5) * data.bin;
-      if (x < shown.xmin || x > shown.xmax) continue;
-      const value = Number(values[panel * cells + iz * data.nx + ix]) || 0;
-      xSums[ix] += value; zSums[iz] += value;
-      }
-    }
-    const xVisible = [], zVisible = [];
-    for (let ix = 0; ix < data.nx; ix += 1) {
-      const x = data.x0 + (ix + .5) * data.bin;
-      if (x >= shown.xmin && x <= shown.xmax) xVisible.push(xSums[ix]);
-    }
-    for (let iz = 0; iz < data.nz; iz += 1) {
-      const z = data.z0 + (iz + .5) * data.bin;
-      if (z >= shown.zmin && z <= shown.zmax) zVisible.push(zSums[iz]);
-    }
-    drawMarginalProfiles(ctx, pane, xVisible, zVisible);
+    drawMarginalProfiles(ctx, pane, profiles[panel], shown);
   }
 }
 
@@ -739,6 +767,7 @@ export class TrajectoryRenderer extends SpatialBase {
     this.selectedSegment = -1;
     this.lineWidth = 1.1;
     this.lineOpacity = .5;
+    this._marginalProfiles = null;
     this._initGl();
     installSpatialInteraction(this, this.overlay);
     installResize(this);
@@ -851,6 +880,7 @@ export class TrajectoryRenderer extends SpatialBase {
   }
   setData(data, preserveView = true) {
     this.data = data;
+    this._marginalProfiles = null;
     const gl = this.gl;
     gl.bindVertexArray(this.vao);
     this._attribute(0, data.vertices, 4, gl.FLOAT);
@@ -900,6 +930,33 @@ export class TrajectoryRenderer extends SpatialBase {
     this._uploadRingEntries();
     if (!preserveView || !this.view) this.view = squareBounds(data.bounds);
     this.draw();
+  }
+  marginalProfiles() {
+    if (this._marginalProfiles || !this.data?.vertices?.length) return this._marginalProfiles;
+    const bins = 72, bounds = squareBounds(this.data.bounds);
+    const xStep = (bounds.xmax - bounds.xmin) / bins;
+    const zStep = (bounds.zmax - bounds.zmin) / bins;
+    const xCounts = Array.from({length: this.data.panelCount}, () => new Float64Array(bins));
+    const zCounts = Array.from({length: this.data.panelCount}, () => new Float64Array(bins));
+    const stride = Math.max(1, Math.ceil(this.data.links / 120000));
+    for (let link = 0; link < this.data.links; link += stride) {
+      const panel = this.data.panels[link * 2], vertex = link * 4;
+      const segment = this.data.segments?.[link * 2];
+      if (panel < 0 || panel >= this.data.panelCount) continue;
+      if (this.ringEnabled && Number.isFinite(segment) && this.ringEntries[segment] < 0) continue;
+      if (this.data.samples?.[link * 2] > this.fraction || this.visibility?.[link] === 0) continue;
+      const x = this.data.vertices[vertex + 2], z = this.data.vertices[vertex + 3];
+      const ix = Math.floor((x - bounds.xmin) / Math.max(1e-12, bounds.xmax - bounds.xmin) * bins);
+      const iz = Math.floor((z - bounds.zmin) / Math.max(1e-12, bounds.zmax - bounds.zmin) * bins);
+      if (ix >= 0 && ix < bins) xCounts[panel][ix] += 1;
+      if (iz >= 0 && iz < bins) zCounts[panel][iz] += 1;
+    }
+    this._marginalProfiles = xCounts.map((xValues, panel) => ({
+      xValues: smoothDensity(xValues), zValues: smoothDensity(zCounts[panel]),
+      x0: bounds.xmin + xStep * .5, z0: bounds.zmin + zStep * .5,
+      xStep, zStep,
+    }));
+    return this._marginalProfiles;
   }
   tooltipText(point) {
     if (!this.data?.segmentLabels || !this.hoverBuckets || !this.view) return null;
@@ -981,6 +1038,7 @@ export class TrajectoryRenderer extends SpatialBase {
       }
     }
     this.data.ringMatches = matches;
+    this._marginalProfiles = null;
     this._uploadRingEntries();
     this.drawGl(); this.drawOverlay();
     return {matches, buildMs: performance.now() - started};
@@ -994,9 +1052,13 @@ export class TrajectoryRenderer extends SpatialBase {
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers[5]);
     gl.bufferData(gl.ARRAY_BUFFER, this.visibility, gl.DYNAMIC_DRAW);
-    this.drawGl();
+    this._marginalProfiles = null;
+    this.drawGl(); if (this.marginalsVisible) this.drawOverlay();
   }
-  setFraction(value) { this.fraction = Math.max(.01, Math.min(1, value)); this.drawGl(); }
+  setFraction(value) {
+    this.fraction = Math.max(.01, Math.min(1, value)); this._marginalProfiles = null;
+    this.drawGl(); if (this.marginalsVisible) this.drawOverlay();
+  }
   setTime(value) { this.timeLimit = Number.isFinite(value) ? value : 1e30; this.drawGl(); }
   setPlaybackSegment(value) {
     this.selectedSegment = Number.isFinite(Number(value)) ? Number(value) : -1;
@@ -1019,6 +1081,7 @@ export class TrajectoryRenderer extends SpatialBase {
     this.ringEnabled = !!segmentCodes?.length;
     this.ringContext = !!showContext;
     this.data.ringEnabled = false;
+    this._marginalProfiles = null;
     this._uploadRingEntries(); this.draw();
   }
   resize() {
@@ -1075,27 +1138,11 @@ export class TrajectoryRenderer extends SpatialBase {
       drawPanelRings(this.ctx, this.width, this.height, this.data, this.view);
       drawPanelWindows(this.ctx, this.width, this.height, this.data, this.view);
       if (this.marginalsVisible && this.data.vertices?.length) {
-        const bins = 42;
         const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
-        const xCounts = Array.from({length: this.data.panelCount}, () => new Uint32Array(bins));
-        const zCounts = Array.from({length: this.data.panelCount}, () => new Uint32Array(bins));
-        const stride = Math.max(1, Math.ceil(this.data.links / 60000));
-        for (let link = 0; link < this.data.links; link += stride) {
-          const panel = this.data.panels[link * 2], vertex = link * 4;
-          const pane = panelPane(layout, panel), shown = equalScaleView(this.view, pane);
-          const x = this.data.vertices[vertex + 2], z = this.data.vertices[vertex + 3];
-          const segment = this.data.segments?.[link * 2];
-          if (x < shown.xmin || x > shown.xmax || z < shown.zmin || z > shown.zmax) continue;
-          if (this.ringEnabled && Number.isFinite(segment) && this.ringEntries[segment] < 0) continue;
-          if (this.data.samples?.[link * 2] > this.fraction || this.data.times?.[link * 2] > this.timeLimit) continue;
-          if (this.visibility?.[link] === 0) continue;
-          const ix = Math.floor((x - shown.xmin) / (shown.xmax - shown.xmin) * bins);
-          const iz = Math.floor((z - shown.zmin) / (shown.zmax - shown.zmin) * bins);
-          if (ix >= 0 && ix < bins) xCounts[panel][ix] += 1;
-          if (iz >= 0 && iz < bins) zCounts[panel][iz] += 1;
-        }
+        const profiles = this.marginalProfiles();
         for (let panel = 0; panel < this.data.panelCount; panel += 1) {
-          drawMarginalProfiles(this.ctx, panelPane(layout, panel), xCounts[panel], zCounts[panel]);
+          const pane = panelPane(layout, panel);
+          drawMarginalProfiles(this.ctx, pane, profiles[panel], equalScaleView(this.view, pane));
         }
       }
       drawMirrorGuide(this.ctx, this.width, this.height, this.data, this.view, this.mirrorGuide);
@@ -1386,15 +1433,18 @@ export class TransitionRenderer extends HeatmapRenderer {
     };
     this.trajectoryOverlay = null;
     this.overlaySegments = new Set();
+    this.selectedCell = null;
   }
   setVisualOptions(options = {}) {
     Object.assign(this.visualOptions, options);
     this.buildTextures();
     this.draw();
   }
-  setTrajectoryOverlay(trajectory, segmentCodes = []) {
+  setTrajectoryOverlay(trajectory, segmentCodes = [], cell = null) {
     this.trajectoryOverlay = trajectory || null;
     this.overlaySegments = new Set((segmentCodes || []).map(Number));
+    this.selectedCell = cell && Number.isInteger(Number(cell.ix)) && Number.isInteger(Number(cell.iz))
+      ? {panel: Number(cell.panel), ix: Number(cell.ix), iz: Number(cell.iz)} : null;
     this.draw();
   }
   setOverlayStyle(width, opacity) {
@@ -1403,8 +1453,8 @@ export class TransitionRenderer extends HeatmapRenderer {
     if (this.overlaySegments.size) this.draw();
   }
   clearTrajectoryOverlay() {
-    if (!this.overlaySegments.size) return;
-    this.overlaySegments.clear(); this.draw();
+    if (!this.overlaySegments.size && !this.selectedCell) return;
+    this.overlaySegments.clear(); this.selectedCell = null; this.draw();
   }
   cellAt(point) {
     if (!this.data) return null;
@@ -1455,7 +1505,35 @@ export class TransitionRenderer extends HeatmapRenderer {
         const pane = this.pane(panel, layout), vertex = link * 4;
         const [x0, y0] = this.worldToPixel(trajectory.vertices[vertex], trajectory.vertices[vertex + 1], pane);
         const [x1, y1] = this.worldToPixel(trajectory.vertices[vertex + 2], trajectory.vertices[vertex + 3], pane);
+        this.ctx.save();
+        this.ctx.beginPath(); this.ctx.rect(pane.left, pane.top, pane.width, pane.height); this.ctx.clip();
         this.ctx.beginPath(); this.ctx.moveTo(x0, y0); this.ctx.lineTo(x1, y1); this.ctx.stroke();
+        this.ctx.restore();
+      }
+      this.ctx.restore();
+    }
+    if (this.selectedCell) {
+      const worldX0 = this.data.x0 + this.selectedCell.ix * this.data.bin;
+      const worldX1 = worldX0 + this.data.bin;
+      const worldZ0 = this.data.z0 + this.selectedCell.iz * this.data.bin;
+      const worldZ1 = worldZ0 + this.data.bin;
+      this.ctx.save();
+      for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+        const pane = this.pane(panel, layout);
+        const [px0, py0] = this.worldToPixel(worldX0, worldZ0, pane);
+        const [px1, py1] = this.worldToPixel(worldX1, worldZ1, pane);
+        const left = Math.min(px0, px1), top = Math.min(py0, py1);
+        const width = Math.abs(px1 - px0), height = Math.abs(py1 - py0);
+        this.ctx.save();
+        this.ctx.beginPath(); this.ctx.rect(pane.left, pane.top, pane.width, pane.height); this.ctx.clip();
+        this.ctx.fillStyle = panel === this.selectedCell.panel
+          ? "rgba(210,91,58,.16)" : "rgba(8,124,114,.10)";
+        this.ctx.strokeStyle = panel === this.selectedCell.panel
+          ? "rgba(174,65,38,.94)" : "rgba(8,105,96,.88)";
+        this.ctx.lineWidth = panel === this.selectedCell.panel ? 2 : 1.35;
+        this.ctx.setLineDash(panel === this.selectedCell.panel ? [] : [4, 3]);
+        this.ctx.fillRect(left, top, width, height); this.ctx.strokeRect(left, top, width, height);
+        this.ctx.restore();
       }
       this.ctx.restore();
     }
