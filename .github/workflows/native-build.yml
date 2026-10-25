@@ -7,10 +7,13 @@ on:
       - 'native_dashboard/**'
       - 'trajectory_dashboard/**'
       - 'requirements-native.txt'
+      - 'requirements.txt'
       - 'daari-deepa.spec'
       - 'tools/**'
       - 'tests/**'
       - '.github/workflows/native-build.yml'
+permissions:
+  contents: read
 jobs:
   tests:
     runs-on: ubuntu-22.04
@@ -62,3 +65,40 @@ jobs:
           name: DaariDeepa-${{ matrix.platform }}
           path: dist/DaariDeepa-*.zip
           retention-days: 14
+
+  download-site:
+    needs: [tests, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: DaariDeepa-*
+          path: download-input
+          merge-multiple: true
+      - run: python tools/build_download_site.py download-input _site --revision "$GITHUB_SHA"
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy-downloads:
+    if: github.ref == 'refs/heads/main'
+    needs: download-site
+    runs-on: ubuntu-22.04
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: dashboard-downloads-pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Deploy download hub
+        id: deployment
+        uses: actions/deploy-pages@v4

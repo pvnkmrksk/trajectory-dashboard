@@ -1,13 +1,16 @@
 """Exercise a built standalone binary against a real PUB, without Python on its PATH."""
 
 import argparse
+import csv
 import json
 import os
 from pathlib import Path
 import socket
 import subprocess
+import struct
+import tempfile
 import time
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 import zmq
 
 p = argparse.ArgumentParser(description=__doc__)
@@ -33,7 +36,6 @@ env["PATH"] = (
 command = [
     str(args.executable.resolve()),
     "--no-browser",
-    "--live-only",
     "--port",
     str(http_port),
     "--telemetry",
@@ -95,6 +97,37 @@ try:
     with urlopen(base + "/api/live/stream", timeout=5) as response:
         assert response.readline() == b"event: snapshot\n"
         assert b"packaged-smoke" in response.readline()
+    with tempfile.TemporaryDirectory(prefix="daari-native-analysis-") as folder:
+        sample = Path(folder) / "sample_VR1_.csv"
+        with sample.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "Current Time",
+                    "CurrentTrial",
+                    "CurrentStep",
+                    "GameObjectPosX",
+                    "GameObjectPosZ",
+                    "AnimalID",
+                ]
+            )
+            writer.writerow(["2026-10-25T12:00:00", 0, 0, 0, 0, "animal-7"])
+            writer.writerow(["2026-10-25T12:00:02", 0, 0, 2, 0, "animal-7"])
+        request = Request(
+            base + "/api/load",
+            data=json.dumps({"source": folder}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=15) as response:
+            payload = response.read()
+        length = struct.unpack_from("<I", payload, 0)[0]
+        header = json.loads(payload[4 : 4 + length])
+        assert header["counts"]["files"] == 1
+        assert header["counts"]["retainedRows"] == 2
+        assert header["playbackMax"] == 2.0, (
+            "Recorded duration must remain seconds, not a changed datetime integer unit"
+        )
+        assert header["categories"]["animal"] == ["animal-7@VR1"]
     print(
         json.dumps(
             {
@@ -105,6 +138,8 @@ try:
                 "lateJoinContext": True,
                 "sse": True,
                 "staticAssets": True,
+                "recordedDurationSeconds": header["playbackMax"],
+                "canonicalAnimalIdentity": True,
             }
         )
     )

@@ -32,7 +32,9 @@
     if(!f)return;
     const key=`${r.endpoint||''}|${c.sessionId||f?.experimentContext?.sessionId||''}|${sys.sceneName||''}|${sys.trialNumber||0}|${sys.sceneNumber||0}`;
     if(generation && key!==generation)clear(); generation=key;
-    if(f.sequence===lastSequence)return;if(lastSequence!==null&&f.sequence<lastSequence)clear();lastSequence=f.sequence;
+    const isNewFrame=f.sequence!==lastSequence;
+    if(isNewFrame&&lastSequence!==null&&f.sequence<lastSequence)clear();
+    if(isNewFrame)lastSequence=f.sequence;
     const now=Date.parse(f.timestampUtc)||Date.now(), profiles=new Map((c.animals||[]).map(a=>[a.vrId,a]));
     const body=$('animals');body.replaceChildren();
     const visible=(f.rigs||[]).slice(0,32), ids=new Set(visible.map(r=>r.vrId));
@@ -46,7 +48,7 @@
       cell(row,number(rig.closedLoop?.yawGain,2),`DC ${number(rig.closedLoop?.yawDCOffsetDegrees,2)}°`);
       cell(row,rig.autoTrim?.supported?(rig.autoTrim.flying?'Flying':'Not flight ready'):'Walking / other',rig.autoTrim?.state||'');
       cell(row,number(rig.closedLoop?.yawOutputDegPerSecond)+' °/s',rig.closedLoop?.appliedThisFrame?'Applied this frame':'No applied tracking this frame');body.append(row);
-      if(!p||![p.x,p.z,p.yaw].every(Number.isFinite))continue;
+      if(!isNewFrame||!p||![p.x,p.z,p.yaw].every(Number.isFinite))continue;
       if(!histories.has(rig.vrId))histories.set(rig.vrId,[]);
       const points=histories.get(rig.vrId);points.push({t:now,x:p.x,z:p.z,yaw:((p.yaw%360)+360)%360});
       if(points.length>1800)points.splice(0,points.length-1800);

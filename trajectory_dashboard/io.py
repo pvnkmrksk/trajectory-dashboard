@@ -12,6 +12,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# The numerical reference pipeline assumes pandas 2 nanosecond timestamps and
+# writable NumPy views. pandas 3 changes both contracts; reject it explicitly
+# rather than silently reporting durations or velocities at the wrong scale.
+if int(pd.__version__.split(".", 1)[0]) >= 3:
+    raise ImportError(
+        "Daari Deepa requires pandas 2.x. Install requirements-native.txt or "
+        "requirements.txt; pandas 3 changes datetime units and view semantics."
+    )
+
 from .filters import compute_segment_stats
 
 

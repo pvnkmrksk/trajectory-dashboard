@@ -109,7 +109,9 @@ class LiveHub:
                 raise ValueError(
                     "Telemetry must be a bounded JSON object with finite numbers"
                 )
-            context = topic.endswith(".context") or data.get("kind") == "matrex.context"
+            context = (
+                topic == self.topic + ".context" or data.get("kind") == "matrex.context"
+            )
             if context:
                 if (
                     data.get("schemaVersion") != 1

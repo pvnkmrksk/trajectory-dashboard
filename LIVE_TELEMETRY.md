@@ -66,13 +66,20 @@ when choosing the number of simultaneous SSE viewers.
 ## Standalone packaging and validation
 
 Run `python tools/build_native.py` after installing `requirements-native.txt`
-and PyInstaller 6. Build on the target OS; PyInstaller does not cross-compile.
+and PyInstaller 6. The analysis reference is deliberately constrained to pandas
+2.x: pandas 3 changes datetime integer units and writable-array semantics, which
+would alter durations and some existing calculations. CI exercises the complete
+reference suite and the packaged smoke now also checks a recorded trajectory.
+Build on the target OS; PyInstaller does not cross-compile.
 The ZIP contains the entire one-folder application, Python/runtime libraries,
 ZeroMQ and the static browser assets. Preserve the whole directory. The native
 launcher opens a browser automatically unless passed `--no-browser`. macOS and
 Linux also include a shell launcher. Unsigned builds do not add code signing
 or installers. GitHub Actions stores the four platform artifacts without
-creating a release.
+creating a release. Passing main-branch packages are additionally published
+at [the static download hub](https://pvnkmrksk.github.io/trajectory-dashboard/)
+with commit and checksum evidence, so downloading does not require a GitHub
+account or depend on artifact retention.
 
 `python tools/smoke_native.py dist/DaariDeepa/DaariDeepa` checks the built
 application with Python removed from its PATH: real ZeroMQ handshake, context

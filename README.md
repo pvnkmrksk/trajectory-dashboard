@@ -1,6 +1,6 @@
 # Daari Deepa
 
-[![Standalone builds](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml/badge.svg)](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml) · [System manual](https://pvnkmrksk.github.io/matrexVR/manual/) · [Cite this software](CITATION.cff)
+[![Standalone builds](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml/badge.svg)](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml) · [Download](https://pvnkmrksk.github.io/trajectory-dashboard/) · [System manual](https://pvnkmrksk.github.io/matrexVR/manual/) · [Cite this software](CITATION.cff)
 
 *Daari Deepa* is Kannada wordplay for a light or lamp along a path: an
 interactive dashboard for illuminating movement trajectories, their local
@@ -53,9 +53,12 @@ context. The live viewer never commands Unity or the trackers.
 Self-contained packages bundle Python, the server, ZeroMQ and offline browser
 assets. [Standalone dashboard builds](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml)
 produces Windows x64, Linux x64, macOS arm64 and macOS x64 ZIP artifacts.
-These are source-build artifacts, expire after 14 days, and GitHub requires
-sign-in to download them; they are not new software releases. The workflow
-runs a real PUB → packaged receiver → HTTP/SSE smoke test on each platform.
+[Direct downloads](https://pvnkmrksk.github.io/trajectory-dashboard/) are
+published from passing main-branch builds on a static Pages site, with source
+revision and SHA-256 checksums. No sign-in or Python installation is needed.
+CI artifacts are also retained for 14 days. These are continuous source
+builds, not new release tags. Each platform passes a real PUB → packaged
+receiver → HTTP/SSE and recorded-data duration smoke test before publication.
 
 To build on your own operating system:
 

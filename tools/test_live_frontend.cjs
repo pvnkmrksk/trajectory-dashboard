@@ -6,7 +6,7 @@ const elements = new Map(), charts = [], intervals = [];
 function element() { return {textContent:'', dataset:{}, children:[], clientWidth:720, clientHeight:420, append(v){this.children.push(v);}, replaceChildren(){this.children=[];}}; }
 const $ = id => { if(!elements.has(id))elements.set(id,element());return elements.get(id); };
 let stream;
-const state = {receiver:{endpoint:'tcp://host:9880',state:'receiving',snapshotAgeSeconds:2},context:{sessionId:'run-A',scene:{worldUnitsPerMetre:100},animals:[{vrId:'VR1',animalId:'animal β',speciesName:'Agrotis infusa',backend:'HejjéTrac'}]},telemetry:{schemaVersion:2,sequence:1,timestampUtc:'2026-10-25T12:00:00Z',experimentContext:{sessionId:'run-A'},system:{sceneName:'Choice',sceneNumber:1,trialNumber:1},frameTiming:{framesPerSecond:120,frameMeanMs:8.3},rigs:[{vrId:'VR1',pose:{x:1,z:2,yaw:45},input:{state:'connected',latest:{ageSeconds:.1,fresh:true}}}]}};
+const state = {receiver:{endpoint:'tcp://host:9880',state:'receiving',snapshotAgeSeconds:0},context:{sessionId:'run-A',scene:{worldUnitsPerMetre:100},animals:[{vrId:'VR1',animalId:'animal β',speciesName:'Agrotis infusa',backend:'HejjéTrac'}]},telemetry:{schemaVersion:2,sequence:1,timestampUtc:'2026-10-25T12:00:00Z',experimentContext:{sessionId:'run-A'},system:{sceneName:'Choice',sceneNumber:1,trialNumber:1},frameTiming:{framesPerSecond:120,frameMeanMs:8.3},rigs:[{vrId:'VR1',pose:{x:1,z:2,yaw:45},input:{state:'connected',latest:{ageSeconds:.1,fresh:true}}}]}};
 const context = {document:{getElementById:$,createElement:element},echarts:{init(){const c={series:[],setOption(o){if(o.series)this.series=o.series;},clear(){this.series=[];},on(){},dispatchAction(){},resize(){}};charts.push(c);return c;}},ResizeObserver:class{observe(){}},EventSource:class{constructor(){stream=this;this.handlers={};}addEventListener(name,fn){this.handlers[name]=fn;}},fetch:async()=>({json:async()=>({...state,controlAvailable:true})}),setInterval:fn=>intervals.push(fn),Date,Map,Set,Number,JSON,Infinity,Math};
 vm.createContext(context);
 vm.runInContext(fs.readFileSync('native_dashboard/static/live.js','utf8'),context);
@@ -17,7 +17,11 @@ function emit(s){stream.handlers.snapshot({data:JSON.stringify(s)});intervals[0]
  assert.equal($('fps').textContent,'120.0 FPS');
  assert.match($('position-units').textContent,/centimetres/);
  assert.equal($('animals').children[0].children[0].textContent,'animal β');
- assert.equal($('animals').children[0].children[2].dataset.stale,'true','A fresh heartbeat must not make an old pose/input fresh');
+ assert.equal($('animals').children[0].children[2].dataset.stale,'false');
+ state.receiver.snapshotAgeSeconds=4;state.context.animals[0].animalId='late context animal';emit(state);
+ assert.equal($('animals').children[0].children[2].dataset.stale,'true','An idle event must age an unchanged pose/input');
+ assert.equal($('animals').children[0].children[0].textContent,'late context animal','Late context updates the table without another pose');
+ assert.equal(charts[0].series[0].data.length,1,'Repeating a snapshot must not duplicate a path point');
  for(let i=2;i<=2200;i++){state.telemetry.sequence=i;state.telemetry.rigs[0].pose.x=i;emit(state);}
  assert.equal(charts[0].series[0].data.length,1800);
  state.receiver.endpoint='tcp://other-host:9880';state.telemetry.sequence=2201;emit(state);

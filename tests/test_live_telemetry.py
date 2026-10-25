@@ -160,3 +160,14 @@ def test_prefix_topic_does_not_mix_other_publishers():
     hub = LiveHub()
     assert not hub.ingest(hub.topic + ".other", json.dumps(packet()).encode())
     assert hub.snapshot()["telemetry"] is None
+
+
+def test_base_topic_can_itself_end_in_context():
+    hub = LiveHub(topic="experiment.context")
+    assert hub.ingest("experiment.context", json.dumps(packet()).encode())
+    assert hub.ingest(
+        "experiment.context.context",
+        json.dumps({"schemaVersion": 1, "kind": "matrex.context"}).encode(),
+    )
+    assert hub.snapshot()["telemetry"]["sequence"] == 1
+    assert hub.snapshot()["receiver"]["contexts"] == 1
