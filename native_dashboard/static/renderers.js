@@ -44,6 +44,42 @@ const PALETTE_FLOATS = new Float32Array(PALETTE.flatMap(color => {
   return [r / 255, g / 255, b / 255, color === "#7f8985" ? .32 : .46];
 }));
 
+function drawSequentialColorbar(ctx, pane, scale, options = {}) {
+  if (!scale || !Number.isFinite(scale.lo) || !Number.isFinite(scale.hi)) return;
+  const barW = 7, barH = Math.min(90, Math.max(48, pane.height * .2));
+  const bx = pane.right - (options.offsetX ?? 27);
+  const by = pane.top + (options.offsetY ?? 8);
+  const gradient = ctx.createLinearGradient(0, by + barH, 0, by);
+  for (let stop = 0; stop <= 1; stop += .2) gradient.addColorStop(stop, sequentialColor(stop));
+  ctx.save();
+  ctx.fillStyle = gradient;
+  ctx.fillRect(bx, by, barW, barH);
+  ctx.strokeStyle = "rgba(25,45,40,.25)";
+  ctx.strokeRect(bx + .5, by + .5, barW - 1, barH - 1);
+  const label = value => scale.integer
+    ? String(Math.round(value))
+    : formatNumber(value, Math.abs(scale.hi - scale.lo) >= 10 ? 0 : 1);
+  ctx.fillStyle = "#44514d";
+  ctx.font = "700 8px Inter, system-ui";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "top";
+  ctx.fillText(label(scale.hi), bx - 3, by);
+  ctx.textBaseline = "bottom";
+  ctx.fillText(label(scale.lo), bx - 3, by + barH);
+  if (scale.title) {
+    ctx.save();
+    ctx.translate(bx + barW + 11, by + barH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "600 9px Inter, system-ui";
+    ctx.fillStyle = "#5a6561";
+    ctx.fillText(scale.title, 0, 0);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
 export function formatNumber(value, digits = 1) {
   if (!Number.isFinite(value)) return "—";
   const abs = Math.abs(value);
@@ -152,8 +188,35 @@ function squareBounds(bounds) {
   return {xmin: cx - half, xmax: cx + half, zmin: cz - half, zmax: cz + half};
 }
 
+export const MAX_DEVICE_PIXEL_RATIO = 3;
+
+export function effectiveDevicePixelRatio() {
+  return Math.min(Math.max(1, window.devicePixelRatio || 1), MAX_DEVICE_PIXEL_RATIO);
+}
+
+/** Physical display of raw data units. Default: 1 data unit = 1 cm. */
+export const displayUnits = {perData: 1, name: "cm"};
+
+export function setDisplayUnits({perData, name} = {}) {
+  const scale = Number(perData);
+  displayUnits.perData = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  displayUnits.name = ["cm", "m", "mm"].includes(name) ? name : "cm";
+}
+
+export function formatPhysical(dataValue, digits = 1) {
+  const value = Number(dataValue) * displayUnits.perData;
+  if (!Number.isFinite(value)) return "—";
+  return `${formatNumber(value, digits)} ${displayUnits.name}`;
+}
+
+export function speedUnitLabel() {
+  return `${displayUnits.name}/s`;
+}
+
 function setupCanvas(canvas, width, height) {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // Cap DPR for GPU memory, but track browser zoom (which raises devicePixelRatio)
+  // so canvases are re-rasterised instead of CSS-upscaled into mush.
+  const dpr = effectiveDevicePixelRatio();
   const w = Math.max(1, Math.round(width * dpr));
   const h = Math.max(1, Math.round(height * dpr));
   if (canvas.width !== w || canvas.height !== h) {
@@ -200,17 +263,18 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
     const title = data?.panelNames?.[panel] || "All data";
     ctx.fillText(String(title).slice(0, 42), left + 3, Math.max(pane.cellTop + 3, top - 18));
     if (view && !options.hideTicks) {
+      const scale = displayUnits.perData;
       ctx.font = "9px ui-monospace, SFMono-Regular, monospace";
       ctx.fillStyle = "#7a827e";
       ctx.textAlign = "center"; ctx.textBaseline = "top";
       for (const value of xTicks.values) {
         const x = left + (value - shown.xmin) / (shown.xmax - shown.xmin) * pane.width;
-        ctx.fillText(formatTick(value, xTicks.step), x, bottom + 5);
+        ctx.fillText(formatTick(value * scale, xTicks.step * scale), x, bottom + 5);
       }
       ctx.textAlign = "right"; ctx.textBaseline = "middle";
       for (const value of zTicks.values) {
         const y = bottom - (value - shown.zmin) / (shown.zmax - shown.zmin) * pane.height;
-        ctx.fillText(formatTick(value, zTicks.step), left - 5, y);
+        ctx.fillText(formatTick(value * scale, zTicks.step * scale), left - 5, y);
       }
       ctx.textBaseline = "top";
       ctx.textAlign = "left";
@@ -227,7 +291,7 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
       ctx.moveTo(x + pixels, y - 4); ctx.lineTo(x + pixels, y + 4); ctx.stroke();
       ctx.font = "700 9px Inter, system-ui, sans-serif";
       ctx.textBaseline = "bottom";
-      ctx.fillText(`${formatNumber(distance, 1)} cm`, x, y - 5);
+      ctx.fillText(formatPhysical(distance, distance * displayUnits.perData >= 10 ? 0 : 1), x, y - 5);
     }
   }
   ctx.restore();
@@ -765,6 +829,8 @@ export class TrajectoryRenderer extends SpatialBase {
     this.fraction = 1;
     this.timeLimit = 1e30;
     this.selectedSegment = -1;
+    this.sequentialCodes = null;
+    this.sequentialThrough = -1;
     this.lineWidth = 1.1;
     this.lineOpacity = .5;
     this._marginalProfiles = null;
@@ -861,6 +927,13 @@ export class TrajectoryRenderer extends SpatialBase {
         outColor = v_color;
       }
     `);
+    this.uniforms = Object.fromEntries([
+      "u_view", "u_grid", "u_canvas", "u_pane", "u_fraction", "u_time",
+      "u_selected_segment", "u_line_width", "u_opacity", "u_ring_entries",
+      "u_ring_enabled", "u_ring_context", "u_ring_texture_width", "u_palette[0]",
+    ].map(name => [name, gl.getUniformLocation(this.program, name)]));
+    gl.useProgram(this.program);
+    gl.uniform4fv(this.uniforms["u_palette[0]"], PALETTE_FLOATS);
     this.vao = gl.createVertexArray();
     this.buffers = Array.from({length: 7}, () => gl.createBuffer());
     this.ringTexture = gl.createTexture();
@@ -892,6 +965,7 @@ export class TrajectoryRenderer extends SpatialBase {
     this.visibility.fill(255);
     this._attribute(5, this.visibility, 1, gl.UNSIGNED_BYTE, true);
     this._attribute(6, data.segments, 1, gl.UNSIGNED_INT, false, 8);
+    this._refreshVisibility();
     gl.bindVertexArray(null);
     this.instanceCount = data.links;
     this.ringEntries = new Float32Array(Math.max(1, data.segmentCount || 1));
@@ -1043,16 +1117,24 @@ export class TrajectoryRenderer extends SpatialBase {
     this.drawGl(); this.drawOverlay();
     return {matches, buildMs: performance.now() - started};
   }
-  setAnimalVisibility(visible) {
-    this.animalVisibility = visible ? [...visible] : null;
+  _refreshVisibility() {
     if (!this.data?.animals || !this.visibility) return;
+    const allowed = this.sequentialThrough < 0 || !this.sequentialCodes
+      ? null
+      : new Set(this.sequentialCodes.slice(0, this.sequentialThrough + 1));
     for (let i = 0; i < this.visibility.length; i += 1) {
-      this.visibility[i] = this.animalVisibility?.[this.data.animals[i * 2]] === false ? 0 : 255;
+      const animalOk = this.animalVisibility?.[this.data.animals[i * 2]] !== false;
+      const seqOk = !allowed || allowed.has(this.data.segments[i * 2]);
+      this.visibility[i] = animalOk && seqOk ? 255 : 0;
     }
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers[5]);
     gl.bufferData(gl.ARRAY_BUFFER, this.visibility, gl.DYNAMIC_DRAW);
     this._marginalProfiles = null;
+  }
+  setAnimalVisibility(visible) {
+    this.animalVisibility = visible ? [...visible] : null;
+    this._refreshVisibility();
     this.drawGl(); if (this.marginalsVisible) this.drawOverlay();
   }
   setFraction(value) {
@@ -1062,6 +1144,13 @@ export class TrajectoryRenderer extends SpatialBase {
   setTime(value) { this.timeLimit = Number.isFinite(value) ? value : 1e30; this.drawGl(); }
   setPlaybackSegment(value) {
     this.selectedSegment = Number.isFinite(Number(value)) ? Number(value) : -1;
+    this.drawGl();
+  }
+  setSequentialAccumulate(orderedCodes, throughIndex = -1) {
+    this.sequentialCodes = Array.isArray(orderedCodes) ? orderedCodes : null;
+    this.sequentialThrough = Number.isFinite(throughIndex) ? throughIndex : -1;
+    this.selectedSegment = -1;
+    this._refreshVisibility();
     this.drawGl();
   }
   setLineStyle(width, opacity) {
@@ -1100,23 +1189,22 @@ export class TrajectoryRenderer extends SpatialBase {
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.program);
-    gl.uniform4f(gl.getUniformLocation(this.program, "u_view"), shown.xmin, shown.xmax, shown.zmin, shown.zmax);
-    gl.uniform2f(gl.getUniformLocation(this.program, "u_grid"), layout.cols, layout.rows);
-    gl.uniform2f(gl.getUniformLocation(this.program, "u_canvas"), this.width, this.height);
-    gl.uniform4f(gl.getUniformLocation(this.program, "u_pane"),
+    gl.uniform4f(this.uniforms.u_view, shown.xmin, shown.xmax, shown.zmin, shown.zmax);
+    gl.uniform2f(this.uniforms.u_grid, layout.cols, layout.rows);
+    gl.uniform2f(this.uniforms.u_canvas, this.width, this.height);
+    gl.uniform4f(this.uniforms.u_pane,
       pane.left - pane.cellLeft, pane.top - pane.cellTop, pane.width, pane.height);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_fraction"), this.fraction);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_time"), this.timeLimit);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_selected_segment"), this.selectedSegment);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_line_width"), this.lineWidth);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_opacity"), this.lineOpacity);
+    gl.uniform1f(this.uniforms.u_fraction, this.fraction);
+    gl.uniform1f(this.uniforms.u_time, this.timeLimit);
+    gl.uniform1f(this.uniforms.u_selected_segment, this.selectedSegment);
+    gl.uniform1f(this.uniforms.u_line_width, this.lineWidth);
+    gl.uniform1f(this.uniforms.u_opacity, this.lineOpacity);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.ringTexture);
-    gl.uniform1i(gl.getUniformLocation(this.program, "u_ring_entries"), 0);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_enabled"), this.ringEnabled ? 1 : 0);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_context"), this.ringContext ? 1 : 0);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_ring_texture_width"), this.ringTextureWidth);
-    gl.uniform4fv(gl.getUniformLocation(this.program, "u_palette[0]"), PALETTE_FLOATS);
+    gl.uniform1i(this.uniforms.u_ring_entries, 0);
+    gl.uniform1f(this.uniforms.u_ring_enabled, this.ringEnabled ? 1 : 0);
+    gl.uniform1f(this.uniforms.u_ring_context, this.ringContext ? 1 : 0);
+    gl.uniform1f(this.uniforms.u_ring_texture_width, this.ringTextureWidth);
     gl.bindVertexArray(this.vao);
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
     gl.bindVertexArray(null);
@@ -1146,60 +1234,60 @@ export class TrajectoryRenderer extends SpatialBase {
         }
       }
       drawMirrorGuide(this.ctx, this.width, this.height, this.data, this.view, this.mirrorGuide);
+      if (!this.cleanMode && this.data.colorScale) {
+        const layout = panelLayout(this.width, this.height, this.data.panelCount, this.data.columns);
+        for (let panel = 0; panel < this.data.panelCount; panel += 1) {
+          drawSequentialColorbar(this.ctx, panelPane(layout, panel), this.data.colorScale);
+        }
+      }
     }
   }
   snapshotDataUrl(exportWidth = 1200, exportHeight = 700) {
-    if (!this.data || !this.instanceCount) return null;
+    if (!this.data) return null;
     const previousWidth = this.width, previousHeight = this.height;
-    exportWidth = Math.max(320, Math.round(exportWidth));
-    exportHeight = Math.max(240, Math.round(exportHeight));
+    exportWidth = Math.max(320, Math.round(Number(exportWidth) || 1200));
+    exportHeight = Math.max(240, Math.round(Number(exportHeight) || 700));
     const staged = this.width !== exportWidth || this.height !== exportHeight;
-    if (staged) {
-      this.width = exportWidth;
-      this.height = exportHeight;
-      this.resize();
-    }
-    this.draw();
-    const gl = this.gl;
-    const width = gl.drawingBufferWidth, height = gl.drawingBufferHeight;
-    if (!(width > 0 && height > 0)) {
+    try {
+      if (staged) {
+        this.width = exportWidth; this.height = exportHeight;
+        this.resize();
+      }
+      this.draw();
+      const gl = this.gl;
+      const width = gl.drawingBufferWidth, height = gl.drawingBufferHeight;
+      if (!(width > 0 && height > 0) || gl.isContextLost?.()) return null;
+      const pixels = new Uint8Array(width * height * 4);
+      // readPixels already synchronizes the framebuffer; finish adds a second
+      // GPU stall. Capture even an empty path layer so its target/axis overlay
+      // survives sparse samples and zero-trial selections.
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      let ink = 0;
+      for (let index = 0; index < pixels.length; index += 64) {
+        if (pixels[index] < 248 || pixels[index + 1] < 248 || pixels[index + 2] < 248) ink += 1;
+      }
+      this.lastSnapshotInk = ink;
+      // Flip in place with one scratch scanline, instead of retaining a second
+      // full-resolution RGBA image during every panel/report capture.
+      const stride = width * 4, scratch = new Uint8Array(stride);
+      for (let row = 0; row < Math.floor(height / 2); row += 1) {
+        const top = row * stride, bottom = (height - row - 1) * stride;
+        scratch.set(pixels.subarray(top, top + stride));
+        pixels.copyWithin(top, bottom, bottom + stride);
+        pixels.set(scratch, bottom);
+      }
+      const output = document.createElement("canvas");
+      output.width = width; output.height = height;
+      const context = output.getContext("2d");
+      context.putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer), width, height), 0, 0);
+      context.drawImage(this.overlay, 0, 0, width, height);
+      return output.toDataURL("image/png");
+    } finally {
       if (staged) {
         this.width = previousWidth; this.height = previousHeight;
         this.resize(); this.draw();
       }
-      return null;
     }
-    gl.finish();
-    const pixels = new Uint8Array(width * height * 4);
-    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-    let ink = 0;
-    for (let index = 0; index < pixels.length; index += 64) {
-      if (pixels[index] < 248 || pixels[index + 1] < 248 || pixels[index + 2] < 248) ink += 1;
-    }
-    this.lastSnapshotInk = ink;
-    if (!ink) {
-      if (staged) {
-        this.width = previousWidth; this.height = previousHeight;
-        this.resize(); this.draw();
-      }
-      return null;
-    }
-    const flipped = new Uint8ClampedArray(pixels.length);
-    const stride = width * 4;
-    for (let y = 0; y < height; y += 1) {
-      flipped.set(pixels.subarray((height - y - 1) * stride, (height - y) * stride), y * stride);
-    }
-    const output = document.createElement("canvas");
-    output.width = width; output.height = height;
-    const context = output.getContext("2d");
-    context.putImageData(new ImageData(flipped, width, height), 0, 0);
-    context.drawImage(this.overlay, 0, 0, width, height);
-    const result = output.toDataURL("image/png");
-    if (staged) {
-      this.width = previousWidth; this.height = previousHeight;
-      this.resize(); this.draw();
-    }
-    return result;
   }
 }
 
@@ -1902,7 +1990,7 @@ export class DirectionRenderer extends CanvasSpatialRenderer {
     if (!Number.isFinite(this.data.angle[index])) return null;
     const unit = this.visualOptions.metric === "count" ? "samples"
       : (this.visualOptions.metric === "percent" ? "%" : "s");
-    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 1)} · ${formatNumber(this.data.meanSpeed?.[index], 1)} cm/s · ${formatNumber(this.abundanceValues[index], 1)} ${unit}`;
+    return `${this.data.panelNames?.[point.panel] || "All"} · ${formatNumber(this.data.angle[index], 1)}° · R ${formatNumber(this.data.strength[index], 1)} · ${formatPhysical(this.data.meanSpeed?.[index], 1)}/s · ${formatNumber(this.abundanceValues[index], 1)} ${unit}`;
   }
   draw() {
     const layout = this.begin();
@@ -2057,6 +2145,7 @@ export class PolarRenderer extends CanvasRenderer {
       this.ctx.fillStyle = "#27332f"; this.ctx.textAlign = "left"; this.ctx.textBaseline = "top";
       this.ctx.fillText(String(this.data.panelNames?.[panel] || "All data").slice(0, 42), col * layout.cellW + 12, row * layout.cellH + 8);
       for (let i = 0; i < this.data.angle.length; i += 1) {
+        if (!Number.isFinite(this.data.angle[i]) || !Number.isFinite(this.data.r[i])) continue;
         if (this.data.panel[i] !== panel || this.data.sample[i] > this.fraction) continue;
         const a = this.data.angle[i] * Math.PI / 180;
         const rr = radius * this.data.r[i];

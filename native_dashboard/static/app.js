@@ -1,6 +1,6 @@
 import {
   TrajectoryRenderer, HeatmapRenderer, DirectionRenderer, TransitionRenderer,
-  NATIVE_PALETTE, formatNumber,
+  NATIVE_PALETTE, formatNumber, setDisplayUnits, effectiveDevicePixelRatio,
 } from "/static/renderers.js";
 import {
   EChartsPolarRenderer, EChartsHeadingRenderer, EChartsMetricsRenderer,
@@ -19,6 +19,9 @@ const resetViewButton = byId("reset-view-button");
 let datasetHeader = null;
 let worker = null;
 let workerReady = false;
+let loadEpoch = 0;
+let loadingDataset = false;
+let loadController = null;
 let workerBusy = false;
 let pendingCompute = null;
 let latestRequest = 0;
@@ -30,6 +33,7 @@ let newDataset = false;
 let sampleSeed = 0;
 let playbackFrame = null;
 let playbackLast = 0;
+let sequentialAccum = 0;
 let rings = [{x: 0, z: 0, r: 3}];
 let activeRing = 0;
 let animalVisibility = [];
@@ -60,6 +64,7 @@ function syncAngleSourceControls(value) {
 
 function setStatus(kind, title, detail) {
   statusDock.className = `status-dock ${kind || ""}`;
+  shell.setAttribute("aria-busy", String(kind === "working"));
   statusDock.title = detail ? `${title} — ${detail}` : title;
   statusTitle.textContent = title;
   statusDetail.textContent = detail || "";
@@ -196,7 +201,7 @@ function datasetSummary(visible = null) {
     <div><b>${formatCount(rows)}</b><span>visible / ${formatCount(counts.retainedRows)} rows</span></div>
     <div><b>${formatCount(segments)}</b><span>visible / ${formatCount(counts.segments)} segments</span></div>
     <div><b>${formatCount(counts.animals)}</b><span>animals</span></div>
-    <div><b>${formatCount(counts.files)}</b><span>files${counts.duplicateFilesSkipped ? ` · ${formatCount(counts.duplicateFilesSkipped)} duplicate copies skipped` : ""}</span></div>`;
+    <div><b>${formatCount(counts.files)}</b><span>files${counts.duplicateFilesSkipped ? ` · ${formatCount(counts.duplicateFilesSkipped)} duplicate copies skipped` : ""}${counts.unsupportedFilesSkipped ? ` · ${formatCount(counts.unsupportedFilesSkipped)} non-trajectory CSVs skipped` : ""}</span></div>`;
 }
 
 function renderFilterAudit(audit = []) {
@@ -668,6 +673,7 @@ function collectState() {
     polarValidMin: numberValue("polar-valid-min", 0),
     polarMode: byId("polar-mode").value,
     roiReach: numberValue("roi-reach", 3),
+    roiNullProbability: Math.max(0, Math.min(1, optionalNumber("roi-null-probability") ?? .5)),
     roiEntered: byId("roi-entered").checked,
     roiTrim: byId("roi-trim").checked,
     ringEnabled: byId("ring-enabled").checked,
@@ -696,7 +702,7 @@ function persistState() {
   const state = collectState();
   const url = new URL(location.href);
   const params = url.searchParams;
-  params.set("source", sourceInput.value);
+  params.set("source", datasetHeader.pattern);
   params.set("group", state.groupBy); params.set("color", state.colorBy);
   if (state.mirrorPool) params.set("mirror", "1"); else params.delete("mirror");
   if (state.mirrorRules.length) params.set("mirrorRules", JSON.stringify(state.mirrorRules)); else params.delete("mirrorRules");
@@ -707,6 +713,12 @@ function persistState() {
   params.set("bound", state.boundPercent); params.set("angle", state.angleSource); params.set("unit", state.statsUnit);
   params.set("pmode", state.polarMode);
   params.set("pcap", state.playbackPercentile);
+  params.set("pscope", byId("playback-scope").value);
+  params.set("uscale", byId("unit-scale").value);
+  params.set("uname", byId("unit-name").value);
+  params.set("figw", byId("fig-panel-width").value);
+  params.set("figh", byId("fig-panel-height").value);
+  params.set("pheight", byId("plot-host-height").value);
   params.set("hmode", state.headingMode); params.set("hbin", state.headingBin); params.set("hsec", state.headingSectors);
   params.set("windows", JSON.stringify(state.windows));
   if (state.windowsVisible) params.set("wshow", "1"); else params.delete("wshow");
@@ -721,7 +733,8 @@ function persistState() {
     jumpThreshold: state.jumpThreshold, jumpBufferMs: state.jumpBufferMs,
     minDisplacement: state.minDisplacement, edgeTrim: state.edgeTrim,
     movingOnly: state.movingOnly, walkThreshold: state.walkThreshold,
-    roiReach: state.roiReach, roiEntered: state.roiEntered, roiTrim: state.roiTrim,
+    roiReach: state.roiReach, roiNullProbability: state.roiNullProbability,
+    roiEntered: state.roiEntered, roiTrim: state.roiTrim,
     polarR: state.polarR, polarValidMin: state.polarValidMin,
   }));
   params.set("tw", byId("trajectory-width").value); params.set("topacity", byId("trajectory-opacity").value);
@@ -754,6 +767,10 @@ function restoreViewStateFromUrl() {
     "bound-percent": params.get("bound"), "angle-source": params.get("angle"),
     "polar-mode": params.get("pmode"),
     "stats-unit": params.get("unit"), "playback-cap": params.get("pcap"),
+    "playback-scope": params.get("pscope"),
+    "unit-scale": params.get("uscale"), "unit-name": params.get("uname"),
+    "fig-panel-width": params.get("figw"), "fig-panel-height": params.get("figh"),
+    "plot-host-height": params.get("pheight"),
     "heading-mode": params.get("hmode"), "heading-bin": params.get("hbin"),
     "heading-sectors": params.get("hsec"), "trajectory-width": params.get("tw"),
     "trajectory-opacity": params.get("topacity"), "heat-metric": params.get("hmetric"),
@@ -823,7 +840,7 @@ function restoreViewStateFromUrl() {
   } catch (_) { /* malformed optional URL state is ignored */ }
   try {
     const quality = JSON.parse(params.get("quality") || "{}");
-    const numbers = {jumpThreshold:"jump-threshold",jumpBufferMs:"jump-buffer",minDisplacement:"min-displacement",edgeTrim:"edge-trim",walkThreshold:"walk-threshold",roiReach:"roi-reach",polarValidMin:"polar-valid-min"};
+    const numbers = {jumpThreshold:"jump-threshold",jumpBufferMs:"jump-buffer",minDisplacement:"min-displacement",edgeTrim:"edge-trim",walkThreshold:"walk-threshold",roiReach:"roi-reach",roiNullProbability:"roi-null-probability",polarValidMin:"polar-valid-min"};
     for (const [key, id] of Object.entries(numbers)) if (quality[key] != null) byId(id).value = quality[key];
     if (Array.isArray(quality.polarR)) { byId("polar-r-min").value = quality.polarR[0]; byId("polar-r-max").value = quality.polarR[1]; }
     for (const [key, id] of Object.entries({movingOnly:"moving-only",roiEntered:"roi-entered",roiTrim:"roi-trim"})) if (quality[key] != null) byId(id).checked = !!quality[key];
@@ -835,6 +852,8 @@ function restoreViewStateFromUrl() {
     const restored = JSON.parse(params.get("rings") || "null");
     if (Array.isArray(restored)) rings = restored.map(ring => ({x:Number(ring.x)||0,z:Number(ring.z)||0,r:Math.max(.01,Number(ring.r)||3)}));
   } catch (_) { /* retain safe default */ }
+  applyDisplayUnits(false);
+  applyPlotHostHeight(false);
 }
 
 const scopeProducts = {
@@ -856,6 +875,7 @@ let scheduledScope = null;
 let scheduledExtra = {};
 function scheduleCompute(scope = "full", delay = 0, extra = {}) {
   if (!workerReady || !datasetHeader) return;
+  if (scope !== "report") cancelPendingReport();
   clearTimeout(computeTimer);
   // A newer interaction replaces a pending request. Merging stale scopes made
   // small filter changes quietly expand back into an all-view rebuild.
@@ -882,13 +902,18 @@ function scopeForCurrentView() {
 }
 
 function invalidateDerivedProducts() {
+  cancelPendingReport();
+  latestRequest += 1; pendingCompute = null;
   for (const key of ["trajectory", "heatmap", "direction", "polar", "heading",
     "metrics", "roi", "statistics", "transition", "windows"]) delete products[key];
+  byId("download-choice-button").disabled = true;
+  byId("roi-choice-summary").textContent = "Target counts will refresh for the current filters when Targets is opened.";
   byId("statistics-content").innerHTML = '<div class="analysis-empty">Statistics will refresh after 16 seconds of inactivity, or immediately when this view is opened.</div>';
   byId("windows-content").innerHTML = '<div class="analysis-empty">Window summaries will refresh in the background, or immediately when this view is opened.</div>';
 }
 
 function invalidateCurtainProducts() {
+  cancelPendingReport();
   clearTimeout(computeTimer);
   scheduledScope = null; scheduledExtra = {};
   pendingCompute = null;
@@ -896,6 +921,8 @@ function invalidateCurtainProducts() {
   clearTimeout(deferredAnalysisTimer); clearTimeout(deferredStatisticsTimer);
   for (const key of ["heatmap", "direction", "polar", "heading", "metrics",
     "roi", "statistics", "transition", "windows"]) delete products[key];
+  byId("download-choice-button").disabled = true;
+  byId("roi-choice-summary").textContent = "Open Targets to calculate counts for the current curtain and filters.";
   byId("statistics-content").innerHTML = '<div class="analysis-empty">Open Statistics to calculate inference for the current curtain and filter intersection.</div>';
   byId("windows-content").innerHTML = '<div class="analysis-empty">Open Windows to calculate summaries for the current curtain and filter intersection.</div>';
 }
@@ -933,6 +960,21 @@ function queueCompute(scope, extra = {}) {
 }
 
 let reportRequestId = null;
+let reportCapturing = false;
+let pngRequestId = null;
+
+function cancelPendingReport() {
+  if (pngRequestId != null) {
+    if (pendingCompute?.requestId === pngRequestId) pendingCompute = null;
+    pngRequestId = null;
+    byId("download-plot-button").disabled = false;
+  }
+  if (reportRequestId == null) return;
+  if (pendingCompute?.requestId === reportRequestId) pendingCompute = null;
+  reportRequestId = null;
+  byId("export-button").disabled = !datasetHeader;
+  byId("export-button").textContent = "Export native report";
+}
 
 function flushCompute() {
   if (!workerReady || workerBusy || !pendingCompute) return;
@@ -1049,7 +1091,10 @@ function compactLetters(count, tests = []) {
         if (withoutSecond.size) next.push(withoutSecond);
       } else next.push(column);
     }
-    columns = next.filter((column, index, all) => !all.some((other, otherIndex) =>
+    const unique = [...new Map(next.map(column => [
+      [...column].sort((a, b) => a - b).join(","), column,
+    ])).values()];
+    columns = unique.filter((column, index, all) => !all.some((other, otherIndex) =>
       otherIndex !== index && column.size < other.size && [...column].every(value => other.has(value))));
   }
   const letter = index => index < 26 ? String.fromCharCode(65 + index)
@@ -1102,6 +1147,36 @@ function renderStatistics(data) {
     <article class="statistics-card"><h3>Method</h3><small>${escapeHtml(data.method)}</small><p class="control-note">Inferential work is calculated on demand in the browser worker, so trajectory interaction and playback remain responsive.</p></article></div>`;
 }
 
+function renderChoiceSummary(roi) {
+  const host = byId("roi-choice-summary");
+  if (!host) return;
+  const choices = roi.choice || [];
+  const pct = value => Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "—";
+  host.innerHTML = `<div class="choice-summary-grid">${choices.map(item => `
+    <article class="statistics-card"><h3>${escapeHtml(roi.panelNames?.[item.panel] || `Panel ${item.panel + 1}`)}</h3>
+      <div class="choice-counts"><div class="choice-count" data-side="left"><b>${formatCount(item.left)}</b><span>Left first</span></div><div class="choice-count" data-side="right"><b>${formatCount(item.right)}</b><span>Right first</span></div></div>
+      <p>${formatCount(item.informative)} decisive / ${formatCount(item.total)} trials · ${formatCount(item.neither)} neither · ${formatCount(item.ambiguous)} simultaneous</p>
+      <p>Right fraction <b>${pct(item.rightFraction)}</b> · exact 95% CI ${pct(item.ciLow)}–${pct(item.ciHigh)}</p>
+      <p>Two-sided binomial p <b>${formatP(item.pValue)}</b> · expected right ${pct(item.nullProbability)} · Holm p ${formatP(item.adjustedP)}</p>
+      <small>Ever reached: left ${formatCount(item.leftReached)} · right ${formatCount(item.rightReached)} · both ${formatCount(item.bothReached)}${item.noTargets ? ` · ${formatCount(item.noTargets)} without target metadata` : ""}</small>
+    </article>`).join("")}</div><p class="choice-summary-note">${escapeHtml(roi.choiceMethod || "First observed target entry per file × trial × step. Neither and simultaneous first reaches are excluded from the binomial test.")} </p>`;
+  byId("download-choice-button").disabled = !choices.length;
+}
+
+function exportChoiceCounts() {
+  if (loadingDataset) return;
+  const roi = products.roi;
+  if (!roi?.choice?.length) return;
+  const columns = ["panel", "total", "left", "right", "ambiguous", "neither", "informative",
+    "leftReached", "rightReached", "bothReached", "noTargets", "rightFraction",
+    "nullProbability", "pValue", "adjustedP", "ciLow", "ciHigh"];
+  const cell = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const rows = roi.choice.map(item => columns.map(key => cell(key === "panel"
+    ? roi.panelNames?.[item.panel] : (Number.isFinite(item[key]) ? item[key] : ""))).join(","));
+  downloadBlob(new Blob([[columns.join(","), ...rows].join("\r\n")], {type: "text/csv;charset=utf-8"}),
+    `daari-deepa-target-counts-${new Date().toISOString().slice(0, 10)}.csv`);
+}
+
 function renderWindows(data) {
   const host = byId("windows-content");
   const cards = data.panels.map((panelName, panel) => {
@@ -1114,6 +1189,10 @@ function renderWindows(data) {
   }).join("");
   host.innerHTML = `<div class="statistics-grid">${cards}<article class="statistics-card"><h3>Window geometry</h3>
     <table><thead><tr><th>Window</th><th>X</th><th>Z</th></tr></thead><tbody>${data.windows.map(window => `<tr><td>${escapeHtml(window.name)}</td><td>${formatNumber(window.xmin, 1)} to ${formatNumber(window.xmax, 1)}</td><td>${formatNumber(window.zmin, 1)} to ${formatNumber(window.zmax, 1)}</td></tr>`).join("")}</tbody></table><p class="control-note">${escapeHtml(data.method)}</p></article></div>`;
+}
+
+function playbackMode() {
+  return byId("playback-scope").value || "all";
 }
 
 function populatePlaybackSegments() {
@@ -1134,17 +1213,39 @@ function selectedSegmentOption() {
   return visibleSegmentOptions.find(item => item.code === code) || null;
 }
 
+function sequentialSegmentIndex() {
+  if (!visibleSegmentOptions.length) return 0;
+  return Math.max(0, Math.min(
+    visibleSegmentOptions.length - 1,
+    Math.round(numberValue("time-scrubber", 0)),
+  ));
+}
+
 function updatePlaybackLimit(summary = currentDurationSummary) {
   if (summary) currentDurationSummary = summary;
   if (!datasetHeader) return;
-  const single = byId("playback-scope").value === "single";
+  const mode = playbackMode();
+  const scrubber = byId("time-scrubber");
+  if (mode === "sequential") {
+    const count = Math.max(1, visibleSegmentOptions.length);
+    scrubber.min = 0;
+    scrubber.max = count - 1;
+    scrubber.step = 1;
+    if (Number(scrubber.value) > count - 1) scrubber.value = count - 1;
+    byId("time-output").title = "Accumulate in experiment order: each VR in turn, then replicate → trial → step";
+    byId("playback-cap").disabled = true;
+    return;
+  }
+  byId("playback-cap").disabled = false;
+  scrubber.min = 0;
+  scrubber.step = 0.001;
+  const single = mode === "single";
   const selected = selectedSegmentOption();
   const key = byId("playback-cap").value === "99" ? "p99"
     : (byId("playback-cap").value === "max" ? "max" : "p95");
   const maximum = Math.max(.001, single && selected
     ? Number(selected.duration) || .001
     : Number(currentDurationSummary?.[key] ?? datasetHeader.playbackQuantiles?.[key] ?? datasetHeader.playbackMax) || .001);
-  const scrubber = byId("time-scrubber");
   scrubber.max = maximum;
   if (Number(scrubber.value) > maximum) scrubber.value = maximum;
   byId("time-output").title = single && selected
@@ -1153,19 +1254,33 @@ function updatePlaybackLimit(summary = currentDurationSummary) {
 }
 
 function updatePlaybackScope() {
-  const single = byId("playback-scope").value === "single";
+  const mode = playbackMode();
+  const single = mode === "single";
+  const sequential = mode === "sequential";
   const select = byId("playback-trial");
-  select.disabled = !single || !visibleSegmentOptions.length;
-  byId("trial-prev").disabled = !single || visibleSegmentOptions.length < 2;
-  byId("trial-next").disabled = !single || visibleSegmentOptions.length < 2;
-  const selected = single ? Number(select.value) : -1;
-  trajectoryRenderer.setPlaybackSegment(single && Number.isFinite(selected) ? selected : -1);
+  select.disabled = !(single || sequential) || !visibleSegmentOptions.length;
+  byId("trial-prev").disabled = !(single || sequential) || visibleSegmentOptions.length < 2;
+  byId("trial-next").disabled = !(single || sequential) || visibleSegmentOptions.length < 2;
+  if (sequential && visibleSegmentOptions.length) {
+    const index = sequentialSegmentIndex();
+    const option = visibleSegmentOptions[index];
+    if (option) select.value = String(option.code);
+  }
   updatePlaybackLimit();
   updatePlaybackTime();
 }
 
 function stepPlaybackSegment(delta) {
   if (!visibleSegmentOptions.length) return;
+  if (playbackMode() === "sequential") {
+    const count = visibleSegmentOptions.length;
+    const next = (sequentialSegmentIndex() + delta + count) % count;
+    byId("time-scrubber").value = next;
+    byId("playback-trial").value = String(visibleSegmentOptions[next].code);
+    playbackActive = true;
+    updatePlaybackScope();
+    return;
+  }
   const current = visibleSegmentOptions.findIndex(item => item.code === Number(byId("playback-trial").value));
   const next = (Math.max(0, current) + delta + visibleSegmentOptions.length) % visibleSegmentOptions.length;
   byId("playback-trial").value = String(visibleSegmentOptions[next].code);
@@ -1246,6 +1361,7 @@ function renderProducts(incoming, summary, quiet = false) {
     if (currentView === "roi") roiRenderer.setData(incoming.roi);
     else roiRenderer.data = incoming.roi;
     byId("roi-summary").textContent = `${formatCount(incoming.roi.baseSegments)} quality-filtered segments contribute to fraction and residence denominators.`;
+    renderChoiceSummary(incoming.roi);
   }
   if (incoming.diagnostics) {
     velocityHistogram.setData(incoming.diagnostics.velocity);
@@ -1269,6 +1385,7 @@ function handleWorkerMessage(event) {
   const message = event.data;
   if (message.type === "ready") {
     workerReady = true;
+    applyButton.disabled = false;
     setStatus("working", "Preparing visible view", "The current layer is calculated first; other analyses refresh after the interface is idle.");
     scheduleDataUpdate(0);
     return;
@@ -1282,6 +1399,11 @@ function handleWorkerMessage(event) {
       if (message.requestId === reportRequestId) {
         reportRequestId = null;
         void captureNativeReport();
+      }
+      if (message.requestId === pngRequestId) {
+        pngRequestId = null;
+        byId("download-plot-button").disabled = false;
+        downloadActivePlot();
       }
     }
     flushCompute();
@@ -1309,6 +1431,7 @@ function handleWorkerMessage(event) {
   }
   if (message.type === "error") {
     workerBusy = false;
+    cancelPendingReport();
     setStatus("error", "Browser analysis failed", String(message.error).split("\n")[0]);
     console.error(message.error);
     flushCompute();
@@ -1319,6 +1442,17 @@ async function loadDataset(source) {
   source = String(source || "").trim();
   if (!source) { setStatus("error", "A data source is required", "Enter a CSV, folder, or recursive glob."); return; }
   stopPlayback(true);
+  cancelPendingReport();
+  clearTimeout(computeTimer); clearTimeout(deferredAnalysisTimer); clearTimeout(deferredStatisticsTimer);
+  const epoch = ++loadEpoch;
+  loadingDataset = true;
+  loadController?.abort();
+  loadController = new AbortController();
+  latestRequest += 1; pendingCompute = null;
+  workerReady = false; workerBusy = false;
+  worker?.terminate(); worker = null;
+  byId("export-button").disabled = true;
+  byId("download-choice-button").disabled = true;
   const urlSource = new URLSearchParams(location.search).get("source") || "";
   const restoreUrl = initialUrlStateAvailable && urlSource === source;
   initialUrlStateAvailable = false;
@@ -1331,13 +1465,15 @@ async function loadDataset(source) {
   }, 180);
   byId("load-button").disabled = true; applyButton.disabled = true;
   try {
-    const response = await fetch("/api/load", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({source})});
+    const response = await fetch("/api/load", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({source}), signal: loadController.signal});
+    if (epoch !== loadEpoch) return;
     if (!response.ok) {
       const error = await response.json().catch(() => ({error: `HTTP ${response.status}`}));
       throw new Error(error.error || `Load failed with HTTP ${response.status}`);
     }
     setLoadProgress(78);
     const buffer = await response.arrayBuffer();
+    if (epoch !== loadEpoch) return;
     setLoadProgress(92);
     const parsed = parseBinary(buffer);
     datasetHeader = parsed.header; sourceInput.value = source;
@@ -1346,18 +1482,27 @@ async function loadDataset(source) {
     populateControls(restoreUrl); products = {}; sharedView = null; newDataset = true; sampleSeed = 0;
     if (worker) worker.terminate();
     workerReady = false; workerBusy = false; pendingCompute = null;
-    worker = new Worker("/static/worker.js"); worker.onmessage = handleWorkerMessage;
-    worker.onerror = event => setStatus("error", "Worker crashed", event.message);
+    worker = new Worker("/static/worker.js");
+    const activeWorker = worker;
+    worker.onmessage = event => { if (worker === activeWorker) handleWorkerMessage(event); };
+    worker.onerror = event => {
+      workerBusy = false; workerReady = false; pendingCompute = null;
+      cancelPendingReport();
+      setStatus("error", "Worker crashed", event.message);
+    };
     worker.postMessage({type: "init", header: datasetHeader, buffer, bodyOffset: parsed.bodyOffset}, [buffer]);
     setLoadProgress(100);
     setStatus("working", "Data loaded", `${formatCount(datasetHeader.counts.retainedRows)} retained rows from ${formatCount(datasetHeader.counts.files)} files transferred once${datasetHeader.counts.duplicateFilesSkipped ? `; ${formatCount(datasetHeader.counts.duplicateFilesSkipped)} duplicate copies skipped` : ""}. Building local views.`);
   } catch (error) {
-    setStatus("error", "Could not load data", error.message);
+    if (epoch === loadEpoch) setStatus("error", "Could not load data", error.message);
   } finally {
     clearInterval(progressTimer);
-    setTimeout(() => setLoadProgress(null), 450);
-    byId("load-button").disabled = false;
-    applyButton.disabled = !datasetHeader;
+    if (epoch === loadEpoch) {
+      loadingDataset = false;
+      setTimeout(() => { if (epoch === loadEpoch) setLoadProgress(null); }, 450);
+      byId("load-button").disabled = false;
+      applyButton.disabled = !workerReady;
+    }
   }
 }
 
@@ -1365,8 +1510,95 @@ function talkGrid(product, spatialCanvas = false) {
   const panelCount = Math.max(1, Number(product?.panelCount) || 1);
   const columns = Math.min(2, panelCount);
   const rows = Math.max(1, Math.ceil(panelCount / columns));
-  const scale = spatialCanvas ? 2 / Math.min(devicePixelRatio || 1, 2) : 1;
-  return {panelCount, columns, rows, width: columns * 800 * scale, height: rows * 450 * scale};
+  const panelW = Math.max(640, numberValue("fig-panel-width", 1600));
+  const panelH = Math.max(360, numberValue("fig-panel-height", 900));
+  // Spatial snapshots are drawn into CSS pixels then multiplied by DPR in setupCanvas.
+  const dpr = spatialCanvas ? effectiveDevicePixelRatio() : 1;
+  return {
+    panelCount, columns, rows,
+    width: columns * panelW / dpr,
+    height: rows * panelH / dpr,
+  };
+}
+
+function applyDisplayUnits(redraw = true) {
+  setDisplayUnits({
+    perData: numberValue("unit-scale", 1),
+    name: byId("unit-name").value || "cm",
+  });
+  const hint = document.querySelector("#trajectory-section .plot-hint");
+  if (hint) {
+    const unit = byId("unit-name").value || "cm";
+    const scale = numberValue("unit-scale", 1);
+    const scaleText = scale === 1 ? `1 data unit = 1 ${unit}` : `1 data unit = ${formatNumber(scale, 3)} ${unit}`;
+    hint.textContent = `Drag to pan · wheel or pinch to zoom · Shift + wheel scrolls the page · double-click resets · drag a ring centre or edge · one X unit = one Z unit · ${scaleText}`;
+  }
+  if (redraw) {
+    for (const renderer of spatialRenderers) if (renderer?.data) renderer.draw();
+  }
+}
+
+function applyPlotHostHeight(redraw = true) {
+  const value = byId("plot-host-height").value || "auto";
+  shell.dataset.plotHeight = value;
+  if (value === "auto") shell.style.removeProperty("--plot-host-height");
+  else shell.style.setProperty("--plot-host-height", value);
+  if (redraw) {
+    requestAnimationFrame(() => {
+      for (const renderer of spatialRenderers) {
+        if (!renderer?.host) continue;
+        const rect = renderer.host.getBoundingClientRect();
+        renderer.width = Math.max(1, rect.width);
+        renderer.height = Math.max(1, rect.height);
+        renderer.resize(); renderer.draw();
+      }
+      for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer,
+        velocityHistogram, displacementHistogram]) {
+        renderer?.chart?.resize?.({animation: {duration: 0}});
+        renderer?.draw?.();
+      }
+    });
+  }
+}
+
+function redrawForPixelRatio() {
+  for (const renderer of spatialRenderers) {
+    if (!renderer?.host) continue;
+    const rect = renderer.host.getBoundingClientRect();
+    renderer.width = Math.max(1, rect.width);
+    renderer.height = Math.max(1, rect.height);
+    renderer.resize();
+    renderer.draw();
+  }
+  for (const renderer of [polarRenderer, headingRenderer, metricsRenderer, roiRenderer,
+    velocityHistogram, displacementHistogram]) {
+    renderer?.chart?.resize?.({animation: {duration: 0}});
+    renderer?.draw?.();
+  }
+}
+
+function installDevicePixelRatioWatcher() {
+  let dpr = window.devicePixelRatio || 1;
+  const arm = () => {
+    const media = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    const onChange = () => {
+      media.removeEventListener?.("change", onChange);
+      arm();
+      if ((window.devicePixelRatio || 1) !== dpr) {
+        dpr = window.devicePixelRatio || 1;
+        redrawForPixelRatio();
+      }
+    };
+    if (media.addEventListener) media.addEventListener("change", onChange);
+    else media.addListener?.(onChange);
+  };
+  arm();
+  visualViewport?.addEventListener("resize", () => {
+    if ((window.devicePixelRatio || 1) !== dpr) {
+      dpr = window.devicePixelRatio || 1;
+      redrawForPixelRatio();
+    }
+  });
 }
 
 function snapshotSpatialRenderer(renderer, product) {
@@ -1409,8 +1641,9 @@ function snapshotChart(renderer, height = 700, product = null, visualCells = nul
   const previousExportMode = renderer.exportMode;
   if (product) renderer.data.columns = layout.columns;
   renderer.exportMode = true;
+  const pixelRatio = 2;
   const staging = document.createElement("div");
-  staging.style.cssText = `position:fixed;left:-20000px;top:0;width:${layout.width}px;height:${layout.height}px;background:white`;
+  staging.style.cssText = `position:fixed;left:-20000px;top:0;width:${layout.width / pixelRatio}px;height:${layout.height / pixelRatio}px;background:white`;
   document.body.appendChild(staging);
   const originalHost = renderer.host;
   let chart = null;
@@ -1419,8 +1652,12 @@ function snapshotChart(renderer, height = 700, product = null, visualCells = nul
     const option = renderer.option();
     renderer.host = originalHost;
     chart = globalThis.echarts.init(staging, null, {renderer: "canvas"});
+    option.animation = false;
+    for (const series of option.series || []) {
+      series.progressive = 0; series.progressiveThreshold = Infinity; series.animation = false;
+    }
     chart.setOption(option, {notMerge: true, lazyUpdate: false});
-    return chart.getDataURL({type: "png", pixelRatio: 2, backgroundColor: "#ffffff"});
+    return chart.getDataURL({type: "png", pixelRatio, backgroundColor: "#ffffff"});
   } finally {
     renderer.host = originalHost;
     renderer.data.columns = previousColumns;
@@ -1504,7 +1741,18 @@ function setDashboardView(view, save = true) {
 function setSpatialLens(lens, save = true) { setDashboardView(lens, save); }
 
 function downloadActivePlot() {
+  if (!workerReady || loadingDataset || reportCapturing) return;
   const lens = currentView === "compare" ? "trajectory" : currentView;
+  const productKey = {occupancy: "heatmap", direction: "direction", transitions: "transition",
+    diagnostics: "diagnostics", roi: "roi", metrics: "metrics", heading: "heading", polar: "polar",
+    trajectory: "trajectory"}[lens];
+  if (productKey && !products[productKey]) {
+    clearTimeout(computeTimer); scheduledScope = null;
+    byId("download-plot-button").disabled = true;
+    setStatus("working", "Preparing current plot", "The latest settings will be drawn before the PNG is exported.");
+    pngRequestId = queueCompute(scopeForCurrentView(), {quiet: true});
+    return;
+  }
   const exports = {
     trajectory: {product: products.trajectory, capture: () => snapshotSpatialRenderer(trajectoryRenderer, products.trajectory)},
     occupancy: {product: products.heatmap, capture: () => snapshotSpatialRenderer(heatmapRenderer, products.heatmap)},
@@ -1516,7 +1764,8 @@ function downloadActivePlot() {
     metrics: {product: {panelCount: 4}, capture: () => snapshotChart(metricsRenderer, 700, null, 4)},
     diagnostics: {product: {panelCount: 1}, capture: () => snapshotChart(velocityHistogram, 430, null, 1)},
   };
-  setStatus("working", "Rendering talk-ready PNG", "Using a fixed two-column grid with 1600 × 900 output pixels per panel.");
+  setStatus("working", "Rendering talk-ready PNG",
+    `Using a two-column grid with ${formatNumber(numberValue("fig-panel-width", 1600), 0)} × ${formatNumber(numberValue("fig-panel-height", 900), 0)} output pixels per panel.`);
   try {
     const spec = exports[lens];
     const url = spec?.capture();
@@ -1537,7 +1786,9 @@ const recipeVisualIds = [
   "heat-range-mode", "heat-cmin", "heat-cmax", "flow-metric",
   "flow-range-mode", "flow-cmin", "flow-cmax", "particle-rate",
   "trail-length", "flow-speed", "flow-variability", "flow-color-mode",
-  "flow-velocity-mode", "polar-mode", "transition-split", "trial-fraction",
+  "flow-velocity-mode", "polar-mode", "playback-scope", "playback-speed",
+  "playback-cap", "unit-scale", "unit-name", "fig-panel-width",
+  "fig-panel-height", "plot-host-height", "transition-split", "trial-fraction",
   "transition-outcome", "transition-display", "transition-support",
   "transition-path-width", "transition-path-opacity",
 ];
@@ -1546,7 +1797,7 @@ function currentRecipe() {
   const state = collectState();
   return {
     schema: "daari-deepa-view/v1",
-    source: sourceInput.value,
+    source: datasetHeader?.pattern || sourceInput.value,
     filtersByLabel: Object.fromEntries(Object.entries(state.filters).map(([key, codes]) => [
       key, codes.map(code => datasetHeader?.categories?.[key]?.[code]).filter(Boolean),
     ])),
@@ -1602,7 +1853,7 @@ function applyRecipeControls(recipe) {
     walkThreshold:"walk-threshold", binSize:"bin-size", boundPercent:"bound-percent",
     angleSource:"angle-source", statsUnit:"stats-unit", polarValidMin:"polar-valid-min",
     polarMode:"polar-mode",
-    roiReach:"roi-reach", ringMatch:"ring-match", playbackPercentile:"playback-cap",
+    roiReach:"roi-reach", roiNullProbability:"roi-null-probability", ringMatch:"ring-match", playbackPercentile:"playback-cap",
     headingMode:"heading-mode", headingBin:"heading-bin", headingSectors:"heading-sectors",
     transitionAxis:"transition-axis", mirrorAxis:"mirror-axis", mirrorCoordinate:"mirror-coordinate",
   };
@@ -1644,6 +1895,7 @@ function applyRecipeControls(recipe) {
   trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
   for (const renderer of spatialRenderers) renderer.setMarginalsVisible(byId("show-marginals").checked);
   applyHeatmapVisuals(); applyDirectionVisuals(); updateFraction(); updatePlaybackLimit(); applyLocalRingObserver(false);
+  applyDisplayUnits(false); applyPlotHostHeight(false);
 }
 
 async function applyRecipe() {
@@ -1651,9 +1903,10 @@ async function applyRecipe() {
     const recipe = JSON.parse(byId("recipe-json").value);
     if (!recipe || recipe.schema !== "daari-deepa-view/v1") throw new Error("Expected a daari-deepa-view/v1 recipe.");
     const requestedSource = String(recipe.source || "").trim();
-    if (requestedSource && requestedSource !== sourceInput.value) await loadDataset(requestedSource);
+    if (requestedSource && requestedSource !== datasetHeader?.pattern) await loadDataset(requestedSource);
+    if (!worker || requestedSource && requestedSource !== datasetHeader?.pattern) throw new Error("Load the recipe's source successfully before applying its controls.");
     applyRecipeControls(recipe);
-    if (workerReady) scheduleCompute("full", 0);
+    if (workerReady) scheduleDataUpdate(0);
     setStatus("ready", "View recipe applied", "The source, subsets, ordering, labels, analysis gates, and visual settings were restored.");
   } catch (error) {
     setStatus("error", "Could not apply recipe", error.message);
@@ -1685,21 +1938,24 @@ function downloadBlob(blob, filename) {
 }
 
 async function exportNativeReport() {
-  if (!datasetHeader || reportRequestId != null) return;
+  if (!datasetHeader || loadingDataset || !workerReady || reportRequestId != null || reportCapturing) return;
+  cancelPendingReport();
   setMirrorGuide(null);
   const exportButton = byId("export-button");
   exportButton.disabled = true; exportButton.textContent = "Preparing report…";
   setStatus("working", "Preparing native report", "Capturing the current linked views and analytical tables locally in your browser.");
-  const coreProducts = ["trajectory", "heatmap", "direction", "polar", "roi", "heading", "metrics", "diagnostics"];
-  if (coreProducts.some(product => !products[product])) {
-    reportRequestId = queueCompute("full", {quiet: true});
-    return;
-  }
-  await captureNativeReport();
+  // A dedicated pass produces every table from one current state, including
+  // optional analyses that may never have been opened or are currently stale.
+  clearTimeout(computeTimer); clearTimeout(deferredAnalysisTimer); clearTimeout(deferredStatisticsTimer);
+  scheduledScope = null; scheduledExtra = {};
+  reportRequestId = queueCompute("report", {quiet: true});
 }
 
 async function captureNativeReport() {
   const exportButton = byId("export-button");
+  reportCapturing = true;
+  const previousInert = shell.inert;
+  shell.inert = true;
   await new Promise(resolve => requestAnimationFrame(() => resolve()));
   try {
   const trajectoryImage = snapshotSpatialRenderer(trajectoryRenderer, products.trajectory);
@@ -1716,7 +1972,13 @@ async function captureNativeReport() {
     ["Displacement", () => snapshotChart(displacementHistogram, 430, null, 1)],
     ["Transition probability", () => products.transition ? snapshotSpatialRenderer(transitionRenderer, products.transition) : null],
   ];
-  const figures = sections.map(([title, capture]) => [title, capture()]).filter(([, image]) => image);
+  const figures = [];
+  for (const [title, capture] of sections) {
+    setStatus("working", `Capturing ${title.toLowerCase()}`, "Preparing the self-contained report locally.");
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    const image = capture();
+    if (image) figures.push([title, image]);
+  }
   const flowSnapshot = products.direction ? {
     nx: products.direction.nx, nz: products.direction.nz, x0: products.direction.x0,
     z0: products.direction.z0, bin: products.direction.bin,
@@ -1727,23 +1989,30 @@ async function captureNativeReport() {
   } : null;
   const embeddedFlow = JSON.stringify(flowSnapshot).replaceAll("<", "\\u003c");
   const tableSections = [
+    ["Target choices and exact binomial tests", byId("roi-choice-summary").innerHTML],
     ["Observation windows", products.windows ? byId("windows-content").innerHTML : ""],
     ["Inferential statistics", products.statistics ? byId("statistics-content").innerHTML : ""],
   ].filter(([, content]) => content);
   const counts = datasetHeader.counts;
+  const embeddedRecipe = JSON.stringify(currentRecipe()).replaceAll("<", "\\u003c");
+  const analyticalTables = JSON.stringify({choice: products.roi?.choice || [], statistics: products.statistics,
+    windows: products.windows, summary: lastSummary}).replaceAll("<", "\\u003c");
   const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Daari Deepa native report</title>
     <style>body{margin:24px auto;max-width:1840px;padding:0 24px;color:#18221f;background:#f4f1ea;font:15px system-ui}h1,h2{font-family:Georgia,serif;font-weight:500}header{border-bottom:1px solid #ccc;padding-bottom:16px}.figure{margin:24px 0;padding:16px;background:#fffdf8;border:1px solid #d9d5ca;border-radius:12px;overflow:hidden}.figure h2{margin:0 0 6px}.figure-stage{position:relative;overflow:hidden;min-height:280px;border:1px solid #e5e1d8;background:#fff;cursor:grab;touch-action:none}.figure-stage:active{cursor:grabbing}.figure img{display:block;width:100%;height:auto;image-rendering:auto;transform-origin:0 0;will-change:transform;user-select:none}.figure-hint{display:block;margin:0 0 9px;color:#6b7672}#flow-live{display:block;width:100%;height:auto;background:#fff;border:1px solid #e5e1d8}small{color:#66716d}.statistics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.statistics-card{padding:12px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse}th,td{padding:5px;border-top:1px solid #eee;text-align:left;font-size:12px}@media print{body{max-width:none;margin:0;padding:0;background:#fff}.figure{break-before:page;border:0;border-radius:0;margin:0;padding:12mm;overflow:visible}.figure-stage{min-height:0;overflow:visible;border:0}.figure img{max-width:100%;transform:none!important;page-break-inside:avoid}#flow-live{display:none}}</style>
-    <header><h1>Daari Deepa — native analysis report</h1><p>${escapeHtml(sourceInput.value)}</p><small>${formatCount(counts.retainedRows)} retained of ${formatCount(counts.sourceRows)} source rows · ${formatCount(counts.segments)} segments · ${formatCount(counts.animals)} animals</small></header>
+    <header><h1>Daari Deepa — native analysis report</h1><p>${escapeHtml(datasetHeader.pattern)}</p><small>${formatCount(counts.retainedRows)} retained of ${formatCount(counts.sourceRows)} source rows · ${formatCount(counts.segments)} loaded segments · ${formatCount(lastSummary?.visibleSegments || 0)} visible segments · ${formatCount(counts.animals)} animals. Distribution displays use p99 upper limits; calculations retain outliers.</small></header>
+    <script type="application/json" id="view-recipe">${embeddedRecipe}</script><script type="application/json" id="analysis-tables">${analyticalTables}</script>
     ${figures.map(([title, image]) => `<section class="figure"><h2>${escapeHtml(title)}</h2><small class="figure-hint">Drag to pan · wheel to zoom · double-click to reset</small><div class="figure-stage"><img draggable="false" src="${image}" alt="${escapeHtml(title)}"></div>${title === "Local direction" && flowSnapshot ? '<canvas id="flow-live" aria-label="Animated local direction field"></canvas>' : ""}</section>`).join("")}
     ${tableSections.map(([title, content]) => `<section class="figure"><h2>${escapeHtml(title)}</h2>${content}</section>`).join("")}
     <footer><small>Exported ${escapeHtml(new Date().toISOString())}. Images retain local pan and zoom; the flow field is animated from the exported binned vectors. No data leaves this file.</small></footer>
-    <script>const FLOW=${embeddedFlow};document.querySelectorAll('.figure-stage').forEach(stage=>{const image=stage.querySelector('img');let scale=1,x=0,y=0,drag=null;const draw=()=>image.style.transform='translate('+x+'px,'+y+'px) scale('+scale+')';stage.addEventListener('wheel',event=>{event.preventDefault();const rect=stage.getBoundingClientRect(),next=Math.max(1,Math.min(8,scale*Math.exp(-event.deltaY*.001)));x=event.clientX-rect.left-(event.clientX-rect.left-x)*next/scale;y=event.clientY-rect.top-(event.clientY-rect.top-y)*next/scale;scale=next;draw()},{passive:false});stage.addEventListener('pointerdown',event=>{drag={x:event.clientX,y:event.clientY,ox:x,oy:y};stage.setPointerCapture(event.pointerId)});stage.addEventListener('pointermove',event=>{if(!drag)return;x=drag.ox+event.clientX-drag.x;y=drag.oy+event.clientY-drag.y;draw()});stage.addEventListener('pointerup',()=>drag=null);stage.addEventListener('dblclick',()=>{scale=1;x=0;y=0;draw()})});if(FLOW){const canvas=document.getElementById('flow-live'),cols=Math.min(2,FLOW.panelCount),rows=Math.ceil(FLOW.panelCount/cols),cellW=800,cellH=450;canvas.width=cols*cellW;canvas.height=rows*cellH;const ctx=canvas.getContext('2d'),cells=FLOW.nx*FLOW.nz,active=[];let max=1;for(const value of FLOW.abundance)max=Math.max(max,value||0);for(let i=0;i<FLOW.angle.length;i++){if(FLOW.angle[i]==null||!(FLOW.abundance[i]>0))continue;const copies=1+Math.floor(3*Math.sqrt(FLOW.abundance[i]/max));for(let n=0;n<copies;n++)active.push(i)}const particles=Array.from({length:Math.min(3500,active.length*2)},(_,i)=>({cell:active[i%active.length],phase:(i*.61803398875)%1,jitter:((i*16807)%997)/997-.5}));const bounds=FLOW.bounds,span=Math.max(bounds.xmax-bounds.xmin,bounds.zmax-bounds.zmin)||1,pad=34,plotW=cellW-pad*2,plotH=cellH-pad*2;function frame(time){ctx.fillStyle='rgba(255,255,255,.18)';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.lineCap='round';for(let panel=0;panel<FLOW.panelCount;panel++){const left=(panel%cols)*cellW+pad,top=Math.floor(panel/cols)*cellH+pad;ctx.fillStyle='#26332f';ctx.font='700 15px system-ui';ctx.fillText(FLOW.panelNames[panel]||'All data',left,top-10);ctx.strokeStyle='rgba(60,80,74,.12)';ctx.strokeRect(left,top,plotW,plotH)}for(const p of particles){const panel=Math.floor(p.cell/cells),local=p.cell%cells,ix=local%FLOW.nx,iz=Math.floor(local/FLOW.nx),angle=FLOW.angle[p.cell]*Math.PI/180,strength=FLOW.strength[p.cell]||0,age=(time*.00024+p.phase)%1,cx=FLOW.x0+(ix+.5)*FLOW.bin,cz=FLOW.z0+(iz+.5)*FLOW.bin,length=FLOW.bin*(.3+1.4*strength),dx=Math.sin(angle)*length,dz=Math.cos(angle)*length,left=(panel%cols)*cellW+pad,top=Math.floor(panel/cols)*cellH+pad,px=value=>left+(value-bounds.xmin)/span*plotW,py=value=>top+plotH-(value-bounds.zmin)/span*plotH,x0=px(cx+dx*(age-.18)+p.jitter*FLOW.bin*.35),y0=py(cz+dz*(age-.18)+p.jitter*FLOW.bin*.35),x1=px(cx+dx*age+p.jitter*FLOW.bin*.35),y1=py(cz+dz*age+p.jitter*FLOW.bin*.35);ctx.strokeStyle='oklch(66% .135 '+(((FLOW.angle[p.cell]%360)+360)%360)+')';ctx.globalAlpha=.18+.55*strength;ctx.lineWidth=.7+1.2*Math.sqrt(FLOW.abundance[p.cell]/max);ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke()}ctx.globalAlpha=1;requestAnimationFrame(frame)}if(active.length)requestAnimationFrame(frame)}</script>`;
+    <script>const FLOW=${embeddedFlow};document.querySelectorAll('.figure-stage').forEach(stage=>{const image=stage.querySelector('img');let scale=1,x=0,y=0,drag=null;const draw=()=>image.style.transform='translate('+x+'px,'+y+'px) scale('+scale+')';stage.addEventListener('wheel',event=>{event.preventDefault();const rect=stage.getBoundingClientRect(),next=Math.max(1,Math.min(8,scale*Math.exp(-event.deltaY*.001)));x=event.clientX-rect.left-(event.clientX-rect.left-x)*next/scale;y=event.clientY-rect.top-(event.clientY-rect.top-y)*next/scale;scale=next;draw()},{passive:false});stage.addEventListener('pointerdown',event=>{drag={x:event.clientX,y:event.clientY,ox:x,oy:y};stage.setPointerCapture(event.pointerId)});stage.addEventListener('pointermove',event=>{if(!drag)return;x=drag.ox+event.clientX-drag.x;y=drag.oy+event.clientY-drag.y;draw()});stage.addEventListener('pointerup',()=>drag=null);stage.addEventListener('dblclick',()=>{scale=1;x=0;y=0;draw()})});if(FLOW){const canvas=document.getElementById('flow-live'),cols=Math.min(2,FLOW.panelCount),rows=Math.ceil(FLOW.panelCount/cols),cellW=800,cellH=450;canvas.width=cols*cellW;canvas.height=rows*cellH;const ctx=canvas.getContext('2d'),cells=FLOW.nx*FLOW.nz,active=[];let max=1;for(const value of FLOW.abundance)max=Math.max(max,value||0);for(let i=0;i<FLOW.angle.length;i++){if(FLOW.angle[i]==null||!(FLOW.abundance[i]>0))continue;const copies=1+Math.floor(3*Math.sqrt(FLOW.abundance[i]/max));for(let n=0;n<copies;n++)active.push(i)}const particles=Array.from({length:Math.min(3500,active.length*2)},(_,i)=>({cell:active[i%active.length],phase:(i*.61803398875)%1,jitter:((i*16807)%997)/997-.5}));const bounds=FLOW.bounds,pad=34,plotW=cellW-pad*2,plotH=cellH-pad*2,centerX=(bounds.xmin+bounds.xmax)/2,centerZ=(bounds.zmin+bounds.zmax)/2,pixelsPerWorld=Math.min(plotW/Math.max(1e-9,bounds.xmax-bounds.xmin),plotH/Math.max(1e-9,bounds.zmax-bounds.zmin));function frame(time){ctx.fillStyle='rgba(255,255,255,.18)';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.lineCap='round';for(let panel=0;panel<FLOW.panelCount;panel++){const left=(panel%cols)*cellW+pad,top=Math.floor(panel/cols)*cellH+pad;ctx.fillStyle='#26332f';ctx.font='700 15px system-ui';ctx.fillText(FLOW.panelNames[panel]||'All data',left,top-10);ctx.strokeStyle='rgba(60,80,74,.12)';ctx.strokeRect(left,top,plotW,plotH)}for(const p of particles){const panel=Math.floor(p.cell/cells),local=p.cell%cells,ix=local%FLOW.nx,iz=Math.floor(local/FLOW.nx),angle=FLOW.angle[p.cell]*Math.PI/180,strength=FLOW.strength[p.cell]||0,age=(time*.00024+p.phase)%1,cx=FLOW.x0+(ix+.5)*FLOW.bin,cz=FLOW.z0+(iz+.5)*FLOW.bin,length=FLOW.bin*(.3+1.4*strength),dx=Math.sin(angle)*length,dz=Math.cos(angle)*length,left=(panel%cols)*cellW+pad,top=Math.floor(panel/cols)*cellH+pad,px=value=>left+plotW/2+(value-centerX)*pixelsPerWorld,py=value=>top+plotH/2-(value-centerZ)*pixelsPerWorld,x0=px(cx+dx*(age-.18)+p.jitter*FLOW.bin*.35),y0=py(cz+dz*(age-.18)+p.jitter*FLOW.bin*.35),x1=px(cx+dx*age+p.jitter*FLOW.bin*.35),y1=py(cz+dz*age+p.jitter*FLOW.bin*.35);ctx.strokeStyle='oklch(66% .135 '+(((FLOW.angle[p.cell]%360)+360)%360)+')';ctx.globalAlpha=.18+.55*strength;ctx.lineWidth=.7+1.2*Math.sqrt(FLOW.abundance[p.cell]/max);ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke()}ctx.globalAlpha=1;requestAnimationFrame(frame)}if(active.length)requestAnimationFrame(frame)}</script>`;
   const blob = new Blob([html], {type: "text/html"});
   downloadBlob(blob, `daari-deepa-native-${new Date().toISOString().slice(0,10)}.html`);
   setStatus("ready", "Report exported", `${figures.length} figures embedded locally, including ${formatCount(trajectoryRenderer.lastSnapshotInk || 0)} sampled trajectory pixels.`);
   } catch (error) {
     setStatus("error", "Report export failed", error.message || String(error));
   } finally {
+    shell.inert = previousInert;
+    reportCapturing = false;
     exportButton.disabled = false; exportButton.textContent = "Export native report";
   }
 }
@@ -1928,8 +2197,34 @@ function updateActiveRing() {
 }
 
 function updatePlaybackTime() {
+  const mode = playbackMode();
+  if (mode === "sequential") {
+    const ordered = visibleSegmentOptions.map(item => item.code);
+    if (!ordered.length) {
+      trajectoryRenderer.setSequentialAccumulate(null, -1);
+      trajectoryRenderer.setTime(Number.POSITIVE_INFINITY);
+      byId("time-output").textContent = "no segments";
+      return;
+    }
+    if (!playbackActive) {
+      trajectoryRenderer.setSequentialAccumulate(null, -1);
+      trajectoryRenderer.setTime(Number.POSITIVE_INFINITY);
+      byId("time-output").textContent = "all segments";
+      return;
+    }
+    const index = sequentialSegmentIndex();
+    const option = visibleSegmentOptions[index];
+    trajectoryRenderer.setSequentialAccumulate(ordered, index);
+    trajectoryRenderer.setTime(Number.POSITIVE_INFINITY);
+    if (option) byId("playback-trial").value = String(option.code);
+    byId("time-output").textContent = option
+      ? `${index + 1} / ${visibleSegmentOptions.length} · + ${option.label}`
+      : "no segments";
+    return;
+  }
+  trajectoryRenderer.setSequentialAccumulate(null, -1);
   const value = numberValue("time-scrubber", 0);
-  const single = byId("playback-scope").value === "single";
+  const single = mode === "single";
   trajectoryRenderer.setPlaybackSegment(single ? Number(byId("playback-trial").value) : -1);
   trajectoryRenderer.setTime(playbackActive ? value : Number.POSITIVE_INFINITY);
   byId("time-output").textContent = playbackActive
@@ -1939,9 +2234,23 @@ function updatePlaybackTime() {
 
 function playbackTick(now) {
   if (!playbackPlaying) { playbackFrame = null; return; }
-  const maxTime = Number(byId("time-scrubber").max) || 1;
   const elapsed = playbackLast ? (now - playbackLast) / 1000 : 0; playbackLast = now;
-  let value = numberValue("time-scrubber") + elapsed * numberValue("playback-speed", 1);
+  const speed = Math.max(.05, numberValue("playback-speed", 1));
+  if (playbackMode() === "sequential") {
+    const count = Math.max(1, visibleSegmentOptions.length);
+    sequentialAccum += elapsed * speed;
+    let index = sequentialSegmentIndex();
+    while (sequentialAccum >= 1) {
+      sequentialAccum -= 1;
+      index = (index + 1) % count;
+    }
+    byId("time-scrubber").value = index;
+    updatePlaybackTime();
+    playbackFrame = requestAnimationFrame(playbackTick);
+    return;
+  }
+  const maxTime = Number(byId("time-scrubber").max) || 1;
+  let value = numberValue("time-scrubber") + elapsed * speed;
   if (value >= maxTime) value = 0;
   byId("time-scrubber").value = value; updatePlaybackTime();
   playbackFrame = requestAnimationFrame(playbackTick);
@@ -1949,7 +2258,7 @@ function playbackTick(now) {
 
 function stopPlayback(reset = false) {
   if (playbackFrame) cancelAnimationFrame(playbackFrame);
-  playbackFrame = null; playbackLast = 0;
+  playbackFrame = null; playbackLast = 0; sequentialAccum = 0;
   playbackPlaying = false;
   if (reset) playbackActive = false;
   if (byId("play-button")) {
@@ -1995,6 +2304,7 @@ byId("clean-button").addEventListener("click", () => setCleanMode(!shell.classLi
 byId("clean-exit").addEventListener("click", () => setCleanMode(false));
 document.addEventListener("keydown", event => { if (event.key === "Escape" && shell.classList.contains("clean-mode")) setCleanMode(false); });
 byId("export-button").addEventListener("click", exportNativeReport);
+byId("download-choice-button").addEventListener("click", exportChoiceCounts);
 byId("download-plot-button").addEventListener("click", downloadActivePlot);
 byId("recipe-capture").addEventListener("click", captureRecipe);
 byId("recipe-apply").addEventListener("click", applyRecipe);
@@ -2187,9 +2497,22 @@ byId("time-scrubber").addEventListener("input", () => {
   playbackActive = true; updatePlaybackTime();
 });
 byId("playback-scope").addEventListener("change", () => {
-  byId("time-scrubber").value = 0; updatePlaybackScope();
+  sequentialAccum = 0;
+  byId("time-scrubber").value = 0;
+  playbackActive = playbackMode() === "sequential";
+  updatePlaybackScope();
+  persistState();
 });
 byId("playback-trial").addEventListener("change", () => {
+  if (playbackMode() === "sequential") {
+    const index = visibleSegmentOptions.findIndex(
+      item => item.code === Number(byId("playback-trial").value),
+    );
+    if (index >= 0) byId("time-scrubber").value = index;
+    playbackActive = true;
+    updatePlaybackScope();
+    return;
+  }
   byId("time-scrubber").value = 0; updatePlaybackScope();
 });
 byId("trial-prev").addEventListener("click", () => stepPlaybackSegment(-1));
@@ -2199,8 +2522,14 @@ byId("playback-cap").addEventListener("change", () => {
 });
 byId("play-button").addEventListener("click", () => {
   if (playbackPlaying) { stopPlayback(); return; }
-  const maximum = Number(byId("time-scrubber").max) || 1;
-  if (!playbackActive || numberValue("time-scrubber") >= maximum) byId("time-scrubber").value = 0;
+  if (playbackMode() === "sequential") {
+    if (!visibleSegmentOptions.length) return;
+    if (!playbackActive) byId("time-scrubber").value = 0;
+    sequentialAccum = 0;
+  } else {
+    const maximum = Number(byId("time-scrubber").max) || 1;
+    if (!playbackActive || numberValue("time-scrubber") >= maximum) byId("time-scrubber").value = 0;
+  }
   playbackActive = true; playbackPlaying = true;
   byId("play-button").textContent = "❚❚ Pause";
   byId("play-button").setAttribute("aria-pressed", "true");
@@ -2212,11 +2541,35 @@ for (const id of ["angle-source", "polar-angle-source"]) {
 }
 syncAngleSourceControls(byId("angle-source").value);
 
+for (const id of ["unit-scale", "unit-name"]) {
+  byId(id).addEventListener("change", () => { applyDisplayUnits(true); persistState(); });
+  byId(id).addEventListener("input", () => applyDisplayUnits(true));
+}
+for (const id of ["fig-panel-width", "fig-panel-height"]) {
+  byId(id).addEventListener("change", () => persistState());
+}
+byId("plot-host-height").addEventListener("change", () => {
+  applyPlotHostHeight(true); persistState();
+});
+applyDisplayUnits(false);
+applyPlotHostHeight(false);
+installDevicePixelRatioWatcher();
+
 for (const control of document.querySelectorAll("[data-scope]")) {
   control.addEventListener("change", () => {
     const scope = control.dataset.scope;
-    if (scope === "layout") updateColumns();
-    else if (scope === "windows") {
+    if (scope === "layout") { updateColumns(); persistState(); return; }
+    const hadPendingWork = workerBusy || !!pendingCompute || !!scheduledScope;
+    cancelPendingReport();
+    // Reject in-flight results immediately, before the debounce expires. An
+    // old background result must never repopulate a newly invalidated cache.
+    latestRequest += 1; pendingCompute = null;
+    clearTimeout(computeTimer); scheduledScope = null; scheduledExtra = {};
+    if (control.id === "roi-null-probability") {
+      control.value = Math.max(0, Math.min(1, optionalNumber("roi-null-probability") ?? .5));
+    }
+    persistState();
+    if (scope === "windows") {
       trajectoryRenderer.setObservationWindows(byId("window-show").checked ? observationWindows() : []);
       delete products.windows;
       if (currentView === "windows") scheduleCompute("windows", 40);
@@ -2229,11 +2582,16 @@ for (const control of document.querySelectorAll("[data-scope]")) {
     } else {
       const dependencies = new Set(scopeProducts[scope] || []);
       for (const product of dependencies) delete products[product];
+      if (dependencies.has("roi")) {
+        byId("download-choice-button").disabled = true;
+        byId("roi-choice-summary").textContent = "Target counts will refresh for the current settings when Targets is opened.";
+      }
       const visibleScope = scopeForCurrentView();
       const visibleProducts = scopeProducts[visibleScope] || [];
       if (visibleProducts.some(product => dependencies.has(product))) scheduleCompute(visibleScope, 80);
       else armDeferredAnalysis();
     }
+    if (hadPendingWork && !scheduledScope) scheduleCompute(scopeForCurrentView(), 80);
   });
 }
 

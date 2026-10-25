@@ -289,6 +289,83 @@ leave the acquisition computer.
 
 ## Verification
 
+### Correctness and performance audit — 25 October 2026
+
+The native analytical worker is covered by numerical reference tests against
+SciPy, including exact two-sided binomial tests and Clopper–Pearson intervals,
+Kruskal–Wallis, Mann–Whitney, and tied/zero-difference Wilcoxon cases. Rayleigh
+uses the Zar approximation from CircStat; undefined zero-resultant directions
+are excluded and inference is withheld below five directional units. Holm
+adjustment is applied within each reported comparison family. References:
+[SciPy binomial inference](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.binomtest.html),
+[SciPy Wilcoxon](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.wilcoxon.html),
+[CircStat Rayleigh implementation](https://github.com/circstat/circstat-matlab/blob/master/circ_rtest.m).
+
+Target cards and CSV exports report one mutually exclusive first observed
+choice per file/trial/step segment: left, right, simultaneous, or neither.
+The exact binomial test uses right successes out of left + right decisive
+trials and defaults to expected right probability 0.5, configurable under
+Targets and persisted in URL/recipe state. Separate ever-reached counts can
+include a trial on both sides. Quality/time-filtered pre-ROI rows define the
+fraction denominator; reached-only and tail trim affect the visible diagnostic
+subset. Overlapping same-side targets use a boolean union, invalid coordinates
+cannot reach, and zero-row segments cannot enter denominators. Reaches use
+retained tracking samples, so entry timing follows that sampling resolution;
+trial inference assumes independent decisive trials, while within-animal
+repeated observations can be dependent.
+
+Histograms use exact p99 upper display bounds and report excluded overflow;
+metric and target distributions start at a p99 display zoom with the full
+observations still available. These display bounds never remove observations
+from inference. Unsupported CSV headers are checked before allocating the
+retention budget, and independent recordings with colliding basenames receive
+distinct source identities. Conflicting target geometry under the same short
+config name is rejected with folder/config details, rather than silently
+choosing one folder's targets.
+
+Worker product caches retain one immutable entry per analytical view (plus a
+separate pooled polar entry) and copy outgoing typed arrays before transfer.
+They invalidate on the relevant analysis, coordinate frame, panel mapping, and
+control changes. Histogram/metric chart summaries are cached independently of
+visibility and viewport. Heading colour is computed once per segment, and
+heading-density allocations are bounded for extreme durations.
+
+The following repeat measurements compare branch commit `282230d` with this
+audit on a 1,906,400-row / 2,122-segment SubScale binary. The Node VM harness
+measures worker preparation, excluding browser painting and transfer; cache
+hits reuse already computed results. Cold filtering/initial preprocessing can
+still take seconds and is not represented by warm cache timings.
+
+| Worker request | Before, warm median | After, warm median |
+|---|---:|---:|
+| Trajectory preparation | 315 ms | 313 ms |
+| Occupancy | 0.57 ms | 0.74 ms |
+| Polar | 1,509 ms | 0.07 ms |
+| Target diagnostics | 266 ms | 0.28 ms |
+| Statistics | 4,576 ms | 0.91 ms |
+
+The chart-option benchmark (6,000 observations per metric, 12 panels, 40
+animals, 200,000 heading errors) measured warm metric assembly around
+110 → 13 ms and target assembly around 17 → 0.5 ms. Initial summary construction
+has a one-time cost. Reproduce these preparation benchmarks with:
+
+```bash
+node scripts/benchmark_native.mjs /path/to/native-payload.bin
+node scripts/benchmark_native_renderers.mjs --baseline 282230d
+python -m pytest -q
+```
+
+The audit passed 138 automated tests, including actual transferable-buffer
+detachment, stale report cancellation, p99 accounting, empty selections,
+malformed positions, repeated source names, target metadata conflicts, zero
+resultants, and 50,000-row heading segments. Browser checks used the real
+SubScale source and confirmed probability changes, exact-count CSV downloads,
+clean console output, and chart rendering. A dedicated report request creates
+all optional tables from one current state; exports include the recipe and
+machine-readable analysis tables alongside figure captures. Chart captures
+finish progressive drawing and honor requested pixel dimensions. Interrupted
+or failed export requests re-enable controls.
+
 ```bash
 python -c "import sys, native_app; print('dash' in sys.modules, 'plotly' in sys.modules)"
 python -c "import py_compile; py_compile.compile('native_app.py', doraise=True)"

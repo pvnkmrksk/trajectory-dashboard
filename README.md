@@ -52,6 +52,18 @@ are captured in a fixed two-column, 16:9 presentation grid at a minimum of
 1600 x 900 pixels per treatment panel, independent of the current browser
 viewport; the HTML report retains local pan/zoom and an animated flow field.
 
+Targets reports left/right first choices, simultaneous reaches, and unreached
+trials separately from the counts that ever reached either side. Its exact
+two-sided binomial test defaults to an expected right fraction of **0.5**;
+change this under **Targets and ROI mask**. Counts, exact confidence intervals,
+and raw/Holm-adjusted p-values can be downloaded as CSV. Reports include all
+analysis tables and the saved view recipe.
+
+Distribution displays default to **p99** upper limits so tracking outliers do
+not flatten the useful range. Clipped tails are labelled and remain in the
+statistics. The native loader also reports skipped non-trajectory CSVs and
+keeps them out of the retained-row budget.
+
 The behavioral contract and the distinction between scientific requirements
 and old framework artifacts are in
 [`NATIVE_REBUILD_REQUIREMENTS.md`](NATIVE_REBUILD_REQUIREMENTS.md).

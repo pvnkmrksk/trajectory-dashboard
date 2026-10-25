@@ -143,6 +143,8 @@
           <label>Reach radius<input id="roi-reach" data-scope="full" type="number" min="0.01" step="0.1" value="3"></label>
           <label class="check"><input id="roi-entered" data-scope="full" type="checkbox"> Reached trials only</label>
           <label class="check"><input id="roi-trim" data-scope="full" type="checkbox"> Trim after ROI exit</label>
+          <label class="span-two">Expected right fraction<input id="roi-null-probability" data-scope="roi" type="number" min="0" max="1" step="0.01" value="0.5" aria-describedby="roi-choice-help"></label>
+          <p class="control-note span-two" id="roi-choice-help">Exact two-sided binomial test of right versus left among decisive first reaches. The default expectation is 0.50. Ties and unreached trials are reported separately.</p>
         </div>
       </details>
 
@@ -195,6 +197,35 @@
           <label>Valid points min<input id="polar-valid-min" data-scope="polar" type="number" min="0" max="1" step="0.05" value="0"></label>
         </div>
       </details>
+
+      <details class="control-card" open>
+        <summary>Units and figure size</summary>
+        <div class="control-body two-up">
+          <label class="span-two" title="Converts axis ticks, scale bars, and speed labels. Geometry stays in raw data units.">1 data unit =
+            <span class="unit-scale-row">
+              <input id="unit-scale" type="number" min="1e-9" step="any" value="1">
+              <select id="unit-name">
+                <option value="cm" selected>cm</option>
+                <option value="m">m</option>
+                <option value="mm">mm</option>
+              </select>
+            </span>
+          </label>
+          <label title="PNG export pixels per treatment panel">Export panel W<input id="fig-panel-width" type="number" min="640" step="10" value="1600"></label>
+          <label title="PNG export pixels per treatment panel">Export panel H<input id="fig-panel-height" type="number" min="360" step="10" value="900"></label>
+          <label class="span-two">Screen plot height
+            <select id="plot-host-height">
+              <option value="auto" selected>Auto</option>
+              <option value="520">520 px</option>
+              <option value="620">620 px</option>
+              <option value="720">720 px</option>
+              <option value="820">820 px</option>
+              <option value="920">920 px</option>
+            </select>
+          </label>
+          <p class="control-note span-two">Default: 1 data unit = 1 cm. Paths are redrawn at the display pixel ratio, so browser zoom stays sharper than a static bitmap.</p>
+        </div>
+      </details>
     </aside>
 
     <main class="workspace" id="workspace">
@@ -225,8 +256,8 @@
             </div>
           </form>
         </details>
-        <div class="status-dock" id="status-dock" aria-live="polite" title="Waiting for data">
-          <span class="status-light"></span><b id="status-title">Waiting for data</b>
+        <div class="status-dock" id="status-dock" role="status" aria-live="polite" aria-atomic="true" aria-describedby="status-detail" tabindex="0" title="Waiting for data">
+          <span class="status-light" aria-hidden="true"></span><b id="status-title">Waiting for data</b>
           <small id="status-detail">Drop a folder anywhere or choose a source.</small>
           <progress id="load-progress" max="100" value="0" hidden aria-label="Dataset loading progress"></progress>
         </div>
@@ -284,7 +315,7 @@
               <small class="span-two">The point budget controls decimation only; filters and statistics still use every retained sample.</small>
             </div></details>
             <details class="context-settings playback-settings"><summary>Playback settings</summary><div class="context-settings-panel">
-              <label>Mode<select id="playback-scope"><option value="all">All segments together</option><option value="single">One segment</option></select></label>
+              <label>Mode<select id="playback-scope"><option value="all">All segments together</option><option value="single">One segment</option><option value="sequential">Sequential · experiment order (VR after VR)</option></select></label>
               <button class="compact trial-stepper" id="trial-prev" type="button" disabled aria-label="Previous segment">←</button>
               <label class="trial-picker">Segment<select id="playback-trial" disabled><option value="">Choose a segment</option></select></label>
               <button class="compact trial-stepper" id="trial-next" type="button" disabled aria-label="Next segment">→</button>
@@ -388,9 +419,11 @@
 
       <section class="plot-section" id="roi-section">
         <div class="section-heading">
-          <div><span class="section-kicker">Target interaction</span><h2>ROI outcomes</h2></div>
+          <div><span class="section-kicker">Target interaction</span><h2>Target outcomes</h2></div>
           <div class="section-summary" id="roi-summary">Target geometry is loaded from the scene configs.</div>
+          <button class="compact" id="download-choice-button" type="button" disabled>Export counts · CSV</button>
         </div>
+        <div class="choice-summary" id="roi-choice-summary" role="region" aria-label="Left and right first-reach counts and binomial statistics"><div class="analysis-empty">Load data with target geometry to inspect left and right reaches.</div></div>
         <div class="plot-card"><div class="plot-host tall" id="roi-plot" aria-label="ROI outcome diagnostics"></div></div>
       </section>
 
@@ -416,7 +449,7 @@
       <section class="plot-section" id="metrics-section">
         <div class="section-heading">
           <div><span class="section-kicker">Exact segment summaries</span><h2>Trial metrics</h2></div>
-          <div class="legend-note">Distance · displacement · speed · tortuosity</div>
+          <div class="legend-note">Distance · displacement · speed · tortuosity<br><span class="distribution-note">p99 display limits · full-data statistics</span></div>
         </div>
         <div class="plot-card"><div class="plot-host tall" id="metrics-plot" aria-label="Trial metric distributions"></div></div>
       </section>
@@ -429,7 +462,7 @@
       <section class="plot-section" id="diagnostics-section">
         <div class="section-heading">
           <div><span class="section-kicker">Load-time reference</span><h2>Diagnostics</h2></div>
-          <div class="legend-note">These distributions describe the retained source frame.</div>
+          <div class="legend-note">Retained source frame<br><span class="distribution-note">Upper display limits use p99; outliers remain in calculations.</span></div>
         </div>
         <div class="diagnostic-grid">
           <div class="plot-card"><h3>Smoothed velocity</h3><div class="plot-host short" id="velocity-hist"></div></div>

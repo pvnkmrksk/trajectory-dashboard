@@ -409,10 +409,13 @@ def _histogram_payload(values: np.ndarray, bins: int = 48, *,
     lo, hi = (exact_range if exact_range is not None else
               (float(np.min(finite)), float(np.max(finite))))
     if display_hi is None:
-        display_hi = float(np.percentile(finite, 99.5))
+        display_hi = float(np.percentile(finite, 99))
     display_hi = float(display_hi)
     if not math.isfinite(display_hi) or display_hi <= lo:
-        display_hi = hi if hi > lo else lo + 1.0
+        # A mass at zero can put p99 at the minimum. Do not fall back to the
+        # tracking-error maximum and squash that entire distribution again.
+        padding = max(1.0, abs(lo) * .01)
+        display_hi = min(hi, lo + padding) if hi > lo else lo + padding
     display_hi = min(max(display_hi, lo + 1e-12),
                      hi if hi > lo else display_hi)
     counts, edges = np.histogram(
@@ -424,6 +427,8 @@ def _histogram_payload(values: np.ndarray, bins: int = 48, *,
         "range": [lo, hi],
         "displayRange": [lo, display_hi],
         "overflow": int(np.count_nonzero(finite > display_hi)),
+        "finiteCount": int(finite.size),
+        "upperPercentile": .99 if exact_range is None else None,
     }
 
 
@@ -453,17 +458,58 @@ def _segment_endpoint_keep(segment_ids, max_points: int | None) -> np.ndarray:
 def _load_reference_dataset(pattern: str):
     """Bounded parallel load using only the reusable analysis package."""
 
+    import csv
+    import gzip
+
     discovered_files = td_io.find_csv_files(pattern)
     if not discovered_files:
         raise NativeDatasetError("No trajectory CSV files matched this source.")
-    files, duplicate_files = _deduplicate_source_files(discovered_files)
+    # Simulator/sensor CSVs may be much larger than trajectory recordings.
+    # Inspect one CSV record, rather than decoding their bodies or assigning
+    # them a share of the retained-row budget.
+    compatible_files = []
+    unsupported_files = []
+    required = set(td_io.REQUIRED_COLUMNS)
+    for path in discovered_files:
+        opener = gzip.open if str(path).lower().endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8-sig", newline="") as handle:
+                columns = next(csv.reader(handle), [])
+            compatible = required.issubset(columns)
+        except (OSError, UnicodeError, csv.Error, EOFError):
+            compatible = False
+        (compatible_files if compatible else unsupported_files).append(path)
+    if not compatible_files:
+        raise NativeDatasetError(
+            "No trajectory CSV files contain the required columns "
+            f"({', '.join(td_io.REQUIRED_COLUMNS)}). "
+            f"Skipped {len(unsupported_files)} unsupported CSV files."
+        )
+    files, duplicate_files = _deduplicate_source_files(compatible_files)
     total_bytes = sum(max(1, os.path.getsize(path)) for path in files)
+    basename_counts: dict[str, int] = {}
+    for path in files:
+        basename = os.path.basename(path)
+        basename_counts[basename] = basename_counts.get(basename, 0) + 1
+    common_root = os.path.commonpath([
+        os.path.dirname(os.path.abspath(path)) for path in files
+    ])
+    source_keys = {
+        path: os.path.relpath(os.path.abspath(path), common_root)
+        for path in files if basename_counts[os.path.basename(path)] > 1
+    }
 
     def load_one(item):
         index, path = item
         frame = td_io.load_csv_fast(path, include_numeric=False)
         if frame is None:
             return index, path, None, None, 0
+        # Two recordings in different session folders may reuse a basename.
+        # Distinguish their atomic segments before deriving any velocity or
+        # exact statistics; confirmed identical copies were removed above.
+        if path in source_keys:
+            frame["SourceFile"] = source_keys[path]
+            td_io._rebuild_segment_ids(frame)
         raw_rows = len(frame)
         raw_speed = velocity_all(frame)
         speed = smoothed_velocity(frame, window=10, raw_speed=raw_speed)
@@ -531,6 +577,7 @@ def _load_reference_dataset(pattern: str):
     frame.attrs["_raw_rows"] = int(sum(item[4] for item in results))
     frame.attrs["_discovered_files"] = len(discovered_files)
     frame.attrs["_duplicate_files_skipped"] = len(duplicate_files)
+    frame.attrs["_unsupported_files_skipped"] = len(unsupported_files)
     frame.attrs["_frame_token"] = (
         pattern,
         tuple(
@@ -542,7 +589,7 @@ def _load_reference_dataset(pattern: str):
     return frame, stats, metadata
 
 
-def _build_native_dataset(pattern: str) -> NativeDataset:
+def _build_native_dataset(pattern: str, source_signature=None) -> NativeDataset:
     frame, stats, metadata = _load_reference_dataset(pattern)
     if frame is None or len(frame) == 0:
         raise NativeDatasetError("No valid trajectory rows matched this source.")
@@ -589,7 +636,10 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
         category_codes[key] = codes
         category_labels[key] = labels
 
-    rois = rois_by_config(metadata)
+    try:
+        rois = rois_by_config(metadata, strict=True)
+    except ValueError as exc:
+        raise NativeDatasetError(str(exc)) from exc
     config_presentations = {
         raw: _config_presentation(raw, rois.get(raw, []))
         for raw in category_labels.get("config", [])
@@ -695,7 +745,7 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
 
     token = repr(frame.attrs.get("_frame_token", (pattern, len(frame))))
     dataset_id = hashlib.sha1(
-        f"{pattern}|{token}|{len(frame)}|{len(starts)}".encode("utf-8")
+        f"{pattern}|{token}|{len(frame)}|{len(starts)}|{source_signature!r}".encode("utf-8")
     ).hexdigest()[:16]
     segment_durations = arrays["segmentDuration"]
     finite_durations = segment_durations[np.isfinite(segment_durations)]
@@ -718,6 +768,7 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
             "files": int(frame["SourceFile"].nunique()),
             "discoveredFiles": int(frame.attrs.get("_discovered_files", frame["SourceFile"].nunique())),
             "duplicateFilesSkipped": int(frame.attrs.get("_duplicate_files_skipped", 0)),
+            "unsupportedFilesSkipped": int(frame.attrs.get("_unsupported_files_skipped", 0)),
             "sourceRows": int(frame.attrs.get("_raw_rows", len(frame))),
             "retainedRows": int(len(frame)),
             "segments": int(len(starts)),
@@ -750,7 +801,7 @@ def _build_native_dataset(pattern: str) -> NativeDataset:
             "step": _histogram_payload(segment_step),
             "replicate": _histogram_payload(segment_replicate),
             "time": _histogram_payload(
-                local_time, display_hi=duration_quantiles["median"]
+                local_time, display_hi=duration_quantiles["p99"]
             ),
             "resultant": _histogram_payload(
                 segment_orientation_r, display_hi=1.0,
@@ -778,12 +829,21 @@ def load_native_dataset(pattern: str) -> NativeDataset:
     pattern = str(pattern or "").strip()
     if not pattern:
         raise NativeDatasetError("Enter a CSV file, folder, or recursive glob.")
-    files, _ = _deduplicate_source_files(td_io.find_csv_files(pattern))
+    files = td_io.find_csv_files(pattern)
+    # Geometry/identity metadata can change without touching a recording.
+    # Include it in the warm-cache signature so corrected targets are used.
+    metadata_files = [
+        os.path.join(folder, name)
+        for folder in sorted({os.path.dirname(os.path.abspath(path)) for path in files})
+        for name in sorted(os.listdir(folder))
+        if name.lower().endswith(".json")
+        and os.path.isfile(os.path.join(folder, name))
+    ]
     cache_key = (
         pattern,
         tuple(
-            (os.path.abspath(path), os.path.getmtime(path), os.path.getsize(path))
-            for path in files
+            (os.path.abspath(path), os.stat(path).st_mtime_ns, os.path.getsize(path))
+            for path in [*files, *metadata_files]
         ),
         LOAD_ROW_BUDGET,
     )
@@ -793,7 +853,7 @@ def load_native_dataset(pattern: str) -> NativeDataset:
         if cached is not None:
             _CACHE.move_to_end(cached.dataset_id)
             return cached
-    dataset = _build_native_dataset(pattern)
+    dataset = _build_native_dataset(pattern, source_signature=cache_key)
     with _CACHE_LOCK:
         _CACHE.pop(dataset.dataset_id, None)
         _CACHE[dataset.dataset_id] = dataset

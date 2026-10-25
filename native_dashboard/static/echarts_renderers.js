@@ -1,15 +1,22 @@
-import {NATIVE_PALETTE, formatNumber} from "/static/renderers.js";
+import {NATIVE_PALETTE, NEUTRAL_INDEX, SEQUENTIAL_OFFSET, formatNumber} from "/static/renderers.js";
+
+const SEQUENTIAL_BAR = Array.from({length: 32}, (_, index) => NATIVE_PALETTE[SEQUENTIAL_OFFSET + index]);
 
 const ECHARTS = globalThis.echarts;
 const INK = "#17211f";
 const MUTED = "#64706c";
 const GRID = "rgba(31, 45, 41, .11)";
 const PAPER = "#ffffff";
+const AXIS_NUMBER = new Intl.NumberFormat(undefined, {maximumSignificantDigits: 4});
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>\"]/g, character => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;",
   })[character]);
+}
+
+function formatCount(value) {
+  return Number.isFinite(value) ? Math.trunc(value).toLocaleString("en-US") : "—";
 }
 
 function autoColumns(count, requested = 0) {
@@ -25,6 +32,31 @@ function quantile(sorted, q) {
   const at = (sorted.length - 1) * q;
   const lo = Math.floor(at), hi = Math.ceil(at), f = at - lo;
   return sorted[lo] * (1 - f) + sorted[hi] * f;
+}
+
+// Only the initial viewport is clipped. The original observations and summaries
+// stay intact, and zooming out can reveal the complete tail.
+function distributionRange(values) {
+  const sorted = Array.from(values || []).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return {lower: 0, upper: 1, clipped: 0};
+  const lower = Math.min(0, sorted[0]);
+  const percentile = quantile(sorted, .99);
+  const upper = percentile > lower ? percentile : lower + Math.max(1, Math.abs(lower) * .01);
+  let clipped = 0;
+  for (const value of sorted) if (value > upper) clipped += 1;
+  return {lower, upper, clipped};
+}
+
+function rangeNote(range) {
+  return range.clipped ? `P99 view · ${range.clipped.toLocaleString()} above view · zoom out for full range` : "";
+}
+
+function initialRangeZoom(range, index) {
+  return {
+    type: "inside", yAxisIndex: index, filterMode: "none", throttle: 35,
+    startValue: range.lower, endValue: range.upper,
+    zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false,
+  };
 }
 
 function deterministicJitter(index, trial, step, animal, width = 13) {
@@ -56,8 +88,56 @@ function densityProfile(sorted, bins = 27) {
   return {median: quantile(sorted, .5), points};
 }
 
+function metricSummary(data, key) {
+  const groups = Array.from({length: data.panelCount}, () => []);
+  const animalRows = Array.from({length: data.animalNames?.length || 0}, () => []);
+  for (let index = 0; index < data[key].length; index += 1) {
+    if (!Number.isFinite(data[key][index])) continue;
+    groups[data.panel[index]]?.push(data[key][index]);
+    animalRows[data.animal[index]]?.push(index);
+  }
+  const boxes = [], profiles = [];
+  for (let panel = 0; panel < groups.length; panel += 1) {
+    const values = groups[panel].sort((a, b) => a - b);
+    boxes.push(values.length ? [values[0], quantile(values, .25), quantile(values, .5), quantile(values, .75), values[values.length - 1]] : [NaN, NaN, NaN, NaN, NaN]);
+    const profile = densityProfile(values);
+    if (profile) profiles.push({...profile, panel});
+  }
+  return {boxes, profiles, animalRows, range: distributionRange(data[key])};
+}
+
+function roiSummary(data) {
+  const animals = Array.from({length: data.animalNames?.length || 0}, () => ({pairs: [], time: [], error: []}));
+  for (let index = 0; index < data.animalCode.length; index += 1) {
+    animals[data.animalCode[index]]?.pairs.push(index);
+  }
+  for (const kind of ["time", "error"]) {
+    for (let index = 0; index < data[`${kind}Values`].length; index += 1) {
+      const animal = data[`${kind}Animals`][index];
+      if (!Number.isFinite(data[`${kind}Values`][index])) continue;
+      animals[animal]?.[kind].push({
+        value: [data[`${kind}Sides`][index] ? "Right" : "Left", data[`${kind}Values`][index]],
+        animal: data.animalNames[animal], panel: data.panelNames[data[`${kind}Panels`][index]],
+        trial: data[`${kind}Trials`][index], metric: kind === "time" ? "Time to first reach" : "Heading error",
+      });
+    }
+  }
+  return {animals, ranges: [
+    {lower: 0, upper: 1, clipped: 0},
+    distributionRange([...data.leftResidence, ...data.rightResidence]),
+    distributionRange(data.timeValues),
+    {lower: -180, upper: 180, clipped: 0},
+  ]};
+}
+
 function animalColor(code) {
   return NATIVE_PALETTE[Number(code) % 16];
+}
+
+function paletteColor(index) {
+  const value = Number(index);
+  if (!Number.isFinite(value)) return NATIVE_PALETTE[NEUTRAL_INDEX];
+  return NATIVE_PALETTE[Math.max(0, Math.min(NATIVE_PALETTE.length - 1, value | 0))];
 }
 
 function toolbox(name, zoom = true) {
@@ -73,7 +153,8 @@ function axisBase() {
   return {
     axisLine: {lineStyle: {color: "#aeb8b4"}},
     axisTick: {lineStyle: {color: "#aeb8b4"}},
-    axisLabel: {color: MUTED, fontSize: 10, hideOverlap: true},
+    axisLabel: {color: MUTED, fontSize: 10, hideOverlap: true,
+      formatter: value => typeof value === "number" ? AXIS_NUMBER.format(value) : value},
     splitLine: {lineStyle: {color: GRID}},
     nameTextStyle: {color: MUTED, fontSize: 10},
   };
@@ -98,11 +179,12 @@ function compactLetters(count, tests = []) {
         if (a.size) next.push(a); if (b.size) next.push(b);
       } else next.push(column);
     }
-    columns = next.filter((column, index, all) => !all.some((other, otherIndex) =>
+    const unique = [...new Map(next.map(column => [[...column].sort((a, b) => a - b).join(","), column])).values()];
+    columns = unique.filter((column, index, all) => !all.some((other, otherIndex) =>
       otherIndex !== index && column.size < other.size && [...column].every(value => other.has(value))));
   }
   return Array.from({length: count}, (_, panel) => columns.map((column, index) =>
-    column.has(panel) ? String.fromCharCode(65 + index) : "").join(""));
+    column.has(panel) ? (index < 26 ? String.fromCharCode(65 + index) : `(${index + 1})`) : "").join(""));
 }
 
 function significanceStars(value) {
@@ -119,8 +201,15 @@ class EChartRenderer {
     this.appliedAnimalVisibility = [];
     this.chart = ECHARTS.init(host, null, {renderer: "canvas", useDirtyRect: true});
     this.resizeObserver = new ResizeObserver(() => {
-      this.chart.resize({animation: {duration: 0}});
-      this.draw();
+      if (this.resizeFrame) return;
+      this.resizeFrame = requestAnimationFrame(() => {
+        this.resizeFrame = null;
+        if (!(host.clientWidth > 0 && host.clientHeight > 0)) return;
+        if (this.chart.getWidth() === host.clientWidth && this.chart.getHeight() === host.clientHeight) return;
+        this.chart.resize({animation: {duration: 0}});
+        // Recalculate absolute grid geometry without discarding the user's zoom.
+        this.draw(true);
+      });
     });
     this.resizeObserver.observe(host);
     this.visibilityObserver = new IntersectionObserver(entries => {
@@ -129,15 +218,19 @@ class EChartRenderer {
     this.visibilityObserver.observe(host);
   }
   setData(data) { this.data = data; this.draw(); }
-  setStatistics(data) { this.statistics = data; this.draw(); }
+  setStatistics(data) { this.statistics = data; this.draw(true); }
   setColumns(value) {
     if (!this.data) return;
-    this.data.columns = Number(value) || 0;
-    this.draw();
+    const next = Number(value) || 0;
+    if (this.data.columns === next) return;
+    this.data.columns = next;
+    this.draw(true);
   }
   setFraction(value) {
-    this.fraction = Math.max(.01, Math.min(1, Number(value) || 1));
-    this.draw();
+    const next = Math.max(.01, Math.min(1, Number(value) || 1));
+    if (next === this.fraction) return;
+    this.fraction = next;
+    this.draw(true);
   }
   setAnimalVisibility(value) {
     this.animalVisibility = value ? [...value] : null;
@@ -166,9 +259,15 @@ class EChartRenderer {
       toolbox: this.exportMode ? {show: false} : toolbox(name, zoom),
     };
   }
-  draw() {
+  draw(preserveZoom = false) {
     if (!this.data) return;
-    this.chart.setOption(this.option(), {notMerge: true, lazyUpdate: false});
+    const option = this.option();
+    if (preserveZoom && option.dataZoom) option.dataZoom = option.dataZoom.map(item => {
+      const {startValue, endValue, start, end, ...configuration} = item;
+      return configuration;
+    });
+    this.chart.setOption(option, {notMerge: !preserveZoom,
+      ...(preserveZoom ? {replaceMerge: ["series"]} : {}), lazyUpdate: false});
     this.appliedAnimalVisibility = (this.data.animalNames || []).map(
       (_, index) => this.animalVisibility?.[index] !== false,
     );
@@ -207,6 +306,14 @@ export class EChartsPolarRenderer extends EChartRenderer {
     });
   }
   setRadialZoomEnabled(value) { this.radialZoomEnabled = !!value; }
+  setAnimalVisibility(value) {
+    const next = value ? [...value] : null;
+    if (JSON.stringify(next) === JSON.stringify(this.animalVisibility)) return;
+    this.animalVisibility = next;
+    // Histogram/density modes aggregate visible animals, and vector mode omits
+    // hidden rays. A legend action alone cannot recreate an omitted series.
+    this.draw();
+  }
   option() {
     const data = this.data;
     const count = Math.max(1, data.panelCount);
@@ -248,6 +355,7 @@ export class EChartsPolarRenderer extends EChartRenderer {
       const counts = Array.from({length: count}, () => new Float64Array(bins));
       if (mode === "histogram") {
         for (let index = 0; index < data.angle.length; index += 1) {
+          if (!Number.isFinite(data.angle[index])) continue;
           if (data.sample[index] > this.fraction || this.animalVisibility?.[data.animal[index]] === false) continue;
           const bin = Math.max(0, Math.min(bins - 1,
             Math.floor((((data.angle[index] + 180) % 360 + 360) % 360) / 360 * bins)));
@@ -312,10 +420,15 @@ export class EChartsPolarRenderer extends EChartRenderer {
       };
     }
 
+    // Colour rays with the same palette indices the worker assigned for Colour By
+    // (shared with raw trajectories). Keep legend / visibility keyed by animal.
     const grouped = new Map();
     for (let i = 0; i < data.angle.length; i += 1) {
+      if (!Number.isFinite(data.angle[i]) || !Number.isFinite(data.r[i])) continue;
       if (data.sample[i] > this.fraction) continue;
-      const key = `${data.panel[i]}|${data.animal[i]}`;
+      if (this.animalVisibility?.[data.animal[i]] === false) continue;
+      const colorIndex = data.color?.[i] ?? (data.animal[i] % 16);
+      const key = `${data.panel[i]}|${data.animal[i]}|${colorIndex}`;
       if (!grouped.has(key)) grouped.set(key, []);
       const animal = data.animalNames?.[data.animal[i]] || `Animal ${data.animal[i] + 1}`;
       grouped.get(key).push({
@@ -327,20 +440,21 @@ export class EChartsPolarRenderer extends EChartRenderer {
     }
     const series = [];
     for (const [key, values] of grouped) {
-      const [panel, animal] = key.split("|").map(Number);
+      const [panel, animal, colorIndex] = key.split("|").map(Number);
       const name = data.animalNames?.[animal] || `Animal ${animal + 1}`;
+      const color = paletteColor(colorIndex);
       series.push({
         name,
         type: "lines", coordinateSystem: "polar", polarIndex: panel,
         data: values, polyline: false, silent: true, large: values.length > 2000,
-        lineStyle: {color: animalColor(animal), width: 1, opacity: .34},
+        lineStyle: {color, width: 1, opacity: .34},
         emphasis: {disabled: true}, select: {disabled: true},
       });
       series.push({
         name, type: "scatter", coordinateSystem: "polar", polarIndex: panel,
         data: values.map(item => ({...item, value: item.value})),
         symbolSize: 4,
-        itemStyle: {color: animalColor(animal), opacity: .48},
+        itemStyle: {color, opacity: .48},
         emphasis: {scale: 1.7, itemStyle: {opacity: 1}},
       });
     }
@@ -361,10 +475,33 @@ export class EChartsPolarRenderer extends EChartRenderer {
         symbolSize: 7, itemStyle: {color: INK}, z: 11,
       });
     }
+    const scale = data.colorScale;
+    const scaleHi = scale && scale.hi === scale.lo ? scale.lo + 1 : scale?.hi;
+    const visualMap = scale ? [{
+      show: true,
+      type: "continuous",
+      min: scale.lo,
+      max: scaleHi,
+      calculable: false,
+      realtime: false,
+      orient: "vertical",
+      right: 10,
+      top: 54,
+      itemWidth: 8,
+      itemHeight: 88,
+      seriesIndex: [],
+      inRange: {color: SEQUENTIAL_BAR},
+      text: [
+        scale.integer ? String(Math.round(scale.hi)) : formatNumber(scale.hi, 1),
+        scale.integer ? String(Math.round(scale.lo)) : formatNumber(scale.lo, 1),
+      ],
+      textStyle: {color: MUTED, fontSize: 9},
+      formatter: value => (scale.integer ? String(Math.round(value)) : formatNumber(value, 1)),
+    }] : undefined;
     return {
       ...this.base("polar-direction", false), title: titles,
       legend: {
-        type: "scroll", left: 12, right: 100, top: 8, height: 28,
+        type: "scroll", left: 12, right: scale ? 120 : 100, top: 8, height: 28,
         selected: selectedMap(data, this.animalVisibility),
         textStyle: {fontSize: 10, color: MUTED}, itemWidth: 16, itemHeight: 7,
       },
@@ -377,12 +514,15 @@ export class EChartsPolarRenderer extends EChartRenderer {
           return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>Angle ${formatNumber(item.value?.[1], 1)}° · R ${formatNumber(item.value?.[0], 1)}`;
         },
       },
-      polar, angleAxis, radiusAxis, series,
+      polar, angleAxis, radiusAxis, series, visualMap,
       graphic: [{
-        type: "text", right: 92, top: 31, silent: true,
+        type: "text", right: scale ? 118 : 92, top: 31, silent: true,
         style: {text: this.radialMax < .999 ? `radial zoom 0–${formatNumber(this.radialMax, 1)} · double-click to reset` : "wheel to radial zoom",
           fill: MUTED, font: "10px Inter, system-ui"},
-      }],
+      }, ...(scale?.title ? [{
+        type: "text", right: 18, top: 148, silent: true, rotation: Math.PI / 2,
+        style: {text: scale.title, fill: MUTED, font: "600 9px Inter, system-ui"},
+      }] : [])],
     };
   }
 }
@@ -398,7 +538,7 @@ export class EChartsHeadingRenderer extends EChartRenderer {
       const col = panel % cols, row = Math.floor(panel / cols);
       grid.push({left: col * cellW + 48, top: top + row * cellH + 24, width: Math.max(40, cellW - 66), height: Math.max(45, cellH - 42), containLabel: false});
       xAxis.push({gridIndex: panel, type: "value", min: 0, max: Math.max(.001, data.maxTime), ...axisBase()});
-      yAxis.push({gridIndex: panel, type: "value", min: -180, max: 180, interval: 90, axisLabel: {...axisBase().axisLabel, formatter: value => `${value}°`}, ...axisBase()});
+      yAxis.push({gridIndex: panel, type: "value", min: -180, max: 180, interval: 90, ...axisBase(), axisLabel: {...axisBase().axisLabel, formatter: value => `${value}°`}});
       titles.push({text: data.panelNames?.[panel] || "All data", left: col * cellW + 48, top: top + row * cellH, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
     }
     const axisIndices = Array.from({length: count}, (_, i) => i);
@@ -508,32 +648,32 @@ export class EChartsHeadingRenderer extends EChartRenderer {
 export class EChartsMetricsRenderer extends EChartRenderer {
   option() {
     const data = this.data;
+    if (this.metricSource !== data) {
+      this.metricSource = data;
+      this.metricCache = new Map();
+    }
     const metrics = [
       ["distance", "Distance walked"], ["displacement", "Net displacement"],
       ["speed", "Median velocity"], ["tortuosity", "Local tortuosity"],
     ];
     const width = Math.max(320, this.host.clientWidth), height = Math.max(420, this.host.clientHeight);
     const cellW = width / 2, cellH = (height - 42) / 2;
-    const grid = [], xAxis = [], yAxis = [], titles = [], series = [];
+    const grid = [], xAxis = [], yAxis = [], titles = [], series = [], ranges = [];
     metrics.forEach(([key, title], metricIndex) => {
       const col = metricIndex % 2, row = Math.floor(metricIndex / 2);
       grid.push({left: col * cellW + 52, top: 44 + row * cellH + 35, width: Math.max(60, cellW - 76), height: Math.max(70, cellH - 66)});
       const metricStatistics = this.statistics?.metrics?.find(result => result.metric === key);
       const letters = compactLetters(data.panelCount, metricStatistics?.pairwise || []);
-      xAxis.push({gridIndex: metricIndex, type: "category", data: data.panelNames,
+      xAxis.push({gridIndex: metricIndex, type: "category", data: data.panelNames, ...axisBase(),
         axisLabel: {...axisBase().axisLabel, rotate: data.panelCount > 5 ? 28 : 0,
-          formatter: (value, index) => `${value}${metricStatistics ? `\n${letters[index] || ""}` : ""}`}, ...axisBase()});
-      yAxis.push({gridIndex: metricIndex, type: "value", scale: true, ...axisBase()});
-      titles.push({text: title, left: col * cellW + 52, top: 44 + row * cellH + 8, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
-      const boxes = [], profiles = [];
-      for (let panel = 0; panel < data.panelCount; panel += 1) {
-        const values = [];
-        for (let i = 0; i < data[key].length; i += 1) if (data.panel[i] === panel && Number.isFinite(data[key][i])) values.push(data[key][i]);
-        values.sort((a, b) => a - b);
-        boxes.push(values.length ? [values[0], quantile(values, .25), quantile(values, .5), quantile(values, .75), values[values.length - 1]] : [NaN, NaN, NaN, NaN, NaN]);
-        const profile = densityProfile(values);
-        if (profile) profiles.push({...profile, panel});
-      }
+          formatter: (value, index) => `${value}${metricStatistics ? `\n${letters[index] || ""}` : ""}`}});
+      yAxis.push({gridIndex: metricIndex, type: "value", min: 0, scale: true, ...axisBase()});
+      if (!this.metricCache.has(key)) this.metricCache.set(key, metricSummary(data, key));
+      const {boxes, profiles, animalRows, range} = this.metricCache.get(key);
+      ranges.push(range);
+      titles.push({text: title, subtext: rangeNote(range), itemGap: 3,
+        subtextStyle: {fontSize: 9, color: MUTED},
+        left: col * cellW + 52, top: 44 + row * cellH + 4, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
       const halfWidth = Math.max(8, Math.min(25, cellW / Math.max(2, data.panelCount) * .26));
       series.push({
         type: "custom", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
@@ -552,14 +692,13 @@ export class EChartsMetricsRenderer extends EChartRenderer {
       });
       series.push({
         type: "boxplot", xAxisIndex: metricIndex, yAxisIndex: metricIndex,
-        data: boxes, silent: false, z: 3,
+        data: boxes, silent: false, clip: true, z: 3,
         boxWidth: [6, Math.max(10, halfWidth * .72)],
         itemStyle: {color: "rgba(255,255,255,.72)", borderColor: "#0e7c73", borderWidth: 1.15},
       });
       for (let animal = 0; animal < (data.animalNames?.length || 0); animal += 1) {
         const points = [];
-        for (let i = 0; i < data[key].length; i += 1) {
-          if (data.animal[i] !== animal || !Number.isFinite(data[key][i])) continue;
+        for (const i of animalRows[animal]) {
           points.push({
             value: [data.panel[i], data[key][i], deterministicJitter(i, data.trial[i], data.step[i], animal)],
             animal: data.animalNames[animal], panel: data.panelNames[data.panel[i]],
@@ -589,10 +728,7 @@ export class EChartsMetricsRenderer extends EChartRenderer {
         if (params.seriesType === "boxplot") return `<b>${escapeHtml(params.name)}</b><br>min ${formatNumber(item[0], 1)} · Q1 ${formatNumber(item[1], 1)}<br>median ${formatNumber(item[2], 1)} · Q3 ${formatNumber(item[3], 1)} · max ${formatNumber(item[4], 1)}`;
         return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}<br>Replicate ${formatNumber(item.replicate, 0)} · trial ${formatNumber(item.trial, 0)} · step ${formatNumber(item.step, 0)}<br>${escapeHtml(item.metric)} ${formatNumber(item.value?.[1], 1)}`;
       }},
-      dataZoom: metrics.map((_, index) => ({
-        type: "inside", yAxisIndex: index, filterMode: "none", throttle: 35,
-        zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false,
-      })),
+      dataZoom: ranges.map(initialRangeZoom),
       grid, xAxis, yAxis, series,
     };
   }
@@ -601,27 +737,43 @@ export class EChartsMetricsRenderer extends EChartRenderer {
 export class EChartsRoiRenderer extends EChartRenderer {
   option() {
     const data = this.data;
+    const labelKey = JSON.stringify([data.panelNames, data.animalNames]);
+    if (this.roiSource !== data || this.roiLabelKey !== labelKey) {
+      this.roiSource = data; this.roiLabelKey = labelKey;
+      this.roiCache = roiSummary(data);
+    }
+    const {animals, ranges} = this.roiCache;
     const width = Math.max(320, this.host.clientWidth), height = Math.max(420, this.host.clientHeight);
     const cellW = width / 2, cellH = (height - 42) / 2;
-    const titlesText = ["Fraction reaching", "Residence seconds / trial", "Time to first reach", "Heading error"];
+    const titlesText = ["Fraction ever reaching", "Residence seconds / trial", "Time to first reach", "Heading error"];
+    const choice = (data.choice || []).reduce((total, result) => {
+      for (const field of ["left", "right", "ambiguous", "neither"]) total[field] += Number(result[field]) || 0;
+      return total;
+    }, {left: 0, right: 0, ambiguous: 0, neither: 0});
+    const firstReachNote = data.choice?.length
+      ? `First: ${choice.left} left · ${choice.right} right · ${choice.ambiguous} tied · ${choice.neither} neither`
+      : "Per animal · reaching trials / all trials";
     const grid = [], xAxis = [], yAxis = [], titles = [], series = [];
     for (let index = 0; index < 4; index += 1) {
       const col = index % 2, row = Math.floor(index / 2);
       grid.push({left: col * cellW + 54, top: 44 + row * cellH + 36, width: Math.max(60, cellW - 78), height: Math.max(70, cellH - 68)});
       xAxis.push({gridIndex: index, type: "category", data: ["Left", "Right"], ...axisBase()});
-      yAxis.push({gridIndex: index, type: "value", min: index === 0 ? 0 : (index === 3 ? -180 : null), max: index === 0 ? 1 : (index === 3 ? 180 : null), scale: index > 0, ...axisBase()});
-      titles.push({text: titlesText[index], left: col * cellW + 54, top: 44 + row * cellH + 8, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
+      yAxis.push({gridIndex: index, type: "value", min: index === 3 ? -180 : 0, max: index === 0 ? 1 : (index === 3 ? 180 : null), scale: index > 0, ...axisBase(),
+        ...(index === 0 ? {axisLabel: {...axisBase().axisLabel, formatter: value => `${formatNumber(value * 100, 0)}%`}} : {}),
+      });
+      titles.push({text: titlesText[index], subtext: index === 0 ? firstReachNote : rangeNote(ranges[index]), itemGap: 3,
+        subtextStyle: {fontSize: 9, color: MUTED}, left: col * cellW + 54, top: 44 + row * cellH + 4, textStyle: {fontSize: 11, fontWeight: 650, color: INK}});
     }
     for (let animal = 0; animal < (data.animalNames?.length || 0); animal += 1) {
       const name = data.animalNames[animal], color = animalColor(animal);
-      const time = [], error = [];
-      for (let i = 0; i < data.animalCode.length; i += 1) if (data.animalCode[i] === animal) {
+      const {pairs, time, error} = animals[animal];
+      for (const i of pairs) {
         const panel = data.panelNames[data.animalPanel[i]];
         series.push({
           name, type: "line", xAxisIndex: 0, yAxisIndex: 0,
           data: [
-            {value: ["Left", data.leftFraction[i]], animal: name, panel, metric: "Fraction reaching"},
-            {value: ["Right", data.rightFraction[i]], animal: name, panel, metric: "Fraction reaching"},
+            {value: ["Left", data.leftFraction[i]], animal: name, panel, metric: "Fraction ever reaching", reached: data.leftReachedCount?.[i], trials: data.animalTrials?.[i], fraction: true},
+            {value: ["Right", data.rightFraction[i]], animal: name, panel, metric: "Fraction ever reaching", reached: data.rightReachedCount?.[i], trials: data.animalTrials?.[i], fraction: true},
           ], symbolSize: 5, itemStyle: {color}, lineStyle: {color, opacity: .24, width: .8},
         });
         series.push({
@@ -632,8 +784,6 @@ export class EChartsRoiRenderer extends EChartRenderer {
           ], symbolSize: 5, itemStyle: {color}, lineStyle: {color, opacity: .24, width: .8},
         });
       }
-      for (let i = 0; i < data.timeValues.length; i += 1) if (data.timeAnimals[i] === animal) time.push({value: [data.timeSides[i] ? "Right" : "Left", data.timeValues[i]], animal: name, panel: data.panelNames[data.timePanels[i]], trial: data.timeTrials[i], metric: "Time to first reach"});
-      for (let i = 0; i < data.errorValues.length; i += 1) if (data.errorAnimals[i] === animal) error.push({value: [data.errorSides[i] ? "Right" : "Left", data.errorValues[i]], animal: name, panel: data.panelNames[data.errorPanels[i]], trial: data.errorTrials[i], metric: "Heading error"});
       const common = {name, itemStyle: {color}, lineStyle: {color, opacity: .25, width: .8}, symbolSize: 5};
       if (time.length) series.push({...common, type: "scatter", xAxisIndex: 2, yAxisIndex: 2, data: time, symbolSize: 4, itemStyle: {color, opacity: .38}});
       if (error.length) series.push({...common, type: "scatter", xAxisIndex: 3, yAxisIndex: 3, data: error, symbolSize: 3, large: error.length > 3000, itemStyle: {color, opacity: .28}});
@@ -643,12 +793,12 @@ export class EChartsRoiRenderer extends EChartRenderer {
       legend: {type: "scroll", left: 12, right: 100, top: 8, selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 14, itemHeight: 7},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {}, trial = Number.isFinite(item.trial) ? `<br>Trial ${formatNumber(item.trial, 0)}` : "";
-        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>${escapeHtml(item.metric)} · ${escapeHtml(item.value?.[0])}: ${formatNumber(item.value?.[1], 1)}`;
+        const value = item.fraction ? `${formatNumber(item.value?.[1] * 100, 1)}%` : formatNumber(item.value?.[1], 1);
+        const count = item.fraction && Number.isFinite(item.reached) && Number.isFinite(item.trials)
+          ? `<br>${formatCount(item.reached)} / ${formatCount(item.trials)} trials · each side counted independently` : "";
+        return `<b>${escapeHtml(item.animal)}</b> · ${escapeHtml(item.panel)}${trial}<br>${escapeHtml(item.metric)} · ${escapeHtml(item.value?.[0])}: ${value}${count}`;
       }},
-      dataZoom: Array.from({length: 4}, (_, index) => ({
-        type: "inside", yAxisIndex: index, filterMode: "none", throttle: 35,
-        zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false,
-      })),
+      dataZoom: ranges.map(initialRangeZoom),
       grid, xAxis, yAxis, series,
     };
   }
@@ -659,13 +809,22 @@ export class EChartsHistogramRenderer extends EChartRenderer {
   option() {
     const data = this.data, bars = [];
     for (let i = 0; i < data.counts.length; i += 1) bars.push({value: [(data.edges[i] + data.edges[i + 1]) / 2, data.counts[i]], lo: data.edges[i], hi: data.edges[i + 1]});
+    const unit = this.name.includes("displacement") ? "trials" : "samples";
+    const displayed = data.displayedCount ?? data.counts.reduce((sum, count) => sum + count, 0);
+    const percentile = Number.isFinite(data.upperPercentile) ? data.upperPercentile * 100 : null;
+    const overflow = Number(data.overflow) || 0, underflow = Number(data.underflow) || 0;
+    const note = [`${formatCount(displayed)} / ${formatCount(data.finiteCount ?? displayed)} ${unit}`,
+      ...(overflow ? [`${formatCount(overflow)} above ${percentile ? `P${formatNumber(percentile, 0)}` : "range"}`] : []),
+      ...(underflow ? [`${formatCount(underflow)} below range`] : []),
+    ].join(" · ");
     return {
       ...this.base(this.name),
-      grid: {left: 52, right: 22, top: 34, bottom: 48},
-      tooltip: {trigger: "item", confine: true, formatter: params => `${formatNumber(params.data.lo, 1)} – ${formatNumber(params.data.hi, 1)}<br><b>${formatNumber(params.data.value[1], 0)}</b> samples`},
-      xAxis: {type: "value", ...axisBase()}, yAxis: {type: "value", ...axisBase()},
+      grid: {left: 52, right: 22, top: 42, bottom: 48},
+      graphic: [{type: "text", left: 52, top: 12, silent: true, style: {text: note, fill: MUTED, font: "9px Inter, system-ui"}}],
+      tooltip: {trigger: "item", confine: true, formatter: params => `${formatNumber(params.data.lo, 1)} – ${formatNumber(params.data.hi, 1)}<br><b>${formatCount(params.data.value[1])}</b> ${unit}`},
+      xAxis: {type: "value", min: data.edges[0], max: data.edges[data.edges.length - 1], ...axisBase()}, yAxis: {type: "value", min: 0, ...axisBase()},
       dataZoom: [{type: "inside", xAxisIndex: 0, filterMode: "none"}, {type: "slider", xAxisIndex: 0, bottom: 7, height: 15}],
-      series: [{type: "bar", data: bars, barWidth: "98%", itemStyle: {color: "rgba(49,95,140,.72)", borderRadius: [2, 2, 0, 0]}, large: true}],
+      series: [{type: "bar", data: bars, barWidth: "98%", itemStyle: {color: "rgba(49,95,140,.72)", borderRadius: [2, 2, 0, 0]}}],
     };
   }
 }
