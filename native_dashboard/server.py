@@ -9,9 +9,10 @@ from pathlib import Path
 import time
 from typing import Any
 
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory, redirect
 
 from .dataset import NativeDatasetError, load_native_dataset
+from .live import install_live_routes
 
 
 LOGGER = logging.getLogger("trajectory.native")
@@ -119,7 +120,7 @@ def _binary_response(payload: bytes) -> Response:
     return response
 
 
-def create_native_app(default_source: str = "") -> Flask:
+def create_native_app(default_source: str = "", *, telemetry: str = "", telemetry_topic: str = "matrex.telemetry.v2", live_only: bool = False) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config["NATIVE_DEFAULT_SOURCE"] = str(default_source or "")
 
@@ -133,6 +134,8 @@ def create_native_app(default_source: str = "") -> Flask:
 
     @app.get("/")
     def index():
+        if app.config.get("LIVE_ONLY"):
+            return redirect("/live/")
         return send_from_directory(STATIC_DIR, "index.html")
 
     @app.get("/native-config.json")
@@ -184,4 +187,5 @@ def create_native_app(default_source: str = "") -> Flask:
     def health():
         return jsonify({"ok": True, "renderer": "browser-native", "plotly": False})
 
+    install_live_routes(app, STATIC_DIR, telemetry, telemetry_topic, live_only)
     return app

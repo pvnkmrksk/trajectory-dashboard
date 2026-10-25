@@ -11,3 +11,9 @@ trajectory_export_*.html
 .claude/
 
 config_names.json
+
+# The browser-native viewer is source, not an exported recording.
+!native_dashboard/static/*.html
+/build/
+/dist/
+*.spec.bak

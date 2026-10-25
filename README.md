@@ -1,5 +1,7 @@
 # Daari Deepa
 
+[![Standalone builds](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml/badge.svg)](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml) · [Download](https://pvnkmrksk.github.io/trajectory-dashboard/) · [System manual](https://pvnkmrksk.github.io/matrexVR/manual/) · [Cite this software](CITATION.cff)
+
 *Daari Deepa* is Kannada wordplay for a light or lamp along a path: an
 interactive dashboard for illuminating movement trajectories, their local
 direction, spatial occupancy, target visits, and transitions.
@@ -10,6 +12,73 @@ renders with purpose-built WebGL2 and Canvas components: no Dash callbacks,
 Plotly figures, or repeated figure JSON are involved after the initial load.
 The original Dash + Plotly application remains available for side-by-side
 parity checks while advanced workflows finish migrating.
+
+## Companion experiment and tracking tools
+
+[MATREX VR](https://github.com/pvnkmrksk/matrexVR) is the Unity experiment renderer that produces the animal trajectories, saved configs and stimulus evidence this dashboard can inspect. Its [complete manual](https://pvnkmrksk.github.io/matrexVR/manual/) covers input units, display mapping, saving, telemetry and replay. [Rekkefly](https://github.com/pvnkmrksk/rekkefly) supplies flight/wing tracking and [HejjéTrac](https://github.com/pvnkmrksk/hejjetrak) supplies spherical-treadmill tracking.
+
+The [MATREX toolchain guide](https://pvnkmrksk.github.io/matrexVR/manual/integrations.html) distinguishes tracker inputs, saved-run analysis and the current-source live monitoring bridge. The projects have independent versions; source additions do not replace archived MATREX VR releases.
+
+
+## Live telemetry and standalone builds
+
+The current source adds **Live** at `/live/`, alongside recorded-data analysis.
+It receives MATREX VR schema-2 snapshots and periodic experiment-context
+heartbeats, then streams the latest state to browsers with Server-Sent Events.
+It shows trajectories, heading, tracker freshness, steering, flight state,
+scene, trial, configuration and animal/species metadata. Live viewing is a
+bounded observation window; MATREX's saved files remain the experiment record.
+
+```bash
+python -m pip install -r requirements-native.txt
+python native_app.py --telemetry tcp://127.0.0.1:9880 --open-browser
+```
+
+For another computer to view the experiment, run the bridge on a reachable
+machine with `--host 0.0.0.0 --live-only`, then open that machine's port 8060
+in the remote browser. The bridge connects to the **Unity telemetry PUB**,
+which is separate from the tracker ports. If the bridge is remote from Unity,
+configure Unity to bind its telemetry on a reachable interface. Publisher
+connection changes are accepted only from the bridge computer's loopback
+browser; remote viewers are read-only. `--live-only` disables the recorded-file
+loading APIs. This is intended for a trusted lab network. No Python or ZeroMQ
+installation is needed on viewing computers.
+
+Current MATREX source repeats context on `matrex.telemetry.v2.context`
+(default every two seconds), so late joiners get the current run and animal
+metadata. Archived MATREX 0.3 publishes the existing snapshot topic without
+that heartbeat; the viewer still shows its snapshots with the available
+context. The live viewer never commands Unity or the trackers.
+
+Self-contained packages bundle Python, the server, ZeroMQ and offline browser
+assets. [Standalone dashboard builds](https://github.com/pvnkmrksk/trajectory-dashboard/actions/workflows/native-build.yml)
+produces Windows x64, Linux x64, macOS arm64 and macOS x64 ZIP artifacts.
+[Direct downloads](https://pvnkmrksk.github.io/trajectory-dashboard/) are
+published from passing main-branch builds on a static Pages site, with source
+revision and SHA-256 checksums. No sign-in or Python installation is needed.
+CI artifacts are also retained for 14 days. These are continuous source
+builds, not new release tags. Each platform passes a real PUB → packaged
+receiver → HTTP/SSE and recorded-data duration smoke test before publication.
+
+To build on your own operating system:
+
+```bash
+python -m pip install -r requirements-native.txt 'pyinstaller>=6,<7'
+python tools/build_native.py
+```
+
+Extract the **whole** ZIP. On Windows open `DaariDeepa.exe`; on macOS open
+`OpenDashboard.command`; on Linux run `OpenDashboard.sh` (desktop launch
+behavior depends on the file manager). The launcher opens the local browser.
+Keep the terminal open while serving; close it or press Ctrl+C to stop.
+Use `--no-browser` for a server and `--help` for connection options. Packages
+are unsigned; redistribution and signing are separate from this source build.
+
+Canonical `AnimalMetadata.json` / `Animals` / `AnimalID` recordings are read
+alongside legacy `FlyMetaData.json` / `Flies` / `FlyID` recordings. Canonical
+values take precedence, species is retained, and `FlyID` remains an internal
+compatibility alias. File-scoped segment identity and numerical analysis are
+unchanged. See [LIVE_TELEMETRY.md](LIVE_TELEMETRY.md) for the full contract.
 
 ## Browser-native dashboard
 
