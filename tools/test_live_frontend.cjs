@@ -34,8 +34,8 @@ function element(){return {textContent:'',style:{},dataset:{},children:[],client
 const $=id=>{if(!elements.has(id))elements.set(id,element());return elements.get(id);};
 class PathRenderer{constructor(host,callback){this.callback=callback;this.view={xmin:-1,xmax:1,zmin:-1,zmax:1};charts.push(this);}setLineStyle(){}setData(data){this.data=data;}setView(view){this.view=view;}}
 class HeadingRenderer{constructor(){charts.push(this);}setData(data){this.data=data;}}
-let stream;const state={receiver:{endpoint:'tcp://host:9880',state:'receiving',snapshotAgeSeconds:0},context:{sessionId:'run-A',inputKind:'demonstration',scene:{worldUnitsPerMetre:100},animals:[{vrId:'VR1',animalId:'animal β',speciesName:'Agrotis infusa',backend:'HejjéTrac'}]},telemetry:{...frame(1,0),schemaVersion:2,experimentContext:{sessionId:'run-A'},system:{sceneName:'Choice',sceneNumber:1,trialNumber:1},frameTiming:{framesPerSecond:120,frameMeanMs:8.3}}};
-const context={document:{getElementById:$,createElement:element,createTextNode:value=>({textContent:value}),addEventListener(){}},...api,TrajectoryRenderer:PathRenderer,EChartsHeadingRenderer:HeadingRenderer,setDisplayUnits(){},NATIVE_PALETTE:Array(16).fill('#246b78'),EventSource:class{constructor(){stream=this;this.handlers={};}addEventListener(name,fn){this.handlers[name]=fn;}},fetch:async()=>({json:async()=>({...state,controlAvailable:true})}),setInterval:fn=>intervals.push(fn),Date,Map,Set,Number,JSON,Infinity,Math};
+let stream,displayUnits;const state={receiver:{endpoint:'tcp://host:9880',state:'receiving',snapshotAgeSeconds:0},context:{sessionId:'run-A',inputKind:'demonstration',scene:{worldUnitsPerMetre:100},animals:[{vrId:'VR1',animalId:'animal β',speciesName:'Agrotis infusa',backend:'HejjéTrac'}]},telemetry:{...frame(1,0),schemaVersion:2,experimentContext:{sessionId:'run-A'},system:{sceneName:'Choice',sceneNumber:1,trialNumber:1},frameTiming:{framesPerSecond:120,frameMeanMs:8.3}}};
+const context={document:{getElementById:$,createElement:element,createTextNode:value=>({textContent:value}),addEventListener(){}},...api,TrajectoryRenderer:PathRenderer,EChartsHeadingRenderer:HeadingRenderer,setDisplayUnits(value){displayUnits=value;},NATIVE_PALETTE:Array(16).fill('#246b78'),EventSource:class{constructor(){stream=this;this.handlers={};}addEventListener(name,fn){this.handlers[name]=fn;}},fetch:async()=>({json:async()=>({...state,controlAvailable:true})}),setInterval:fn=>intervals.push(fn),Date,Map,Set,Number,JSON,Infinity,Math};
 vm.createContext(context);vm.runInContext(fs.readFileSync('native_dashboard/static/live.js','utf8').replace(/^import .*;\n/gm,''),context);
 function emit(s){stream.handlers.snapshot({data:JSON.stringify(s)});intervals[0]();}
 (async()=>{
@@ -62,5 +62,30 @@ function emit(s){stream.handlers.snapshot({data:JSON.stringify(s)});intervals[0]
  state.telemetry={...state.telemetry,...frame(7,11),system:{sceneName:'Swarm',sceneNumber:2,trialNumber:1},experimentContext:{sessionId:'run-B',worldUnitsPerMetre:1}};emit(state);assert.equal(charts[0].data.currentPoses.length,1);
  state.context.timestampUtc=new Date(1790000009000).toISOString();state.context.experiment={sceneName:'Choice',sceneNumber:1,trialNumber:1,configFile:'old.json'};state.context.scene={name:'Choice',worldUnitsPerMetre:100};emit(state);
  assert.match($('scene').textContent,/Swarm/);assert.match($('position-units').textContent,/metres/);assert.notEqual($('config').textContent,'old.json');
- console.log('PASS: shared live rendering, signed headings, gap/clock boundaries, sample/time/rig bounds, stable auto range, metadata, pause and manual view preservation');
+ // Freeze a real populated block, then cycle through mismatched heartbeat/snapshot
+ // boundaries, changed units, a new session and endpoint while acquisition continues.
+ state.context={sessionId:'run-B',experiment:{sceneName:'Swarm',sceneNumber:2,trialNumber:1},scene:{worldUnitsPerMetre:1}};
+ state.telemetry={...state.telemetry,...frame(8,11.1)};emit(state);
+ $('pause-view').onclick();const frozenPath=charts[0].data,frozenHeading=charts[1].data,frozenSummary=$('view-window').textContent;
+ assert.ok(frozenPath.links>0);assert.equal(displayUnits.name,'m');
+ for(let block=3;block<=12;block++){
+  const scene=block%2?'Choice_desync':'Swarm';const session=block>8?'run-C':'run-B';
+  state.context={sessionId:session,timestampUtc:new Date(1790000000000+block*20000).toISOString(),experiment:{sceneName:scene,sceneNumber:block,trialNumber:2},scene:{worldUnitsPerMetre:100}};
+  state.receiver.contextAgeSeconds=0;state.receiver.snapshotAgeSeconds=4;emit(state);
+  assert.equal(charts[0].data,frozenPath,'A newer context awaiting poses must preserve paused trajectories');
+  assert.equal(charts[1].data,frozenHeading,'Context transitions must preserve paused heading time range/series');
+  state.telemetry={...frame(block+10,block*20),system:{sceneName:scene,sceneNumber:block,trialNumber:2},experimentContext:{sessionId:session,worldUnitsPerMetre:100}};
+  if(block===10)state.receiver.endpoint='tcp://third-host:9880';emit(state);
+  $('fit-paths').onclick();assert.equal(charts[0].data,frozenPath,'Fit must use the frozen block after multiple resets');
+  assert.equal(charts[1].data,frozenHeading);assert.equal(displayUnits.name,'m','New scene units cannot relabel a paused block');
+  assert.equal($('view-window').textContent,frozenSummary,'Frozen count/time/context label must remain stable');
+  assert.match($('position-units').textContent,/metres/);assert.match($('scene').textContent,new RegExp('block '+block));
+ }
+ $('pause-view').onclick();assert.notEqual(charts[0].data,frozenPath);assert.equal(charts[0].data.currentPoses.length,1);
+ assert.equal(displayUnits.name,'cm');assert.match($('position-units').textContent,/centimetres/);assert.match($('view-window').textContent,/block 12/);
+ $('pause-view').onclick();$('clear-view').onclick();assert.equal(charts[0].data.currentPoses.length,0,'Explicit Clear replaces a paused snapshot');
+ state.telemetry={...state.telemetry,...frame(30,240.1)};emit(state);$('fit-paths').onclick();
+ assert.equal(charts[0].data.currentPoses.length,0,'After explicit Clear, Fit cannot reveal newly acquired paused samples');
+ $('pause-view').onclick();assert.equal(charts[0].data.currentPoses.length,1);
+ console.log('PASS: shared live rendering, signed headings, gap/clock boundaries, bounded histories, metadata, multi-context paused snapshot/units, Fit, explicit Clear and resume');
 })().catch(error=>{console.error(error);process.exitCode=1;});

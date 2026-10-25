@@ -9,14 +9,19 @@ import {LivePlotModel, followBounds, signedHeading} from '/static/live_model.js'
   try {pathRenderer=new TrajectoryRenderer($('paths-plot'),()=>{autoRange=false;range=pathRenderer.view;updateRangeButton();});pathRenderer.setLineStyle(1.8,.8);}
   catch(error){rendererError=error.message;}
   const headingRenderer=new EChartsHeadingRenderer($('heading-plot'));
-  let paused=false,generation='',dirty=true,displayed=null;
+  let paused=false,generation='',dirty=true,displayed=null,pendingGenerationReset=false;
+  let plotMeta={displayUnits:{perData:1,name:'world units'},unitsLabel:'World X / Z · scene world units',contextLabel:''};
   const text=(id,value)=>{$(id).textContent=value??'—';};
   const number=(v,digits=1)=>Number.isFinite(v)?v.toFixed(digits):'—';
   function updateRangeButton(){text('fit-paths',autoRange?'Auto range on':'Fit & follow');$('fit-paths').dataset.following=String(autoRange);}
-  function clear(){model.clear();displayed=null;range=null;autoRange=true;dirty=true;updateRangeButton();paint(true);}
-  $('clear-view').onclick=clear;
+  function clear(preservePaused=false){
+    model.clear();dirty=true;
+    if(preservePaused&&paused&&displayed){pendingGenerationReset=true;return;}
+    displayed=null;range=null;autoRange=true;pendingGenerationReset=false;updateRangeButton();paint(true);
+  }
+  $('clear-view').onclick=()=>clear();
   $('fit-paths').onclick=()=>{autoRange=true;range=null;updateRangeButton();dirty=true;paint(true);};
-  $('pause-view').onclick=()=>{paused=!paused;text('pause-view',paused?'Resume view':'Pause view');$('pause-view').ariaPressed=String(paused);$('history-window').disabled=paused;if(paused)text('view-window','Paused · '+$('view-window').textContent);if(!paused){dirty=true;paint();}};
+  $('pause-view').onclick=()=>{paused=!paused;text('pause-view',paused?'Resume view':'Pause view');$('pause-view').ariaPressed=String(paused);$('history-window').disabled=paused;if(paused)text('view-window','Paused · '+$('view-window').textContent);if(!paused){if(pendingGenerationReset){range=null;autoRange=true;pendingGenerationReset=false;updateRangeButton();}dirty=true;paint();}};
   $('history-window').onchange=()=>{model.setWindow($('history-window').value);dirty=true;};
   function cell(row, primary, secondary, stale=false){const td=document.createElement('td');td.textContent=primary??'—';td.dataset.stale=String(stale);if(secondary){const small=document.createElement('small');small.textContent=secondary;td.append(small);}row.append(td);}
   function receive(data){
@@ -38,9 +43,10 @@ import {LivePlotModel, followBounds, signedHeading} from '/static/live_model.js'
     text('config',c.experiment?.configFile||c.experiment?.design||f?.experimentContext?.configFile||'Waiting for context heartbeat');
     const kind=c.inputKind||f?.experimentContext?.inputKind;
     text('input-kind',kind==='demonstration'?'Demonstration input':kind==='tracker'?'Tracker input · verify source':'Source unspecified');
-    const units=c.scene?.worldUnitsPerMetre??f?.experimentContext?.worldUnitsPerMetre; text('position-units',`World X / Z · ${units===1?'metres':units===100?'centimetres':'scene world units'} · current viewing window`);
+    const units=c.scene?.worldUnitsPerMetre??f?.experimentContext?.worldUnitsPerMetre;
+    plotMeta={displayUnits:units===100?{perData:1,name:'cm'}:Number.isFinite(units)&&units>0?{perData:1/units,name:'m'}:{perData:1,name:'world units'},unitsLabel:`World X / Z · ${units===1?'metres':units===100?'centimetres':'scene world units'}`,contextLabel:scene?`${scene} · block ${sys.sceneNumber||'—'} · trial ${sys.trialNumber||'—'}`:''};
     const key=`${r.endpoint||''}|${c.sessionId||f?.experimentContext?.sessionId||''}|${sys.sceneName||''}|${sys.trialNumber||0}|${sys.sceneNumber||0}`;
-    if(generation && key!==generation)clear(); generation=key;
+    if(generation && key!==generation)clear(true); generation=key;
     if(!f){const body=$('animals');body.replaceChildren();const row=document.createElement('tr');cell(row,'Waiting for a matching pose snapshot');row.children[0].colSpan=7;body.append(row);return;}
     const profiles=new Map((c.animals||[]).map(a=>[a.vrId,a]));
     const body=$('animals');body.replaceChildren();
@@ -57,19 +63,18 @@ import {LivePlotModel, followBounds, signedHeading} from '/static/live_model.js'
       cell(row,number(rig.closedLoop?.yawOutputDegPerSecond)+' °/s',rig.closedLoop?.appliedThisFrame?'Applied this frame':'No applied tracking this frame');body.append(row);
     }
     model.receive(f,c.animals||[],r.snapshotAgeSeconds||0);
-    const perMetre=c.scene?.worldUnitsPerMetre??f.experimentContext?.worldUnitsPerMetre;
-    setDisplayUnits(perMetre===100?{perData:1,name:'cm'}:Number.isFinite(perMetre)&&perMetre>0?{perData:1/perMetre,name:'m'}:{perData:1,name:'world units'});
     dirty=true;
   }
   function paint(force=false){
     if(!dirty||paused&&!force||document.visibilityState==='hidden')return;
-    dirty=false;const data=paused&&displayed?displayed:model.payloads();displayed=data;
+    dirty=false;const data=paused&&displayed?displayed:{...model.payloads(),...plotMeta,seconds:model.seconds,droppedForLimit:model.droppedForLimit};displayed=data;
+    setDisplayUnits(data.displayUnits);text('position-units',`${data.unitsLabel} · ${paused?'paused view':'current viewing window'}`);
     if(pathRenderer){
       pathRenderer.setData(data.trajectory,true);
       if(autoRange){range=followBounds(range,data.trajectory.bounds);pathRenderer.setView(range);}
     }
     headingRenderer.setData(data.heading,true);
-    text('view-window',`${paused?'Paused · ':''}${data.rigs} rig${data.rigs===1?'':'s'} · ${data.points.toLocaleString()} displayed samples · up to ${model.seconds}s per block${model.droppedForLimit?' · sample cap reached':''}`);
+    text('view-window',`${paused?'Paused · ':''}${data.rigs} rig${data.rigs===1?'':'s'} · ${data.points.toLocaleString()} displayed samples · up to ${data.seconds}s per block${data.contextLabel?' · '+data.contextLabel:''}${data.droppedForLimit?' · sample cap reached':''}`);
     $('paths-empty').hidden=data.points>0;$('heading-empty').hidden=data.heading.vertices.length>0;
     const legend=$('plot-legend');legend.replaceChildren();
     for(const pose of data.trajectory.currentPoses){
@@ -81,6 +86,6 @@ import {LivePlotModel, followBounds, signedHeading} from '/static/live_model.js'
   document.addEventListener('visibilitychange',()=>{if(document.visibilityState!=='hidden'){dirty=true;paint();}});
   async function initial(){const data=await fetch('/api/live/snapshot',{cache:'no-store'}).then(r=>r.json());$('connect-button').disabled=!data.controlAvailable;$('endpoint').disabled=!data.controlAvailable;$('topic').disabled=!data.controlAvailable;if(data.receiver?.endpoint)$('endpoint').value=data.receiver.endpoint;else $('connection-details').open=true;if(!data.controlAvailable)text('connect-message','Read-only remote viewer. The server operator controls the publisher connection.');receive(data);}
   const events=new EventSource('/api/live/stream');events.addEventListener('snapshot',e=>{try{receive(JSON.parse(e.data));}catch(error){text('error','Cannot display packet: '+error.message);}});events.onerror=()=>{text('connection','Viewer connection lost · reconnecting');$('connection').dataset.state='stale';};
-  $('connect-form').onsubmit=async e=>{e.preventDefault();$('connect-button').disabled=true;try{const response=await fetch('/api/live/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint:$('endpoint').value,topic:$('topic').value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Connection failed');clear();text('connect-message','Subscribed. Waiting for the next published snapshot and context heartbeat.');}catch(error){text('connect-message',error.message);}finally{$('connect-button').disabled=false;}};
+  $('connect-form').onsubmit=async e=>{e.preventDefault();$('connect-button').disabled=true;try{const response=await fetch('/api/live/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint:$('endpoint').value,topic:$('topic').value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Connection failed');clear(true);text('connect-message','Subscribed. Waiting for the next published snapshot and context heartbeat.');}catch(error){text('connect-message',error.message);}finally{$('connect-button').disabled=false;}};
   initial().catch(error=>text('error',error.message));
 })();
