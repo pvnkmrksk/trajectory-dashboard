@@ -26,8 +26,8 @@ function load(file, names, extras = {}) {
   vm.runInContext(source + '\nthis.exports = {' + names.join(',') + '};', context);
   return {context, ...context.exports};
 }
-const native = load('renderers.js', ['TrajectoryRenderer', 'PolarRenderer', 'NATIVE_PALETTE', 'NEUTRAL_INDEX', 'SEQUENTIAL_OFFSET', 'formatNumber']);
-const charts = load('echarts_renderers.js', ['EChartsMetricsRenderer', 'EChartsRoiRenderer', 'EChartsHistogramRenderer', 'EChartsPolarRenderer', 'compactLetters'], native);
+const native = load('renderers.js', ['TrajectoryRenderer', 'PolarRenderer', 'NATIVE_PALETTE', 'NEUTRAL_INDEX', 'SEQUENTIAL_OFFSET', 'formatNumber', 'drawCurrentPoses', 'setDisplayUnits', 'displayUnits']);
+const charts = load('echarts_renderers.js', ['EChartsMetricsRenderer', 'EChartsRoiRenderer', 'EChartsHistogramRenderer', 'EChartsPolarRenderer', 'EChartsHeadingRenderer', 'compactLetters'], native);
 function renderer(Type, data) {
   const result = Object.create(Type.prototype);
   Object.assign(result, {data, host: {clientWidth: 1200, clientHeight: 750}, fraction: 1});
@@ -198,4 +198,41 @@ legacy.ctx = new Proxy({}, {get: (_target, key) => (...args) => {
 }});
 legacy.draw();
 assert.equal(nonfinite.length, 0);
+""")
+
+
+def test_live_heading_options_reuse_recorded_axes_and_colour_without_changing_defaults():
+    _run_node(r"""
+const data = {panelCount: 1, panelNames: ['Current block'], maxTime: 125,
+  panels: [0, 0], animals: [0, 0], samples: [0, 0], vertices: [124, -90, 125, 0],
+  trials: [1, 1], steps: [1, 1], animalNames: ['VR2'], mode: 'trial'};
+const saved = renderer(charts.EChartsHeadingRenderer, data).option();
+assert.equal(saved.xAxis[0].min, 0);assert.equal(saved.yAxis[0].min, -180);
+assert.equal(saved.yAxis[0].max, 180);assert.equal(saved.series[0].lineStyle.width, .8);
+const live = renderer(charts.EChartsHeadingRenderer, {...data,minTime: 65,
+  lineWidth: 1.8,lineOpacity: .85,animalColors: [1]}).option();
+assert.equal(live.xAxis[0].min, 65);assert.equal(live.xAxis[0].max, 125);
+assert.equal(live.series[0].lineStyle.color, native.NATIVE_PALETTE[1]);
+assert.equal(live.series[0].lineStyle.width, 1.8);
+assert.equal(live.series[0].data[0].coords[0][1], -90);
+""")
+
+
+def test_live_current_heading_markers_follow_unity_xz_coordinates_and_honest_units():
+    _run_node(r"""
+const rotations = [], positions = [];
+const ctx = new Proxy({}, {set: () => true, get: (_, key) => {
+  if (key === 'rotate') return value => rotations.push(value);
+  if (key === 'translate') return (x,y) => positions.push([x,y]);
+  return () => {};
+}});
+native.drawCurrentPoses(ctx,800,500,{panelCount:1,currentPoses:[
+  {x:0,z:0,yaw:0,color:0},{x:1,z:1,yaw:90,color:1},{x:0,z:0,yaw:NaN},
+]}, {xmin:-2,xmax:2,zmin:-2,zmax:2});
+assert.equal(rotations.length, 2);assert.equal(rotations[0], 0);
+assert.ok(Math.abs(rotations[1] - Math.PI/2) < 1e-10);
+assert.ok(positions[1][0] > positions[0][0]);
+assert.ok(positions[1][1] < positions[0][1], '+Z must render upward as in recorded paths');
+native.setDisplayUnits({perData:1,name:'world units'});
+assert.equal(native.displayUnits.name, 'world units', 'Unknown scene scale cannot be labelled centimetres');
 """)

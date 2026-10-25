@@ -200,7 +200,7 @@ export const displayUnits = {perData: 1, name: "cm"};
 export function setDisplayUnits({perData, name} = {}) {
   const scale = Number(perData);
   displayUnits.perData = Number.isFinite(scale) && scale > 0 ? scale : 1;
-  displayUnits.name = ["cm", "m", "mm"].includes(name) ? name : "cm";
+  displayUnits.name = ["cm", "m", "mm", "world units"].includes(name) ? name : "cm";
 }
 
 export function formatPhysical(dataValue, digits = 1) {
@@ -296,6 +296,24 @@ function drawPanelChrome(ctx, width, height, data, view, options = {}) {
   }
   ctx.restore();
   return layout;
+}
+
+/** Optional current-pose overlay. Unity yaw0 points along +Z; +90 points +X. */
+export function drawCurrentPoses(ctx, width, height, data, view) {
+  if (!data?.currentPoses?.length || !view) return;
+  const layout = panelLayout(width, height, data.panelCount, data.columns);
+  for (const pose of data.currentPoses) {
+    if (![pose.x, pose.z, pose.yaw].every(Number.isFinite)) continue;
+    const pane = panelPane(layout, pose.panel || 0), shown = equalScaleView(view, pane);
+    const x = pane.left + (pose.x - shown.xmin) / (shown.xmax - shown.xmin) * pane.width;
+    const y = pane.bottom - (pose.z - shown.zmin) / (shown.zmax - shown.zmin) * pane.height;
+    ctx.save();ctx.beginPath();ctx.rect(pane.left, pane.top, pane.width, pane.height);ctx.clip();
+    ctx.translate(x, y);ctx.rotate(pose.yaw * Math.PI /180);
+    ctx.globalAlpha = pose.stale ? .35 : 1;
+    ctx.fillStyle = PALETTE[(pose.color ||0) % CATEGORY_COLORS];ctx.strokeStyle = "#ffffff";ctx.lineWidth = 1.5;
+    ctx.beginPath();ctx.moveTo(0, -10);ctx.lineTo(6, 7);ctx.lineTo(0, 3);ctx.lineTo(-6, 7);ctx.closePath();ctx.fill();ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function drawPanelRois(ctx, width, height, data, view, visible = true) {
@@ -1223,6 +1241,7 @@ export class TrajectoryRenderer extends SpatialBase {
         scaleBar: true,
       });
       drawPanelRois(this.ctx, this.width, this.height, this.data, this.view, this.roisVisible);
+      drawCurrentPoses(this.ctx, this.width, this.height, this.data, this.view);
       drawPanelRings(this.ctx, this.width, this.height, this.data, this.view);
       drawPanelWindows(this.ctx, this.width, this.height, this.data, this.view);
       if (this.marginalsVisible && this.data.vertices?.length) {
