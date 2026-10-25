@@ -17,11 +17,16 @@
   $('pause-view').onclick=()=>{paused=!paused;$('pause-view').textContent=paused?'Resume view':'Pause view';if(!paused)dirty=true;};
   function cell(row, primary, secondary, stale=false){const td=document.createElement('td');td.textContent=primary??'—';td.dataset.stale=String(stale);if(secondary){const small=document.createElement('small');small.textContent=secondary;td.append(small);}row.append(td);}
   function receive(data){
-    latest=data; const f=data.telemetry, candidate=data.context||{}, r=data.receiver||{};
-    const currentSession=f?.experimentContext?.sessionId, c=currentSession&&candidate.sessionId&&currentSession!==candidate.sessionId?{}:candidate;
+    latest=data; let f=data.telemetry; const candidate=data.context||{}, r=data.receiver||{};
+    const pairs=[[f?.experimentContext?.sessionId,candidate.sessionId],[f?.system?.sceneName,candidate.experiment?.sceneName||candidate.scene?.name],[f?.system?.sceneNumber,candidate.experiment?.sceneNumber],[f?.system?.trialNumber,candidate.experiment?.trialNumber]];
+    const mismatch=!!f&&pairs.some(([a,b])=>a!=null&&b!=null&&String(a)!==String(b));
+    const ct=Date.parse(candidate.timestampUtc), ft=Date.parse(f?.timestampUtc);
+    const contextNewer=Number.isFinite(ct)&&Number.isFinite(ft)?ct>ft:r.contextAgeSeconds!=null&&(r.snapshotAgeSeconds==null||r.contextAgeSeconds<r.snapshotAgeSeconds);
+    const waitingForPose=mismatch&&contextNewer, c=mismatch&&!contextNewer?{}:candidate;
+    if(waitingForPose)f=null;
     text('connection',({receiving:'Telemetry receiving',waiting:'Waiting for publisher',stale:'Telemetry stale',error:'Receiver error',disconnected:'Choose a publisher'})[r.state]||'Waiting');$('connection').dataset.state=r.state||'waiting';
     text('diagnostics',`${r.endpoint||'No publisher selected'} · ${r.snapshots||0} snapshots · ${r.contexts||0} context heartbeats · ${r.sequenceGaps||0} source-sequence gaps · ${r.invalidPackets||0} invalid packets · ${r.publisherRestarts||0} publisher restarts · snapshot age ${number(r.snapshotAgeSeconds,2)} s · context age ${number(r.contextAgeSeconds,2)} s`);
-    text('error',r.error||f?.system?.error||'');
+    text('error',r.error||(waitingForPose?'Experiment context advanced; waiting for a matching pose snapshot.':f?.system?.error||''));
     const sys=f?.system||c.experiment||{}, scene=sys.sceneName||c.experiment?.sceneName;
     text('run-id',c.experimentName||c.sessionId||f?.experimentContext?.sessionId||'Waiting for context heartbeat');
     text('scene',scene?`${scene} · block ${sys.sceneNumber||'—'}`:'—');
@@ -29,9 +34,9 @@
     const timing=f?.frameTiming||{};text('fps',Number.isFinite(timing.framesPerSecond)?number(timing.framesPerSecond)+' FPS':Number.isFinite(timing.frameMeanMs)?number(timing.frameMeanMs)+' ms':'—');
     text('config',c.experiment?.configFile||c.experiment?.design||f?.experimentContext?.configFile||'Waiting for context heartbeat');
     const units=c.scene?.worldUnitsPerMetre??f?.experimentContext?.worldUnitsPerMetre; text('position-units',`World X / Z · ${units===1?'metres':units===100?'centimetres':'scene world units'} · current viewing window`);
-    if(!f)return;
     const key=`${r.endpoint||''}|${c.sessionId||f?.experimentContext?.sessionId||''}|${sys.sceneName||''}|${sys.trialNumber||0}|${sys.sceneNumber||0}`;
     if(generation && key!==generation)clear(); generation=key;
+    if(!f){const body=$('animals');body.replaceChildren();const row=document.createElement('tr');cell(row,'Waiting for a matching pose snapshot');row.children[0].colSpan=6;body.append(row);return;}
     const isNewFrame=f.sequence!==lastSequence;
     if(isNewFrame&&lastSequence!==null&&f.sequence<lastSequence)clear();
     if(isNewFrame)lastSequence=f.sequence;

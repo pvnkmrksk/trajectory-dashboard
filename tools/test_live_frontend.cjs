@@ -38,5 +38,17 @@ function emit(s){stream.handlers.snapshot({data:JSON.stringify(s)});intervals[0]
  $('pause-view').onclick();state.telemetry.sequence=4;emit(state);assert.equal($('pause-view').textContent,'Resume view');
  $('pause-view').onclick();intervals[0]();assert.equal(charts[0].series[0].data.length,2);
  $('clear-view').onclick();intervals[0]();assert.equal(charts[0].series.length,0);
+ state.context={sessionId:'run-B',timestampUtc:'2026-10-25T12:00:10Z',experiment:{sceneName:'Swarm',sceneNumber:2,trialNumber:1,configFile:'swarm.json'},scene:{name:'Swarm',worldUnitsPerMetre:1}};state.receiver.contextAgeSeconds=0;state.receiver.snapshotAgeSeconds=4;emit(state);
+ assert.match($('scene').textContent,/Swarm/);
+ assert.match($('position-units').textContent,/metres/);
+ assert.equal(charts[0].series.length,0,'A newer context must not relabel old-scene paths with new units');
+ assert.match($('animals').children[0].children[0].textContent,/Waiting/);
+ state.telemetry.timestampUtc='2026-10-25T12:00:11Z';state.telemetry.system={sceneName:'Swarm',sceneNumber:2,trialNumber:1};state.telemetry.experimentContext={sessionId:'run-B',worldUnitsPerMetre:1};state.telemetry.sequence=5;emit(state);
+ assert.equal(charts[0].series[0].data.length,1);
+ state.context.timestampUtc='2026-10-25T12:00:09Z';state.context.experiment={sceneName:'Choice',sceneNumber:1,trialNumber:1,configFile:'old.json'};state.context.scene={name:'Choice',worldUnitsPerMetre:100};emit(state);
+ assert.match($('scene').textContent,/Swarm/);
+ assert.match($('position-units').textContent,/metres/,'An older context must not relabel a newer pose');
+ assert.notEqual($('config').textContent,'old.json');
+
  console.log('PASS: live frontend units/FPS, Unicode, stale input, bounded histories, endpoint/session/restart changes and pause/clear controls');
 })().catch(error=>{console.error(error);process.exitCode=1;});
