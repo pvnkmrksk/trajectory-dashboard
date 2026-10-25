@@ -1,0 +1,64 @@
+name: Standalone dashboard builds
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'native_app.py'
+      - 'native_dashboard/**'
+      - 'trajectory_dashboard/**'
+      - 'requirements-native.txt'
+      - 'daari-deepa.spec'
+      - 'tools/**'
+      - 'tests/**'
+      - '.github/workflows/native-build.yml'
+jobs:
+  tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements.txt pytest
+      - run: python -m pytest tests -q
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+          - os: windows-2022
+            platform: windows-x64
+          - os: macos-15
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-native.txt 'pyinstaller>=6,<7'
+      - run: python tools/build_native.py
+      - name: Check packaged command
+        run: dist/DaariDeepa/DaariDeepa --help
+        if: runner.os != 'Windows'
+      - name: Check packaged Windows command
+        run: dist/DaariDeepa/DaariDeepa.exe --help
+        if: runner.os == 'Windows'
+      - name: Exercise packaged HTTP, SSE and ZeroMQ
+        run: python tools/smoke_native.py dist/DaariDeepa/DaariDeepa
+        if: runner.os != 'Windows'
+      - name: Exercise packaged Windows HTTP, SSE and ZeroMQ
+        run: python tools/smoke_native.py dist/DaariDeepa/DaariDeepa.exe
+        if: runner.os == 'Windows'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DaariDeepa-${{ matrix.platform }}
+          path: dist/DaariDeepa-*.zip
+          retention-days: 14

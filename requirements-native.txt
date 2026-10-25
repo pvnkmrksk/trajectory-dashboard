@@ -1,0 +1,7 @@
+# Browser-native analysis and live telemetry. Dash/Plotly are not required.
+flask>=3.0,<4
+pandas>=2.0
+numpy>=1.24
+scipy>=1.11,<2
+pyzmq>=26,<28
+waitress>=3,<4

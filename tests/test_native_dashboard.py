@@ -71,7 +71,7 @@ def test_native_binary_is_aligned_and_file_scoped(tmp_path):
     assert header["playbackQuantiles"] == {
         "median": 2.0, "p95": 2.0, "p99": 2.0, "max": 2.0,
     }
-    assert sorted(header["categories"]["animal"]) == ["fly-0@unknown", "fly-4@unknown"]
+    assert sorted(header["categories"]["animal"]) == ["fly-0@VR1", "fly-4@VR1"]
     assert "rawColumns" not in header
     assert header["arrays"]["segmentDuration"]["length"] == 2
     assert set(header["filterHistograms"]) == {

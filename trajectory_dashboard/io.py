@@ -24,7 +24,7 @@ REQUIRED_COLUMNS = [
 ]
 
 
-_VR_RE = re.compile(r"\bVR\s*0*([0-9]+)\b", re.IGNORECASE)
+_VR_RE = re.compile(r"(?<![A-Za-z0-9])VR\s*0*([0-9]+)(?![A-Za-z0-9])", re.IGNORECASE)
 SORT_COLUMNS = ["SourceFolder", "SourceFile", "CurrentTrial", "CurrentStep", "Current Time"]
 SCENE_COLUMN_PRIORITY = (
     "SceneName",
@@ -126,7 +126,7 @@ def _find_fly_metadata(csv_dir: str) -> str | None:
     """Find fly metadata beside a CSV without crossing its source folder."""
 
     folder = Path(csv_dir)
-    for pattern in ("*FlyMetaData.json", "*metadata.json"):
+    for pattern in ("*AnimalMetaData.json", "*AnimalMetadata.json", "animal_metadata.json", "*FlyMetaData.json", "*metadata.json"):
         hits = sorted(folder.glob(pattern))
         if hits:
             return str(hits[0])
@@ -232,8 +232,8 @@ def _fly_id_from_frame(df: pd.DataFrame) -> pd.Series | None:
     """Return a FlyID-like column already present in a CSV, if any."""
 
     candidates = (
-        "FlyID", "FlyId", "fly_id", "flyid", "Fly ID",
         "AnimalID", "AnimalId", "animal_id", "Animal ID",
+        "FlyID", "FlyId", "fly_id", "flyid", "Fly ID",
     )
     for col in candidates:
         if col not in df.columns:
@@ -247,7 +247,7 @@ def _fly_id_from_frame(df: pd.DataFrame) -> pd.Series | None:
 def _metadata_flies(meta) -> list[dict]:
     if not isinstance(meta, dict):
         return []
-    for key in ("Flies", "flies", "FlyMetaData", "fly_metadata"):
+    for key in ("Animals", "animals", "Flies", "flies", "FlyMetaData", "fly_metadata"):
         flies = meta.get(key)
         if isinstance(flies, list):
             return [fly for fly in flies if isinstance(fly, dict)]
@@ -388,12 +388,15 @@ def load_folder_metadata(folder: str) -> dict:
     """Load sequence order, fly metadata, and Choice config JSONs for a folder."""
 
     meta = {"folder": folder, "configs": {}, "sequence_order": [], "fly_metadata": None}
+    metadata_path = _find_fly_metadata(folder)
     for path in Path(folder).glob("*.json"):
         data = loads_tolerant(path.read_text())
         if data is None:
             continue
-        if "FlyMetaData" in path.name or "metadata" in path.name.lower():
-            meta["fly_metadata"] = data
+        if "metadata" in path.name.lower():
+            if str(path) == metadata_path:
+                meta["fly_metadata"] = data
+                meta["animal_metadata"] = data
         elif "sequenceConfig" in path.name:
             order = []
             for seq in data.get("sequences", []) if isinstance(data, dict) else []:
@@ -485,7 +488,10 @@ def load_csv_fast(filepath: str, *, include_numeric: bool = True) -> pd.DataFram
         fly = _lookup_fly(meta, vr_number)
         if fly:
             metadata_matched = True
-            fly_id = str(fly.get("FlyID") or fly_id)
+            fly_id = str(fly.get("AnimalID") if "AnimalID" in fly else fly.get("FlyID") or fly_id)
+            if not fly_id or fly_id == "None":
+                fly_id = _fallback_fly_id(csv_base, vr_number)
+            df["SpeciesName"] = fly.get("SpeciesName") or "unknown"
             df["Sex"] = fly.get("Sex", "unknown")
     if "Sex" not in df.columns:
         df["Sex"] = "unknown"
@@ -495,6 +501,9 @@ def load_csv_fast(filepath: str, *, include_numeric: bool = True) -> pd.DataFram
         df["FlyID"] = csv_fly_id
     else:
         df["FlyID"] = str(fly_id)
+    df["AnimalID"] = df["FlyID"]  # Canonical public alias; historical grouping stays stable.
+    if "SpeciesName" not in df.columns:
+        df["SpeciesName"] = "unknown"
     df["SourceFolder"] = os.path.basename(csv_dir)
     df["SourceFile"] = csv_base
 
@@ -505,7 +514,7 @@ def load_csv_fast(filepath: str, *, include_numeric: bool = True) -> pd.DataFram
     base_keep = {
         "Current Time", "CurrentTrial", "CurrentStep", "GameObjectPosX",
         "GameObjectPosZ", "ConfigFile", "SceneName", "VR", "FlyID", "Sex",
-        "SourceFolder", "SourceFile", "_seg_id", "TrialIndex",
+        "SourceFolder", "SourceFile", "_seg_id", "TrialIndex", "AnimalID", "SpeciesName",
         "OriginalCurrentTrial",
     }
     numeric_keep = {
@@ -516,7 +525,7 @@ def load_csv_fast(filepath: str, *, include_numeric: bool = True) -> pd.DataFram
         and not df[col].isna().all()
     }
     df = df[[col for col in df.columns if col in (base_keep | numeric_keep)]]
-    for col in ("ConfigFile", "SceneName", "VR", "FlyID", "Sex", "SourceFolder", "SourceFile"):
+    for col in ("ConfigFile", "SceneName", "VR", "FlyID", "AnimalID", "SpeciesName", "Sex", "SourceFolder", "SourceFile"):
         if col in df.columns:
             df[col] = df[col].astype("category")
     return df
@@ -547,7 +556,7 @@ def load_dataset(pattern: str) -> TrajectoryDataset:
     df = pd.concat(frames, ignore_index=True)
     concatenate_restarted_trials(df)
     sort_frame_for_segments(df)
-    for col in ("ConfigFile", "SceneName", "VR", "FlyID", "Sex", "SourceFolder", "SourceFile"):
+    for col in ("ConfigFile", "SceneName", "VR", "FlyID", "AnimalID", "SpeciesName", "Sex", "SourceFolder", "SourceFile"):
         if col in df.columns:
             df[col] = df[col].astype("category")
     return TrajectoryDataset(df, compute_segment_stats(df), metadata, pattern)

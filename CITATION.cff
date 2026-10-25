@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "Please cite this software and record the commit used for your analysis."
+type: software
+title: "Daari Deepa: animal trajectory analysis and live experiment monitoring"
+authors:
+  - family-names: Kaushik
+    given-names: Pavan Kumar
+repository-code: "https://github.com/pvnkmrksk/trajectory-dashboard"
+url: "https://github.com/pvnkmrksk/trajectory-dashboard"
