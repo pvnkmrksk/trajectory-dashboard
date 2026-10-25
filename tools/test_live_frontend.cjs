@@ -14,6 +14,8 @@ assert.equal(m.payloads().trajectory.animalNames[0],'VR1 · animal β');
 const invalid=frame(4,10.3);invalid.rigs[0].pose.x=NaN;m.receive(invalid);m.receive(frame(5,10.4));
 assert.equal(m.payloads().trajectory.links,2,'Invalid poses break paths without creating phantom motion');
 m.receive(frame(6,20));assert.equal(m.payloads().trajectory.links,2,'A real telemetry outage breaks the path');
+const bounded=m.payloads();assert.equal(bounded.trajectory.vertices.length,bounded.trajectory.links*4);
+assert.equal(bounded.heading.panels.length,bounded.heading.vertices.length/2,'Unused buffer capacity cannot create ghost links');
 m.receive(frame(1,30));assert.equal(m.payloads().points,1,'Publisher reset clears retained samples');
 m.receive(frame(2,29));assert.equal(m.payloads().points,1,'A source-clock reset starts a fresh viewing window');
 m.receive(frame(2,29));assert.equal(m.payloads().points,1,'Repeated reset packet is not duplicated');

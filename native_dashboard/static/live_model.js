@@ -85,29 +85,38 @@ export class LivePlotModel {
   }
   payloads() {
     const entries=[...this.histories].filter(([,h])=>h.active),names=entries.map(([,h])=>h.name);
-    const vertices=[],panels=[],colors=[],animals=[],segments=[],times=[],samples=[];
-    const hv=[],hp=[],hc=[],ha=[],hs=[],ht=[],hstep=[];
-    const currentPoses=[];
+    const capacity=entries.reduce((sum,[,h])=>sum+Math.max(0,h.points.length-1),0),pairs=capacity*2;
+    // One bounded allocation per attribute, rather than repeatedly growing large
+    // JavaScript arrays and copying each of them into a typed buffer every draw.
+    const vertices=new Float32Array(capacity*4),panels=new Uint16Array(pairs),colors=new Uint8Array(pairs);
+    const animals=new Uint16Array(pairs),segments=new Uint32Array(pairs),times=new Float32Array(pairs),samples=new Float32Array(pairs);
+    const hv=new Float32Array(capacity*4),hp=new Uint16Array(pairs),hc=new Uint8Array(pairs);
+    const ha=new Uint16Array(pairs),hs=new Float32Array(pairs),ht=new Float32Array(pairs),hstep=new Float32Array(pairs);
+    ht.fill(NaN);hstep.fill(NaN);
+    let links=0,headingLinks=0;const currentPoses=[];
     entries.forEach(([,history],animal)=>{
       const points=history.points;
       for (let index=1;index<points.length;index++) {
         const previous=points[index-1],point=points[index];if(point.broken)continue;
-        vertices.push(previous.x,previous.z,point.x,point.z);panels.push(0,0);colors.push(history.color,history.color);
-        animals.push(animal,animal);segments.push(animal,animal);times.push(previous.t,point.t);samples.push(0,0);
+        const v=links*4,a=links*2;
+        vertices[v]=previous.x;vertices[v+1]=previous.z;vertices[v+2]=point.x;vertices[v+3]=point.z;
+        colors[a]=colors[a+1]=history.color;animals[a]=animals[a+1]=animal;segments[a]=segments[a+1]=animal;
+        times[a]=previous.t;times[a+1]=point.t;links++;
         // Recorded heading plots break at +/-180 rather than drawing a false turn.
         if (Math.abs(point.yaw-previous.yaw)>180) continue;
-        hv.push(previous.t,previous.yaw,point.t,point.yaw);hp.push(0,0);hc.push(history.color,history.color);
-        ha.push(animal,animal);hs.push(0,0);ht.push(NaN,NaN);hstep.push(NaN,NaN);
+        const h=headingLinks*4,b=headingLinks*2;
+        hv[h]=previous.t;hv[h+1]=previous.yaw;hv[h+2]=point.t;hv[h+3]=point.yaw;
+        hc[b]=hc[b+1]=history.color;ha[b]=ha[b+1]=animal;headingLinks++;
       }
       const latest=points.at(-1);if(latest) currentPoses.push({...latest,panel:0,color:history.color,name:history.name,stale:history.stale});
     });
     const bounds=streamBounds(this.histories);
-    return {trajectory:{vertices:Float32Array.from(vertices),panels:Uint16Array.from(panels),colors:Uint8Array.from(colors),
-      animals:Uint16Array.from(animals),segments:Uint32Array.from(segments),times:Float32Array.from(times),samples:Float32Array.from(samples),
-      panelCount:1,panelNames:['Live trajectories'],animalNames:names,columns:1,links:vertices.length/4,
+    return {trajectory:{vertices:vertices.subarray(0,links*4),panels:panels.subarray(0,links*2),colors:colors.subarray(0,links*2),
+      animals:animals.subarray(0,links*2),segments:segments.subarray(0,links*2),times:times.subarray(0,links*2),samples:samples.subarray(0,links*2),
+      panelCount:1,panelNames:['Live trajectories'],animalNames:names,columns:1,links,
       segmentCount:entries.length,segmentLabels:names,bounds,rois:[],currentPoses},
-      heading:{mode:'trial',vertices:Float32Array.from(hv),panels:Uint16Array.from(hp),colors:Uint8Array.from(hc),
-        samples:Float32Array.from(hs),animals:Uint16Array.from(ha),trials:Float32Array.from(ht),steps:Float32Array.from(hstep),
+      heading:{mode:'trial',vertices:hv.subarray(0,headingLinks*4),panels:hp.subarray(0,headingLinks*2),colors:hc.subarray(0,headingLinks*2),
+        samples:hs.subarray(0,headingLinks*2),animals:ha.subarray(0,headingLinks*2),trials:ht.subarray(0,headingLinks*2),steps:hstep.subarray(0,headingLinks*2),
         minTime:Math.max(0,this.now-this.seconds),maxTime:Math.max(.001,this.now),panelCount:1,
         panelNames:['Seconds since joining this block'],animalNames:names,animalColors:entries.map(([,h])=>h.color),columns:1,
         lineWidth:1.8,lineOpacity:.85},

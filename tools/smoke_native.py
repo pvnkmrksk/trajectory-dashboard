@@ -90,6 +90,11 @@ try:
         "/live/",
         "/static/live.js",
         "/static/live.css",
+        "/static/live_model.js",
+        "/static/renderers.js",
+        "/static/echarts_renderers.js",
+        "/static/icons/pause.svg",
+        "/static/icons/LICENSE.txt",
         "/static/vendor/echarts.min.js",
     ):
         with urlopen(base + route, timeout=5) as response:
