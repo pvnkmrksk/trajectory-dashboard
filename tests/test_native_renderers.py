@@ -215,6 +215,8 @@ assert.equal(live.xAxis[0].min, 65);assert.equal(live.xAxis[0].max, 125);
 assert.equal(live.series[0].lineStyle.color, native.NATIVE_PALETTE[1]);
 assert.equal(live.series[0].lineStyle.width, 1.8);
 assert.equal(live.series[0].data[0].coords[0][1], -90);
+assert.match(live.aria.label.description,/65 to 125 seconds/);
+assert.ok(!live.aria.label.description.includes('NaN'));
 """)
 
 

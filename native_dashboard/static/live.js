@@ -9,18 +9,18 @@ import {LivePlotModel, followBounds, signedHeading} from '/static/live_model.js'
   try {pathRenderer=new TrajectoryRenderer($('paths-plot'),()=>{autoRange=false;range=pathRenderer.view;updateRangeButton();});pathRenderer.setLineStyle(1.8,.8);}
   catch(error){rendererError=error.message;}
   const headingRenderer=new EChartsHeadingRenderer($('heading-plot'));
-  let latest=null,paused=false,generation='',dirty=true;
+  let paused=false,generation='',dirty=true,displayed=null;
   const text=(id,value)=>{$(id).textContent=value??'—';};
   const number=(v,digits=1)=>Number.isFinite(v)?v.toFixed(digits):'—';
-  function updateRangeButton(){text('fit-paths',autoRange?'Auto range on':'Fit & follow');$('fit-paths').ariaPressed=String(autoRange);}
-  function clear(){model.clear();range=null;autoRange=true;dirty=true;updateRangeButton();paint(true);}
+  function updateRangeButton(){text('fit-paths',autoRange?'Auto range on':'Fit & follow');$('fit-paths').dataset.following=String(autoRange);}
+  function clear(){model.clear();displayed=null;range=null;autoRange=true;dirty=true;updateRangeButton();paint(true);}
   $('clear-view').onclick=clear;
   $('fit-paths').onclick=()=>{autoRange=true;range=null;updateRangeButton();dirty=true;paint(true);};
-  $('pause-view').onclick=()=>{paused=!paused;text('pause-view',paused?'Resume view':'Pause view');$('pause-view').ariaPressed=String(paused);if(!paused){dirty=true;paint();}};
+  $('pause-view').onclick=()=>{paused=!paused;text('pause-view',paused?'Resume view':'Pause view');$('pause-view').ariaPressed=String(paused);$('history-window').disabled=paused;if(paused)text('view-window','Paused · '+$('view-window').textContent);if(!paused){dirty=true;paint();}};
   $('history-window').onchange=()=>{model.setWindow($('history-window').value);dirty=true;};
   function cell(row, primary, secondary, stale=false){const td=document.createElement('td');td.textContent=primary??'—';td.dataset.stale=String(stale);if(secondary){const small=document.createElement('small');small.textContent=secondary;td.append(small);}row.append(td);}
   function receive(data){
-    latest=data; let f=data.telemetry; const candidate=data.context||{}, r=data.receiver||{};
+    let f=data.telemetry; const candidate=data.context||{}, r=data.receiver||{};
     const pairs=[[f?.experimentContext?.sessionId,candidate.sessionId],[f?.system?.sceneName,candidate.experiment?.sceneName||candidate.scene?.name],[f?.system?.sceneNumber,candidate.experiment?.sceneNumber],[f?.system?.trialNumber,candidate.experiment?.trialNumber]];
     const mismatch=!!f&&pairs.some(([a,b])=>a!=null&&b!=null&&String(a)!==String(b));
     const ct=Date.parse(candidate.timestampUtc), ft=Date.parse(f?.timestampUtc);
@@ -44,7 +44,7 @@ import {LivePlotModel, followBounds, signedHeading} from '/static/live_model.js'
     if(!f){const body=$('animals');body.replaceChildren();const row=document.createElement('tr');cell(row,'Waiting for a matching pose snapshot');row.children[0].colSpan=7;body.append(row);return;}
     const profiles=new Map((c.animals||[]).map(a=>[a.vrId,a]));
     const body=$('animals');body.replaceChildren();
-    const visible=(f.rigs||[]).slice(0,32), ids=new Set(visible.map(r=>r.vrId));
+    const visible=(f.rigs||[]).slice(0,32);
     for(const rig of visible){
       const p=rig.pose, profile=profiles.get(rig.vrId)||{}, row=document.createElement('tr');
       cell(row,profile.animalId||rig.vrId,profile.animalId?rig.vrId:'');
@@ -63,13 +63,13 @@ import {LivePlotModel, followBounds, signedHeading} from '/static/live_model.js'
   }
   function paint(force=false){
     if(!dirty||paused&&!force||document.visibilityState==='hidden')return;
-    dirty=false;const data=model.payloads();
+    dirty=false;const data=paused&&displayed?displayed:model.payloads();displayed=data;
     if(pathRenderer){
       pathRenderer.setData(data.trajectory,true);
       if(autoRange){range=followBounds(range,data.trajectory.bounds);pathRenderer.setView(range);}
     }
     headingRenderer.setData(data.heading,true);
-    text('view-window',`${data.rigs} rig${data.rigs===1?'':'s'} · ${data.points.toLocaleString()} displayed samples · up to ${model.seconds}s per block${model.droppedForLimit?' · sample cap reached':''}`);
+    text('view-window',`${paused?'Paused · ':''}${data.rigs} rig${data.rigs===1?'':'s'} · ${data.points.toLocaleString()} displayed samples · up to ${model.seconds}s per block${model.droppedForLimit?' · sample cap reached':''}`);
     $('paths-empty').hidden=data.points>0;$('heading-empty').hidden=data.heading.vertices.length>0;
     const legend=$('plot-legend');legend.replaceChildren();
     for(const pose of data.trajectory.currentPoses){

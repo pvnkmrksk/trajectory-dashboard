@@ -33,8 +33,26 @@ and sequence restart. Histories are an observation window, not a recording.
 
 World X/Z are displayed without changing coordinates. When supplied,
 `worldUnitsPerMetre` identifies metres (1), centimetres (100), or another
-explicit scene scale. Heading is world yaw in degrees. Tracker freshness and
+explicit scene scale. Heading is signed world yaw in degrees. Tracker freshness and
 telemetry freshness are separate indicators.
+
+## Shared plots and live controls
+
+Live paths use the same WebGL trajectory renderer, palette, equal-scale X/Z
+pan/zoom and physical scale bars as recorded analysis. Live headings use the
+same ECharts renderer and signed −180° to +180° convention; circular wraps and
+telemetry outages break lines instead of drawing artificial turns. A current
+pose arrow uses Unity's +Z-forward / +90°-toward-+X convention. Unknown scene
+scales stay labelled world units.
+
+Choose a 30, 60 or 120-second viewing window. Auto range expands to include new
+motion and uses a quiet margin before shrinking, so stationary jitter does not
+continually move the axes. Panning/zooming holds your spatial range; **Fit &
+follow** resumes automatic framing. **Pause view** freezes the displayed
+samples while reception and the status table continue; fitting a paused view
+uses that same frozen sample set. Clear window affects this browser only.
+Hidden tabs stop drawing while the bounded receiver state keeps updating.
+Connection settings are folded away after a publisher has been configured.
 
 ## Server and remote viewing
 

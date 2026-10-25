@@ -28,6 +28,10 @@ heartbeats, then streams the latest state to browsers with Server-Sent Events.
 It shows trajectories, heading, tracker freshness, steering, flight state,
 scene, trial, configuration and animal/species metadata. Live viewing is a
 bounded observation window; MATREX's saved files remain the experiment record.
+Live rendering now reuses the recorded-data WebGL trajectory and heading
+renderers, with current heading arrows, wrap-safe signed angles, and a bounded
+30/60/120-second window. Pan to hold a range; Fit & follow restores automatic
+framing. Pause freezes plots while acquisition and status continue.
 
 ```bash
 python -m pip install -r requirements-native.txt

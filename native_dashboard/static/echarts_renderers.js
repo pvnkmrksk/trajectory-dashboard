@@ -634,6 +634,7 @@ export class EChartsHeadingRenderer extends EChartRenderer {
     }
     return {
       ...this.base("heading-local-time"), title: titles,
+      aria: {enabled: true, label: {description: `Signed heading from -180 to +180 degrees. Time ${formatNumber(Math.max(0, Number(data.minTime)||0),1)} to ${formatNumber(data.maxTime,1)} seconds. ${(data.animalNames||[]).length} animal series. Circular wraps break the line.`}},
       legend: {type: "scroll", right: 92, top: 8, width: "48%", selected: selectedMap(data, this.animalVisibility), textStyle: {fontSize: 10, color: MUTED}, itemWidth: 16, itemHeight: 7},
       tooltip: {trigger: "item", confine: true, formatter: params => {
         const item = params.data || {}, end = item.coords?.[1] || [];

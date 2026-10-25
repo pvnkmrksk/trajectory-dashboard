@@ -49,6 +49,7 @@ function emit(s){stream.handlers.snapshot({data:JSON.stringify(s)});intervals[0]
  state.telemetry={...state.telemetry,...frame(3,.2)};emit(state);assert.equal(charts[0].view,held,'Manual spatial view survives incoming data');
  $('fit-paths').onclick();assert.equal($('fit-paths').textContent,'Auto range on');
  $('pause-view').onclick();state.telemetry={...state.telemetry,...frame(4,.3)};emit(state);assert.equal(charts[0].data.links,2,'Pause freezes drawings, not acquisition');
+ assert.match($('view-window').textContent,/Paused/);$('fit-paths').onclick();assert.equal(charts[0].data.links,2,'Fitting a paused chart must not reveal newer samples');
  $('pause-view').onclick();assert.equal(charts[0].data.links,3);
  state.receiver.endpoint='tcp://other-host:9880';state.telemetry={...state.telemetry,...frame(5,.4)};emit(state);assert.equal(charts[0].data.links,0,'Endpoint changes clear trails');
  state.telemetry.experimentContext.sessionId='run-B';state.telemetry={...state.telemetry,...frame(6,.5)};emit(state);
