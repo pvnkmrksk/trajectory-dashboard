@@ -846,6 +846,7 @@ export class TrajectoryRenderer extends SpatialBase {
     this.ctx = this.overlay.getContext("2d");
     this.fraction = 1;
     this.timeLimit = 1e30;
+    this.futureContext = false;
     this.selectedSegment = -1;
     this.sequentialCodes = null;
     this.sequentialThrough = -1;
@@ -1160,6 +1161,7 @@ export class TrajectoryRenderer extends SpatialBase {
     this.drawGl(); if (this.marginalsVisible) this.drawOverlay();
   }
   setTime(value) { this.timeLimit = Number.isFinite(value) ? value : 1e30; this.drawGl(); }
+  setFutureContext(enabled) { this.futureContext = !!enabled; }
   setPlaybackSegment(value) {
     this.selectedSegment = Number.isFinite(Number(value)) ? Number(value) : -1;
     this.drawGl();
@@ -1224,6 +1226,13 @@ export class TrajectoryRenderer extends SpatialBase {
     gl.uniform1f(this.uniforms.u_ring_context, this.ringContext ? 1 : 0);
     gl.uniform1f(this.uniforms.u_ring_texture_width, this.ringTextureWidth);
     gl.bindVertexArray(this.vao);
+    if (this.futureContext && this.timeLimit < 1e29) {
+      gl.uniform1f(this.uniforms.u_time, 1e30);
+      gl.uniform1f(this.uniforms.u_opacity, Math.min(.10, this.lineOpacity * .16));
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
+      gl.uniform1f(this.uniforms.u_time, this.timeLimit);
+      gl.uniform1f(this.uniforms.u_opacity, this.lineOpacity);
+    }
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, this.instanceCount);
     gl.bindVertexArray(null);
   }

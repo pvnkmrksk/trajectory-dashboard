@@ -607,6 +607,9 @@ def _build_native_dataset(pattern: str, source_signature=None) -> NativeDataset:
     x = _finite_float(frame["GameObjectPosX"])
     z = _finite_float(frame["GameObjectPosZ"])
     local_time = _local_time_seconds(frame, starts, ends)
+    wall_ns = frame["Current Time"].astype("int64", copy=False).to_numpy(dtype=np.int64)
+    wall_origin = int(wall_ns.min())
+    replay_time = ((wall_ns - wall_origin) / 1e9).astype(np.float32)
     smooth_speed = _finite_float(frame["_smoothed_velocity"])
     raw_speed = _finite_float(frame["_raw_velocity"])
     movement = _movement_heading(x, z, starts)
@@ -706,6 +709,7 @@ def _build_native_dataset(pattern: str, source_signature=None) -> NativeDataset:
         "x": x,
         "z": z,
         "time": local_time,
+        "replayTime": replay_time,
         "speed": smooth_speed,
         "rawSpeed": raw_speed,
         "orientation": orientation,
@@ -763,6 +767,8 @@ def _build_native_dataset(pattern: str, source_signature=None) -> NativeDataset:
     }
     meta = {
         "datasetId": dataset_id,
+        "replayTimeline": {"clock": "recorded-wallclock-ticks",
+                           "originTicks": str(wall_origin // 100 + 621355968000000000)},
         "pattern": pattern,
         "counts": {
             "files": int(frame["SourceFile"].nunique()),
