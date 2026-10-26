@@ -38,6 +38,7 @@ def _args():
         action="store_true",
         help="Suppress automatic browser opening in standalone packages",
     )
+    parser.add_argument("--replay-token", default="", help="Local recorded replay owner nonce; separate from live telemetry")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -58,6 +59,7 @@ def main():
             telemetry=args.telemetry,
             telemetry_topic=args.telemetry_topic,
             live_only=args.live_only,
+            replay_token=args.replay_token,
         )
     except (ValueError, ImportError) as error:
         raise SystemExit(str(error))

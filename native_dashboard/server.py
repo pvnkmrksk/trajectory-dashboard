@@ -13,6 +13,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory, redire
 
 from .dataset import NativeDatasetError, load_native_dataset
 from .live import install_live_routes
+from .replay import install_replay_routes
 
 
 LOGGER = logging.getLogger("trajectory.native")
@@ -120,7 +121,7 @@ def _binary_response(payload: bytes) -> Response:
     return response
 
 
-def create_native_app(default_source: str = "", *, telemetry: str = "", telemetry_topic: str = "matrex.telemetry.v2", live_only: bool = False) -> Flask:
+def create_native_app(default_source: str = "", *, telemetry: str = "", telemetry_topic: str = "matrex.telemetry.v2", live_only: bool = False, replay_token: str = "") -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config["NATIVE_DEFAULT_SOURCE"] = str(default_source or "")
 
@@ -188,4 +189,5 @@ def create_native_app(default_source: str = "", *, telemetry: str = "", telemetr
         return jsonify({"ok": True, "renderer": "browser-native", "plotly": False})
 
     install_live_routes(app, STATIC_DIR, telemetry, telemetry_topic, live_only)
+    install_replay_routes(app, STATIC_DIR, replay_token, _binary_response, load_native_dataset)
     return app
